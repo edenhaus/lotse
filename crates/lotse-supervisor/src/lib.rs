@@ -48,6 +48,7 @@ mod recording;
 mod registry;
 mod resolve;
 mod session;
+mod signaling;
 pub mod worker;
 mod worker_text;
 
@@ -220,13 +221,16 @@ pub fn bind(settings: &Settings) -> Result<Listeners, BindError> {
         owner_uid: settings.owner_uid,
         allow_uid: settings.allow_uid,
         max_connections: settings.limits.max_connections,
-        // One per session, one `stream/subscribe` per stream and one for
-        // every stream: the cap never refuses what the other limits allow.
-        max_subscriptions: settings
-            .limits
-            .max_sessions
-            .saturating_add(settings.limits.max_streams)
-            .saturating_add(1),
+        // One per session, one `stream/subscribe` and one
+        // `signaling/subscribe` per stream and one of each for every
+        // stream: the cap never refuses what the other limits allow.
+        max_subscriptions: settings.limits.max_sessions.saturating_add(
+            settings
+                .limits
+                .max_streams
+                .saturating_add(1)
+                .saturating_mul(2),
+        ),
         tls: settings.control_tls.clone(),
     })?;
     Ok(Listeners { api, udp, tcp })
@@ -454,7 +458,7 @@ pub(crate) mod test_support {
 
     use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
     use lotse_core::registry::Registries;
-    use lotse_core::test_util::FakeSourceFactory;
+    use lotse_core::test_util::{FakeSignaledSourceFactory, FakeSourceFactory};
 
     use super::*;
     use crate::worker::WorkerConfig;
@@ -541,13 +545,18 @@ pub(crate) mod test_support {
         }
     }
 
-    /// An environment whose workers are `binary`, with the fake source.
+    /// An environment whose workers are `binary`, with the fake source and
+    /// the signaled fake source (`fake-signaled`).
     pub(crate) fn environment(binary: &str) -> Environment {
         let mut registries = Registries::default();
         registries
             .sources
             .register(Arc::new(FakeSourceFactory::new(&["fake"])))
             .expect("the fake source registers");
+        registries
+            .sources
+            .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
+            .expect("the signaled fake source registers");
         Environment {
             registries,
             worker: WorkerConfig {

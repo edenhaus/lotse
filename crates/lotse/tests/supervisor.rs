@@ -3,7 +3,10 @@
 //! stream goes live with its tracks, losing demand lingers then stops the
 //! worker, a crashing worker is restarted with backoff, connection
 //! attempts take turns under `sources.connect_concurrency`, a backchannel
-//! probe among them, and shutdown stops everything within the budget.
+//! probe among them, and shutdown stops everything within the budget; a
+//! signaled source starts its worker without a host lookup and, with no
+//! client subscribing to its signaling within the wait, backs off
+//! unreachable.
 //! Needs the `source-fake` feature (on with `--all-features`).
 
 #![cfg(feature = "source-fake")]
@@ -26,7 +29,7 @@ use lotse_api_types::command::parse_command;
 use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
 use lotse_core::clock::{Clock, SystemClock};
 use lotse_core::registry::Registries;
-use lotse_core::test_util::FakeSourceFactory;
+use lotse_core::test_util::{FakeSignaledSourceFactory, FakeSourceFactory};
 use lotse_supervisor::api::{ConnectionId, Event, Handler as _, Outcome};
 use lotse_supervisor::worker::WorkerConfig;
 use lotse_supervisor::{Environment, Identity, Limits, Settings, Supervisor};
@@ -65,6 +68,10 @@ fn supervisor_with(connects: NonZeroUsize) -> Supervisor {
     registries
         .sources
         .register(Arc::new(FakeSourceFactory::new(&["fake"])))
+        .unwrap();
+    registries
+        .sources
+        .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
         .unwrap();
     let environment = Environment {
         registries,
@@ -137,7 +144,7 @@ async fn next_state(events: &mut mpsc::Receiver<Event>) -> (String, Option<Strin
 
 fn put(stream_id: &str, options: &Value, preload: bool) -> Value {
     json!({ "id": 1, "type": "stream/put", "stream_id": stream_id,
-            "sources": [{ "url": "fake://127.0.0.1/", "options": options }], "preload": preload })
+            "sources": [lotse_testing::source("fake://127.0.0.1/", options.clone())], "preload": preload })
 }
 
 #[tokio::test]
@@ -209,6 +216,46 @@ async fn preload_starts_a_worker_that_goes_live_and_linger_stops_it() {
         events.recv().await.unwrap().payload["type"],
         "stream_removed"
     );
+    s.shutdown().await;
+}
+
+/// A signaled source, named by its protocol, starts its worker without a
+/// host lookup (it has no address), and with no control-API client
+/// subscribing to its signaling the supervisor refuses its open once it
+/// waited 10 s for one: the source's attempt ends unreachable, and the
+/// stream backs off with that as its last error.
+#[tokio::test]
+async fn a_signaled_source_without_a_signaling_client_backs_off_unreachable() {
+    let s = supervisor();
+    let mut events = subscription(call(&s, json!({ "id": 1, "type": "stream/subscribe" })).await);
+    let put = json!({ "id": 2, "type": "stream/put", "stream_id": "door",
+        "sources": [{ "protocol": "fake-signaled" }], "preload": true });
+    assert_eq!(result(call(&s, put).await)["created"], true);
+    let mut states = Vec::new();
+    let error = loop {
+        let (state, error) = next_state(&mut events).await;
+        if state == "backoff" {
+            break error;
+        }
+        states.push(state);
+    };
+    assert_eq!(states, ["idle", "connecting"]);
+    assert_eq!(error.as_deref(), Some("source_unreachable"));
+    let door = result(
+        call(
+            &s,
+            json!({ "id": 3, "type": "stream/get", "stream_id": "door" }),
+        )
+        .await,
+    );
+    let message = door["last_error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("no_signaling_client") && !message.contains("resolving"),
+        "{door}"
+    );
+    // The worker runs on, backing off: only its source failed.
+    let worker = &door["sources"][0]["connection"]["worker"];
+    assert!(worker["pid"].as_u64().unwrap() > 0, "{door}");
     s.shutdown().await;
 }
 
@@ -306,8 +353,7 @@ async fn with_one_connect_permit_two_preloaded_cameras_connect_one_at_a_time() {
             call(
                 &s,
                 json!({ "id": 1, "type": "stream/put", "stream_id": stream,
-                        "sources": [{ "url": format!("fake://127.0.0.1:{port}/"),
-                                      "options": { "ready_after_ms": 400 } }],
+                        "sources": [lotse_testing::source(&format!("fake://127.0.0.1:{port}/"), json!({ "ready_after_ms": 400 }))],
                         "preload": true }),
             )
             .await,

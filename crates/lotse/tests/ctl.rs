@@ -75,22 +75,20 @@ fn ok(socket: &Path, args: &[&str]) -> Value {
 fn check_info(socket: &Path) {
     let info = ok(socket, &["info"]);
     assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
-    assert!(
-        info["schemes"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::from("fake"))
-    );
-    // The schemes follow the registered factories, `source-http` one of
-    // them by default.
-    let schemes = info["schemes"].as_array().unwrap();
-    for scheme in ["http", "https"] {
-        assert_eq!(
-            schemes.contains(&Value::from(scheme)),
-            cfg!(feature = "source-http"),
-            "{scheme} in {schemes:?}"
-        );
+    // The protocols follow the registered factories, of both kinds:
+    // `source-http`, `source-rtsp` and `source-webrtc` are on by default.
+    let mut protocols = vec!["fake", "fake-signaled"];
+    if cfg!(feature = "source-http") {
+        protocols.extend(["http", "https"]);
     }
+    if cfg!(feature = "source-rtsp") {
+        protocols.extend(["rtsp", "rtsps"]);
+    }
+    if cfg!(feature = "source-webrtc") {
+        protocols.push("webrtc");
+    }
+    protocols.sort_unstable();
+    assert_eq!(info["protocols"], serde_json::json!(protocols));
     // The recording container follows its feature, with the limits of recordings.
     assert_eq!(
         info["outputs"]
@@ -178,13 +176,18 @@ fn check_errors(socket: &Path) {
     assert_eq!(missing.status.code(), Some(1));
     let error = json(&String::from_utf8_lossy(&missing.stdout));
     assert_eq!(error["error"]["code"], "stream_not_found");
+    // A scheme that names no protocol of the API's is no request.
     for url in ["rtmp://cam/", "ftp://cam/live.ts"] {
         let bad_scheme = ctl(socket, &["stream", "put", "x", "--url", url]);
         assert_eq!(bad_scheme.status.code(), Some(1), "{url}");
-        assert_eq!(
-            json(&String::from_utf8_lossy(&bad_scheme.stdout))["error"]["code"],
-            "scheme_unsupported",
-            "{url}"
+        let error = json(&String::from_utf8_lossy(&bad_scheme.stdout));
+        assert_eq!(error["error"]["code"], "invalid_request", "{url}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("unknown variant, expected one of `rtsp`"),
+            "{error}"
         );
     }
     // A fragment is refused before any factory sees the url, `http` too.

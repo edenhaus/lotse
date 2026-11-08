@@ -2,60 +2,13 @@
 //! of `stream/get` and `stream/list`, and the events of `stream/subscribe`.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-
-/// One entry of `stream/put`'s `sources`.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct SourceSpec {
-    /// The source URL, credentials included; redacted everywhere it is
-    /// reported.
-    #[cfg_attr(feature = "schema", schemars(length(max = crate::limits::MAX_URL_CHARS)))]
-    pub url: String,
-    /// Per-scheme options, typed by the scheme's factory; unknown fields
-    /// there are rejected too.
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub options: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Prints the URL's scheme only and the options' names without their
-/// values, which a future scheme may make secret. The URL is not parsed
-/// yet, so where its userinfo, path and query end is not known, and any of
-/// them can carry a secret. `Serialize` is the wire form a client sends,
-/// so it keeps both; a serialized command is never logged.
-impl fmt::Debug for SourceSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SourceSpec")
-            .field("url", &redact_unparsed(&self.url))
-            .field("options", &self.options.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-/// `url` as `scheme://****` when it starts with a scheme (RFC 3986 §3.1:
-/// a letter, then letters, digits, `+`, `-` and `.`) and `://`, else
-/// `****`: the redacted form of a URL not parsed yet. A parsed source URL
-/// prints its origin too (`lotse_core::secret::RedactedUrl`).
-fn redact_unparsed(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, _))
-            if scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
-        {
-            format!("{scheme}://****")
-        }
-        _ => "****".to_owned(),
-    }
-}
+use crate::source::SourceSpec;
 
 /// `stream/put`'s `audio`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -189,17 +142,21 @@ pub struct ConnectionInfo {
     pub worker: Option<WorkerInfo>,
 }
 
-/// A source as `stream/get` reports it.
+/// A source as `stream/get` reports it: the source in the shape
+/// `stream/put` takes it, and its connection's state. The source is an
+/// object of its own, not flattened in here: a protocol's fields may share
+/// a name with the state's (`rtsp`'s `backchannel` option and the
+/// `backchannel` the probe found).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct SourceInfo {
-    /// The URL redacted to its origin, `scheme://[****@]host[:port]`, then
-    /// `/****` when the path is anything but empty or `/` and `?****` when
-    /// a query is present: the path and query can carry secrets (a camera
-    /// key, a session token) as the userinfo can.
-    pub url: String,
-    /// The protocol (`rtsp`).
-    pub protocol: String,
+    /// The source as `stream/put` took it, its `protocol` and its fields
+    /// with every default filled in, its `url` redacted to its origin,
+    /// `scheme://[****@]host[:port]`, then `/****` when the path is
+    /// anything but empty or `/` and `?****` when a query is present: the
+    /// path and query can carry secrets (a camera key, a session token) as
+    /// the userinfo can.
+    pub source: SourceSpec,
     /// The connection's state.
     pub state: StreamState,
     /// Reconnects so far.
@@ -566,48 +523,6 @@ mod tests {
     use crate::error::ErrorCode;
 
     #[test]
-    fn rfc3986_s3_1_debug_prints_a_source_urls_scheme_only_and_no_option_values() {
-        let spec: SourceSpec = serde_json::from_value(json!({
-            "url": "rtsp://admin:hunter2@cam.local:554/h264?x=1",
-            "options": { "transport": "tcp" }
-        }))
-        .unwrap();
-        assert_eq!(
-            format!("{spec:?}"),
-            r#"SourceSpec { url: "rtsp://****", options: ["transport"] }"#
-        );
-        // The command that carries it prints it the same way.
-        let put = crate::parse_command(
-            r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"url":"rtsp://u:hunter2@c/"}]}"#,
-        )
-        .unwrap();
-        let debug = format!("{put:?}");
-        assert!(
-            debug.contains(r#""rtsp://****""#) && !debug.contains("hunter2"),
-            "{debug}"
-        );
-        // The wire form keeps the credentials a client sends.
-        assert_eq!(
-            serde_json::to_value(&spec).unwrap()["url"],
-            "rtsp://admin:hunter2@cam.local:554/h264?x=1"
-        );
-        for (url, shown) in [
-            ("rtsp://cam.local/key?token=t", "rtsp://****"),
-            ("https://u:pa/ss?w#rd@cam/", "https://****"),
-            ("svc+x-1.2://cam", "svc+x-1.2://****"),
-            ("rtsp://", "rtsp://****"),
-            ("u:p@cam/key", "****"),
-            ("://cam/key", "****"),
-            ("1rtsp://cam/key", "****"),
-            ("x@y://cam/key", "****"),
-            ("rt sp://cam/key", "****"),
-            ("", "****"),
-        ] {
-            assert_eq!(redact_unparsed(url), shown, "{url}");
-        }
-    }
-
-    #[test]
     fn stream_events_serialize_like_the_contract_examples() {
         let event = StreamEvent::Stream {
             stream_id: "front".into(),
@@ -715,8 +630,11 @@ mod tests {
             since: "2026-09-28T11:02:03.000Z".into(),
             last_error: None,
             sources: vec![SourceInfo {
-                url: "rtsp://****@192.168.1.10:554/****".into(),
-                protocol: "rtsp".into(),
+                source: serde_json::from_value(json!({
+                    "protocol": "rtsp", "url": "rtsp://****@192.168.1.10:554/****",
+                    "transport": "udp"
+                }))
+                .unwrap(),
                 state: StreamState::Live,
                 reconnects: 2,
                 backchannel: Some(SourceBackchannel {
@@ -756,6 +674,17 @@ mod tests {
         assert_eq!(json["stats"]["recording_bytes"], 0);
         assert_eq!(json["state"], "live");
         assert_eq!(json["sources"][0]["connection"]["worker"]["pid"], 4711);
+        // The source in the shape `stream/put` takes, its state beside it.
+        assert_eq!(
+            json["sources"][0]["source"],
+            json!({ "protocol": "rtsp", "url": "rtsp://****@192.168.1.10:554/****",
+                    "transport": "udp", "backchannel": false, "timeout_ms": 10_000,
+                    "user_agent": null })
+        );
+        assert_eq!(
+            json["sources"][0]["backchannel"],
+            json!({ "codec": "pcmu", "state": "available" })
+        );
         assert_eq!(json["stats"]["frames_dropped"], 0);
         assert!(
             json["tracks"][0].get("audio_delay_ms").is_none(),
@@ -842,11 +771,12 @@ mod tests {
         assert_eq!(stream.backchannel, StreamBackchannel::default());
         assert_eq!((stream.prerecord_ms, stream.recordings.len()), (0, 0));
         let source: SourceInfo = serde_json::from_value(json!({
-            "url": "rtsp://cam/", "protocol": "rtsp", "state": "live", "reconnects": 0,
+            "source": { "protocol": "webrtc" }, "state": "live", "reconnects": 0,
             "connection": { "id": "c1", "worker": null }
         }))
         .unwrap();
         assert_eq!(source.backchannel, None, "a source without one");
+        assert_eq!(source.source.protocol(), "webrtc");
         assert_eq!(
             serde_json::to_value(SourceBackchannel {
                 codec: "pcmu".into(),

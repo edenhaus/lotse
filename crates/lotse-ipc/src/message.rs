@@ -7,7 +7,7 @@
 //! versioning.
 
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +161,9 @@ pub enum ToWorker {
         /// The recording.
         recording_id: String,
     },
+    /// What the supervisor answers a signaled source's signaling
+    /// ([`ToSupervisor::Signal`]) with: the control-API client's relay.
+    Signal(SignalCommand),
 }
 
 impl ToWorker {
@@ -344,13 +347,16 @@ pub enum SessionEvent {
 pub struct SourceSpec {
     /// The supervisor's id for the connection, echoed in reports.
     pub connection_id: String,
-    /// The full source URL, credentials included.
-    pub url: String,
-    /// The per-scheme options as JSON text.
+    /// What names the source: its URL, or a signaled source's protocol.
+    pub target: SourceTarget,
+    /// The protocol's fields but the URL, as JSON text: what its
+    /// factory parses.
     pub options: String,
-    /// The host name, for the protocol URL and TLS SNI.
+    /// The host name, for the protocol URL and TLS SNI; empty for a
+    /// signaled source, which has no address.
     pub peer_host: String,
-    /// The resolved addresses to try, in order (workers have no DNS).
+    /// The resolved addresses to try, in order (workers have no DNS); none
+    /// for a signaled source.
     pub peer_addrs: Vec<SocketAddr>,
     /// Where the reconnect schedule starts: where the connection's earlier
     /// workers left it, so a source that keeps failing is not retried at
@@ -360,6 +366,28 @@ pub struct SourceSpec {
     /// The pre-record window the connection's tracks keep, in milliseconds,
     /// 0 for none; [`ToWorker::Prerecord`] changes it later.
     pub prerecord_ms: u32,
+}
+
+/// What names a source a worker runs. `Debug` redacts the URL, which
+/// carries the credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceTarget {
+    /// A source the worker connects to: its full URL, credentials
+    /// included, whose scheme is a protocol the worker's registry has.
+    Url(String),
+    /// A source whose signaling the control-API client relays, by its
+    /// protocol (`webrtc`), which the worker's registry has as a signaled
+    /// one: it has no address, and each attempt opens a signaling channel.
+    Signaled(String),
+}
+
+impl fmt::Debug for SourceTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Url(_) => f.write_str("Url(****)"),
+            Self::Signaled(protocol) => f.debug_tuple("Signaled").field(protocol).finish(),
+        }
+    }
 }
 
 /// Where a source's reconnect schedule stands: all a new worker needs to
@@ -377,7 +405,7 @@ impl fmt::Debug for SourceSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SourceSpec")
             .field("connection_id", &self.connection_id)
-            .field("url", &"****")
+            .field("target", &self.target)
             .field("options", &"****")
             .field("peer_host", &self.peer_host)
             .field("peer_addrs", &self.peer_addrs)
@@ -447,6 +475,247 @@ pub enum ToSupervisor {
         /// What happened.
         event: RecordingReport,
     },
+    /// A signaled source's signaling: it asks for a channel to the
+    /// control-API client that relays its signaling, or sends on one;
+    /// [`ToWorker::Signal`] answers.
+    Signal(SignalReport),
+}
+
+/// The most bytes of SDP a [`SignalCommand::Answer`] carries, and the
+/// bound of a [`SignalReport::Offer`]'s tighter cap
+/// ([`MAX_SIGNAL_OFFER_BYTES`]): the control API's cap on an SDP
+/// (`MAX_SDP_CHARS`, 64 Ki characters, which its frame bounds to as many
+/// bytes). With [`MAX_SIGNAL_TEXT_BYTES`] for the rest, a signal message
+/// stays far below the frame's [`MAX_MESSAGE_BYTES`](crate::MAX_MESSAGE_BYTES),
+/// so encoding one never fails for its size; the sender drops a longer one.
+pub const MAX_SIGNAL_SDP_BYTES: usize = 64 * 1024;
+
+/// The most bytes of any other text a signal message carries: a
+/// candidate line, a `mid`, a code or a message. The control API's cap
+/// on a candidate line (`MAX_TEXT_CHARS`, 1024 characters) in bytes,
+/// four per character.
+pub const MAX_SIGNAL_TEXT_BYTES: usize = 4 * 1024;
+
+/// The most bytes of SDP a worker's [`SignalReport::Offer`] carries: what
+/// the supervisor passes on to the client. A WebRTC offer of audio, video
+/// and a data channel, its host candidates included, is two or three KiB.
+/// The worker ends a signal whose offer is longer itself, so the
+/// supervisor never has to reject one.
+pub const MAX_SIGNAL_OFFER_BYTES: usize = 16 * 1024;
+
+/// The most bytes of a worker's [`SignalReport::Candidate`] line or `mid`:
+/// the control API's cap on a candidate line (`MAX_TEXT_CHARS`, 1024
+/// characters), which the supervisor checks it against in bytes. The
+/// worker ends a signal whose candidate is longer itself, as for an
+/// offer over [`MAX_SIGNAL_OFFER_BYTES`].
+pub const MAX_SIGNAL_CANDIDATE_BYTES: usize = 1024;
+
+/// What a worker's signaled source sends toward the control-API client
+/// that relays its signaling (`lotse_core::signaling`), in the order it
+/// sends it. A channel is asked for with `Open` and named by the
+/// supervisor's `signal_id` from its [`SignalCommand::Opened`] on; its
+/// `Closed` is its last report.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignalReport {
+    /// A connection attempt asks for a signaling channel; `Opened` or
+    /// `Refused` with the same `request` answers it.
+    Open {
+        /// The worker's id for the open, unique within the worker.
+        request: u64,
+    },
+    /// The attempt that sent `Open` with `request` is over before an
+    /// answer came: none is needed any more, and an `Opened` that
+    /// crosses this is closed at once.
+    Cancel {
+        /// The open's id.
+        request: u64,
+    },
+    /// The source's SDP offer (RFC 8829 §5.2), once per signal. `Debug`
+    /// shows its length only: it carries the ICE password (RFC 8839 §5.4).
+    Offer {
+        /// The signal.
+        signal_id: String,
+        /// The SDP, at most [`MAX_SIGNAL_OFFER_BYTES`].
+        sdp: String,
+    },
+    /// A local candidate trickled after the offer (RFC 8838 §8), or the
+    /// end-of-candidates indication, an empty `candidate` (RFC 8838 §13).
+    Candidate {
+        /// The signal.
+        signal_id: String,
+        /// The `candidate:` attribute without `a=`, or empty; at most
+        /// [`MAX_SIGNAL_CANDIDATE_BYTES`].
+        candidate: String,
+        /// The `a=mid` of its media section (RFC 8843 §7.1), at most
+        /// [`MAX_SIGNAL_CANDIDATE_BYTES`].
+        mid: Option<String>,
+        /// The index of its media section, 0 for the first.
+        mline_index: Option<u16>,
+    },
+    /// The source closed the channel: the signal is over.
+    Closed {
+        /// The signal.
+        signal_id: String,
+        /// The source's close code (`lotse_core::signaling::close`).
+        code: String,
+        /// What happened, for humans.
+        message: String,
+    },
+}
+
+impl fmt::Debug for SignalReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open { request } => f.debug_struct("Open").field("request", request).finish(),
+            Self::Cancel { request } => f.debug_struct("Cancel").field("request", request).finish(),
+            Self::Offer { signal_id, sdp } => f
+                .debug_struct("Offer")
+                .field("signal_id", signal_id)
+                .field("sdp_len", &sdp.len())
+                .finish(),
+            Self::Candidate {
+                signal_id,
+                candidate,
+                mid,
+                mline_index,
+            } => f
+                .debug_struct("Candidate")
+                .field("signal_id", signal_id)
+                .field("candidate", candidate)
+                .field("mid", mid)
+                .field("mline_index", mline_index)
+                .finish(),
+            Self::Closed {
+                signal_id,
+                code,
+                message,
+            } => f
+                .debug_struct("Closed")
+                .field("signal_id", signal_id)
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+        }
+    }
+}
+
+/// What the supervisor tells a worker about its signaled sources'
+/// signaling: the answer to an `Open`, and what the control-API client
+/// relays on an open signal.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignalCommand {
+    /// The open `request` got a channel, the signal `signal_id`.
+    Opened {
+        /// The open's id, as its `Open` named it.
+        request: u64,
+        /// The signal's id, which every later message about it names.
+        signal_id: String,
+        /// The host addresses the source may gather candidates on,
+        /// enumerated by the supervisor before the worker was sandboxed.
+        local_addrs: Vec<IpAddr>,
+    },
+    /// The open `request` got no channel: the attempt ends unreachable.
+    Refused {
+        /// The open's id.
+        request: u64,
+        /// Why (`no_signaling_client`).
+        code: String,
+        /// What happened, for humans.
+        message: String,
+    },
+    /// The camera's SDP answer (RFC 8829 §5.3). `Debug` shows its length
+    /// only: it carries the camera's ICE password.
+    Answer {
+        /// The signal.
+        signal_id: String,
+        /// The SDP, at most [`MAX_SIGNAL_SDP_BYTES`].
+        sdp: String,
+    },
+    /// A candidate of the camera's (RFC 8838 §10), or its
+    /// end-of-candidates indication, an empty `candidate`.
+    Candidate {
+        /// The signal.
+        signal_id: String,
+        /// The `candidate:` attribute without `a=`, or empty.
+        candidate: String,
+        /// The `a=mid` of its media section.
+        mid: Option<String>,
+        /// The index of its media section, 0 for the first.
+        mline_index: Option<u16>,
+    },
+    /// The camera or its integration ended the signal with an error;
+    /// nothing follows.
+    Failed {
+        /// The signal.
+        signal_id: String,
+        /// The client's code.
+        code: String,
+        /// What happened, for humans.
+        message: String,
+    },
+    /// The client relaying the signal went away; nothing follows.
+    Gone {
+        /// The signal.
+        signal_id: String,
+    },
+}
+
+impl fmt::Debug for SignalCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Opened {
+                request,
+                signal_id,
+                local_addrs,
+            } => f
+                .debug_struct("Opened")
+                .field("request", request)
+                .field("signal_id", signal_id)
+                .field("local_addrs", local_addrs)
+                .finish(),
+            Self::Refused {
+                request,
+                code,
+                message,
+            } => f
+                .debug_struct("Refused")
+                .field("request", request)
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+            Self::Answer { signal_id, sdp } => f
+                .debug_struct("Answer")
+                .field("signal_id", signal_id)
+                .field("sdp_len", &sdp.len())
+                .finish(),
+            Self::Candidate {
+                signal_id,
+                candidate,
+                mid,
+                mline_index,
+            } => f
+                .debug_struct("Candidate")
+                .field("signal_id", signal_id)
+                .field("candidate", candidate)
+                .field("mid", mid)
+                .field("mline_index", mline_index)
+                .finish(),
+            Self::Failed {
+                signal_id,
+                code,
+                message,
+            } => f
+                .debug_struct("Failed")
+                .field("signal_id", signal_id)
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+            Self::Gone { signal_id } => f
+                .debug_struct("Gone")
+                .field("signal_id", signal_id)
+                .finish(),
+        }
+    }
 }
 
 /// The reason of a [`RecordingReport::Closed`] that ends a recording as the
@@ -721,7 +990,7 @@ mod tests {
     fn source_spec_debug_redacts_the_url() {
         let spec = SourceSpec {
             connection_id: "c1".into(),
-            url: "rtsp://admin:hunter2@cam/main".into(),
+            target: SourceTarget::Url("rtsp://admin:hunter2@cam/main".into()),
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec!["192.168.1.10:554".parse().unwrap()],
@@ -733,7 +1002,7 @@ mod tests {
         };
         let text = format!("{spec:?}");
         assert!(!text.contains("hunter2"), "{text}");
-        assert!(text.contains("url: \"****\""), "{text}");
+        assert!(text.contains("target: Url(****)"), "{text}");
         assert!(text.contains("options: \"****\""), "{text}");
         assert!(text.contains("192.168.1.10:554"), "{text}");
         assert!(
@@ -741,8 +1010,24 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("prerecord_ms: 30000"), "{text}");
-        let wrapped = ToWorker::RunSource(spec);
+        let wrapped = ToWorker::RunSource(spec.clone());
         assert!(!format!("{wrapped:?}").contains("hunter2"));
+        assert_eq!(
+            decode::<ToWorker>(&encode(&wrapped).unwrap()).unwrap(),
+            wrapped
+        );
+        // A signaled source: its protocol, no address.
+        let signaled = SourceSpec {
+            target: SourceTarget::Signaled("webrtc".into()),
+            peer_host: String::new(),
+            peer_addrs: vec![],
+            ..spec
+        };
+        assert!(
+            format!("{signaled:?}").contains(r#"target: Signaled("webrtc")"#),
+            "{signaled:?}"
+        );
+        let wrapped = ToWorker::SwitchSource(signaled);
         assert_eq!(
             decode::<ToWorker>(&encode(&wrapped).unwrap()).unwrap(),
             wrapped
@@ -970,6 +1255,163 @@ mod tests {
                 decode::<ToWorker>(&encode(&release).unwrap()).unwrap(),
                 release
             );
+        }
+    }
+
+    fn signal_reports() -> Vec<SignalReport> {
+        vec![
+            SignalReport::Open { request: 1 },
+            SignalReport::Cancel { request: u64::MAX },
+            SignalReport::Offer {
+                signal_id: "01JSIG".into(),
+                sdp: "v=0\r\na=ice-pwd:hunter2hunter2hunter2hu\r\n".into(),
+            },
+            SignalReport::Candidate {
+                signal_id: "01JSIG".into(),
+                candidate: "candidate:1 1 udp 2130706431 192.0.2.7 50000 typ host".into(),
+                mid: Some("0".into()),
+                mline_index: Some(0),
+            },
+            SignalReport::Candidate {
+                signal_id: "01JSIG".into(),
+                candidate: String::new(),
+                mid: None,
+                mline_index: None,
+            },
+            SignalReport::Closed {
+                signal_id: "01JSIG".into(),
+                code: "answer_timeout".into(),
+                message: "no answer within 20 s".into(),
+            },
+        ]
+    }
+
+    fn signal_commands() -> Vec<SignalCommand> {
+        vec![
+            SignalCommand::Opened {
+                request: 1,
+                signal_id: "01JSIG".into(),
+                local_addrs: vec!["192.0.2.7".parse().unwrap(), "2001:db8::7".parse().unwrap()],
+            },
+            SignalCommand::Refused {
+                request: 2,
+                code: "no_signaling_client".into(),
+                message: "no client relays this stream's signaling".into(),
+            },
+            SignalCommand::Answer {
+                signal_id: "01JSIG".into(),
+                sdp: "v=0\r\na=ice-pwd:hunter2hunter2hunter2hu\r\n".into(),
+            },
+            SignalCommand::Candidate {
+                signal_id: "01JSIG".into(),
+                candidate: "candidate:2 1 udp 1 198.51.100.9 5000 typ host".into(),
+                mid: Some("1".into()),
+                mline_index: Some(1),
+            },
+            SignalCommand::Failed {
+                signal_id: "01JSIG".into(),
+                code: "webrtc_session_ended".into(),
+                message: "the camera ended the session".into(),
+            },
+            SignalCommand::Gone {
+                signal_id: "01JSIG".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn the_signal_messages_round_trip() {
+        for report in signal_reports() {
+            let message = ToSupervisor::Signal(report);
+            assert_eq!(
+                decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+        for command in signal_commands() {
+            let message = ToWorker::Signal(command);
+            assert_eq!(
+                decode::<ToWorker>(&encode(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn rfc8839_5_4_signal_debug_shows_an_sdp_s_length_not_its_ice_password() {
+        let reports: Vec<String> = signal_reports()
+            .into_iter()
+            .map(|report| format!("{:?}", ToSupervisor::Signal(report)))
+            .collect();
+        let commands: Vec<String> = signal_commands()
+            .into_iter()
+            .map(|command| format!("{:?}", ToWorker::Signal(command)))
+            .collect();
+        for text in reports.iter().chain(&commands) {
+            assert!(!text.contains("hunter2"), "{text}");
+        }
+        assert_eq!(
+            reports,
+            [
+                "Signal(Open { request: 1 })",
+                "Signal(Cancel { request: 18446744073709551615 })",
+                "Signal(Offer { signal_id: \"01JSIG\", sdp_len: 40 })",
+                "Signal(Candidate { signal_id: \"01JSIG\", candidate: \"candidate:1 1 udp 2130706431 192.0.2.7 50000 typ host\", mid: Some(\"0\"), mline_index: Some(0) })",
+                "Signal(Candidate { signal_id: \"01JSIG\", candidate: \"\", mid: None, mline_index: None })",
+                "Signal(Closed { signal_id: \"01JSIG\", code: \"answer_timeout\", message: \"no answer within 20 s\" })",
+            ]
+        );
+        assert_eq!(
+            commands,
+            [
+                "Signal(Opened { request: 1, signal_id: \"01JSIG\", local_addrs: [192.0.2.7, 2001:db8::7] })",
+                "Signal(Refused { request: 2, code: \"no_signaling_client\", message: \"no client relays this stream's signaling\" })",
+                "Signal(Answer { signal_id: \"01JSIG\", sdp_len: 40 })",
+                "Signal(Candidate { signal_id: \"01JSIG\", candidate: \"candidate:2 1 udp 1 198.51.100.9 5000 typ host\", mid: Some(\"1\"), mline_index: Some(1) })",
+                "Signal(Failed { signal_id: \"01JSIG\", code: \"webrtc_session_ended\", message: \"the camera ended the session\" })",
+                "Signal(Gone { signal_id: \"01JSIG\" })",
+            ]
+        );
+    }
+
+    /// The caps in bytes: an offer of a few KiB fits many times over, a
+    /// candidate line as the control API's 1024 characters, an answer as
+    /// its 64 Ki, any other text four bytes per such character.
+    #[test]
+    fn the_signal_caps_are_16_kib_for_an_offer_and_the_control_api_s_for_the_rest() {
+        assert_eq!(MAX_SIGNAL_OFFER_BYTES, 16_384);
+        assert_eq!(MAX_SIGNAL_CANDIDATE_BYTES, 1_024);
+        assert_eq!(MAX_SIGNAL_SDP_BYTES, 65_536);
+        assert_eq!(MAX_SIGNAL_TEXT_BYTES, 4_096);
+    }
+
+    #[test]
+    fn the_longest_signal_messages_fit_a_frame() {
+        let text = "x".repeat(MAX_SIGNAL_TEXT_BYTES);
+        let sdp = "x".repeat(MAX_SIGNAL_SDP_BYTES);
+        let messages = [
+            encode(&ToSupervisor::Signal(SignalReport::Offer {
+                signal_id: text.clone(),
+                sdp: sdp.clone(),
+            })),
+            encode(&ToSupervisor::Signal(SignalReport::Candidate {
+                signal_id: text.clone(),
+                candidate: text.clone(),
+                mid: Some(text.clone()),
+                mline_index: Some(u16::MAX),
+            })),
+            encode(&ToWorker::Signal(SignalCommand::Answer {
+                signal_id: text.clone(),
+                sdp,
+            })),
+            encode(&ToWorker::Signal(SignalCommand::Failed {
+                signal_id: text.clone(),
+                code: text.clone(),
+                message: text,
+            })),
+        ];
+        for message in messages {
+            assert!(message.unwrap().len() < crate::MAX_MESSAGE_BYTES);
         }
     }
 

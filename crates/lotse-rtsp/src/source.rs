@@ -1,7 +1,9 @@
 //! The RTSP source: one retina session per connection attempt on the
 //! source's own connection to the camera, its media TCP interleaved or,
-//! opt-in, RTP over UDP, the H.264 and H.265 normalizers of `lotse-codec`
-//! on its packets, RTCP Sender Reports as sync hints.
+//! opt-in, RTP over UDP, the RTP receive path of `lotse-codec` on its
+//! packets (see [`lotse_codec::rtp_ingest`], with the H.264 and H.265
+//! normalizers, the side branch's depacketizers and the timelines), RTCP
+//! Sender Reports as sync hints.
 //!
 //! Implements RFC 2326 (RTSP 1.0: DESCRIBE, SETUP, PLAY, TEARDOWN through
 //! retina), RFC 3550 §5.1 (packet header fields kept) and §6.4.1 (Sender
@@ -34,29 +36,23 @@
 //! alone. A stream that opts in or out turns the probe on or off without
 //! this session noticing.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use lotse_codec::aac::AacDepacketizer;
-use lotse_codec::h264::{
-    DEFAULT_MAX_PAYLOAD, Depacketizer, FrameOverLimit, LIBWEBRTC_MAX_FRAME_PACKETS,
-    NormalizedPacket, PacketNormalizer, ParameterSets,
-};
+use lotse_api_types::source::TlsTrust;
+use lotse_codec::h264::ParameterSets;
 use lotse_codec::h265;
+use lotse_codec::rtp_ingest::{Declared, RtpPacket, RtpTracks, Sprop};
 use lotse_core::clock::Clock;
 use lotse_core::codec::{Codec, Kind};
-use lotse_core::discontinuity::TimestampGuard;
 use lotse_core::ingest::IngestCounters;
-use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields, TimestampUnwrapper};
-use lotse_core::source::{ClockReport, Source, SourceCtx, SourceDescriptor, SourceError, SyncHint};
+use lotse_core::source::{Source, SourceCtx, SourceDescriptor, SourceError};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::Throttle;
-use lotse_core::track::Track;
 use lotse_tls::TlsTarget;
 use retina::client::{
     Credentials, InitialSequenceNumberPolicy, InitialTimestampPolicy, PlayOptions,
@@ -69,8 +65,8 @@ use crate::backchannel::probe;
 use crate::backchannel::session::Probed;
 use crate::driver::{Budget, Connection, Driver, Duplex, Item, Received};
 use crate::error::camera_text;
-use crate::factory::PROTOCOL;
-use crate::options::{RtspOptions, Transport as MediaTransport};
+use crate::factory::{PROTOCOL, TLS_PROTOCOL};
+use crate::options::{RtspOptions, Transport as MediaTransport, user_agent};
 use crate::udp::Pair;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -104,7 +100,7 @@ pub(crate) const TEARDOWN: Budget = Budget {
 pub struct RtspSource {
     /// The URL, credentials inside.
     url: SourceUrl,
-    /// The options.
+    /// The options; an `rtsps` source's interleave over TCP.
     options: RtspOptions,
     /// For `rtsps`: the server name and the certificate check.
     tls: Option<TlsTarget>,
@@ -123,19 +119,49 @@ impl RtspSource {
             probed: Probed::default(),
         }
     }
+
+    /// The source's fields as its protocol's `stream/put` variant has
+    /// them, but its URL: every default applied, and for `rtsps` its trust
+    /// (a pin in its canonical form) in place of the `transport` that
+    /// protocol does not take. Nothing here is secret: a certificate
+    /// fingerprint is public.
+    fn fields(&self) -> serde_json::Value {
+        let mut fields = serde_json::json!(self.options);
+        if let (Some(tls), Some(map)) = (&self.tls, fields.as_object_mut()) {
+            let _transport = map.remove("transport");
+            map.insert(
+                "tls".to_owned(),
+                serde_json::json!(TlsTrust::from(tls.trust)),
+            );
+        }
+        fields
+    }
 }
 
 impl Source for RtspSource {
     fn describe(&self) -> SourceDescriptor {
         SourceDescriptor {
-            protocol: PROTOCOL,
-            url: self.url.clone(),
-            options: self.options.redacted(),
+            protocol: if self.tls.is_some() {
+                TLS_PROTOCOL
+            } else {
+                PROTOCOL
+            },
+            url: Some(self.url.clone()),
+            options: self.fields(),
         }
     }
 
+    /// The fields, minus `backchannel`, which is deliberately not in the
+    /// key so enabling talk-back never opens a second camera session: the
+    /// supervisor asks for the backchannel on the shared connection when
+    /// one of its streams does. Every default is applied, so `{}` and the
+    /// defaults spelled out are one key, as is every spelling of one pin.
     fn connection_options(&self) -> serde_json::Value {
-        self.options.connection_key()
+        let mut key = self.fields();
+        if let Some(fields) = key.as_object_mut() {
+            let _backchannel = fields.remove("backchannel");
+        }
+        key
     }
 
     fn wants_backchannel(&self) -> bool {
@@ -186,33 +212,6 @@ pub(crate) fn credentials(url: &SourceUrl) -> Option<Credentials> {
             .map(|p| p.expose_secret().clone())
             .unwrap_or_default(),
     })
-}
-
-/// What the SDP said about one stream, as core wants it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Declared {
-    /// Video or audio.
-    pub(crate) kind: Kind,
-    /// The codec.
-    pub(crate) codec: Codec,
-    /// Ticks per second.
-    pub(crate) clock_rate: u32,
-    /// The parameter sets the SDP announced, if any.
-    pub(crate) sets: Sprop,
-}
-
-/// The parameter sets a video stream's SDP announced: RFC 6184 §8.1
-/// `sprop-parameter-sets`, or RFC 7798 §7.1 `sprop-vps`, `sprop-sps` and
-/// `sprop-pps`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) enum Sprop {
-    /// None, or not a codec that has them.
-    #[default]
-    None,
-    /// H.264's SPS and PPS.
-    H264(ParameterSets),
-    /// H.265's VPS, SPS and PPS.
-    H265(h265::ParameterSets),
 }
 
 /// Maps an SDP media description onto a codec.
@@ -401,13 +400,26 @@ fn refuse_decoding_order(declared: Declared, sdp: &[u8]) -> Declared {
     }
 }
 
+/// A stream of the `DESCRIBE` answer the source sets up: its index among
+/// the session's streams, its RTP payload type and the track it declares.
+/// The payload type is read when the stream is picked, so carrying it
+/// never looks the index up again.
+struct Chosen {
+    /// The stream's index among the session's streams.
+    index: usize,
+    /// The RTP payload type the SDP gave the stream.
+    pt: u8,
+    /// The track the stream declares.
+    declared: Declared,
+}
+
 /// Picks the first video and the first audio stream of the SDP the
 /// camera sends; `sdp` is the description retina parsed the streams from,
 /// read for what retina does not expose. The session never asks for the
 /// backchannel, so the camera describes none (ONVIF Streaming
 /// Specification §5.3.1) and every stream is one the camera sends.
-fn select(streams: &[Stream], sdp: &[u8]) -> Vec<(usize, Declared)> {
-    let mut chosen: Vec<(usize, Declared)> = Vec::new();
+fn select(streams: &[Stream], sdp: &[u8]) -> Vec<Chosen> {
+    let mut chosen: Vec<Chosen> = Vec::new();
     for (index, stream) in streams.iter().enumerate() {
         let (sets, extra) = parameters(stream);
         let Some(declared) = declare(
@@ -421,119 +433,16 @@ fn select(streams: &[Stream], sdp: &[u8]) -> Vec<(usize, Declared)> {
             continue;
         };
         let declared = refuse_decoding_order(declared, sdp);
-        if chosen.iter().any(|(_, d)| d.kind == declared.kind) {
+        if chosen.iter().any(|c| c.declared.kind == declared.kind) {
             continue;
         }
-        chosen.push((index, declared));
+        chosen.push(Chosen {
+            index,
+            pt: stream.rtp_payload_type(),
+            declared,
+        });
     }
     chosen
-}
-
-/// The two normalization layers of a video stream, with the side branch's
-/// reused buffer of finished access units and what the stream's SPS says.
-///
-/// The track's codec follows an in-band SPS only when what it says
-/// changes, and keeps the parameter sets of that change: a camera can send
-/// a byte-different SPS with every frame, and each codec change is a
-/// control event every session handles. What a session checks against
-/// its payload type is what the SPS says, never its bytes.
-enum Video {
-    /// H.264 (RFC 6184).
-    H264 {
-        /// The live-path normalizer.
-        normalizer: PacketNormalizer,
-        /// The side-branch depacketizer.
-        depacketizer: Depacketizer,
-        /// Its finished units.
-        units: Vec<lotse_codec::h264::AccessUnit>,
-        /// What the SPS the track's codec was last set from says.
-        sps: Option<lotse_codec::h264::SpsInfo>,
-    },
-    /// H.265 (RFC 7798).
-    H265 {
-        /// The live-path normalizer.
-        normalizer: h265::PacketNormalizer,
-        /// The side-branch depacketizer.
-        depacketizer: h265::Depacketizer,
-        /// Its finished units.
-        units: Vec<h265::AccessUnit>,
-        /// What the SPS the track's codec was last set from says.
-        sps: Option<h265::SpsInfo>,
-    },
-}
-
-impl Video {
-    /// The layers for a declared stream, seeded with the SDP's sets; `None`
-    /// for codecs without them.
-    fn new(declared: &Declared, max_frame_bytes: usize) -> Option<Self> {
-        match (&declared.codec, &declared.sets) {
-            (Codec::H264 { .. }, Sprop::H264(sets)) => Some(Self::H264 {
-                normalizer: PacketNormalizer::new(DEFAULT_MAX_PAYLOAD, sets.clone()),
-                depacketizer: Depacketizer::new(max_frame_bytes, sets.clone()),
-                units: Vec::new(),
-                sps: sets
-                    .sps
-                    .as_deref()
-                    .and_then(|sps| lotse_codec::h264::parse_sps(sps).ok()),
-            }),
-            (Codec::H265 { .. }, Sprop::H265(sets)) => Some(Self::H265 {
-                normalizer: h265::PacketNormalizer::new(DEFAULT_MAX_PAYLOAD, sets.clone()),
-                depacketizer: h265::Depacketizer::new(max_frame_bytes, sets.clone()),
-                units: Vec::new(),
-                sps: sets
-                    .sps
-                    .as_deref()
-                    .and_then(|sps| h265::parse_sps(sps).ok()),
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// A stream the connection carries.
-struct Carried {
-    /// Its track.
-    track: Arc<Track>,
-    /// Its payload type in the SDP.
-    pt: u8,
-    /// The normalization layers, for H.264 and H.265.
-    video: Option<Video>,
-    /// The side-branch depacketizer, for AAC-LC.
-    aac: Option<AacDepacketizer>,
-    /// Cut-through audio codecs: every packet is a frame too.
-    packet_frames: bool,
-    /// Unwraps timestamps for the side branch.
-    unwrapper: TimestampUnwrapper,
-    /// The last timestamp, for frame boundaries of raw video.
-    last_ts: Option<u32>,
-    /// Watches the timestamps for a new timeline.
-    guard: TimestampGuard,
-    /// Payloads that violated the packetization, for one warning.
-    violations: u64,
-    /// The rate limit of the `frame_over_browser_limit` warning.
-    over_limit: Throttle,
-}
-
-impl Carried {
-    /// The state for a declared stream on `track`.
-    fn new(track: Arc<Track>, pt: u8, declared: &Declared) -> Self {
-        Self {
-            pt,
-            video: Video::new(declared, track.limits().max_frame_bytes),
-            aac: matches!(declared.codec, Codec::AacLc { .. })
-                .then(|| AacDepacketizer::new(track.limits().max_frame_bytes)),
-            packet_frames: matches!(
-                declared.codec,
-                Codec::Pcmu | Codec::Pcma | Codec::G722 | Codec::Opus { .. }
-            ),
-            unwrapper: TimestampUnwrapper::new(),
-            last_ts: None,
-            guard: TimestampGuard::new(declared.clock_rate),
-            violations: 0,
-            over_limit: Throttle::default(),
-            track,
-        }
-    }
 }
 
 /// Runs `future` under the read deadline and cancellation.
@@ -566,35 +475,36 @@ pub(crate) async fn within_on<T>(
 
 /// The streams of the `DESCRIBE` answer to set up ([`select`]), or a
 /// protocol error when there is none.
-fn choose(streams: &[Stream], sdp: &[u8]) -> Result<Vec<(usize, Declared)>, SourceError> {
+fn choose(streams: &[Stream], sdp: &[u8]) -> Result<Vec<Chosen>, SourceError> {
     let chosen = select(streams, sdp);
     if chosen.is_empty() {
         return Err(SourceError::Protocol(
             "the SDP describes no video or audio stream".into(),
         ));
     }
-    for (index, declared) in &chosen {
+    for Chosen {
+        index, declared, ..
+    } in &chosen
+    {
         tracing::info!(index, kind = %declared.kind, codec = declared.codec.name(), clock_rate = declared.clock_rate, "rtsp: setting up");
     }
     Ok(chosen)
 }
 
 /// Declares a track for each of the `chosen` streams, set up by now:
-/// what each stream index of `streams` maps to, if carried.
-fn carry(
-    streams: &[Stream],
-    chosen: &[(usize, Declared)],
-    ctx: &mut SourceCtx,
-) -> Vec<Option<Carried>> {
-    let mut carried: Vec<Option<Carried>> = (0..streams.len()).map(|_| None).collect();
-    for (index, declared) in chosen {
+/// the receive path of each, by its stream index.
+fn carry(chosen: &[Chosen], ctx: &mut SourceCtx) -> RtpTracks {
+    let mut carried = RtpTracks::new(PROTOCOL);
+    for Chosen {
+        index,
+        pt,
+        declared,
+    } in chosen
+    {
         let track = ctx
             .tracks
             .declare(declared.kind, declared.codec.clone(), declared.clock_rate);
-        let pt = streams.get(*index).map_or(0, Stream::rtp_payload_type);
-        if let Some(slot) = carried.get_mut(*index) {
-            *slot = Some(Carried::new(track, pt, declared));
-        }
+        carried.carry(*index, track, *pt, declared);
     }
     carried
 }
@@ -608,7 +518,7 @@ fn session_options(ask: &Ask) -> SessionOptions {
     let url = &ask.camera.url;
     SessionOptions::default()
         .creds(credentials(url))
-        .user_agent(ask.camera.options.user_agent().to_owned())
+        .user_agent(user_agent(&ask.camera.options).to_owned())
         .teardown(TeardownPolicy::Auto)
         .max_message_size(MAX_MESSAGE)
 }
@@ -616,7 +526,7 @@ fn session_options(ask: &Ask) -> SessionOptions {
 /// DESCRIBE of the source URL itself, SETUP of the chosen streams TCP
 /// interleaved or, with `transport: "udp"`, RTP over UDP to a pair bound
 /// for each, the track declarations and PLAY, on `driver`, each under the
-/// read deadline: what each stream index maps to, if carried. A camera
+/// read deadline: the receive path of the streams carried. A camera
 /// that refuses UDP is not asked for TCP instead ([`setup_error`]). The
 /// `DESCRIBE` never carries the backchannel's `Require` header: the
 /// backchannel has sessions of its own ([`crate::backchannel`]).
@@ -624,7 +534,7 @@ async fn set_up(
     driver: &mut Driver,
     ask: &Ask,
     ctx: &mut SourceCtx,
-) -> Result<Vec<Option<Carried>>, SourceError> {
+) -> Result<RtpTracks, SourceError> {
     let url = &ask.camera.url;
     let deadline = Duration::from_millis(ask.camera.options.timeout_ms);
     tracing::info!(host = %ctx.peer.host, addrs = ?ctx.peer.addrs, "rtsp: describing");
@@ -640,7 +550,7 @@ async fn set_up(
     // `rtsps` with UDP is refused at validation: plain datagrams would
     // carry what the TLS session protects.
     let udp = ask.camera.options.transport == MediaTransport::Udp;
-    for (index, _) in &chosen {
+    for Chosen { index, .. } in &chosen {
         within(ctx, deadline, "SETUP", async {
             let set_up = if udp {
                 let pair = Pair::bind(ask.camera.addr.ip())?;
@@ -652,7 +562,7 @@ async fn set_up(
         })
         .await?;
     }
-    let carried = carry(driver.streams(), &chosen, ctx);
+    let carried = carry(&chosen, ctx);
     within(ctx, deadline, "PLAY", async {
         driver
             .play(play_options())
@@ -851,7 +761,7 @@ async fn run_core(dialer: &Dialer, ask: &Ask, ctx: &mut SourceCtx) -> SourceErro
 /// stream opts in again ([`probe::start`]), which ends with the session.
 async fn play(
     driver: &mut Driver,
-    mut carried: Vec<Option<Carried>>,
+    mut carried: RtpTracks,
     ask: &Ask,
     ctx: &SourceCtx,
 ) -> SourceError {
@@ -874,8 +784,6 @@ async fn play(
     let mut first_media = ctx.time.sleep(deadline);
     let ingest = ctx.tracks.ingest();
     let mut loss_log = Throttle::default();
-    let mut timelines = Timelines::default();
-    let mut normalized = Vec::new();
     loop {
         let item = tokio::select! {
             item = driver.next_item() => item,
@@ -892,27 +800,27 @@ async fn play(
                 }
                 let arrival = ctx.time.now();
                 count_loss(&ingest, &mut loss_log, packet.loss, arrival);
-                let index = packet.stream;
-                let ts = packet.ts;
-                let jumped = carried
-                    .get_mut(index)
-                    .and_then(Option::as_mut)
-                    .and_then(|entry| entry.guard.observe(ts, arrival));
-                if let Some(moved_ms) = jumped
-                    && let Err(err) =
-                        new_timeline(&mut carried, index, ctx, &mut timelines, moved_ms, arrival)
-                {
+                let Received {
+                    stream,
+                    ts,
+                    seq,
+                    ssrc,
+                    marker,
+                    payload,
+                    ..
+                } = packet;
+                let packet = RtpPacket {
+                    seq,
+                    ts,
+                    ssrc,
+                    marker,
+                    payload,
+                };
+                if let Err(err) = carried.receive(stream, packet, arrival, ctx) {
                     break err;
                 }
-                if let Some(Some(entry)) = carried.get_mut(index) {
-                    on_rtp(entry, ctx, arrival, packet, &mut normalized);
-                }
             }
-            Ok(Item::Rtcp(compound)) => {
-                if let Some(Some(entry)) = carried.get(compound.stream_id()) {
-                    on_rtcp(entry, ctx, ctx.time.now(), &compound);
-                }
-            }
+            Ok(Item::Rtcp(compound)) => on_rtcp(&carried, ctx, ctx.time.now(), &compound),
         }
     }
 }
@@ -939,405 +847,23 @@ fn count_loss(ingest: &IngestCounters, log: &mut Throttle, lost: u16, arrival: I
     }
 }
 
-/// How many new timelines one connection attempt starts within
-/// [`TIMELINE_WINDOW`] before its camera's timestamps count as broken.
-///
-/// RFC 3550 §5.1 has a stream's timestamps come from a clock that
-/// "increments monotonically and linearly in time", 32-bit wrap aside: a
-/// jump ([`TimestampGuard`]) is a reset of that clock, a camera reboot or
-/// an encoder restart, which happens once, not every few frames. A new
-/// timeline is not free either: every track starts an epoch, so every
-/// viewer's video waits for the next keyframe
-/// ([`lotse_core::session::apply_track_event`]),
-/// and the clock mapping forgets its Sender Report fit (RFC 3550 §6.4.1),
-/// so lip sync falls back to arrival times until the next report. A
-/// camera whose timestamps jump on every packet would start one epoch per
-/// packet: viewers never reach a keyframe of the epoch they wait for and
-/// the mapping never fits again. Capping the epochs while the attempt goes
-/// on would leave the jumps inside an epoch, where a viewer's timestamp
-/// offset no longer holds, so the attempt ends instead, with a protocol
-/// error the stream's status shows, and core's runner reconnects under its
-/// backoff, which bounds the epochs of the reconnects. Ten per window, one
-/// a second on average, still passes a camera that restarts its clock at
-/// every keyframe of a one-second GOP.
-const MAX_TIMELINES: usize = 10;
-
-/// The sliding window [`MAX_TIMELINES`] counts the new timelines of one
-/// connection attempt in: the summary interval of the rate-limited log.
-const TIMELINE_WINDOW: Duration = lotse_core::throttle::SUMMARY_INTERVAL;
-
-/// The new timelines of one connection attempt: when the last
-/// [`MAX_TIMELINES`] started, for the bound, and the rate limit of their
-/// log line.
-#[derive(Debug, Default)]
-struct Timelines {
-    /// When each new timeline within the last [`TIMELINE_WINDOW`] started,
-    /// oldest first; never more than [`MAX_TIMELINES`].
-    recent: VecDeque<Instant>,
-    /// The rate limit of the `timestamps jumped` line.
-    log: Throttle,
-}
-
-impl Timelines {
-    /// Admits one more new timeline at `now`, or refuses it as the
-    /// [`MAX_TIMELINES`] + 1st within [`TIMELINE_WINDOW`]: the camera's
-    /// timestamps no longer follow a clock (RFC 3550 §5.1).
-    fn admit(&mut self, now: Instant) -> Result<(), SourceError> {
-        while let Some(first) = self.recent.front()
-            && now.saturating_duration_since(*first) >= TIMELINE_WINDOW
-        {
-            self.recent.pop_front();
-        }
-        if self.recent.len() >= MAX_TIMELINES {
-            tracing::warn!(
-                timelines = MAX_TIMELINES,
-                window_s = TIMELINE_WINDOW.as_secs(),
-                "rtsp: the camera's timestamps keep jumping; ending the attempt"
-            );
-            return Err(SourceError::Protocol(format!(
-                "the camera's RTP timestamps jumped more than {MAX_TIMELINES} times within {} s: they must follow one clock that increments linearly in time (RFC 3550 §5.1)",
-                TIMELINE_WINDOW.as_secs()
-            )));
-        }
-        self.recent.push_back(now);
-        Ok(())
-    }
-}
-
-/// The camera's timestamps left their timeline on stream `index` at
-/// `arrival`: one new epoch for every track, the clock mapping forgotten,
-/// and every stream's timestamp state restarted so the other tracks' own
-/// jumps are part of the same epoch, logged at most once per summary
-/// interval. An error, and nothing restarted, when `timelines` refuses
-/// one more ([`MAX_TIMELINES`]).
-fn new_timeline(
-    carried: &mut [Option<Carried>],
-    index: usize,
-    ctx: &SourceCtx,
-    timelines: &mut Timelines,
-    moved_ms: i64,
-    arrival: Instant,
-) -> Result<(), SourceError> {
-    timelines.admit(arrival)?;
-    let logged = timelines.log.hit(arrival);
-    for (i, entry) in carried.iter_mut().enumerate() {
-        let Some(entry) = entry.as_mut() else {
-            continue;
-        };
-        if i == index {
-            if let Some(count) = logged {
-                tracing::info!(track = %entry.track.id(), moved_ms, count, "rtsp: timestamps jumped; new epoch");
-            }
-        } else {
-            entry.guard.rebase();
-        }
-        entry.unwrapper = TimestampUnwrapper::new();
-        entry.last_ts = None;
-    }
-    ctx.tracks.discontinuity();
-    ctx.clock.reset();
-    Ok(())
-}
-
-/// Publishes the live path's packets of one source packet on `track`.
-fn publish_normalized(
-    track: &Track,
-    arrival: Instant,
-    rtp: RtpHeaderFields,
-    normalized: &mut Vec<NormalizedPacket>,
-) {
-    for out in normalized.drain(..) {
-        track.publish_packet(MediaPacket {
-            arrival,
-            rtp: RtpHeaderFields {
-                marker: out.marker,
-                ..rtp
-            },
-            frame_start: out.frame_start,
-            keyframe_start: out.keyframe_start,
-            epoch: 0,
-            lateness: Duration::ZERO,
-            payload: Arc::from(out.payload.as_ref()),
-        });
-    }
-}
-
-/// Publishes one finished access unit of the side branch on `track`:
-/// its timestamp, whether it is a keyframe, its Annex B bytes.
-fn publish_unit(
-    track: &Track,
-    unwrapper: &mut TimestampUnwrapper,
-    ctx: &SourceCtx,
-    arrival: Instant,
-    (ts, keyframe, payload): (u32, bool, Bytes),
-) {
-    let ticks = unwrapper.unwrap(ts);
-    track.publish_frame(MediaFrame {
-        ts: MediaTime::from_ticks(ticks),
-        wallclock: ctx.clock.map(track.id(), ts, arrival),
-        arrival,
-        keyframe,
-        discontinuity: false,
-        epoch: 0,
-        payload,
-    });
-}
-
-/// A packet the normalizer cannot read: dropped, warned about once per
-/// connection.
-fn violation(track: &Track, violations: &mut u64, err: &dyn std::fmt::Display) {
-    *violations = violations.saturating_add(1);
-    if *violations == 1 {
-        tracing::warn!(track = %track.id(), error = %err, "rtsp: packetization violation; packet dropped");
-    }
-}
-
-/// A frame the live path carried in more packets than some libwebrtc
-/// receivers assemble ([`LIBWEBRTC_MAX_FRAME_PACKETS`]): counted on the
-/// track, and warned about at most once per summary interval. Every
-/// session sends it whole all the same.
-fn frame_over_limit(
-    track: &Track,
-    throttle: &mut Throttle,
-    arrival: Instant,
-    frame: Option<FrameOverLimit>,
-) {
-    let Some(frame) = frame else { return };
-    track.count_frame_over_browser_limit();
-    if let Some(count) = throttle.hit(arrival) {
-        tracing::warn!(
-            track = %track.id(),
-            code = "frame_over_browser_limit",
-            codec = track.codec().name(),
-            bytes = frame.bytes,
-            packets = frame.packets,
-            limit = LIBWEBRTC_MAX_FRAME_PACKETS,
-            keyframe = frame.keyframe,
-            count,
-            advice = "lower the camera's bitrate or use its substream",
-            "rtsp: frame over the packet limit of some libwebrtc receivers (by version); sent whole, those viewers may freeze until a keyframe that fits"
-        );
-    }
-}
-
-/// One video packet through both normalization layers: the live path's
-/// packets, then the side branch's finished units, with the track's codec
-/// updated when a unit brings a new SPS.
-fn on_video(
-    entry: &mut Carried,
-    ctx: &SourceCtx,
-    arrival: Instant,
-    rtp: RtpHeaderFields,
-    payload: &Bytes,
-    normalized: &mut Vec<NormalizedPacket>,
-) {
-    let Carried {
-        track,
-        video,
-        unwrapper,
-        violations,
-        over_limit,
-        ..
-    } = entry;
-    let RtpHeaderFields {
-        seq, ts, marker, ..
-    } = rtp;
-    let Some(video) = video else { return };
-    normalized.clear();
-    match video {
-        Video::H264 {
-            normalizer,
-            depacketizer,
-            units,
-            sps,
-        } => {
-            if let Err(err) = normalizer.normalize(ts, marker, payload, normalized) {
-                violation(track, violations, &err);
-            }
-            frame_over_limit(
-                track,
-                over_limit,
-                arrival,
-                normalizer.take_frame_over_limit(),
-            );
-            publish_normalized(track, arrival, rtp, normalized);
-            units.clear();
-            let _violation = depacketizer.push(seq, ts, marker, payload, units);
-            for unit in units.drain(..) {
-                if let Some(info) = unit.sps.filter(|info| *sps != Some(*info)) {
-                    *sps = Some(info);
-                    let sets = depacketizer.parameter_sets();
-                    track.set_codec(Codec::H264 {
-                        profile_level_id: Some(info.profile_level_id),
-                        sps: sets.sps.clone(),
-                        pps: sets.pps.clone(),
-                    });
-                }
-                publish_unit(
-                    track,
-                    unwrapper,
-                    ctx,
-                    arrival,
-                    (unit.ts, unit.keyframe, unit.payload),
-                );
-            }
-        }
-        Video::H265 {
-            normalizer,
-            depacketizer,
-            units,
-            sps,
-        } => {
-            if let Err(err) = normalizer.normalize(ts, marker, payload, normalized) {
-                violation(track, violations, &err);
-            }
-            frame_over_limit(
-                track,
-                over_limit,
-                arrival,
-                normalizer.take_frame_over_limit(),
-            );
-            publish_normalized(track, arrival, rtp, normalized);
-            units.clear();
-            let _violation = depacketizer.push(seq, ts, marker, payload, units);
-            for unit in units.drain(..) {
-                if let Some(info) = unit.sps.filter(|info| *sps != Some(*info)) {
-                    *sps = Some(info);
-                    let sets = depacketizer.parameter_sets();
-                    track.set_codec(Codec::H265 {
-                        vps: sets.vps.clone(),
-                        sps: sets.sps.clone(),
-                        pps: sets.pps.clone(),
-                    });
-                }
-                publish_unit(
-                    track,
-                    unwrapper,
-                    ctx,
-                    arrival,
-                    (unit.ts, unit.keyframe, unit.payload),
-                );
-            }
-        }
-    }
-}
-
-/// One RTP packet: cut through, and depacketized on the side branch.
-fn on_rtp(
-    entry: &mut Carried,
-    ctx: &SourceCtx,
-    arrival: Instant,
-    packet: Received,
-    normalized: &mut Vec<NormalizedPacket>,
-) {
-    let Received {
-        ts,
-        seq,
-        ssrc,
-        marker,
-        payload,
-        ..
-    } = packet;
-    let rtp = RtpHeaderFields {
-        pt: entry.pt,
-        seq,
-        ts,
-        marker,
-        ssrc,
-    };
-    if entry.video.is_some() {
-        on_video(entry, ctx, arrival, rtp, &payload, normalized);
-        return;
-    }
-    // Raw cut-through: audio, and video codecs without a normalizer yet.
-    let frame_start = entry.track.kind() == Kind::Audio || entry.last_ts != Some(ts);
-    entry.last_ts = Some(ts);
-    entry.track.publish_packet(MediaPacket {
-        arrival,
-        rtp,
-        frame_start,
-        keyframe_start: false,
-        epoch: 0,
-        lateness: Duration::ZERO,
-        payload: Arc::from(payload.as_ref()),
-    });
-    if let Some(aac) = entry.aac.as_mut() {
-        let id = entry.track.id();
-        let stamp = |ts| (ctx.clock.map(id, ts, arrival), arrival);
-        publish_aac(
-            aac,
-            &entry.track,
-            &mut entry.unwrapper,
-            stamp,
-            rtp,
-            &payload,
-        );
-    }
-    if entry.packet_frames {
-        let ticks = entry.unwrapper.unwrap(ts);
-        entry.track.publish_frame(MediaFrame {
-            ts: MediaTime::from_ticks(ticks),
-            wallclock: ctx.clock.map(entry.track.id(), ts, arrival),
-            arrival,
-            keyframe: true,
-            discontinuity: false,
-            epoch: 0,
-            payload,
-        });
-    }
-}
-
-/// One AAC packet on the side branch: its RFC 3640 units become frames
-/// on `track`, each stamped by `stamp` from its RTP timestamp with its
-/// capture time and its arrival. A violation is warned about once per
-/// connection.
-fn publish_aac(
-    aac: &mut AacDepacketizer,
-    track: &Track,
-    unwrapper: &mut TimestampUnwrapper,
-    stamp: impl Fn(u32) -> (Instant, Instant),
-    rtp: RtpHeaderFields,
-    payload: &[u8],
-) {
-    let mut frames = Vec::new();
-    if let Err(err) = aac.push(rtp.seq, rtp.ts, rtp.marker, payload, &mut frames)
-        && aac.stats().violations == 1
-    {
-        tracing::warn!(track = %track.id(), error = %err, "rtsp: AAC payload violates RFC 3640; packet dropped");
-    }
-    for frame in frames {
-        let ticks = unwrapper.unwrap(frame.ts);
-        let (wallclock, arrival) = stamp(frame.ts);
-        track.publish_frame(MediaFrame {
-            ts: MediaTime::from_ticks(ticks),
-            wallclock,
-            arrival,
-            keyframe: true,
-            discontinuity: false,
-            epoch: 0,
-            payload: frame.payload,
-        });
-    }
-}
-
-/// One RTCP compound packet: Sender Reports become sync hints.
+/// One RTCP compound packet: its Sender Reports become sync hints of
+/// its stream's track, if carried.
 fn on_rtcp(
-    entry: &Carried,
+    carried: &RtpTracks,
     ctx: &SourceCtx,
     arrival: Instant,
     compound: &retina::rtcp::ReceivedCompoundPacket,
 ) {
     for packet in compound.pkts() {
         if let Ok(Some(report)) = packet.as_sender_report() {
-            ctx.clock.report(ClockReport {
-                track: entry.track.id(),
-                clock_rate: entry.track.clock_rate(),
-                hint: SyncHint::RtcpSenderReport {
-                    ntp: report.ntp_timestamp().0,
-                    rtp_ts: report.rtp_timestamp(),
-                },
+            carried.sender_report(
+                compound.stream_id(),
+                report.ntp_timestamp().0,
+                report.rtp_timestamp(),
                 arrival,
-            });
+                ctx,
+            );
         }
     }
 }
@@ -1350,8 +876,6 @@ mod tests {
         reason = "test code"
     )]
 
-    use futures_util::FutureExt as _;
-    use lotse_core::source::ResolvedPeer;
     use lotse_core::text::CUT_MARK;
 
     use super::*;
@@ -1665,573 +1189,5 @@ mod tests {
             assert!(name.starts_with("x\u{fffd}yyy"), "{media}: {name}");
             assert!(name.ends_with(&format!("y{CUT_MARK}")), "{media}: {name}");
         }
-    }
-
-    #[test]
-    fn a_new_timeline_starts_one_epoch_and_restarts_every_streams_timestamps() {
-        use lotse_core::clock::{Clock as _, SystemClock};
-        use lotse_core::clock_map::{ClockMapper, SyncMode};
-        use lotse_core::source::{BackchannelSlot, ClockInput, TrackSet};
-        use lotse_core::track::TrackLimits;
-
-        let t0 = SystemClock.now();
-        let set = TrackSet::new(TrackLimits::default(), t0);
-        let mapper = Arc::new(ClockMapper::new());
-        let (clock, _reports) = ClockInput::channel(Arc::clone(&mapper));
-        let mut ctx = SourceCtx {
-            peer: ResolvedPeer {
-                host: "cam".into(),
-                addrs: vec![],
-            },
-            tracks: set.publisher(),
-            clock,
-            time: Arc::new(SystemClock),
-            backchannel: BackchannelSlot::default(),
-            cancel: CancellationToken::new(),
-        };
-        let video = declare("video", "h264", 90_000, None, Sprop::None, &[]).unwrap();
-        let audio = declare("audio", "pcmu", 8_000, None, Sprop::None, &[]).unwrap();
-        let v0 = ctx.tracks.declare(video.kind, video.codec.clone(), 90_000);
-        let a0 = ctx.tracks.declare(audio.kind, audio.codec.clone(), 8_000);
-        let mut carried = vec![
-            Some(Carried::new(Arc::clone(&v0), 96, &video)),
-            None,
-            Some(Carried::new(Arc::clone(&a0), 0, &audio)),
-        ];
-        for entry in carried.iter_mut().flatten() {
-            assert_eq!(entry.guard.observe(1_000, t0), None);
-            entry.unwrapper.unwrap(1_000);
-            entry.last_ts = Some(1_000);
-        }
-        mapper.ingest(ClockReport {
-            track: v0.id(),
-            clock_rate: 90_000,
-            hint: SyncHint::RtcpSenderReport {
-                ntp: 1 << 32,
-                rtp_ts: 1_000,
-            },
-            arrival: t0,
-        });
-        assert_eq!(mapper.mode(v0.id()), SyncMode::SenderReports);
-
-        // Video jumped: its guard already holds the new timestamp.
-        assert!(
-            carried[0]
-                .as_mut()
-                .unwrap()
-                .guard
-                .observe(5_000_000, t0)
-                .is_some()
-        );
-        new_timeline(&mut carried, 0, &ctx, &mut Timelines::default(), 55, t0).unwrap();
-        assert_eq!((v0.epoch(), a0.epoch()), (1, 1), "one epoch for all tracks");
-        assert_eq!(mapper.mode(v0.id()), SyncMode::Arrival);
-        let [v, none, a] = <&mut [Option<Carried>; 3]>::try_from(carried.as_mut_slice()).unwrap();
-        assert!(none.is_none(), "the streams stay");
-        let (v, a) = (v.as_mut().unwrap(), a.as_mut().unwrap());
-        assert_eq!(
-            v.guard.observe(5_003_000, t0),
-            None,
-            "video continues its new timeline"
-        );
-        // Audio takes whatever comes next as its base: its own jump is part
-        // of the same epoch.
-        assert_eq!(a.guard.observe(9_999_999, t0), None);
-        for entry in [v, a] {
-            assert_eq!(entry.unwrapper.last(), None);
-            assert_eq!(entry.last_ts, None);
-        }
-    }
-
-    #[test]
-    fn rfc3550_5_1_the_timelines_beyond_the_bound_within_the_window_are_refused() {
-        use lotse_core::clock::{Clock as _, FakeClock};
-
-        let t0 = FakeClock::from_system().now();
-        let mut timelines = Timelines::default();
-        // Exactly the bound at one instant: every one admitted.
-        for n in 0..MAX_TIMELINES {
-            assert!(timelines.admit(t0).is_ok(), "timeline {n}");
-        }
-        let refused = timelines.admit(t0 + TIMELINE_WINDOW.saturating_sub(Duration::from_nanos(1)));
-        let message = refused.unwrap_err().to_string();
-        assert!(
-            message.contains("more than 10 times within 10 s"),
-            "{message}"
-        );
-        assert!(message.contains("(RFC 3550 §5.1)"), "{message}");
-        assert_eq!(
-            timelines.recent.len(),
-            MAX_TIMELINES,
-            "a refusal is not counted"
-        );
-        // A window after them, they have left it.
-        assert!(timelines.admit(t0 + TIMELINE_WINDOW).is_ok());
-        assert_eq!(timelines.recent.len(), 1);
-    }
-
-    #[test]
-    fn occasional_timelines_below_the_bound_are_each_admitted() {
-        use lotse_core::clock::{Clock as _, FakeClock};
-
-        let t0 = FakeClock::from_system().now();
-        let mut timelines = Timelines::default();
-        // One a second, for a minute: never more than the bound in a window.
-        let every = TIMELINE_WINDOW / u32::try_from(MAX_TIMELINES).unwrap();
-        for n in 0..60_u32 {
-            assert!(timelines.admit(t0 + every * n).is_ok(), "timeline {n}");
-        }
-        assert_eq!(timelines.recent.len(), MAX_TIMELINES);
-    }
-
-    /// What `run` logs at `info` and above, every field evaluated.
-    fn logged(run: impl FnOnce()) -> String {
-        let mut captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, run);
-        std::io::Write::flush(&mut captured).unwrap();
-        let bytes = captured.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
-    }
-
-    /// A log writer into a shared buffer.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn a_refused_timeline_restarts_nothing_and_every_jump_logs_throttled() {
-        let (t0, _set, mut ctx) = video_ctx();
-        let declared = declare("video", "h264", 90_000, None, Sprop::None, &[]).unwrap();
-        let v0 = ctx
-            .tracks
-            .declare(declared.kind, declared.codec.clone(), 90_000);
-        let mut carried = vec![Some(Carried::new(Arc::clone(&v0), 96, &declared))];
-        let mut timelines = Timelines::default();
-        let logs = logged(|| {
-            for _ in 0..MAX_TIMELINES {
-                new_timeline(&mut carried, 0, &ctx, &mut timelines, 55, t0).unwrap();
-            }
-            carried[0].as_mut().unwrap().last_ts = Some(1_000);
-            assert!(new_timeline(&mut carried, 0, &ctx, &mut timelines, 55, t0).is_err());
-        });
-        assert_eq!(v0.epoch(), 10, "no epoch for the refused one");
-        assert_eq!(carried[0].as_ref().unwrap().last_ts, Some(1_000));
-        let jumped: Vec<&str> = logs.lines().filter(|l| l.contains("jumped")).collect();
-        assert_eq!(jumped.len(), 1, "{logs}");
-        assert!(jumped[0].contains("moved_ms=55 count=1"), "{logs}");
-        assert!(logs.contains("WARN"), "{logs}");
-        assert!(
-            logs.contains("ending the attempt timelines=10 window_s=10"),
-            "{logs}"
-        );
-    }
-
-    /// A source context on a fresh track set, for the video path tests.
-    fn video_ctx() -> (Instant, Arc<lotse_core::source::TrackSet>, SourceCtx) {
-        use lotse_core::clock::{Clock as _, SystemClock};
-        use lotse_core::clock_map::ClockMapper;
-        use lotse_core::source::{BackchannelSlot, ClockInput, TrackSet};
-        use lotse_core::track::TrackLimits;
-
-        let t0 = SystemClock.now();
-        let set = TrackSet::new(TrackLimits::default(), t0);
-        let (clock, _reports) = ClockInput::channel(Arc::new(ClockMapper::new()));
-        let ctx = SourceCtx {
-            peer: ResolvedPeer {
-                host: "cam".into(),
-                addrs: vec![],
-            },
-            tracks: set.publisher(),
-            clock,
-            time: Arc::new(SystemClock),
-            backchannel: BackchannelSlot::default(),
-            cancel: CancellationToken::new(),
-        };
-        (t0, set, ctx)
-    }
-
-    /// The RTP fields of a video packet that ends its access unit.
-    const fn video_rtp(seq: u16, ts: u32) -> RtpHeaderFields {
-        RtpHeaderFields {
-            pt: 96,
-            seq,
-            ts,
-            marker: true,
-            ssrc: 1,
-        }
-    }
-
-    #[test]
-    fn rfc7798_a_unit_with_a_new_sps_updates_the_codec_and_violations_drop() {
-        let (t0, _set, mut ctx) = video_ctx();
-        // No sprop parameters: the codec learns the sets from the stream.
-        let video = declare("video", "h265", 90_000, None, Sprop::None, &[]).unwrap();
-        let v0 = ctx.tracks.declare(video.kind, video.codec.clone(), 90_000);
-        let mut entry = Carried::new(Arc::clone(&v0), 96, &video);
-        let mut packets = v0.subscribe_packets();
-        let mut frames = v0.subscribe_frames();
-        let mut normalized = Vec::new();
-        let (vps, sps, pps) = (
-            h265::test_data::vps(),
-            h265::test_data::sps(640, 480),
-            h265::test_data::pps(),
-        );
-        let idr = [h265::nal::IDR_W_RADL << 1, 0x01, 0xaa];
-        let ap = h265::nal::aggregate(&[&vps, &sps, &pps, &idr]);
-        on_video(
-            &mut entry,
-            &ctx,
-            t0,
-            video_rtp(2, 3_000),
-            &ap,
-            &mut normalized,
-        );
-        assert_eq!(
-            v0.codec().as_ref(),
-            &Codec::H265 {
-                vps: Some(Bytes::from(vps)),
-                sps: Some(Bytes::from(sps)),
-                pps: Some(Bytes::from(pps)),
-            }
-        );
-        let packet = packets.try_recv().unwrap().unwrap();
-        assert!(packet.keyframe_start && packet.rtp.marker);
-        let frame = frames.try_recv().unwrap().unwrap();
-        assert!(frame.keyframe);
-        assert_eq!(frame.ts.ticks(), 3_000);
-        // A unit over the datagram target is re-split: only the last
-        // packet carries the marker (RFC 7798 §4.1).
-        let big: Vec<u8> = [1 << 1, 0x01].into_iter().chain([0x5a; 2_000]).collect();
-        on_video(
-            &mut entry,
-            &ctx,
-            t0,
-            video_rtp(3, 4_000),
-            &Bytes::from(big),
-            &mut normalized,
-        );
-        let first = packets.try_recv().unwrap().unwrap();
-        let second = packets.try_recv().unwrap().unwrap();
-        assert!(!first.rtp.marker && second.rtp.marker);
-        // PACI is not read: dropped, counted.
-        let paci = Bytes::from_static(&[h265::nal::PACI << 1, 0x01]);
-        on_video(
-            &mut entry,
-            &ctx,
-            t0,
-            video_rtp(4, 6_000),
-            &paci,
-            &mut normalized,
-        );
-        on_video(
-            &mut entry,
-            &ctx,
-            t0,
-            video_rtp(5, 9_000),
-            &paci,
-            &mut normalized,
-        );
-        assert_eq!(entry.violations, 2, "warned once, counted twice");
-        assert!(packets.try_recv().unwrap().is_none());
-    }
-
-    /// The codec changes announced to `sub` so far.
-    fn codec_changes(sub: &mut lotse_core::track::TrackSubscription) -> Vec<Codec> {
-        let mut changes = Vec::new();
-        while let Some(Some(event)) = sub.next().now_or_never() {
-            if let lotse_core::track::TrackEvent::TrackChanged { codec, .. } = event {
-                changes.push(Codec::clone(&codec));
-            }
-        }
-        changes
-    }
-
-    /// The H.264 descriptor of `sps` and `pps`.
-    fn h264_codec(sps: &[u8], pps: &[u8]) -> Codec {
-        Codec::H264 {
-            profile_level_id: Some(lotse_codec::h264::parse_sps(sps).unwrap().profile_level_id),
-            sps: Some(Bytes::copy_from_slice(sps)),
-            pps: Some(Bytes::copy_from_slice(pps)),
-        }
-    }
-
-    #[test]
-    fn rfc6184_the_codec_follows_what_an_sps_says_not_its_bytes() {
-        use lotse_codec::h264::test_data;
-
-        let (t0, _set, mut ctx) = video_ctx();
-        let mut normalized = Vec::new();
-        let (vga, hd, pps) = (
-            test_data::sps(640, 480),
-            test_data::sps(1280, 720),
-            test_data::pps(),
-        );
-        // `test_data::sps(640, 480)` with two reference frames: other
-        // bytes, the same profile, level and size.
-        let mut bits = test_data::Bits::default();
-        bits.bits(66, 8)
-            .bits(0xc0, 8)
-            .bits(40, 8)
-            .ue(0)
-            .ue(0)
-            .ue(2)
-            .ue(2)
-            .bit(false);
-        bits.ue(39).ue(29).bit(true).bit(true).bit(false).bit(false);
-        let vga_again = [vec![0x67], bits.finish()].concat();
-        assert_ne!(vga_again, vga);
-        assert_eq!(
-            lotse_codec::h264::parse_sps(&vga_again),
-            lotse_codec::h264::parse_sps(&vga)
-        );
-        // The SDP's sprop SPS already says what the stream's does.
-        let sets = ParameterSets {
-            sps: Some(Bytes::from(vga.clone())),
-            pps: Some(Bytes::from(pps.clone())),
-        };
-        let video = declare("video", "h264", 90_000, None, Sprop::H264(sets), &[]).unwrap();
-        let v0 = ctx.tracks.declare(video.kind, video.codec.clone(), 90_000);
-        let mut entry = Carried::new(Arc::clone(&v0), 96, &video);
-        let mut sub = v0.subscribe(lotse_core::track::Unit::Packets);
-        let mut seq = 0;
-        let mut send = |sps: &[u8]| {
-            seq += 1;
-            let stap = lotse_codec::h264::nal::stap_a(&[sps, &pps, &[0x65, 0xaa]]);
-            let rtp = video_rtp(seq, u32::from(seq) * 3_000);
-            on_video(&mut entry, &ctx, t0, rtp, &stap, &mut normalized);
-        };
-        for _ in 0..3 {
-            send(&vga_again);
-            send(&vga);
-        }
-        assert_eq!(codec_changes(&mut sub), []);
-        assert_eq!(*v0.codec(), h264_codec(&vga, &pps));
-        send(&hd);
-        send(&vga_again);
-        send(&vga);
-        assert_eq!(
-            codec_changes(&mut sub),
-            [h264_codec(&hd, &pps), h264_codec(&vga_again, &pps)]
-        );
-    }
-
-    #[test]
-    fn rfc7798_the_codec_follows_what_an_sps_says_not_its_bytes() {
-        let (t0, _set, mut ctx) = video_ctx();
-        let mut normalized = Vec::new();
-        let (vps, pps) = (h265::test_data::vps(), h265::test_data::pps());
-        let (vga, hd) = (
-            h265::test_data::sps(640, 480),
-            h265::test_data::sps(1280, 720),
-        );
-        // Other bytes, the same SPS to the reader: a trailing zero byte.
-        let vga_again = [vga.clone(), vec![0]].concat();
-        assert_eq!(h265::parse_sps(&vga_again), h265::parse_sps(&vga));
-        let sets = h265::ParameterSets {
-            vps: Some(Bytes::from(vps.clone())),
-            sps: Some(Bytes::from(vga.clone())),
-            pps: Some(Bytes::from(pps.clone())),
-        };
-        let video = declare("video", "h265", 90_000, None, Sprop::H265(sets), &[]).unwrap();
-        let v0 = ctx.tracks.declare(video.kind, video.codec.clone(), 90_000);
-        let mut entry = Carried::new(Arc::clone(&v0), 96, &video);
-        let mut sub = v0.subscribe(lotse_core::track::Unit::Packets);
-        let idr = [h265::nal::IDR_W_RADL << 1, 0x01, 0xaa];
-        let mut seq = 0;
-        let mut send = |sps: &[u8]| {
-            seq += 1;
-            let ap = h265::nal::aggregate(&[&vps, sps, &pps, &idr]);
-            let rtp = video_rtp(seq, u32::from(seq) * 3_000);
-            on_video(&mut entry, &ctx, t0, rtp, &ap, &mut normalized);
-        };
-        send(&vga_again);
-        send(&vga);
-        assert_eq!(codec_changes(&mut sub), []);
-        send(&hd);
-        let h265 = |sps: &[u8]| Codec::H265 {
-            vps: Some(Bytes::from(vps.clone())),
-            sps: Some(Bytes::copy_from_slice(sps)),
-            pps: Some(Bytes::from(pps.clone())),
-        };
-        assert_eq!(codec_changes(&mut sub), [h265(&hd)]);
-    }
-
-    #[test]
-    fn rfc6184_a_unit_with_a_new_sps_updates_the_codec_and_violations_drop() {
-        // A STAP-A with a new SPS, then STAP-Bs, which packetization mode 1
-        // does not allow.
-        let (t0, _set, mut ctx) = video_ctx();
-        let mut normalized = Vec::new();
-        let video = declare("video", "h264", 90_000, None, Sprop::None, &[]).unwrap();
-        let v1 = ctx.tracks.declare(video.kind, video.codec.clone(), 90_000);
-        let mut entry = Carried::new(Arc::clone(&v1), 96, &video);
-        let sps = [0x67, 0x42, 0xc0, 0x28, 0xda, 0x02, 0x80, 0xf6, 0x40];
-        let pps = [0x68, 0xce, 0x38, 0x80];
-        let stap = lotse_codec::h264::nal::stap_a(&[&sps, &pps, &[0x65, 0xaa]]);
-        on_video(
-            &mut entry,
-            &ctx,
-            t0,
-            video_rtp(1, 0),
-            &stap,
-            &mut normalized,
-        );
-        assert_eq!(
-            *v1.codec(),
-            Codec::H264 {
-                profile_level_id: Some([0x42, 0xc0, 0x28]),
-                sps: Some(Bytes::copy_from_slice(&sps)),
-                pps: Some(Bytes::copy_from_slice(&pps)),
-            }
-        );
-        let stap_b = Bytes::from_static(&[25, 0]);
-        on_video(
-            &mut entry,
-            &ctx,
-            t0,
-            video_rtp(2, 3_000),
-            &stap_b,
-            &mut normalized,
-        );
-        on_video(
-            &mut entry,
-            &ctx,
-            t0,
-            video_rtp(3, 6_000),
-            &stap_b,
-            &mut normalized,
-        );
-        assert_eq!(entry.violations, 2);
-    }
-
-    /// RTP cut through as it came (no normalizer for the codec): every
-    /// audio packet starts a frame, a video packet only when its timestamp
-    /// moves on (RFC 3550 §5.1: the packets of a frame share one).
-    #[test]
-    fn rfc3550_5_1_cut_through_frames_start_per_audio_packet_and_per_video_timestamp() {
-        use lotse_core::clock::{Clock as _, SystemClock};
-        use lotse_core::clock_map::ClockMapper;
-        use lotse_core::source::{BackchannelSlot, ClockInput, TrackSet};
-        use lotse_core::track::TrackLimits;
-
-        let t0 = SystemClock.now();
-        let set = TrackSet::new(TrackLimits::default(), t0);
-        let (clock, _reports) = ClockInput::channel(Arc::new(ClockMapper::new()));
-        let mut ctx = SourceCtx {
-            peer: ResolvedPeer {
-                host: "cam".into(),
-                addrs: vec![],
-            },
-            tracks: set.publisher(),
-            clock,
-            time: Arc::new(SystemClock),
-            backchannel: BackchannelSlot::default(),
-            cancel: CancellationToken::new(),
-        };
-        let received = |seq, ts| Received {
-            stream: 0,
-            ts,
-            seq,
-            ssrc: 1,
-            marker: false,
-            loss: 0,
-            payload: Bytes::from_static(&[1, 2, 3]),
-        };
-        let mut normalized = Vec::new();
-        for (media, encoding, rate, starts) in [
-            ("audio", "pcmu", 8_000, [true, true, true]),
-            ("video", "jpeg", 90_000, [true, false, true]),
-        ] {
-            let declared = declare(media, encoding, rate, None, Sprop::None, &[]).unwrap();
-            let track = ctx
-                .tracks
-                .declare(declared.kind, declared.codec.clone(), rate);
-            let mut entry = Carried::new(Arc::clone(&track), 0, &declared);
-            assert!(entry.video.is_none(), "cut through");
-            let mut packets = track.subscribe_packets();
-            for (seq, ts) in [(1, 1_000), (2, 1_000), (3, 4_000)] {
-                on_rtp(&mut entry, &ctx, t0, received(seq, ts), &mut normalized);
-            }
-            let got: Vec<bool> = (0..3)
-                .map(|_| packets.try_recv().unwrap().unwrap().frame_start)
-                .collect();
-            assert_eq!(got, starts, "{encoding}");
-        }
-    }
-
-    #[test]
-    fn rfc3640_violations_drop_the_packet_and_good_units_become_frames() {
-        use lotse_core::clock::{Clock as _, SystemClock};
-        use lotse_core::clock_map::ClockMapper;
-        use lotse_core::source::{BackchannelSlot, ClockInput, TrackSet};
-        use lotse_core::track::TrackLimits;
-
-        let t0 = SystemClock.now();
-        let set = TrackSet::new(TrackLimits::default(), t0);
-        let (clock, _reports) = ClockInput::channel(Arc::new(ClockMapper::new()));
-        let mut ctx = SourceCtx {
-            peer: ResolvedPeer {
-                host: "cam".into(),
-                addrs: vec![],
-            },
-            tracks: set.publisher(),
-            clock,
-            time: Arc::new(SystemClock),
-            backchannel: BackchannelSlot::default(),
-            cancel: CancellationToken::new(),
-        };
-        let audio = declare(
-            "audio",
-            "mpeg4-generic",
-            16_000,
-            Some(1),
-            Sprop::None,
-            &[0x14, 0x08],
-        )
-        .unwrap();
-        let a0 = ctx.tracks.declare(audio.kind, audio.codec.clone(), 16_000);
-        let mut entry = Carried::new(Arc::clone(&a0), 97, &audio);
-        let mut frames = a0.subscribe_frames();
-        let rtp = |seq, ts| RtpHeaderFields {
-            pt: 97,
-            seq,
-            ts,
-            marker: true,
-            ssrc: 1,
-        };
-        let aac = entry.aac.as_mut().unwrap();
-        // One stamp for every packet: one instance of `publish_aac`.
-        let stamp = |_| (t0, t0);
-        // Two violations (one warning), then a good packet.
-        for (seq, payload) in [(1, &[0x00_u8][..]), (2, &[0x00, 0x0d, 0x00][..])] {
-            publish_aac(aac, &a0, &mut entry.unwrapper, stamp, rtp(seq, 0), payload);
-        }
-        assert!(frames.try_recv().unwrap().is_none(), "dropped");
-        let good = lotse_codec::aac::packetize(&[b"ab", b"cd"]);
-        publish_aac(aac, &a0, &mut entry.unwrapper, stamp, rtp(3, 5_000), &good);
-        let first = frames.try_recv().unwrap().unwrap();
-        let second = frames.try_recv().unwrap().unwrap();
-        assert_eq!((first.ts.ticks(), &first.payload[..]), (5_000, &b"ab"[..]));
-        assert_eq!(
-            (second.ts.ticks(), &second.payload[..]),
-            (6_024, &b"cd"[..])
-        );
-        assert_eq!(aac.stats().violations, 2);
     }
 }

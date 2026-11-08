@@ -325,7 +325,7 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
         call(
             &s,
             1,
-            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [{ "url": cam.url() }] }),
+            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&cam.url(), json!({}))] }),
         )
         .await,
     );
@@ -363,7 +363,7 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
         call(
             &s,
             1,
-            &json!({ "id": 3, "type": "stream/put", "stream_id": "front", "sources": [{ "url": other }] }),
+            &json!({ "id": 3, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&other, json!({}))] }),
         )
         .await,
     );
@@ -395,7 +395,7 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
     // `stream/get` shows the URL's origin only, its path redacted; the
     // second DESCRIBE above is what tells the new path was connected.
     assert_eq!(
-        front["sources"][0]["url"],
+        front["sources"][0]["source"]["url"],
         SourceUrl::parse(&other).unwrap().to_string()
     );
     assert_eq!(front["state"], "live");
@@ -478,7 +478,7 @@ async fn onvif_5_3_1_opting_in_probes_beside_the_viewing_session_without_restart
     } = supervisor();
     let put = |id: u64, options: Value| {
         json!({ "id": id, "type": "stream/put", "stream_id": "door", "preload": true,
-                "sources": [{ "url": cam.url(), "options": options }] })
+                "sources": [lotse_testing::source(&cam.url(), options)] })
     };
     let stats = cam.stats();
     result(call(&s, 1, &put(1, json!({}))).await);
@@ -635,7 +635,7 @@ async fn onvif_5_3_1_an_offer_right_after_the_opt_in_waits_for_the_probe_and_neg
     } = supervisor();
     let put = |id: u64, options: Value| {
         json!({ "id": id, "type": "stream/put", "stream_id": "door",
-                "sources": [{ "url": cam.url(), "options": options }] })
+                "sources": [lotse_testing::source(&cam.url(), options)] })
     };
     result(call(&s, 1, &put(1, json!({}))).await);
     let mut before = Talker::offer(&s, "door", "before", TalkbackOffer::Dedicated).await;
@@ -731,7 +731,7 @@ async fn onvif_5_3_1_a_talk_back_request_the_stream_cannot_serve_is_declined_nev
     } = supervisor();
     let put = |id: u64, stream_id: &str, cam: &FakeCamera, options: Value| {
         json!({ "id": id, "type": "stream/put", "stream_id": stream_id,
-                "sources": [{ "url": cam.url(), "options": options }] })
+                "sources": [lotse_testing::source(&cam.url(), options)] })
     };
     let opted_in = json!({ "backchannel": true });
     result(call(&s, 1, &put(1, "talking", &talking, opted_in.clone())).await);
@@ -788,7 +788,7 @@ async fn a_viewer_plays_through_the_control_api_and_survives_a_control_reconnect
         call(
             &s,
             1,
-            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [{ "url": cam.url() }] }),
+            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&cam.url(), json!({}))] }),
         )
         .await,
     );
@@ -1135,7 +1135,7 @@ async fn a_preloaded_stream_serves_the_first_frame_from_its_gop_cache_and_linger
     );
     let put = |preload: bool| {
         json!({ "id": 1, "type": "stream/put", "stream_id": "front",
-                "sources": [{ "url": cam.url() }], "preload": preload })
+                "sources": [lotse_testing::source(&cam.url(), json!({}))], "preload": preload })
     };
     let get = json!({ "id": 3, "type": "stream/get", "stream_id": "front" });
     // `preload` connects at put, with no viewer.
@@ -1273,7 +1273,7 @@ async fn a_viewer_behind_a_udp_block_plays_over_ice_tcp() {
         call(
             s,
             1,
-            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [{ "url": cam.url() }] }),
+            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&cam.url(), json!({}))] }),
         )
         .await,
     );
@@ -1448,7 +1448,7 @@ async fn put_front(s: &Supervisor, cam: &FakeCamera) {
         call(
             s,
             1,
-            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [{ "url": cam.url() }] }),
+            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&cam.url(), json!({}))] }),
         )
         .await,
     );

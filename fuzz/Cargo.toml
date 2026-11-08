@@ -246,3 +246,10 @@ path = "fuzz_targets/recording_audio.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "webrtc_ingest"
+path = "fuzz_targets/webrtc_ingest.rs"
+test = false
+doc = false
+bench = false

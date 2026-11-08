@@ -34,6 +34,7 @@ lotse-ipc = { workspace = true }
 [dev-dependencies]
 allocation-counter = { workspace = true } # the demux's allocation count (tests/allocations.rs)
 divan = { workspace = true } # the microbenchmarks (benches/)
+lotse-api-types = { workspace = true, features = ["test-util"] } # the `fake` and `fake-signaled` sources of `stream/put`
 lotse-core = { workspace = true, features = ["test-util"] } # the fake source and clock
 lotse-testing = { workspace = true } # the fake TURN server
 rustix = { workspace = true, features = ["process"] } # signals to `run`, a reaped worker and a descriptor limit in the tests

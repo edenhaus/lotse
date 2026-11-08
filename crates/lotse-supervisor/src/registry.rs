@@ -1,7 +1,8 @@
 //! The registry: every stream's desired state, the source connections
 //! streams share, each connection's demand and its latest snapshot as the
 //! driver reports it, the viewer sessions, the event recordings
-//! ([`crate::recording`]), and the subscribers of `stream/subscribe`.
+//! ([`crate::recording`]), the subscribers of `stream/subscribe`, and the
+//! signaled sources' signaling ([`crate::signaling`]).
 //!
 //! One mutex over the maps, taken only on control-plane operations and
 //! never held across an await. Drivers publish snapshots into it, the
@@ -17,6 +18,8 @@ use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::info::{ProcessMetrics, WorkerMetrics};
 use lotse_api_types::session::{CloseCode, Session, SessionEvent};
+use lotse_api_types::signaling::SignalCloseCode;
+use lotse_api_types::source::SourceSpec;
 use lotse_api_types::stream::{
     AudioMode, BackchannelState, ConnectionInfo, LastError, Orientation, SourceBackchannel,
     SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState, StreamStats, TalkerReason,
@@ -47,6 +50,7 @@ use crate::recording::{
     FinishedRecording, RecordingCounters, RecordingEntry, RecordingLimits, StoppingRecording,
 };
 use crate::session::{ChannelRequest, SessionEntry, api_event, close_code};
+use crate::signaling::Signaling;
 use crate::worker::WorkerManager;
 
 /// Events a subscription may hold before the server's forwarder drains
@@ -174,17 +178,79 @@ pub(crate) struct WorkerProcess {
     pub(crate) memory: Option<MemoryProbe>,
 }
 
+/// What names a source: the URL lotse connects to, or, for a source whose
+/// signaling the control-API client relays, its protocol and the stream
+/// it belongs to, which is its identity, as it has no address. `Debug` and
+/// `Display` show the URL redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum SourceTarget {
+    /// A source lotse connects to: its URL, credentials included.
+    Url(SourceUrl),
+    /// A signaled source.
+    Signaled {
+        /// Its protocol (`webrtc`).
+        protocol: &'static str,
+        /// The stream it belongs to.
+        stream: String,
+    },
+}
+
+impl SourceTarget {
+    /// The URL of a source lotse connects to; `None` for a signaled one.
+    pub(crate) const fn url(&self) -> Option<&SourceUrl> {
+        match self {
+            Self::Url(url) => Some(url),
+            Self::Signaled { .. } => None,
+        }
+    }
+
+    /// Whether the client relays the source's signaling: it has no host
+    /// to look up and no port, and never switches in place.
+    pub(crate) const fn signaled(&self) -> bool {
+        matches!(self, Self::Signaled { .. })
+    }
+
+    /// The protocol of a signaled source, which its offers name; `None`
+    /// for a source lotse connects to, whose worker opens no signal.
+    pub(crate) const fn signaled_protocol(&self) -> Option<&'static str> {
+        match self {
+            Self::Url(_) => None,
+            Self::Signaled { protocol, .. } => Some(protocol),
+        }
+    }
+}
+
+/// The redacted URL, or `<protocol> of stream <stream>`.
+impl fmt::Display for SourceTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Url(url) => write!(f, "{url}"),
+            Self::Signaled { protocol, stream } => write!(f, "{protocol} of stream {stream}"),
+        }
+    }
+}
+
+/// As `Display`.
+impl fmt::Debug for SourceTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 /// What streams share a connection by: the canonical source spec.
-/// The URL compares scheme, host, port, path, query and credentials; the
-/// options are the source's [`connection_options`](lotse_core::source::Source::connection_options),
+/// The URL compares scheme, host, port, path, query and credentials; a
+/// signaled source's target is its protocol and stream, so each stream
+/// has its own connection; the options are the source's
+/// [`connection_options`](lotse_core::source::Source::connection_options),
 /// normalized by its factory (defaults applied, key order irrelevant) and
 /// without options that do not change what is received. Holds the
 /// credentials and unredacted options, so `Debug` shows the redacted URL
 /// and the option names only.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConnectionKey {
-    /// The URL, credentials included.
-    pub(crate) url: SourceUrl,
+    /// The URL, credentials included, or the signaled source's protocol
+    /// and stream.
+    pub(crate) target: SourceTarget,
     /// The normalized receive-relevant options.
     pub(crate) options: serde_json::Value,
 }
@@ -197,7 +263,7 @@ impl fmt::Debug for ConnectionKey {
             .map(|fields| fields.keys().map(String::as_str).collect())
             .unwrap_or_default();
         f.debug_struct("ConnectionKey")
-            .field("url", &self.url)
+            .field("target", &self.target)
             .field("options", &names)
             .finish()
     }
@@ -206,12 +272,13 @@ impl fmt::Debug for ConnectionKey {
 /// One source of a stream, bound to its connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamSource {
-    /// The URL, as `stream/get` reports it.
-    pub(crate) url: SourceUrl,
-    /// The per-scheme options as given.
+    /// What names it: its URL, as `stream/get` reports it redacted, or
+    /// its protocol.
+    pub(crate) target: SourceTarget,
+    /// The protocol's fields but the URL, defaults filled in.
     pub(crate) options: serde_json::Map<String, serde_json::Value>,
-    /// The protocol name the factory reports.
-    pub(crate) protocol: &'static str,
+    /// The source as `stream/get` reports it: as put, the URL redacted.
+    pub(crate) reported: SourceSpec,
     /// The connection's id.
     pub(crate) connection: String,
     /// What the connection's driver runs for this source; its
@@ -335,6 +402,8 @@ pub(crate) struct State {
     pub(crate) recording_limits: RecordingLimits,
     /// The demux's sessions; `None` without a front door (tests).
     pub(crate) registrations: Option<Arc<Registrations>>,
+    /// The signaled sources' signaling: subscriptions, opens and signals.
+    pub(crate) signaling: Signaling,
 }
 
 impl State {
@@ -354,10 +423,12 @@ impl State {
             .iter()
             .find(|(id, entry)| {
                 id.as_str() != except
-                    && entry
-                        .sources
-                        .iter()
-                        .any(|source| source.url.expose_url() == url.expose_url())
+                    && entry.sources.iter().any(|source| {
+                        source
+                            .target
+                            .url()
+                            .is_some_and(|own| own.expose_url() == url.expose_url())
+                    })
             })
             .map(|(id, _)| id.clone())
     }
@@ -489,7 +560,8 @@ impl State {
 
     /// Recomputes which streams reference connection `id` and its demand
     /// from them; a connection nothing references any more is dropped,
-    /// which stops its driver.
+    /// which stops its driver, and one that still serves streams ends the
+    /// signals of those that left it ([`State::signals_left_streams`]).
     pub(crate) fn refresh_connection(&mut self, id: &str) {
         let Some(entry) = self.connections.get_mut(id) else {
             return;
@@ -504,6 +576,11 @@ impl State {
             tracing::info!(connection.id = id, "connection released");
             self.connections.remove(id);
             self.forget_stopping_recordings(id);
+            self.signals_ended(
+                id,
+                SignalCloseCode::SourceStopped,
+                "the stream's source was removed",
+            );
             return;
         }
         let preloads = entry
@@ -537,6 +614,7 @@ impl State {
             );
             entry.demand.send_replace(demand);
         }
+        self.signals_left_streams(id);
     }
 
     /// Opens a subscription and queues the current state of every matching
@@ -579,8 +657,8 @@ impl State {
         rx
     }
 
-    /// Drops the subscriptions of a control connection that closed and
-    /// orphans its sessions; returns each orphan's id, serial and epoch
+    /// Drops the subscriptions of a control connection that closed (its
+    /// signaling ones end their signals) and orphans its sessions; returns each orphan's id, serial and epoch
     /// for its grace timer.
     pub(crate) fn connection_closed(
         &mut self,
@@ -588,6 +666,7 @@ impl State {
     ) -> Vec<(String, u64, u64)> {
         self.subscribers
             .retain(|subscriber| subscriber.connection != connection);
+        self.signaling_connection_closed(connection);
         let mut orphans = Vec::new();
         for (id, session) in &mut self.sessions {
             if session.owned_by_connection(connection) {
@@ -1304,8 +1383,7 @@ impl State {
                     .and_then(|s| s.worker.as_ref())
                     .and_then(|worker| worker.memory.clone());
                 let info = SourceInfo {
-                    url: source.url.to_string(),
-                    protocol: source.protocol.to_owned(),
+                    source: source.reported.clone(),
                     state: snapshot.map_or(StreamState::Idle, |s| api_state(s.state)),
                     reconnects: snapshot.map_or(0, |s| s.reconnects),
                     backchannel: connection.and_then(source_backchannel),
@@ -1640,7 +1718,7 @@ mod tests {
     fn spec_on(connection: &str, backchannel: bool) -> DriverSpec {
         DriverSpec {
             connection_id: connection.into(),
-            url: "fake://127.0.0.1/".into(),
+            target: lotse_ipc::SourceTarget::Url("fake://127.0.0.1/".into()),
             options: "{}".into(),
             host: "127.0.0.1".into(),
             port: None,
@@ -1653,9 +1731,12 @@ mod tests {
         StreamEntry {
             sources: vec![StreamSource {
                 spec: spec_on("c1", false),
-                url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                 options: serde_json::Map::new(),
-                protocol: "fake",
+                reported: serde_json::from_value(
+                    serde_json::json!({ "protocol": "fake", "url": "fake://127.0.0.1/" }),
+                )
+                .unwrap(),
                 connection: "c1".into(),
             }],
             preload,
@@ -1736,7 +1817,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -1821,7 +1902,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -2072,7 +2153,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -2134,7 +2215,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -2270,7 +2351,7 @@ mod tests {
         let (demand, _demand) = watch::channel(Demand::default());
         let (commands, mut rx) = mpsc::channel(1);
         let key = ConnectionKey {
-            url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+            target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
             options: serde_json::Value::Null,
         };
         state.connections.insert(
@@ -2367,12 +2448,12 @@ mod tests {
         let _logs = captured.install();
         let (mut state, mut rx) = relay_state(0);
         let key = |url: &str| ConnectionKey {
-            url: SourceUrl::parse(url).unwrap(),
+            target: SourceTarget::Url(SourceUrl::parse(url).unwrap()),
             options: serde_json::Value::Null,
         };
         let spec = |url: &str| DriverSpec {
             connection_id: "c1".into(),
-            url: url.into(),
+            target: lotse_ipc::SourceTarget::Url(url.into()),
             options: "{}".into(),
             host: "127.0.0.1".into(),
             port: None,
@@ -2409,7 +2490,10 @@ mod tests {
             "the key follows the put"
         );
         let_assert!(Ok(DriverCommand::SwitchSource(sent)) = rx.try_recv());
-        assert_eq!(sent.url, "fake://127.0.0.1/b");
+        assert_eq!(
+            sent.target,
+            lotse_ipc::SourceTarget::Url("fake://127.0.0.1/b".into())
+        );
         assert!(rx.try_recv().is_err());
         assert_eq!(captured.lines("driver queue full").len(), 1);
     }
@@ -2459,7 +2543,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -2623,7 +2707,7 @@ mod tests {
     #[test]
     fn a_connection_key_compares_url_and_options_and_debug_keeps_their_secrets() {
         let key = |url: &str, options: serde_json::Value| ConnectionKey {
-            url: SourceUrl::parse(url).unwrap(),
+            target: SourceTarget::Url(SourceUrl::parse(url).unwrap()),
             options,
         };
         let secret = key(
@@ -2640,7 +2724,7 @@ mod tests {
         assert_eq!(
             format!("{:?}", key("fake://cam/", serde_json::Value::Null)),
             format!(
-                "ConnectionKey {{ url: {:?}, options: [] }}",
+                "ConnectionKey {{ target: {}, options: [] }}",
                 SourceUrl::parse("fake://cam/").unwrap()
             )
         );
@@ -2658,6 +2742,31 @@ mod tests {
                 "rtsp://admin:other@cam/main",
                 serde_json::json!({ "token": "sesame-open", "timeout_ms": 5000 })
             )
+        );
+        // A signaled source's key is its protocol and stream: one
+        // connection per stream, and no URL.
+        let signaled = |protocol: &'static str, stream: &str| ConnectionKey {
+            target: SourceTarget::Signaled {
+                protocol,
+                stream: stream.into(),
+            },
+            options: serde_json::Value::Null,
+        };
+        let front = signaled("webrtc", "front");
+        assert_eq!(front, signaled("webrtc", "front"));
+        assert_ne!(front, signaled("webrtc", "back"));
+        assert_ne!(front, signaled("other", "front"));
+        assert_eq!(front.target.url(), None);
+        assert!(front.target.signaled() && !secret.target.signaled());
+        assert_eq!(front.target.signaled_protocol(), Some("webrtc"));
+        assert_eq!(
+            secret.target.signaled_protocol(),
+            None,
+            "a URL source opens no signal"
+        );
+        assert_eq!(
+            format!("{front:?}"),
+            "ConnectionKey { target: webrtc of stream front, options: [] }"
         );
     }
 

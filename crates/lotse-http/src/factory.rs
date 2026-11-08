@@ -1,12 +1,12 @@
-//! The `http` and `https` schemes' factory: options checked, the source
+//! The `http` and `https` protocols' factory: options checked, the source
 //! built.
 
 use lotse_core::source::{Source, SourceCapabilities, SourceConfigError, SourceFactory};
 use lotse_core::source_url::SourceUrl;
 use lotse_tls::{TlsTarget, Trust};
 
-use crate::options::HttpOptions;
-use crate::source::{HttpSource, PROTOCOL};
+use crate::options::{HttpOptions, HttpsOptions};
+use crate::source::{HttpSource, PROTOCOL, TLS_PROTOCOL};
 
 /// RFC 9110 §4.2.1: the default port of `http://`.
 pub const DEFAULT_PORT: u16 = 80;
@@ -19,42 +19,47 @@ pub const DEFAULT_TLS_PORT: u16 = 443;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HttpFactory;
 
-/// The `https` target for `url` and `options`; `None` for `http`. The TLS
-/// options are refused on `http`, and the pin and `insecure_tls` together.
-fn tls_target(
+/// `options` parsed as `protocol`'s, or why not.
+fn parse<T: serde::de::DeserializeOwned>(
+    protocol: &'static str,
+    options: &serde_json::Value,
+) -> Result<T, SourceConfigError> {
+    serde_json::from_value(options.clone()).map_err(|err| SourceConfigError::InvalidOptions {
+        protocol,
+        message: err.to_string(),
+    })
+}
+
+/// An `https` source's options as the source runs with them, and its TLS
+/// target (RFC 9110 §4.2.2), whose pin and host are checked here.
+fn https(
     url: &SourceUrl,
-    options: &HttpOptions,
-) -> Result<Option<TlsTarget>, SourceConfigError> {
-    let invalid = |message: &str| SourceConfigError::InvalidOptions {
-        scheme: PROTOCOL,
-        message: message.to_owned(),
-    };
-    let trust = match (options.tls_fingerprint, options.insecure_tls) {
-        (Some(_), true) => return Err(invalid("set tls_fingerprint or insecure_tls, not both")),
-        (Some(pin), false) => Trust::Pin(pin),
-        (None, true) => Trust::Insecure,
-        (None, false) => Trust::Roots,
-    };
-    if url.scheme() != "https" {
-        return if trust == Trust::Roots {
-            Ok(None)
-        } else {
-            Err(invalid(
-                "tls_fingerprint and insecure_tls apply to https:// only",
-            ))
-        };
-    }
-    TlsTarget::new(url.host(), trust)
-        .map(Some)
-        .map_err(|message| SourceConfigError::InvalidUrl {
-            scheme: PROTOCOL,
+    options: HttpsOptions,
+) -> Result<(HttpOptions, TlsTarget), SourceConfigError> {
+    let HttpsOptions {
+        timeout_ms,
+        max_bandwidth,
+        tls,
+    } = options;
+    let trust = Trust::try_from(&tls).map_err(|err| SourceConfigError::InvalidOptions {
+        protocol: TLS_PROTOCOL,
+        message: err.to_string(),
+    })?;
+    let target =
+        TlsTarget::new(url.host(), trust).map_err(|message| SourceConfigError::InvalidUrl {
+            protocol: TLS_PROTOCOL,
             message,
-        })
+        })?;
+    let options = HttpOptions {
+        timeout_ms,
+        max_bandwidth,
+    };
+    Ok((options, target))
 }
 
 impl SourceFactory for HttpFactory {
-    fn schemes(&self) -> &'static [&'static str] {
-        &["http", "https"]
+    fn protocols(&self) -> &'static [&'static str] {
+        &[PROTOCOL, TLS_PROTOCOL]
     }
 
     /// Nothing goes back to the server: no backchannel.
@@ -62,26 +67,29 @@ impl SourceFactory for HttpFactory {
         SourceCapabilities { backchannel: false }
     }
 
-    fn default_port(&self, scheme: &str) -> Option<u16> {
-        Some(if scheme == "https" {
+    fn default_port(&self, protocol: &str) -> Option<u16> {
+        Some(if protocol == TLS_PROTOCOL {
             DEFAULT_TLS_PORT
         } else {
             DEFAULT_PORT
         })
     }
 
+    /// `url`'s scheme picks the protocol, whose options `options` must
+    /// be: the supervisor hands an `https` source's here only with an
+    /// `https://` URL.
     fn validate(
         &self,
         url: &SourceUrl,
         options: &serde_json::Value,
     ) -> Result<Box<dyn Source>, SourceConfigError> {
-        let options =
-            HttpOptions::parse(options).map_err(|err| SourceConfigError::InvalidOptions {
-                scheme: PROTOCOL,
-                message: err.to_string(),
-            })?;
-        let tls = tls_target(url, &options)?;
-        Ok(Box::new(HttpSource::new(url.clone(), options, tls)))
+        let source = if url.scheme() == TLS_PROTOCOL {
+            let (options, tls) = https(url, parse(TLS_PROTOCOL, options)?)?;
+            HttpSource::new(url.clone(), options, Some(tls))
+        } else {
+            HttpSource::new(url.clone(), parse(PROTOCOL, options)?, None)
+        };
+        Ok(Box::new(source))
     }
 }
 
@@ -97,7 +105,7 @@ mod tests {
 
     use super::*;
 
-    const PIN: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const PIN: &str = "BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD";
 
     fn url(input: &str) -> SourceUrl {
         SourceUrl::parse(input).unwrap()
@@ -106,7 +114,7 @@ mod tests {
     #[test]
     fn the_factory_serves_http_and_https_without_a_backchannel() {
         let factory = HttpFactory;
-        assert_eq!(factory.schemes(), ["http", "https"]);
+        assert_eq!(factory.protocols(), ["http", "https"]);
         assert!(!factory.capabilities().backchannel);
     }
 
@@ -118,29 +126,38 @@ mod tests {
     }
 
     #[test]
-    fn null_options_are_the_defaults_and_the_source_describes_itself_redacted() {
+    fn empty_options_are_the_defaults_and_the_source_describes_itself_redacted() {
         let factory = HttpFactory;
         let url = url("http://user:pass@cam.local/live/index.m3u8");
-        let source = factory.validate(&url, &serde_json::Value::Null).unwrap();
+        let source = factory.validate(&url, &json!({})).unwrap();
         let described = source.describe();
         assert_eq!(described.protocol, "http");
-        assert_eq!(described.url, url);
-        assert!(!described.url.to_string().contains("pass"));
-        assert_eq!(described.options, HttpOptions::default().redacted());
+        assert_eq!(described.url.as_ref(), Some(&url));
+        assert!(!described.url.as_ref().unwrap().to_string().contains("pass"));
         assert_eq!(
-            source.connection_options(),
-            HttpOptions::default().connection_key()
+            described.options,
+            json!({ "timeout_ms": 10_000, "max_bandwidth": null })
         );
+        assert_eq!(source.connection_options(), described.options);
         // `{}` and the defaults spelled out are the same connection.
         let spelled = factory
-            .validate(&url, &json!({ "timeout_ms": 10_000 }))
+            .validate(
+                &url,
+                &json!({ "timeout_ms": 10_000, "max_bandwidth": null }),
+            )
             .unwrap();
         assert_eq!(spelled.connection_options(), source.connection_options());
-        let capped = factory
-            .validate(&url, &json!({ "max_bandwidth": 1_000_000 }))
-            .unwrap();
-        assert_eq!(capped.describe().options["max_bandwidth"], 1_000_000);
-        assert_ne!(capped.connection_options(), source.connection_options());
+        for other in [
+            json!({ "max_bandwidth": 1_000_000 }),
+            json!({ "timeout_ms": 5_000 }),
+        ] {
+            let built = factory.validate(&url, &other).unwrap();
+            assert_ne!(
+                built.connection_options(),
+                source.connection_options(),
+                "{other}"
+            );
+        }
         // Plain HTTP carries no TLS target.
         assert!(format!("{source:?}").contains("tls: None"), "{source:?}");
     }
@@ -153,13 +170,17 @@ mod tests {
             json!({ "nope": 1 }),
             json!({ "timeout_ms": "soon" }),
             json!({ "user_agent": "Client/1" }),
-            json!([]),
+            json!({ "tls": "insecure" }),
+            json!({ "max_bandwidth": -1 }),
         ] {
             let err = factory.validate(&url, &options).unwrap_err();
             assert!(
                 matches!(
                     err,
-                    SourceConfigError::InvalidOptions { scheme: "http", .. }
+                    SourceConfigError::InvalidOptions {
+                        protocol: "http",
+                        ..
+                    }
                 ),
                 "{options}: {err}"
             );
@@ -167,56 +188,76 @@ mod tests {
     }
 
     #[test]
-    fn rfc9110_4_2_2_the_tls_options_are_checked_at_put() {
+    fn rfc9110_4_2_2_https_runs_with_the_trust_it_names() {
         let factory = HttpFactory;
         let https = url("https://cam.local/s.m3u8");
-        let http = url("http://cam.local/s.m3u8");
-        for (options, trust) in [
-            (json!({}), "Roots"),
-            (json!({ "tls_fingerprint": PIN }), "Pin"),
-            (json!({ "insecure_tls": true }), "Insecure"),
+        let source = factory.validate(&https, &json!({})).unwrap();
+        assert_eq!(source.describe().protocol, "https");
+        assert_eq!(
+            source.describe().options,
+            json!({ "timeout_ms": 10_000, "max_bandwidth": null, "tls": "roots" })
+        );
+        for (options, trust, shown) in [
+            (json!({}), "Roots", json!("roots")),
+            (json!({ "tls": "insecure" }), "Insecure", json!("insecure")),
+            (
+                json!({ "tls": { "pin": PIN.replace(':', "") } }),
+                "Pin",
+                json!({ "pin": PIN.to_lowercase() }),
+            ),
         ] {
-            let source = factory.validate(&https, &options).unwrap();
-            let debug = format!("{source:?}");
+            let built = factory.validate(&https, &options).unwrap();
+            let debug = format!("{built:?}");
             assert!(debug.contains("server_name"), "{options}: {debug}");
             assert!(debug.contains(trust), "{options}: {debug}");
+            // Every spelling of one pin is one key.
+            assert_eq!(built.connection_options()["tls"], shown, "{options}");
         }
-        let both = json!({ "tls_fingerprint": PIN, "insecure_tls": true });
-        let err = factory.validate(&https, &both).unwrap_err();
+        // A refused pin is not repeated: a value pasted there can carry
+        // credentials.
+        let err = factory
+            .validate(
+                &https,
+                &json!({ "tls": { "pin": "https://u:hunter2@cam/" } }),
+            )
+            .unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+        let err = factory
+            .validate(&https, &json!({ "tls": { "pin": "ab:cd" } }))
+            .unwrap_err();
         assert!(
-            matches!(err, SourceConfigError::InvalidOptions { .. })
-                && err.to_string().contains("not both"),
+            matches!(
+                &err,
+                SourceConfigError::InvalidOptions {
+                    protocol: "https",
+                    ..
+                }
+            ) && err.to_string().contains("64 hex digits"),
             "{err}"
         );
         let err = factory
-            .validate(&https, &json!({ "tls_fingerprint": "ab:cd" }))
+            .validate(&https, &json!({ "tls": "none" }))
             .unwrap_err();
         assert!(
-            matches!(err, SourceConfigError::InvalidOptions { .. })
-                && err.to_string().contains("64 hex digits"),
+            matches!(
+                err,
+                SourceConfigError::InvalidOptions {
+                    protocol: "https",
+                    ..
+                }
+            ),
             "{err}"
-        );
-        for options in [
-            json!({ "tls_fingerprint": PIN }),
-            json!({ "insecure_tls": true }),
-        ] {
-            let err = factory.validate(&http, &options).unwrap_err();
-            assert!(
-                matches!(err, SourceConfigError::InvalidOptions { .. })
-                    && err.to_string().contains("https:// only"),
-                "{options}: {err}"
-            );
-        }
-        assert!(
-            factory
-                .validate(&http, &json!({ "insecure_tls": false }))
-                .is_ok()
         );
         let bad_host = url("https://a!b/");
         let err = factory.validate(&bad_host, &json!({})).unwrap_err();
         assert!(
-            matches!(err, SourceConfigError::InvalidUrl { scheme: "http", .. })
-                && err.to_string().contains("TLS server name"),
+            matches!(
+                err,
+                SourceConfigError::InvalidUrl {
+                    protocol: "https",
+                    ..
+                }
+            ) && err.to_string().contains("TLS server name"),
             "{err}"
         );
         // The same host over plain HTTP needs no server name.

@@ -180,7 +180,7 @@ async fn closed(worker: &mut Worker) -> (String, String) {
 /// Runs the source until it is live, granting its attempt as the
 /// supervisor would.
 async fn run_camera(door: &mut FrontDoor, cam: &FakeCamera) {
-    run_camera_with(door, cam, "null").await;
+    run_camera_with(door, cam, "{}").await;
 }
 
 /// [`run_camera`] with the source's `options` (JSON).
@@ -188,7 +188,7 @@ async fn run_camera_with(door: &mut FrontDoor, cam: &FakeCamera, options: &str) 
     door.worker
         .run_source(&SourceSpec {
             connection_id: "c1".into(),
-            url: cam.url(),
+            target: lotse_ipc::SourceTarget::Url(cam.url()),
             options: options.into(),
             peer_host: "127.0.0.1".into(),
             peer_addrs: vec![cam.addr()],

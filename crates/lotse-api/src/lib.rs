@@ -242,7 +242,8 @@ pub struct Config {
     /// Control connections at once.
     pub max_connections: u32,
     /// Open subscriptions per connection (`stream/subscribe`,
-    /// `webrtc/offer`, `session/adopt`, `recording/create`); one more is answered
+    /// `webrtc/offer`, `session/adopt`, `recording/create`,
+    /// `signaling/subscribe`); one more is answered
     /// `limit_reached` before the handler sees it. Ended ones do not count.
     pub max_subscriptions: u32,
     /// The mutual-TLS listener, if one is configured.

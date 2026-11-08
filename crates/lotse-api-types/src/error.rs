@@ -34,8 +34,10 @@ pub enum ErrorCode {
     SubscriptionNotFound,
     /// Streams, sessions, sessions per stream or connections.
     LimitReached,
-    /// The source URL scheme is not in `info.schemes`.
-    SchemeUnsupported,
+    /// The source's protocol is one the API defines but this build did
+    /// not register: not in `info.protocols`. A protocol the API does not
+    /// define is `invalid_request`.
+    ProtocolUnsupported,
     /// The source URL, credentials aside, is already another stream's;
     /// `details.stream_id` names it.
     SourceInUse,
@@ -76,6 +78,9 @@ pub enum ErrorCode {
     /// `GET /v0/recording/{recording_id}` (HTTP 409) of a recording whose bytes another
     /// request already took: a recording has one body.
     RecordingAlreadyFetched,
+    /// `signaling/answer`, `signaling/candidate` or `signaling/error` of a
+    /// signal that is not open, or that another control connection owns.
+    SignalNotFound,
 }
 
 impl ErrorCode {
@@ -91,7 +96,7 @@ impl ErrorCode {
             Self::SessionIdInUse => "session_id_in_use",
             Self::SubscriptionNotFound => "subscription_not_found",
             Self::LimitReached => "limit_reached",
-            Self::SchemeUnsupported => "scheme_unsupported",
+            Self::ProtocolUnsupported => "protocol_unsupported",
             Self::SourceInUse => "source_in_use",
             Self::ShuttingDown => "shutting_down",
             Self::NotPermitted => "not_permitted",
@@ -109,6 +114,7 @@ impl ErrorCode {
             Self::RecordingNotFound => "recording_not_found",
             Self::RecordingIdInUse => "recording_id_in_use",
             Self::RecordingAlreadyFetched => "recording_already_fetched",
+            Self::SignalNotFound => "signal_not_found",
         }
     }
 
@@ -185,7 +191,7 @@ mod tests {
             ErrorCode::SessionIdInUse,
             ErrorCode::SubscriptionNotFound,
             ErrorCode::LimitReached,
-            ErrorCode::SchemeUnsupported,
+            ErrorCode::ProtocolUnsupported,
             ErrorCode::SourceInUse,
             ErrorCode::ShuttingDown,
             ErrorCode::InternalError,
@@ -202,6 +208,7 @@ mod tests {
             ErrorCode::RecordingNotFound,
             ErrorCode::RecordingIdInUse,
             ErrorCode::RecordingAlreadyFetched,
+            ErrorCode::SignalNotFound,
         ];
         for code in all {
             let json = serde_json::to_value(code).unwrap();
@@ -216,17 +223,19 @@ mod tests {
         // Nor is a recording event's.
         assert_eq!(ErrorCode::parse("audio_omitted"), None);
         assert_eq!(ErrorCode::parse("not_fetched"), None);
+        // Nor is a signal's.
+        assert_eq!(ErrorCode::parse("camera_error"), None);
     }
 
     #[test]
     fn errors_serialize_like_the_contract_example() {
         let error = ApiError::new(
-            ErrorCode::SchemeUnsupported,
-            "scheme 'http' is not supported",
+            ErrorCode::ProtocolUnsupported,
+            "protocol 'http' is not supported",
         );
         assert_eq!(
             serde_json::to_value(&error).unwrap(),
-            serde_json::json!({ "code": "scheme_unsupported", "message": "scheme 'http' is not supported" })
+            serde_json::json!({ "code": "protocol_unsupported", "message": "protocol 'http' is not supported" })
         );
         let detailed = error.clone().with_detail("protocol", "rtsp");
         assert_eq!(
@@ -235,7 +244,7 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "scheme_unsupported: scheme 'http' is not supported"
+            "protocol_unsupported: protocol 'http' is not supported"
         );
         let parsed: ApiError =
             serde_json::from_str("{\"code\":\"source_timeout\",\"message\":\"m\"}").unwrap();

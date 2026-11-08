@@ -30,6 +30,7 @@ mod recording;
 pub mod relay;
 mod sendmsg;
 mod sessions;
+mod signaling;
 mod talkback;
 #[cfg(test)]
 mod test_logs;
@@ -37,8 +38,8 @@ mod test_logs;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use lotse_codec::transcode::recording::ToOpus;
 use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
@@ -49,15 +50,18 @@ use lotse_core::runner::{
     ConnectGate, ProbeAsk, ProbeGate, RunnerConfig, RunnerEvent, SourceRunner,
 };
 use lotse_core::session::SessionLimits;
-use lotse_core::source::{BackchannelSlot, BackchannelTasks, ResolvedPeer, TrackSet};
+use lotse_core::signaling::SignalingOpener;
+use lotse_core::source::{
+    BackchannelSlot, BackchannelTasks, ResolvedPeer, Source, SourceConfigError, TrackSet,
+};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackId, TrackLimits};
 use lotse_ipc::{
     Channel, Decoded, IpcError, PrerecordStats, RecordingReport, RecordingSpec, Sender,
-    SessionEvent, SessionSpec, SourceSpec, SourceState, ToSupervisor, ToWorker, TrackInfo,
-    TrackStats, WorkerStats,
+    SessionEvent, SessionSpec, SignalCommand, SignalReport, SourceSpec, SourceState, SourceTarget,
+    ToSupervisor, ToWorker, TrackInfo, TrackStats, WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -71,6 +75,7 @@ pub use crate::recording::{
 };
 use crate::recording::{EndReason, RecordingStart, Recordings};
 use crate::sessions::{ConnectionMedia, SessionManager};
+use crate::signaling::WorkerSignaling;
 use crate::talkback::{Arbiter, TalkerChanged, TalkerFeed};
 
 /// How often the worker pushes its counters.
@@ -124,7 +129,7 @@ pub enum Error {
     /// validates specs before spawning, so this is a bug on its side.
     #[error("source rejected ({code}): {message}")]
     SourceRejected {
-        /// The API code (`scheme_unsupported`, `invalid_request`).
+        /// The API code (`protocol_unsupported`, `invalid_request`).
         code: &'static str,
         /// What was wrong.
         message: String,
@@ -138,6 +143,12 @@ pub enum Error {
     /// The source did not stop within the shutdown deadline.
     #[error("the source did not stop within {0} ms")]
     ShutdownTimeout(u64),
+    /// A signal report's send to the supervisor, held up by its full
+    /// socket, was cut short at the shutdown deadline: part of a frame may
+    /// be written, so the channel takes nothing more and the worker exits
+    /// without its final flush.
+    #[error("a signal report's send was cut short at the shutdown deadline")]
+    SignalSendCut,
 }
 
 /// Builds the runtime, opens the channel on stdin and serves until the
@@ -258,6 +269,7 @@ pub async fn serve(
     let (session_tx, mut session_rx) = mpsc::channel::<(String, SessionEvent)>(256);
     let (recording_tx, recording_rx) = mpsc::channel::<(String, RecordingReport)>(64);
     let (probes, mut probe_asks) = ProbeGate::closed();
+    let (signaling, signal_rx) = WorkerSignaling::new();
     let mut serving = Serving {
         tx,
         registries,
@@ -277,6 +289,8 @@ pub async fn serve(
         recordings: Recordings::new(recording_tx),
         recording_rx,
         prerecord: None,
+        signaling,
+        signal_rx,
     };
     let fds: Vec<BorrowedFd<'_>> = memory.iter().map(AsFd::as_fd).collect();
     serving
@@ -313,6 +327,10 @@ pub async fn serve(
             // `serving` holds the recordings' sender, so the reports never end.
             Some((recording_id, event)) = serving.recording_rx.recv() => {
                 serving.on_recording_report(recording_id, event).await?;
+            }
+            // `serving` holds the signaling's sender, so the reports never end.
+            Some(report) = serving.signal_rx.recv() => {
+                serving.tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
             }
             // `serving` holds the gate's sender, so the asks never end.
             Some(ask) = probe_asks.recv() => {
@@ -372,6 +390,12 @@ struct Serving<'a> {
     /// The connection's pre-record window, set on its native tracks; `None`
     /// keeps no ring.
     prerecord: Option<Duration>,
+    /// The signaling of the worker's signaled sources: one opener for the
+    /// running source and the standby, and the dispatcher of the
+    /// supervisor's answers.
+    signaling: Arc<WorkerSignaling>,
+    /// What the signaled sources send the supervisor.
+    signal_rx: mpsc::Receiver<SignalReport>,
 }
 
 /// The message that passes a probe's `ask` on to the supervisor.
@@ -405,6 +429,9 @@ impl Serving<'_> {
                     &[],
                 )
                 .await?;
+        }
+        while let Ok(report) = self.signal_rx.try_recv() {
+            self.tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
         }
         while let Ok(event) = self.runner_rx.try_recv() {
             report(&mut self.tx, event, None).await?;
@@ -535,6 +562,7 @@ impl Serving<'_> {
             ToWorker::Prerecord { ms } => self.on_prerecord(ms),
             ToWorker::StartRecording(spec) => self.on_start_recording(spec, fds).await?,
             ToWorker::StopRecording { recording_id } => self.on_stop_recording(&recording_id),
+            ToWorker::Signal(command) => self.on_signal(command).await?,
             ToWorker::Shutdown { deadline_ms } => {
                 return self.on_shutdown(deadline_ms).await.map(Some);
             }
@@ -581,6 +609,7 @@ impl Serving<'_> {
             self.settings,
             &self.probes,
             &self.backchannels,
+            &self.signaling,
             self.runner_tx.clone(),
         )?);
         self.prerecord = prerecord_window(spec.prerecord_ms);
@@ -685,6 +714,16 @@ impl Serving<'_> {
         Ok(())
     }
 
+    /// `Signal`: the supervisor's answer to a signaled source's open, or
+    /// what the client relays on its channel; a channel the worker cannot
+    /// take is closed at once.
+    async fn on_signal(&mut self, command: SignalCommand) -> Result<(), Error> {
+        if let Some(report) = self.signaling.command(command) {
+            self.tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
+        }
+        Ok(())
+    }
+
     /// `SwitchConnectGranted`: the standby may connect now.
     fn on_switch_connect_granted(&self) {
         if let Some(standby) = &self.standby {
@@ -741,6 +780,8 @@ impl Serving<'_> {
             standby,
             running,
             backchannels,
+            signaling,
+            signal_rx,
             ..
         } = self;
         // Each recording writes its last fragment, and its report waits for the
@@ -775,6 +816,9 @@ impl Serving<'_> {
         let (ended, torn_down) = tokio::join!(ending, teardown);
         ended?;
         torn_down?;
+        // The sources stopped, so their signaling channels are closed: each
+        // relay queues its close, which goes out ahead of the exit.
+        close_signaling(signaling, signal_rx, tx, clock, deadline).await?;
         Ok(ExitReason::Shutdown)
     }
 
@@ -812,6 +856,7 @@ impl Serving<'_> {
             self.settings,
             &self.probes,
             &self.backchannels,
+            &self.signaling,
             self.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -1135,7 +1180,8 @@ async fn refuse_renegotiation(
 
 /// Validates `spec` against the registry and starts its runner on a new
 /// track set, its probes waiting at `probes`, its backchannel sessions'
-/// tasks tracked in `backchannels`.
+/// tasks tracked in `backchannels`, a signaled source's channels opened
+/// through `signaling`.
 #[expect(
     clippy::too_many_arguments,
     reason = "wires the source into the worker's shared parts, as start_runner does"
@@ -1147,6 +1193,7 @@ fn start_source(
     settings: &Settings,
     probes: &ProbeGate,
     backchannels: &BackchannelTasks,
+    signaling: &Arc<WorkerSignaling>,
     events: mpsc::Sender<RunnerEvent>,
 ) -> Result<Running, Error> {
     let native = TrackSet::new(settings.limits, clock.now());
@@ -1157,6 +1204,7 @@ fn start_source(
         settings,
         probes,
         backchannels,
+        signaling,
         events,
         Arc::clone(&native),
         "source",
@@ -1189,10 +1237,81 @@ fn start_source(
     })
 }
 
+/// A source a spec names, built by its factory, and how the worker wires
+/// it.
+#[derive(Debug)]
+struct Built {
+    /// The source.
+    source: Box<dyn Source>,
+    /// Its protocol can carry audio back (`SourceCapabilities::backchannel`).
+    backchannel: bool,
+    /// The client relays its signaling: it gets the signaling opener.
+    signaled: bool,
+    /// What names it in the log: the redacted URL, or the protocol.
+    shown: String,
+}
+
+/// Builds the source `spec` names with the registry's factory for it: a
+/// URL's scheme's, which is its protocol, or a signaled source's
+/// protocol's. The supervisor checked the spec before it sent it, so a
+/// refusal is a bug on its side.
+fn build_source(spec: &SourceSpec, registries: &Registries) -> Result<Built, Error> {
+    let options: serde_json::Value =
+        serde_json::from_str(&spec.options).map_err(|err| Error::SourceRejected {
+            code: "invalid_request",
+            message: format!("options are not JSON: {err}"),
+        })?;
+    match &spec.target {
+        SourceTarget::Url(raw) => {
+            let url = SourceUrl::parse(raw).map_err(|err| Error::SourceRejected {
+                code: "invalid_request",
+                message: err.to_string(),
+            })?;
+            let Some(factory) = registries.sources.get(url.scheme()) else {
+                return Err(Error::SourceRejected {
+                    code: "protocol_unsupported",
+                    message: format!("protocol {:?} is not compiled in", url.scheme()),
+                });
+            };
+            Ok(Built {
+                source: factory
+                    .validate(&url, &options)
+                    .map_err(|err| invalid(&err))?,
+                backchannel: factory.capabilities().backchannel,
+                signaled: false,
+                shown: url.to_string(),
+            })
+        }
+        SourceTarget::Signaled(protocol) => {
+            let Some(factory) = registries.sources.signaled(protocol) else {
+                return Err(Error::SourceRejected {
+                    code: "protocol_unsupported",
+                    message: format!("signaled protocol {protocol:?} is not compiled in"),
+                });
+            };
+            Ok(Built {
+                source: factory.validate(&options).map_err(|err| invalid(&err))?,
+                backchannel: false,
+                signaled: true,
+                shown: protocol.clone(),
+            })
+        }
+    }
+}
+
+/// A factory's refusal of a spec's source, as the worker reports it.
+fn invalid(err: &SourceConfigError) -> Error {
+    Error::SourceRejected {
+        code: "invalid_request",
+        message: err.to_string(),
+    }
+}
+
 /// Validates `spec` against the registry and starts its runner on
 /// `native`, reporting to `events`, its probes waiting at `probes`, its
-/// backchannel sessions' tasks tracked in `backchannels`; `role` names it
-/// in the log.
+/// backchannel sessions' tasks tracked in `backchannels`, its signaling
+/// channels opened through `signaling` when its protocol's signaling is
+/// the client's to relay; `role` names it in the log.
 #[expect(
     clippy::too_many_arguments,
     reason = "wires one runner into the worker's shared parts; called from two places"
@@ -1204,46 +1323,36 @@ fn start_runner(
     settings: &Settings,
     probes: &ProbeGate,
     backchannels: &BackchannelTasks,
+    signaling: &Arc<WorkerSignaling>,
     events: mpsc::Sender<RunnerEvent>,
     native: Arc<TrackSet>,
     role: &'static str,
 ) -> Result<Runner, Error> {
-    let url = SourceUrl::parse(&spec.url).map_err(|err| Error::SourceRejected {
-        code: "invalid_request",
-        message: err.to_string(),
-    })?;
-    let factory = registries
-        .sources
-        .get(url.scheme())
-        .ok_or_else(|| Error::SourceRejected {
-            code: "scheme_unsupported",
-            message: format!("scheme {:?} is not compiled in", url.scheme()),
-        })?;
-    let options: serde_json::Value =
-        serde_json::from_str(&spec.options).map_err(|err| Error::SourceRejected {
-            code: "invalid_request",
-            message: format!("options are not JSON: {err}"),
-        })?;
-    let source = factory
-        .validate(&url, &options)
-        .map_err(|err| Error::SourceRejected {
-            code: "invalid_request",
-            message: err.to_string(),
-        })?;
+    let Built {
+        source,
+        backchannel,
+        signaled,
+        shown,
+    } = build_source(spec, registries)?;
     // Two-way audio stays off for a protocol that cannot carry audio
     // back, whatever its source puts in the slot.
-    let backchannel = factory
-        .capabilities()
-        .backchannel
-        .then(|| BackchannelSlot::gated(probes.clone()).tracked(backchannels.clone()));
+    let backchannel =
+        backchannel.then(|| BackchannelSlot::gated(probes.clone()).tracked(backchannels.clone()));
     let capable = backchannel.is_some();
+    // Only a signaled source gets the opener: no other opens a channel to
+    // the control-API client.
+    let signaled = signaled.then(|| {
+        let opener: Arc<dyn SignalingOpener> = Arc::<WorkerSignaling>::clone(signaling);
+        opener
+    });
     tracing::info!(
         connection = %spec.connection_id,
-        url = %url,
+        source = %shown,
         peer = %spec.peer_host,
         addrs = ?spec.peer_addrs,
         role,
         backchannel = capable,
+        signaled = signaled.is_some(),
         backoff_attempts = spec.backoff.attempts,
         immediate_used = spec.backoff.immediate_used,
         "running source"
@@ -1261,6 +1370,7 @@ fn start_runner(
         native,
         Arc::clone(&mapper),
         backchannel.clone().unwrap_or_default(),
+        signaled,
         Arc::clone(clock),
         settings.runner,
         ReconnectBackoff::resumed(
@@ -1375,6 +1485,62 @@ async fn close_backchannels(tasks: &BackchannelTasks, clock: &Arc<dyn Clock>) {
             grace_ms = BACKCHANNEL_CLOSE_GRACE.as_millis(),
             "backchannel sessions still closing after the grace; the worker exits without them"
         ),
+    }
+}
+
+/// Waits, until `deadline` on `clock`, for the relays of the signaling
+/// channels to end, each having queued its channel's close, and sends the
+/// reports of `signal_rx` to the supervisor on `tx` meanwhile, so no relay
+/// waits for room; the last ones go out with the worker's final flush. A
+/// send the supervisor's full socket holds up is cut short at the
+/// deadline too, and is [`Error::SignalSendCut`]: it may have written
+/// part of a frame, so nothing, the final flush included, may follow it
+/// on `tx`.
+async fn close_signaling(
+    signaling: &WorkerSignaling,
+    signal_rx: &mut mpsc::Receiver<SignalReport>,
+    tx: &mut Sender,
+    clock: &Arc<dyn Clock>,
+    deadline: Instant,
+) -> Result<(), Error> {
+    let open = signaling.relays();
+    // Set while a send is under way, so the deadline knows it cut one.
+    let sending = AtomicBool::new(false);
+    let relay = async {
+        let ended = signaling.relays_ended();
+        tokio::pin!(ended);
+        loop {
+            tokio::select! {
+                biased;
+                // The signaling holds the reports' sender, so they never end.
+                Some(report) = signal_rx.recv() => {
+                    sending.store(true, Ordering::Relaxed);
+                    tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
+                    sending.store(false, Ordering::Relaxed);
+                }
+                () = &mut ended => {
+                    tracing::debug!(open, "signaling relays ended");
+                    return Ok::<(), Error>(());
+                }
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        relayed = relay => relayed,
+        () = clock.sleep(deadline.saturating_duration_since(clock.now())) => {
+            tracing::warn!(
+                left = signaling.relays(),
+                "signaling relays still closing at the deadline; the worker exits without their closes"
+            );
+            if sending.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    "a signal report's send to the supervisor's full socket was cut short; the worker exits without its final flush"
+                );
+                return Err(Error::SignalSendCut);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1558,7 +1724,7 @@ mod tests {
     use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
         BackchannelCapture, ECHO_ANSWER, EchoSessionFactory, FakeOutputFactory,
-        FakeRecordingMuxerFactory, FakeSourceFactory,
+        FakeRecordingMuxerFactory, FakeSignaledSourceFactory, FakeSourceFactory,
     };
     use lotse_ipc::Receiver;
     use tokio::sync::Notify;
@@ -1620,7 +1786,7 @@ mod tests {
     fn spec(url: &str, options: &str) -> SourceSpec {
         SourceSpec {
             connection_id: "c1".into(),
-            url: url.into(),
+            target: SourceTarget::Url(url.into()),
             options: options.into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
@@ -2709,6 +2875,367 @@ mod tests {
         );
     }
 
+    /// The signaled fake source, as the WebRTC camera source's protocol.
+    fn signaled_registries() -> Arc<Registries> {
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register_signaled(Arc::new(FakeSignaledSourceFactory::new("webrtc")))
+            .unwrap();
+        Arc::new(registries)
+    }
+
+    /// The spec of a signaled source of `protocol`: no address.
+    fn signaled_spec(protocol: &str, options: &str) -> SourceSpec {
+        SourceSpec {
+            target: SourceTarget::Signaled(protocol.into()),
+            peer_host: String::new(),
+            ..spec("unused://", options)
+        }
+    }
+
+    /// The worker's next signal report, the other messages skipped.
+    async fn next_signal(h: &mut Harness) -> SignalReport {
+        let_assert!(
+            ToSupervisor::Signal(report) =
+                next_where(h, &|message| matches!(message, ToSupervisor::Signal(_))).await
+        );
+        report
+    }
+
+    async fn signal_command(h: &mut Harness, command: SignalCommand) {
+        h.tx.send_msg(&ToWorker::Signal(command), &[])
+            .await
+            .unwrap();
+    }
+
+    /// A signaled source opens a channel per attempt through the
+    /// supervisor: its offer and candidates go out as reports, the
+    /// client's answer comes in and it goes live; the client gone ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc8829_5_a_signaled_source_s_offer_and_answer_go_through_the_supervisor() {
+        let mut h = start_with_settings(signaled_registries(), quiet_settings());
+        h.next().await;
+        h.tx.send_msg(&ToWorker::RunSource(signaled_spec("webrtc", "{}")), &[])
+            .await
+            .unwrap();
+        let_assert!(SignalReport::Open { request } = next_signal(&mut h).await);
+        signal_command(
+            &mut h,
+            SignalCommand::Opened {
+                request,
+                signal_id: "sig-1".into(),
+                local_addrs: vec!["192.0.2.7".parse().unwrap()],
+            },
+        )
+        .await;
+        let candidate = |candidate: &str| SignalReport::Candidate {
+            signal_id: "sig-1".into(),
+            candidate: candidate.into(),
+            mid: Some("0".into()),
+            mline_index: Some(0),
+        };
+        assert_eq!(
+            [
+                next_signal(&mut h).await,
+                next_signal(&mut h).await,
+                next_signal(&mut h).await,
+            ],
+            [
+                SignalReport::Offer {
+                    signal_id: "sig-1".into(),
+                    sdp: lotse_core::test_util::FAKE_SIGNALED_OFFER.into(),
+                },
+                candidate("candidate:1 1 udp 2130706431 192.0.2.7 9 typ host"),
+                candidate(""),
+            ]
+        );
+        signal_command(
+            &mut h,
+            SignalCommand::Answer {
+                signal_id: "sig-1".into(),
+                sdp: "v=0 answer".into(),
+            },
+        )
+        .await;
+        next_where(&mut h, &|message| {
+            *message == ToSupervisor::SourceState(SourceState::Live)
+        })
+        .await;
+
+        signal_command(
+            &mut h,
+            SignalCommand::Gone {
+                signal_id: "sig-1".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_signal(&mut h).await,
+            SignalReport::Closed {
+                signal_id: "sig-1".into(),
+                code: "signaling_lost".into(),
+                message: "the signaling client is gone".into(),
+            }
+        );
+        // The reconnect's attempt opens again.
+        let_assert!(SignalReport::Open { request: again } = next_signal(&mut h).await);
+        assert_eq!(again, request + 1);
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
+    /// A signaled source whose open the supervisor refuses backs off
+    /// unreachable; a channel no attempt asked for is closed at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_signaled_source_whose_open_is_refused_backs_off_unreachable() {
+        let mut h = start_with_settings(signaled_registries(), quiet_settings());
+        h.next().await;
+        signal_command(
+            &mut h,
+            SignalCommand::Opened {
+                request: 99,
+                signal_id: "stale".into(),
+                local_addrs: vec![],
+            },
+        )
+        .await;
+        assert_eq!(
+            next_signal(&mut h).await,
+            SignalReport::Closed {
+                signal_id: "stale".into(),
+                code: "source_stopped".into(),
+                message: "the attempt that asked for the channel is over".into(),
+            }
+        );
+        h.tx.send_msg(&ToWorker::RunSource(signaled_spec("webrtc", "{}")), &[])
+            .await
+            .unwrap();
+        let_assert!(SignalReport::Open { request: again } = next_signal(&mut h).await);
+        signal_command(
+            &mut h,
+            SignalCommand::Refused {
+                request: again,
+                code: "no_signaling_client".into(),
+                message: "no client relays this stream's signaling".into(),
+            },
+        )
+        .await;
+        // One line, so the line is covered whichever message comes first.
+        let backoff = next_where(&mut h, &|m| {
+            matches!(m, ToSupervisor::SourceState(SourceState::Backoff { .. }))
+        })
+        .await;
+        let_assert!(
+            ToSupervisor::SourceState(SourceState::Backoff { code, message, .. }) = backoff
+        );
+        assert_eq!(code, "source_unreachable");
+        assert!(message.contains("no_signaling_client"), "{message}");
+
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
+    /// The signal reports still queued when the worker is done go out
+    /// with its last messages.
+    #[tokio::test]
+    async fn the_last_signal_reports_go_out_before_the_worker_exits() {
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let (signaling, signal_rx) = WorkerSignaling::new();
+        serving.signaling = signaling;
+        serving.signal_rx = signal_rx;
+        let opening = spawn_named("test.open", serving.signaling.open());
+        while serving.signal_rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let mut session_rx = mpsc::channel(1).1;
+        serving
+            .flush(ExitReason::Shutdown, &mut session_rx)
+            .await
+            .unwrap();
+        drop(serving);
+        assert_eq!(
+            within(rx.recv_msg::<ToSupervisor>())
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            ToSupervisor::Signal(SignalReport::Open { request: 1 })
+        );
+        opening.abort();
+    }
+
+    /// Opens the channel `signal_id` through `signaling`, reading the open
+    /// from `signal_rx`.
+    async fn opened_channel(
+        signaling: &WorkerSignaling,
+        signal_rx: &mut mpsc::Receiver<SignalReport>,
+        signal_id: &str,
+    ) -> lotse_core::signaling::SignalingChannel {
+        let opening = spawn_named("test.open", signaling.open());
+        let_assert!(Some(SignalReport::Open { request }) = within(signal_rx.recv()).await);
+        let opened = SignalCommand::Opened {
+            request,
+            signal_id: signal_id.into(),
+            local_addrs: vec![],
+        };
+        assert_eq!(signaling.command(opened), None);
+        opening.await.unwrap().unwrap()
+    }
+
+    /// The shutdown waits for the signaling relays, so the close each
+    /// queues once its source let go of the channel goes out before the
+    /// worker exits.
+    #[tokio::test]
+    async fn the_shutdown_waits_for_the_signaling_relays_to_queue_their_closes() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let (signaling, mut signal_rx) = WorkerSignaling::new();
+        let mut channels = Vec::new();
+        for signal_id in ["sig-1", "sig-2"] {
+            channels.push(opened_channel(&signaling, &mut signal_rx, signal_id).await);
+        }
+        serving.signaling = signaling;
+        serving.signal_rx = signal_rx;
+        // The sources let go of their channels a while later, as stopping
+        // ones do.
+        let _sources = spawn_named("test.sources", async move {
+            for channel in channels {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                drop(channel);
+            }
+        });
+        assert_eq!(
+            serving.on_shutdown(1_000).await.unwrap(),
+            ExitReason::Shutdown
+        );
+        drop(serving);
+        for signal_id in ["sig-1", "sig-2"] {
+            assert_eq!(
+                within(rx.recv_msg::<ToSupervisor>())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                ToSupervisor::Signal(SignalReport::Closed {
+                    signal_id: signal_id.into(),
+                    code: "source_stopped".into(),
+                    message: "the source stopped".into(),
+                })
+            );
+        }
+        assert_eq!(
+            logs.lines(Level::DEBUG, "signaling relays ended")[0].fields,
+            " open=2"
+        );
+    }
+
+    /// A report the supervisor does not read holds the shutdown up only
+    /// until its deadline: the send to a full socket is cut short, and as
+    /// it may have written part of a frame, the shutdown ends in
+    /// `SignalSendCut` instead of the final flush, which would write after
+    /// it and wait on the same full socket with no deadline.
+    #[tokio::test]
+    async fn a_signal_report_a_full_socket_holds_up_is_cut_short_at_the_deadline() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, unread_socket) = serving(&settings);
+        let fake = Arc::new(FakeClock::default());
+        serving.clock = fake.clone();
+        let (signaling, mut signal_rx) = WorkerSignaling::new();
+        let channel = opened_channel(&signaling, &mut signal_rx, "sig-1").await;
+        // More offers than the socket's buffer holds, which no one reads.
+        let (reports, unread) = mpsc::channel(64);
+        for _ in 0..64 {
+            reports
+                .try_send(SignalReport::Offer {
+                    signal_id: "sig-1".into(),
+                    sdp: "v".repeat(lotse_ipc::MAX_SIGNAL_OFFER_BYTES),
+                })
+                .unwrap();
+        }
+        serving.signaling = signaling;
+        serving.signal_rx = unread;
+        let done = AtomicBool::new(false);
+        let shutdown = async {
+            let ended = serving.on_shutdown(1_000).await;
+            done.store(true, Ordering::Relaxed);
+            ended
+        };
+        let deadline = async {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!done.load(Ordering::Relaxed), "the send waits for room");
+            fake.advance(Duration::from_secs(1));
+        };
+        let (ended, ()) = within(async { tokio::join!(shutdown, deadline) }).await;
+        let left = serving.signal_rx.len();
+        assert!(matches!(ended, Err(Error::SignalSendCut)), "{ended:?}");
+        assert!(left > 0, "it stopped sending: {left} left");
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "signaling relays still closing at the deadline; the worker exits without their closes"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "a signal report's send to the supervisor's full socket was cut short; the worker exits without its final flush"
+            )
+            .len(),
+            1
+        );
+        drop((channel, unread_socket, reports));
+    }
+
+    /// A relay whose channel is still open at the shutdown's deadline is
+    /// left with a warning: the shutdown goes on.
+    #[tokio::test]
+    async fn a_signaling_relay_still_open_at_the_deadline_is_left_with_a_warning() {
+        let (logs, _guard) = Logs::capture();
+        let fake = Arc::new(FakeClock::default());
+        let clock: Arc<dyn Clock> = fake.clone();
+        let (signaling, mut signal_rx) = WorkerSignaling::new();
+        let channel = opened_channel(&signaling, &mut signal_rx, "sig-1").await;
+        let (ours, theirs) = Channel::pair().unwrap();
+        let (mut tx, _) = Channel::from_fd(theirs).unwrap().split();
+        let deadline = fake.now() + Duration::from_secs(1);
+        let closing = spawn_named("test.close", async move {
+            close_signaling(&signaling, &mut signal_rx, &mut tx, &clock, deadline)
+                .await
+                .unwrap();
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        fake.advance(Duration::from_millis(999));
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished(), "waits until the deadline");
+        fake.advance(Duration::from_millis(1));
+        within(closing).await.unwrap();
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "signaling relays still closing at the deadline; the worker exits without their closes"
+            )[0]
+            .fields,
+            " left=1"
+        );
+        drop((channel, ours));
+    }
+
     /// A release on a connection whose protocol has no backchannel does
     /// nothing, and nothing is reported.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3441,7 +3968,7 @@ mod tests {
         fn open_session(
             &self,
             request: lotse_core::session::SessionRequest,
-            now: std::time::Instant,
+            now: Instant,
         ) -> Result<
             (Box<dyn lotse_core::session::SessionEngine>, String),
             lotse_core::session::SessionOpenError,
@@ -4567,9 +5094,65 @@ mod tests {
 
     #[tokio::test]
     async fn bad_specs_and_a_second_source_are_errors() {
+        for (spec, code, message) in [
+            (
+                spec("not a url", "null"),
+                "invalid_request",
+                "url does not parse",
+            ),
+            (
+                spec("rtsp://cam/", "null"),
+                "protocol_unsupported",
+                "protocol \"rtsp\" is not compiled in",
+            ),
+            (
+                spec("fake://cam/", "{not json"),
+                "invalid_request",
+                "options are not JSON",
+            ),
+            (
+                spec("fake://cam/", "{\"transport\":\"udp\"}"),
+                "invalid_request",
+                "fake source takes no options",
+            ),
+            (
+                signaled_spec("webrtc", "null"),
+                "protocol_unsupported",
+                "signaled protocol \"webrtc\" is not compiled in",
+            ),
+            (
+                signaled_spec("fake-signaled", "{\"audio\":true}"),
+                "invalid_request",
+                "fake signaled source takes no options",
+            ),
+            (
+                signaled_spec("fake-signaled", "{not json"),
+                "invalid_request",
+                "options are not JSON",
+            ),
+        ] {
+            let mut registries = Registries::default();
+            registries
+                .sources
+                .register(Arc::new(FakeSourceFactory::new(&["fake"])))
+                .unwrap();
+            registries
+                .sources
+                .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
+                .unwrap();
+            let shown = format!("{:?}", spec.target);
+            let_assert!(
+                Err(Error::SourceRejected {
+                    code: got,
+                    message: text
+                }) = build_source(&spec, &registries)
+            );
+            assert_eq!(got, code, "{shown}");
+            assert!(text.contains(message), "{shown}: {text}");
+        }
         for (url, options, code) in [
             ("not a url", "null", "invalid_request"),
-            ("rtsp://cam/", "null", "scheme_unsupported"),
+            ("rtsp://cam/", "null", "protocol_unsupported"),
             ("fake://cam/", "{not json", "invalid_request"),
             ("fake://cam/", "{\"transport\":\"udp\"}", "invalid_request"),
         ] {
@@ -4605,7 +5188,7 @@ mod tests {
             .unwrap();
         let err = within(h.worker).await.unwrap().unwrap_err();
         let_assert!(Error::SourceRejected { code: got, .. } = err);
-        assert_eq!(got, "scheme_unsupported");
+        assert_eq!(got, "protocol_unsupported");
     }
 
     /// The worker process: the control channel on stdin, a runtime of its
@@ -4667,6 +5250,8 @@ mod tests {
             recordings: Recordings::new(mpsc::channel(1).0),
             recording_rx: mpsc::channel(1).1,
             prerecord: None,
+            signaling: WorkerSignaling::new().0,
+            signal_rx: mpsc::channel(1).1,
         };
         (serving, ours.split().1)
     }
@@ -4751,6 +5336,7 @@ mod tests {
             &settings,
             &serving.probes,
             &serving.backchannels,
+            &serving.signaling,
             serving.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -4826,7 +5412,7 @@ mod tests {
         fn describe(&self) -> SourceDescriptor {
             SourceDescriptor {
                 protocol: "stubborn",
-                url: self.url.clone(),
+                url: Some(self.url.clone()),
                 options: serde_json::Value::Null,
             }
         }
@@ -4864,7 +5450,7 @@ mod tests {
     }
 
     impl SourceFactory for Stubborn {
-        fn schemes(&self) -> &'static [&'static str] {
+        fn protocols(&self) -> &'static [&'static str] {
             &["stubborn"]
         }
 
@@ -4996,7 +5582,7 @@ mod tests {
             let (logs, _guard) = Logs::capture();
             let settings = settings();
             let (mut serving, _rx) = serving(&settings);
-            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let closed = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&closed);
             let close = CancellationToken::new();
             let _session = serving
@@ -5079,6 +5665,7 @@ mod tests {
             &settings,
             &ProbeGate::default(),
             &tasks,
+            &WorkerSignaling::new().0,
             mpsc::channel(1).0,
             TrackSet::new(TrackLimits::default(), clock.now()),
             "source",
@@ -5098,11 +5685,11 @@ mod tests {
     fn errors_display_and_seeds_differ_by_time() {
         assert_eq!(
             Error::SourceRejected {
-                code: "scheme_unsupported",
+                code: "protocol_unsupported",
                 message: "x".into()
             }
             .to_string(),
-            "source rejected (scheme_unsupported): x"
+            "source rejected (protocol_unsupported): x"
         );
         assert_eq!(
             Error::ShutdownTimeout(5).to_string(),
@@ -5677,6 +6264,7 @@ mod tests {
             &settings,
             &serving.probes,
             &serving.backchannels,
+            &serving.signaling,
             serving.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",

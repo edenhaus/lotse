@@ -604,7 +604,7 @@ impl InProcess {
         tx.send_msg(
             &ToWorker::RunSource(SourceSpec {
                 connection_id: "c1".into(),
-                url: url.into(),
+                target: lotse_ipc::SourceTarget::Url(url.into()),
                 options: options.into(),
                 peer_host: "cam".into(),
                 peer_addrs,
@@ -1935,7 +1935,7 @@ impl Api {
             call(
                 &supervisor,
                 &json!({ "id": 2, "type": "stream/put", "stream_id": "door",
-                         "sources": [{ "url": url, "options": options }] }),
+                         "sources": [lotse_testing::source(url, options.clone())] }),
             )
             .await,
         );
@@ -2785,7 +2785,7 @@ async fn onvif_5_3_1_opting_in_and_out_leaves_the_video_alone_and_frees_the_talk
     .expect("camera");
     let put = |options: Value| {
         json!({ "id": 2, "type": "stream/put", "stream_id": "door",
-                "sources": [{ "url": camera.url(), "options": options }] })
+                "sources": [lotse_testing::source(&camera.url(), options)] })
     };
     let mut api = Api::start_with(
         Arc::new(lotse_rtsp::RtspFactory),

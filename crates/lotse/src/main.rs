@@ -111,6 +111,16 @@ fn registries() -> Registries {
             .sources
             .register(Arc::new(lotse_http::HttpFactory)),
     );
+    // WebRTC cameras (Nest, Ring, Matter through Home Assistant): lotse
+    // offers, the control-API client relays the signaling. No address, so
+    // a signaled protocol, not a URL scheme.
+    #[cfg(feature = "source-webrtc")]
+    registered(
+        "webrtc source",
+        registries
+            .sources
+            .register_signaled(Arc::new(lotse_webrtc::ingest::WebRtcSourceFactory)),
+    );
     #[cfg(feature = "source-fake")]
     // With a backchannel, so the talk-back tests reach a worker's arbiter
     // through the control API.
@@ -118,6 +128,15 @@ fn registries() -> Registries {
         "fake source",
         registries.sources.register(Arc::new(
             lotse_core::test_util::FakeSourceFactory::with_backchannel(&["fake"]),
+        )),
+    );
+    #[cfg(feature = "source-fake")]
+    // Signaled, so the end-to-end tests reach a worker's signaling through
+    // the supervisor.
+    registered(
+        "signaled fake source",
+        registries.sources.register_signaled(Arc::new(
+            lotse_core::test_util::FakeSignaledSourceFactory::new("fake-signaled"),
         )),
     );
     registries
@@ -129,6 +148,7 @@ fn registries() -> Registries {
     feature = "output-webrtc",
     feature = "source-rtsp",
     feature = "source-http",
+    feature = "source-webrtc",
     feature = "source-fake"
 ))]
 fn registered(what: &str, outcome: Result<(), lotse_core::registry::RegistryError>) {
@@ -378,9 +398,26 @@ mod tests {
         assert!(!recording.accepts(&h264), "fMP4 needs the parameter sets");
     }
 
+    /// The registries of a build with the WebRTC source hold it as the
+    /// signaled protocol `webrtc`, no URL protocol.
+    #[cfg(feature = "source-webrtc")]
+    #[test]
+    fn the_webrtc_source_is_registered_behind_its_feature() {
+        let registries = registries();
+        assert!(registries.sources.protocols().contains(&"webrtc"));
+        assert!(registries.sources.get("webrtc").is_none());
+        let webrtc = registries
+            .sources
+            .signaled("webrtc")
+            .expect("the webrtc factory");
+        assert_eq!(webrtc.protocol(), "webrtc");
+    }
+
     #[cfg(any(
         feature = "output-webrtc",
         feature = "source-rtsp",
+        feature = "source-http",
+        feature = "source-webrtc",
         feature = "source-fake"
     ))]
     #[test]
@@ -388,11 +425,14 @@ mod tests {
         use lotse_core::registry::RegistryError;
         let logs = logging::capture_logs(|| {
             registered("fake source", Ok(()));
-            registered("fake source", Err(RegistryError::DuplicateScheme("fake")));
+            registered("fake source", Err(RegistryError::DuplicateProtocol("fake")));
         });
         assert_eq!(logs.lines().count(), 1, "{logs}");
         assert!(logs.contains("ERROR"), "{logs}");
         assert!(logs.contains("fake source not registered"), "{logs}");
-        assert!(logs.contains("scheme fake is already registered"), "{logs}");
+        assert!(
+            logs.contains("protocol fake is already registered"),
+            "{logs}"
+        );
     }
 }

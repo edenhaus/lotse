@@ -294,7 +294,7 @@ async fn interop(transport: Transport, audio: Audio) {
         .command(json!({
             "type": "stream/put",
             "stream_id": STREAM,
-            "sources": [{ "url": camera.url(), "options": { "transport": transport.name() } }],
+            "sources": [lotse_testing::source(&camera.url(), json!({ "transport": transport.name() }))],
             "preload": true,
         }))
         .await
@@ -410,7 +410,7 @@ async fn mediamtx_rfc2326_10_7_a_failed_udp_attempt_is_torn_down() {
         .command(json!({
             "type": "stream/put",
             "stream_id": STREAM,
-            "sources": [{ "url": camera.url(), "options": { "transport": "udp", "timeout_ms": 1500 } }],
+            "sources": [lotse_testing::source(&camera.url(), json!({ "transport": "udp", "timeout_ms": 1500 }))],
             "preload": true,
         }))
         .await
@@ -541,18 +541,26 @@ mod http {
             .command(json!({
                 "type": "stream/put",
                 "stream_id": STREAM,
-                "sources": [{ "url": url, "options": options }],
+                "sources": [lotse_testing::source(url, options.clone())],
                 "preload": true,
             }))
             .await
             .expect("stream/put");
     }
 
-    /// The live HTTP stream: the source over `http` and every track timed
-    /// by its arrival.
-    fn check_live_http(stream: &Value, audio: Audio) {
+    /// The live HTTP stream: the source reported under `protocol` (`http`,
+    /// or `https` for a URL over TLS) with a URL of that scheme, and every
+    /// track timed by its arrival.
+    fn check_live_http(stream: &Value, audio: Audio, protocol: &str) {
         check_live(stream, audio);
-        assert_eq!(stream["sources"][0]["protocol"], "http", "{stream}");
+        let source = &stream["sources"][0]["source"];
+        assert_eq!(source["protocol"], protocol, "{stream}");
+        assert!(
+            source["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with(&format!("{protocol}://"))),
+            "{stream}"
+        );
         let tracks = stream["tracks"].as_array().expect("tracks");
         assert!(tracks.iter().all(|t| t["sync"] == "arrival"), "{stream}");
     }
@@ -645,12 +653,13 @@ mod http {
         let url = camera.hls_url().expect("HLS");
         let options = certificate.as_ref().map_or_else(
             || json!({}),
-            |c| json!({ "tls_fingerprint": c.fingerprint() }),
+            |c| json!({ "tls": { "pin": c.fingerprint() } }),
         );
         let (daemon, control) = daemon(&format!("hls-{}-{}", variant.name(), audio.name())).await;
         put(&control, &url, options).await;
 
-        check_live_http(&wait_live(&control, audio, &*clock).await, audio);
+        let protocol = if tls { "https" } else { "http" };
+        check_live_http(&wait_live(&control, audio, &*clock).await, audio, protocol);
         check_hls_session(&camera).await;
         let during = view(&control, audio, &clock).await;
         assert_eq!(during["sources"][0]["reconnects"], 0, "{during}");
@@ -723,7 +732,11 @@ mod http {
                 .expect("MediaMTX and ffmpeg (run through `mise run interop`)");
         let (daemon, control) = daemon("hls-restart").await;
         put(&control, &camera.hls_url().expect("HLS"), json!({})).await;
-        check_live_http(&wait_live(&control, Audio::Aac, &*clock).await, Audio::Aac);
+        check_live_http(
+            &wait_live(&control, Audio::Aac, &*clock).await,
+            Audio::Aac,
+            "http",
+        );
 
         camera
             .restart_publisher(Arc::clone(&clock))
@@ -733,7 +746,7 @@ mod http {
             s["state"] == "live" && s["sources"][0]["reconnects"].as_u64() >= Some(1)
         })
         .await;
-        check_live_http(&stream, Audio::Aac);
+        check_live_http(&stream, Audio::Aac, "http");
         let during = view(&control, Audio::Aac, &clock).await;
         assert_eq!(during["state"], "live", "{during}");
 
@@ -762,7 +775,11 @@ mod http {
         let server = TsServer::start(Audio::Aac).expect("ffmpeg (run through `mise run interop`)");
         let (daemon, control) = daemon("raw-mpegts").await;
         put(&control, &server.url(), json!({})).await;
-        check_live_http(&wait_live(&control, Audio::Aac, &*clock).await, Audio::Aac);
+        check_live_http(
+            &wait_live(&control, Audio::Aac, &*clock).await,
+            Audio::Aac,
+            "http",
+        );
         let during = view(&control, Audio::Aac, &clock).await;
         assert_eq!(during["sources"][0]["state"], "live", "{during}");
 
@@ -873,7 +890,7 @@ mod recording {
             .command(json!({
                 "type": "stream/put",
                 "stream_id": STREAM,
-                "sources": [{ "url": camera.url() }],
+                "sources": [lotse_testing::source(&camera.url(), json!({}))],
                 "preload": true,
                 "prerecord_ms": WINDOW_MS,
             }))

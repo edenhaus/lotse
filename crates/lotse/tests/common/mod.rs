@@ -10,10 +10,12 @@
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
+    clippy::indexing_slicing,
     dead_code,
     reason = "test code shared by several test binaries; each uses a subset"
 )]
 
+pub(crate) mod mp4;
 pub(crate) mod recording_body;
 
 use std::io::{BufRead as _, BufReader};

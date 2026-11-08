@@ -1,7 +1,8 @@
 # lotse
 
 A small, fast, memory-safe media daemon built for Home Assistant. It takes
-camera streams (RTSP, and HLS or MPEG-TS over HTTP) and serves them to
+camera streams (RTSP, HLS or MPEG-TS over HTTP, and WebRTC cameras such as
+Nest, Ring and Matter ones, whose signaling its client relays) and serves them to
 browsers over WebRTC, with two-way audio designed in from the start, and
 as event recordings: fragmented MP4 that starts before the event, from the
 seconds it keeps in memory, for its client to store. It does nothing
@@ -86,7 +87,7 @@ its password masked too. *Orientation* is
 again and the open session turns the picture from its next frame, without
 reconnecting; the CVO row says whether the answer negotiated the video
 orientation extension or the browser did not offer it. *Two-way audio*
-puts the stream with the RTSP option `backchannel` and offers a
+puts the stream with the RTSP field `backchannel` and offers a
 send-only audio m-line right after; the daemon answers it from the
 camera's backchannel once its probe found it, or declines it with
 `backchannel_declined` and why while the session plays (the page shows it); *Talk* then
@@ -100,6 +101,45 @@ socket and nothing else.
 `--listen ADDR` serves it elsewhere than `127.0.0.1:8080`, on a loopback
 address only: anything that reaches the relay drives the daemon, so an
 address reachable from the network also needs `--insecure-listen`.
+
+Every source of `stream/put` is named by its `protocol`, with that
+protocol's own fields beside it, and `stream/get` reports it in the same
+shape (its URL redacted); `info.protocols` lists the protocols a build
+registered:
+
+```json
+{ "protocol": "rtsp",   "url": "rtsp://user:pass@cam/s1", "transport": "udp", "backchannel": true }
+{ "protocol": "rtsps",  "url": "rtsps://cam/s1", "tls": { "pin": "AB:CD:…" } }
+{ "protocol": "http",   "url": "http://cam/live.m3u8", "max_bandwidth": 4000000 }
+{ "protocol": "https",  "url": "https://cam/live.m3u8", "tls": "insecure" }
+{ "protocol": "webrtc", "data_channel": "dataSendChannel", "audio": true }
+```
+
+A URL protocol's name is its URL's scheme; credentials go in the URL's
+userinfo. `tls` is `"roots"` (the default), `"insecure"` (warned about on
+every connection) or `{"pin": "<SHA-256 fingerprint>"}`. `lotse ctl
+stream put` names a source by its `--url`'s scheme, or by `--protocol`
+for one without a URL, and merges `--options` into it.
+
+A WebRTC camera (Home Assistant's native WebRTC cameras: Nest, Ring,
+Matter) has no address lotse could connect to, so a stream names it by
+its protocol alone, `{"protocol": "webrtc"}`, and the stream is its
+identity; its fields are `data_channel` (the data channel label the
+camera's integration asks for, `dataSendChannel` for Nest) and `audio`
+(default `true`). lotse makes the offer, but the camera's signaling is its
+cloud's, so the control-API client relays it: it subscribes with
+`signaling/subscribe`, takes each `offer` event (it names the stream) and
+each `candidate` event to the camera, and brings back the camera's answer, its
+candidates and its errors with `signaling/answer`, `signaling/candidate`
+and `signaling/error`; a `closed` event ends the camera's session. The
+media then comes straight from the camera to the worker over UDP: the
+source gathers its candidates on the host addresses of the WebRTC UDP
+front door (`--webrtc-udp-listen`; the `ready` event lists them), each on
+a port of its own, so the camera's media server must reach one of them.
+With no host address found, or without a subscribed client, the source
+reports `source_unreachable`.
+The dev viewer does not relay signaling, so such a source needs a client
+that does.
 
 ## License
 

@@ -41,10 +41,18 @@ pub const MAX_ICE_SERVERS: usize = 16;
 /// The most `urls` of one ICE server.
 pub const MAX_ICE_URLS: usize = 16;
 
-/// The longest certificate pin of `clients/remove`: 32 hex pairs and the
-/// 31 colons between them.
+/// The longest certificate pin, of `clients/remove` and of a source's
+/// `tls`: 32 hex pairs and the 31 colons between them.
 pub const MAX_PIN_CHARS: usize = 95;
 
 /// The longest ICE server URL, TURN username or credential, trickled
 /// candidate or `sdp_mid`.
 pub const MAX_TEXT_CHARS: usize = 1024;
+
+/// The shape of a `signaling/error`'s `code`: a lowercase word of letters,
+/// digits and underscores, as the API's own codes are.
+pub const SIGNAL_ERROR_CODE_PATTERN: &str = "^[a-z0-9_]{1,64}$";
+
+/// The longest `signaling/error` `code`, as
+/// [`SIGNAL_ERROR_CODE_PATTERN`] has it.
+pub const MAX_SIGNAL_ERROR_CODE_CHARS: usize = 64;

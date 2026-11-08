@@ -1,64 +1,97 @@
-//! The factory registries the binary fills at startup: sources by scheme,
-//! outputs by kind, transcoders as a list, the recording container in its own
-//! slot. Nothing else in the tree names a concrete source or output.
+//! The factory registries the binary fills at startup: sources by
+//! protocol, those lotse connects to by URL and those whose signaling the
+//! client relays, outputs by kind, transcoders as a list, the recording
+//! container in its own slot. Nothing else in the tree names a concrete
+//! source or output.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::output::OutputFactory;
 use crate::recording::RecordingMuxerFactory;
-use crate::source::SourceFactory;
+use crate::source::{SignaledSourceFactory, SourceFactory};
 use crate::transcode::{Transcoder, UplinkFactory};
 
 /// Why a registration was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RegistryError {
-    /// Two factories claim the same scheme.
-    #[error("scheme {0} is already registered")]
-    DuplicateScheme(&'static str),
+    /// Two factories claim the same protocol, of either kind.
+    #[error("protocol {0} is already registered")]
+    DuplicateProtocol(&'static str),
     /// Two factories claim the same output kind.
     #[error("output kind {0} is already registered")]
     DuplicateOutput(&'static str),
-    /// A factory declares no scheme at all.
-    #[error("source factory declares no scheme")]
-    NoScheme,
+    /// A factory declares no protocol at all.
+    #[error("source factory declares no protocol")]
+    NoProtocol,
 }
 
-/// Source factories by scheme.
+/// Source factories by protocol, one namespace for both kinds: those of
+/// sources lotse connects to by URL, whose protocols are their URLs'
+/// schemes, and those of signaled sources. A protocol has one factory.
 #[derive(Debug, Default)]
 pub struct SourceRegistry {
-    /// Scheme → factory. Sorted, so `schemes()` is stable.
-    by_scheme: BTreeMap<&'static str, Arc<dyn SourceFactory>>,
+    /// URL protocol → factory.
+    by_url: BTreeMap<&'static str, Arc<dyn SourceFactory>>,
+    /// Signaled protocol → factory.
+    by_signaled: BTreeMap<&'static str, Arc<dyn SignaledSourceFactory>>,
 }
 
 impl SourceRegistry {
-    /// Registers `factory` for every scheme it declares.
+    /// Whether `protocol` is taken, by a factory of either kind.
+    fn taken(&self, protocol: &str) -> bool {
+        self.by_url.contains_key(protocol) || self.by_signaled.contains_key(protocol)
+    }
+
+    /// Registers `factory` for every protocol it declares.
     pub fn register(&mut self, factory: Arc<dyn SourceFactory>) -> Result<(), RegistryError> {
-        let schemes = factory.schemes();
-        let Some((last, rest)) = schemes.split_last() else {
-            return Err(RegistryError::NoScheme);
+        let protocols = factory.protocols();
+        let Some((last, rest)) = protocols.split_last() else {
+            return Err(RegistryError::NoProtocol);
         };
-        if let Some(taken) = schemes
-            .iter()
-            .find(|scheme| self.by_scheme.contains_key(*scheme))
-        {
-            return Err(RegistryError::DuplicateScheme(taken));
+        if let Some(taken) = protocols.iter().find(|protocol| self.taken(protocol)) {
+            return Err(RegistryError::DuplicateProtocol(taken));
         }
-        for scheme in rest {
-            self.by_scheme.insert(scheme, Arc::clone(&factory));
+        for protocol in rest {
+            self.by_url.insert(protocol, Arc::clone(&factory));
         }
-        self.by_scheme.insert(last, factory);
+        self.by_url.insert(last, factory);
         Ok(())
     }
 
-    /// The factory for `scheme`, if one is registered.
-    pub fn get(&self, scheme: &str) -> Option<&Arc<dyn SourceFactory>> {
-        self.by_scheme.get(scheme)
+    /// The URL factory for `protocol`, if one is registered.
+    pub fn get(&self, protocol: &str) -> Option<&Arc<dyn SourceFactory>> {
+        self.by_url.get(protocol)
     }
 
-    /// Every registered scheme, sorted: `info.schemes`.
-    pub fn schemes(&self) -> Vec<&'static str> {
-        self.by_scheme.keys().copied().collect()
+    /// Registers the signaled `factory` under its protocol.
+    pub fn register_signaled(
+        &mut self,
+        factory: Arc<dyn SignaledSourceFactory>,
+    ) -> Result<(), RegistryError> {
+        let protocol = factory.protocol();
+        if self.taken(protocol) {
+            return Err(RegistryError::DuplicateProtocol(protocol));
+        }
+        self.by_signaled.insert(protocol, factory);
+        Ok(())
+    }
+
+    /// The signaled factory for `protocol`, if one is registered.
+    pub fn signaled(&self, protocol: &str) -> Option<&Arc<dyn SignaledSourceFactory>> {
+        self.by_signaled.get(protocol)
+    }
+
+    /// Every registered protocol, of both kinds, sorted: `info.protocols`.
+    pub fn protocols(&self) -> Vec<&'static str> {
+        let mut protocols: Vec<_> = self
+            .by_url
+            .keys()
+            .chain(self.by_signaled.keys())
+            .copied()
+            .collect();
+        protocols.sort_unstable();
+        protocols
     }
 }
 
@@ -114,7 +147,7 @@ impl TranscoderRegistry {
 /// Everything the binary registers, handed to the supervisor and the worker.
 #[derive(Debug, Default)]
 pub struct Registries {
-    /// Sources by scheme.
+    /// Sources by protocol.
     pub sources: SourceRegistry,
     /// Outputs by kind.
     pub outputs: OutputRegistry,
@@ -138,22 +171,24 @@ mod tests {
     )]
 
     use super::*;
-    use crate::test_util::{FakeOutputFactory, FakeSourceFactory, FakeTranscoder};
+    use crate::test_util::{
+        FakeOutputFactory, FakeSignaledSourceFactory, FakeSourceFactory, FakeTranscoder,
+    };
 
     #[test]
-    fn sources_register_by_scheme_once() {
+    fn sources_register_by_protocol_once() {
         let mut registry = SourceRegistry::default();
         registry
-            .register(Arc::new(FakeSourceFactory::new(&["fake", "fakes"])))
+            .register(Arc::new(FakeSourceFactory::new(&["fakes", "fake"])))
             .unwrap();
-        assert_eq!(registry.schemes(), ["fake", "fakes"]);
+        assert_eq!(registry.protocols(), ["fake", "fakes"]);
         assert!(registry.get("fake").is_some());
         assert!(registry.get("rtsp").is_none());
         assert_eq!(
             registry
                 .register(Arc::new(FakeSourceFactory::new(&["other", "fake"])))
                 .unwrap_err(),
-            RegistryError::DuplicateScheme("fake")
+            RegistryError::DuplicateProtocol("fake")
         );
         assert!(
             registry.get("other").is_none(),
@@ -163,7 +198,51 @@ mod tests {
             registry
                 .register(Arc::new(FakeSourceFactory::new(&[])))
                 .unwrap_err(),
-            RegistryError::NoScheme
+            RegistryError::NoProtocol
+        );
+    }
+
+    #[test]
+    fn url_and_signaled_protocols_share_one_namespace() {
+        let mut registry = SourceRegistry::default();
+        registry
+            .register(Arc::new(FakeSourceFactory::new(&["fake"])))
+            .unwrap();
+        registry
+            .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
+            .unwrap();
+        registry
+            .register_signaled(Arc::new(FakeSignaledSourceFactory::new("another")))
+            .unwrap();
+        assert_eq!(registry.protocols(), ["another", "fake", "fake-signaled"]);
+        assert_eq!(
+            registry.signaled("fake-signaled").unwrap().protocol(),
+            "fake-signaled"
+        );
+        assert!(registry.signaled("fake").is_none(), "a URL protocol");
+        assert!(registry.get("fake-signaled").is_none(), "a signaled one");
+        // One protocol, one factory: a protocol taken by either kind.
+        for taken in ["fake-signaled", "fake"] {
+            assert_eq!(
+                registry
+                    .register_signaled(Arc::new(FakeSignaledSourceFactory::new(taken)))
+                    .unwrap_err(),
+                RegistryError::DuplicateProtocol(taken)
+            );
+        }
+        assert_eq!(
+            registry
+                .register(Arc::new(FakeSourceFactory::new(&["other", "another"])))
+                .unwrap_err(),
+            RegistryError::DuplicateProtocol("another")
+        );
+        assert!(
+            registry.get("other").is_none(),
+            "nothing of a refused factory"
+        );
+        assert_eq!(
+            RegistryError::DuplicateProtocol("x").to_string(),
+            "protocol x is already registered"
         );
     }
 
@@ -201,19 +280,15 @@ mod tests {
             registries.recording.is_none(),
             "no recording container by default"
         );
-        assert_eq!(registries.sources.schemes(), Vec::<&str>::new());
+        assert_eq!(registries.sources.protocols(), Vec::<&str>::new());
         assert_eq!(registries.outputs.kinds(), Vec::<&str>::new());
-        assert_eq!(
-            RegistryError::DuplicateScheme("x").to_string(),
-            "scheme x is already registered"
-        );
         assert_eq!(
             RegistryError::DuplicateOutput("x").to_string(),
             "output kind x is already registered"
         );
         assert_eq!(
-            RegistryError::NoScheme.to_string(),
-            "source factory declares no scheme"
+            RegistryError::NoProtocol.to_string(),
+            "source factory declares no protocol"
         );
     }
 }

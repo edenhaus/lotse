@@ -449,6 +449,7 @@ mod tests {
                         stream_id,
                         urls,
                         url_file: None,
+                        protocol: None,
                         options,
                         preload: true,
                         audio,
@@ -489,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn ctl_stream_put_takes_its_urls_from_url_or_url_file_never_both() {
+    fn ctl_stream_put_takes_its_urls_from_url_or_url_file_or_a_protocol_never_two() {
         use crate::ctl::{CtlCommand, StreamCommand};
         let put = |args: &[&str]| {
             let base = ["lotse", "ctl", "--socket", "/s", "stream", "put", "front"];
@@ -523,6 +524,39 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let err = put(&["--url", "fake://cam/", "--url-file", "-"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        // A source without a URL is named by its protocol, never beside one.
+        let args: CtlArgs = args_of(
+            &[
+                "lotse",
+                "ctl",
+                "--socket",
+                "/s",
+                "stream",
+                "put",
+                "door",
+                "--protocol",
+                "webrtc",
+            ],
+            "ctl",
+        );
+        assert!(
+            matches!(
+                &args.command,
+                CtlCommand::Stream {
+                    command: StreamCommand::Put { urls, url_file: None, protocol: Some(protocol), .. },
+                } if urls.is_empty() && protocol == "webrtc"
+            ),
+            "{:?}",
+            args.command
+        );
+        for other in [["--url", "fake://cam/"], ["--url-file", "-"]] {
+            let err = put(&["--protocol", "webrtc", other[0], other[1]]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{other:?}"
+            );
+        }
     }
 
     #[test]

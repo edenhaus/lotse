@@ -144,7 +144,11 @@ impl Handler for FakeHandler {
             | Command::SessionList(_)
             | Command::SessionClose(_)
             | Command::SessionAdopt(_)
-            | Command::BackchannelRelease(_) => Outcome::Result(json!({})),
+            | Command::BackchannelRelease(_)
+            | Command::SignalingSubscribe(_)
+            | Command::SignalingAnswer(_)
+            | Command::SignalingCandidate(_)
+            | Command::SignalingError(_) => Outcome::Result(json!({})),
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)
@@ -378,7 +382,7 @@ async fn hello_comes_first_then_results_follow_the_contract() {
     send(&mut ws, json!({ "id": 1, "type": "ping" })).await;
     assert_eq!(recv(&mut ws).await, json!({ "id": 1, "type": "pong" }));
 
-    send(&mut ws, json!({ "id": 2, "type": "stream/put", "stream_id": "front", "sources": [{ "url": "rtsp://c/" }] })).await;
+    send(&mut ws, json!({ "id": 2, "type": "stream/put", "stream_id": "front", "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] })).await;
     assert_eq!(
         recv(&mut ws).await,
         json!({ "id": 2, "type": "result", "success": true, "result": { "created": true } })
@@ -430,7 +434,7 @@ async fn subscriptions_deliver_events_until_unsubscribed() {
     let running = start("subscribe", FakeHandler::default(), 8);
     let mut ws = connect(&running.socket).await;
     recv(&mut ws).await;
-    send(&mut ws, json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "url": "rtsp://c/" }] })).await;
+    send(&mut ws, json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] })).await;
     recv(&mut ws).await;
 
     send(&mut ws, json!({ "id": 2, "type": "stream/subscribe" })).await;
@@ -444,7 +448,7 @@ async fn subscriptions_deliver_events_until_unsubscribed() {
         json!({ "id": 2, "type": "event", "event": { "type": "stream", "stream_id": "a", "state": "idle", "last_error": null } })
     );
 
-    send(&mut ws, json!({ "id": 3, "type": "stream/put", "stream_id": "b", "sources": [{ "url": "rtsp://c/" }] })).await;
+    send(&mut ws, json!({ "id": 3, "type": "stream/put", "stream_id": "b", "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] })).await;
     let mut seen = [recv(&mut ws).await, recv(&mut ws).await];
     seen.sort_by_key(|f| f["type"].as_str().unwrap().to_owned());
     assert_eq!(seen[0]["event"]["stream_id"], "b");
@@ -456,7 +460,7 @@ async fn subscriptions_deliver_events_until_unsubscribed() {
     )
     .await;
     assert_eq!(recv(&mut ws).await["success"], true);
-    send(&mut ws, json!({ "id": 5, "type": "stream/put", "stream_id": "c", "sources": [{ "url": "rtsp://c/" }] })).await;
+    send(&mut ws, json!({ "id": 5, "type": "stream/put", "stream_id": "c", "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] })).await;
     assert_eq!(recv(&mut ws).await["result"]["created"], true);
     send(&mut ws, json!({ "id": 6, "type": "ping" })).await;
     assert_eq!(recv(&mut ws).await["type"], "pong", "no event slipped in");
@@ -570,6 +574,7 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
             6,
             json!({ "type": "recording/create", "stream_id": "a", "duration_ms": 1_000 }),
         ),
+        (7, json!({ "type": "signaling/subscribe" })),
     ] {
         let mut frame = frame;
         frame["id"] = json!(id);
@@ -586,14 +591,15 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
         .filter(|line| line.contains("subscription limit of the connection reached"))
         .map(str::to_owned)
         .collect();
-    assert_eq!(refusals.len(), 4, "{refusals:?}");
+    assert_eq!(refusals.len(), 5, "{refusals:?}");
     assert!(
         refusals[2].contains("id=5") && refusals[2].contains("session/adopt"),
         "{refusals:?}"
     );
     assert!(refusals[3].contains("recording/create"), "{refusals:?}");
+    assert!(refusals[4].contains("signaling/subscribe"), "{refusals:?}");
     // Other commands are not affected.
-    send(&mut ws, json!({ "id": 7, "type": "info" })).await;
+    send(&mut ws, json!({ "id": 8, "type": "info" })).await;
     assert_eq!(recv(&mut ws).await["result"]["version"], "0.0.0-test");
 
     // The session's channel closes: its subscription ended and frees a slot.
