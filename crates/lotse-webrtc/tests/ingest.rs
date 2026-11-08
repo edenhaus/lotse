@@ -648,7 +648,7 @@ fn rfc8445_6_1_1_the_offerer_controls_connects_and_carries_the_negotiated_tracks
             _ => None,
         })
         .collect();
-    assert!(!reports.is_empty());
+    assert_ne!(reports, []);
     assert_eq!(pair.engine.stats().sender_reports, reports.len() as u64);
     assert!(
         reports.iter().any(|(index, _, _)| *index == 1),
@@ -1124,7 +1124,7 @@ fn rfc8829_5_2_no_answer_within_20_s_ends_the_attempt_as_answer_timeout() {
     assert_eq!(message, "webrtc: no answer within 20 s");
     // An answer after the end is not taken.
     pair.answer(camera_config(true), |answer| answer);
-    assert!(pair.tracks().is_empty());
+    assert_eq!(pair.tracks(), []);
 }
 
 #[test]
@@ -1190,7 +1190,7 @@ fn rfc8445_8_an_answer_or_a_handshake_completing_at_its_deadline_is_not_taken() 
     let mut pair = Pair::offer(&video_only());
     pair.now += ANSWER_TIMEOUT;
     pair.answer(camera_config(false), |answer| answer);
-    assert!(pair.tracks().is_empty());
+    assert_eq!(pair.tracks(), []);
     let (error, code, _) = pair.ended().unwrap();
     assert_eq!(
         error,
@@ -1218,7 +1218,7 @@ fn rfc8445_8_an_answer_or_a_handshake_completing_at_its_deadline_is_not_taken() 
     }
     assert!(pair.camera().connected);
     assert!(!pair.engine.is_connected());
-    assert!(!pair.camera().out.is_empty());
+    assert_ne!(pair.camera().out, []);
     pair.now = started + CONNECT_BY;
     pair.deliver();
     assert!(!pair.engine.is_connected());
