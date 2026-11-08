@@ -726,21 +726,20 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversize_frame_is_refused_on_both_sides() {
+        use std::task::{Context, Poll, Waker};
+
         let (mut a_tx, _a_rx, _b_tx, _b_rx) = pair();
         let big = vec![0_u8; MAX_MESSAGE_BYTES + 1];
         // Refused before any write, in its first poll: a send let through
         // would wait for a reader that never comes.
         let polled = {
             let send = std::pin::pin!(a_tx.send(&big, &[]));
-            send.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            send.poll(&mut Context::from_waker(Waker::noop()))
         };
-        assert!(
-            matches!(
-                polled,
-                std::task::Poll::Ready(Err(IpcError::TooLarge { .. }))
-            ),
-            "{polled:?}"
-        );
+        // On one line: a `matches!` split over lines leaves its unmatched
+        // arm a line of its own, which a passing test never runs.
+        let refused = matches!(polled, Poll::Ready(Err(IpcError::TooLarge { .. })));
+        assert!(refused, "{polled:?}");
         let fds: Vec<OwnedFd> = (0..=MAX_FDS)
             .map(|_| {
                 let (s, _t) = UnixStream::pair().unwrap();
