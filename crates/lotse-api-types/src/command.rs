@@ -1289,6 +1289,31 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_user_agent_or_data_channel_is_not_repeated_in_the_error() {
+        // A value can carry a secret (a URL with credentials pasted into
+        // the wrong field): the refusal names the field's rule, not it.
+        for source in [
+            json!({ "protocol": "rtsp", "url": "rtsp://c/", "user_agent": "rtsp://u:hunter2@cam/\n" }),
+            json!({ "protocol": "webrtc", "data_channel": "hunter2\u{7}" }),
+        ] {
+            let frame =
+                json!({ "id": 9, "type": "stream/put", "stream_id": "a", "sources": [source] })
+                    .to_string();
+            let err = parse_command(&frame).unwrap_err();
+            assert_eq!(err.error.code, ErrorCode::InvalidRequest, "{frame}");
+            let shown = serde_json::to_string(&err.error).unwrap();
+            assert!(
+                !shown.contains("hunter2") && !shown.contains("cam/"),
+                "{shown}"
+            );
+            assert!(
+                shown.contains("user_agent must be") || shown.contains("data_channel must be"),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
     fn rfc8838_signaling_commands_name_their_signal_and_leave_out_what_the_camera_did_not_say() {
         let_assert!(
             Command::SignalingSubscribe(subscribe) =

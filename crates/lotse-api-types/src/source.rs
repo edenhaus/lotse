@@ -90,7 +90,7 @@ fn deserialize_user_agent<'de, D: Deserializer<'de>>(
     let value = Option::<String>::deserialize(deserializer)?;
     match value {
         Some(text) if !is_valid_user_agent(&text) => Err(serde::de::Error::custom(format!(
-            "user_agent must be 1 to {MAX_USER_AGENT_LEN} printable ASCII characters, with spaces or tabs only between them (RFC 7230 §3.2), not {text:?}"
+            "user_agent must be 1 to {MAX_USER_AGENT_LEN} printable ASCII characters, with spaces or tabs only between them (RFC 7230 §3.2)"
         ))),
         other => Ok(other),
     }
@@ -113,7 +113,7 @@ fn deserialize_label<'de, D: Deserializer<'de>>(
     let value = Option::<String>::deserialize(deserializer)?;
     match value {
         Some(label) if !is_valid_label(&label) => Err(serde::de::Error::custom(format!(
-            "data_channel must be 1 to {MAX_LABEL_CHARS} characters, none a control character, not {label:?}"
+            "data_channel must be 1 to {MAX_LABEL_CHARS} characters, none a control character"
         ))),
         other => Ok(other),
     }
