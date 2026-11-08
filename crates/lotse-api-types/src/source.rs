@@ -97,8 +97,9 @@ fn deserialize_user_agent<'de, D: Deserializer<'de>>(
 }
 
 /// Whether `label` can be the data channel's label: 1 to
-/// [`MAX_LABEL_CHARS`] characters, none of them a control character, so
-/// it prints and logs as one line.
+/// [`MAX_LABEL_CHARS`] characters, none of them a control character
+/// (`char::is_control`, Unicode `Cc`), so it logs as one line. Other
+/// characters that do not print (a format or private-use one) are taken.
 fn is_valid_label(label: &str) -> bool {
     let chars = label.chars().count();
     (1..=MAX_LABEL_CHARS).contains(&chars) && !label.chars().any(char::is_control)
@@ -112,7 +113,7 @@ fn deserialize_label<'de, D: Deserializer<'de>>(
     let value = Option::<String>::deserialize(deserializer)?;
     match value {
         Some(label) if !is_valid_label(&label) => Err(serde::de::Error::custom(format!(
-            "data_channel must be 1 to {MAX_LABEL_CHARS} printable characters, not {label:?}"
+            "data_channel must be 1 to {MAX_LABEL_CHARS} characters, none a control character, not {label:?}"
         ))),
         other => Ok(other),
     }
@@ -780,10 +781,14 @@ mod tests {
     }
 
     #[test]
-    fn rfc8832_5_1_a_data_channel_label_is_1_to_64_printable_characters() {
+    fn rfc8832_5_1_a_data_channel_label_is_1_to_64_characters_none_a_control_character() {
         let longest = "é".repeat(MAX_LABEL_CHARS);
         let parsed = spec(json!({ "protocol": "webrtc", "data_channel": longest }));
         assert_eq!(parsed.options()["data_channel"], longest.as_str());
+        // A character that does not print but is no control character (a
+        // zero-width space, Unicode `Cf`) is taken.
+        let parsed = spec(json!({ "protocol": "webrtc", "data_channel": "data\u{200b}" }));
+        assert_eq!(parsed.options()["data_channel"], "data\u{200b}");
         // `null` spelled out is no data channel.
         let parsed = spec(json!({ "protocol": "webrtc", "data_channel": null }));
         assert!(parsed.options()["data_channel"].is_null());
@@ -795,7 +800,7 @@ mod tests {
         ] {
             let err = refusal(json!({ "protocol": "webrtc", "data_channel": label }));
             assert!(
-                err.contains("data_channel must be 1 to 64 printable characters"),
+                err.contains("data_channel must be 1 to 64 characters, none a control character"),
                 "{label:?}: {err}"
             );
         }
