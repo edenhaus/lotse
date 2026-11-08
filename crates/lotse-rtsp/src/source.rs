@@ -35,6 +35,21 @@
 //! ([`crate::backchannel::open`]), which a reconnect of this one leaves
 //! alone. A stream that opts in or out turns the probe on or off without
 //! this session noticing.
+//!
+//! Keyframe requests: the source cannot ask the camera for a keyframe, so
+//! it never takes its tracks' requests
+//! ([`Track::keyframe_requests`](lotse_core::track::Track::keyframe_requests)),
+//! which core then counts and drops; viewers wait for the camera's next
+//! keyframe. A PLI (RFC 4585 §6.3.1) may only go to a camera whose SDP
+//! negotiated it (the `RTP/AVPF` profile with `a=rtcp-fb:* pli` or `nack
+//! pli`, RFC 4585 §4.2), and lotse could not send it on either transport:
+//! TCP interleaved, RTCP goes out only through retina's `queue_rtcp`,
+//! which takes a `StreamDirection::Sending` stream alone (its
+//! `PlayingCore::sending_channel`, retina at the pinned rev, read
+//! 2026-11-08), and retina's `Stream` keeps neither the profile nor the
+//! `rtcp-fb` attributes. Over UDP the source owns each RTCP socket, so a
+//! compound RR + PLI (RFC 4585 §3.1) of its own is possible, behind its own
+//! parse of the SDP (`SessionCore::sdp` keeps it whole): not done yet.
 
 use std::future::Future;
 use std::net::SocketAddr;

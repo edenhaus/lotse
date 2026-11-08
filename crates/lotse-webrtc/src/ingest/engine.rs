@@ -27,8 +27,10 @@
 //! is one from before the camera's timestamps jumped (RFC 3550 §5.1), late
 //! or of a former source. Picture Loss Indications (RFC 4585 §6.3.1)
 //! ask the camera for a keyframe once connected, every
-//! [`PLI_INTERVAL`] until one arrived (at most [`STARTUP_PLIS`]), and after
-//! a gap in the video's sequence numbers, rate-limited. Consent freshness
+//! [`PLI_INTERVAL`] until one arrived (at most [`STARTUP_PLIS`]), after
+//! a gap in the video's sequence numbers, and when the track's viewers
+//! want one (`IngestEngine::request_keyframe`), these two together at
+//! most one per [`PLI_INTERVAL`]. Consent freshness
 //! (RFC 7675) is str0m's: its agent going disconnected after the
 //! connection ends the attempt (`SPEC-DEVIATION`, at
 //! `IngestEngine::on_event`: seconds without an answer, not RFC 7675
@@ -1551,13 +1553,8 @@ impl IngestEngine {
         } else {
             self.other_codec(pt);
         }
-        if lost && self.keyframe {
-            let spaced = self
-                .last_pli
-                .is_none_or(|last| self.now.saturating_duration_since(last) >= PLI_INTERVAL);
-            if spaced {
-                self.request_pli("video packets lost");
-            }
+        if lost && self.keyframe && self.pli_spaced() {
+            self.request_pli("video packets lost");
         }
         self.startup_pli(true);
     }
@@ -1594,6 +1591,36 @@ impl IngestEngine {
         self.pli_due = (self.startup_plis < STARTUP_PLIS)
             .then(|| self.now.checked_add(PLI_INTERVAL))
             .flatten();
+    }
+
+    /// Whether [`PLI_INTERVAL`] passed since the last PLI, of any cause.
+    fn pli_spaced(&self) -> bool {
+        self.last_pli
+            .is_none_or(|last| self.now.saturating_duration_since(last) >= PLI_INTERVAL)
+    }
+
+    /// The track's viewers want a keyframe at `now`, a request core
+    /// coalesced over all of them
+    /// ([`Track::request_keyframe`](lotse_core::track::Track::request_keyframe)):
+    /// a PLI (RFC 4585 §6.3.1) under the spacing a loss's keeps,
+    /// [`PLI_INTERVAL`] since the last PLI of any cause, so the startup,
+    /// loss and viewer requests together send at most one per interval.
+    /// Before the connection it adds none, and while the startup PLIs
+    /// still run neither: they ask already once it is up. Whether one
+    /// went out.
+    pub fn request_keyframe(&mut self, now: Instant) -> bool {
+        self.now = now;
+        if !self.is_connected() || self.pli_due.is_some() {
+            tracing::debug!("webrtc: keyframe request left to the startup PLIs");
+            return false;
+        }
+        if !self.pli_spaced() {
+            tracing::debug!(
+                "webrtc: keyframe request within the PLI interval; the last PLI's keyframe is due"
+            );
+            return false;
+        }
+        self.request_pli("a viewer wants a keyframe")
     }
 
     /// Asks the camera for a keyframe with a Picture Loss Indication (RFC

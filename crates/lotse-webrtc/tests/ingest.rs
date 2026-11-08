@@ -30,6 +30,7 @@ use lotse_core::clock::{Clock, FakeClock, SystemClock};
 use lotse_core::clock_map::ClockMapper;
 use lotse_core::codec::{Codec, Kind};
 use lotse_core::ingest::{IngestCounters, IngestStats};
+use lotse_core::keyframe::KeyframeOutcome;
 use lotse_core::signaling::{
     LocalSignal, RemoteSignal, SignalCandidate, SignalClose, SignalingOpener, SignalingRelay, close,
 };
@@ -862,6 +863,53 @@ fn rfc3550_6_4_1_losses_late_packets_and_rejected_datagrams_reach_the_connection
     assert_eq!(gaps.len(), 1, "{logs}");
     assert!(gaps[0].contains("lost=3"), "{logs}");
     assert!(pair.ended().is_none(), "{:?}", pair.ended());
+}
+
+/// The track's viewers' keyframe requests, coalesced by core, become
+/// PLIs under the spacing the startup and loss PLIs keep: at most one per
+/// interval for all three causes together.
+#[test]
+fn rfc4585_6_3_1_a_viewer_s_keyframe_request_is_a_pli_rate_limited_with_the_startup_and_loss_plis()
+{
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false), |answer| answer);
+    // Before the connection: no stream to ask on yet.
+    assert!(!pair.engine.request_keyframe(pair.now));
+    pair.connect();
+    pair.step(Duration::from_millis(1));
+    assert_eq!(pair.engine.stats().plis, 1, "the first startup PLI");
+    // While the startup PLIs run, a viewer's request adds none.
+    assert!(!pair.engine.request_keyframe(pair.now));
+    pair.step(Duration::from_millis(1));
+    assert_eq!(pair.engine.stats().plis, 1);
+    pair.frame(true);
+    pair.engine.keyframe_seen();
+    // Within the interval of the startup PLI: none.
+    assert!(!pair.engine.request_keyframe(pair.now));
+    pair.step(PLI_INTERVAL);
+    // Past it: one, which reaches the camera.
+    assert!(pair.engine.request_keyframe(pair.now));
+    pair.step(Duration::from_millis(50));
+    assert_eq!(pair.engine.stats().plis, 2);
+    assert_eq!(pair.camera().keyframe_requests, 2);
+    // A loss within the interval of the viewer's asks nothing more.
+    pair.camera().seq += 3;
+    pair.frame(false);
+    assert_eq!(pair.engine.stats().plis, 2);
+    // A viewer's within the interval of a loss's neither.
+    pair.step(PLI_INTERVAL);
+    pair.camera().seq += 3;
+    pair.frame(false);
+    assert_eq!(pair.engine.stats().plis, 3, "the loss's");
+    assert!(!pair.engine.request_keyframe(pair.now));
+    pair.step(PLI_INTERVAL - Duration::from_millis(1));
+    assert!(!pair.engine.request_keyframe(pair.now), "to the tick");
+    pair.step(Duration::from_millis(1));
+    assert!(pair.engine.request_keyframe(pair.now));
+    pair.step(Duration::from_millis(50));
+    assert_eq!(pair.engine.stats().plis, 4);
+    assert_eq!(pair.camera().keyframe_requests, 4);
 }
 
 #[test]
@@ -2524,6 +2572,72 @@ mod source {
             camera.pump(Duration::from_millis(100)).await;
         }
         assert_eq!(camera.camera.keyframe_requests, asked);
+        running.cancel.cancel();
+        within(running.run).await.unwrap();
+    }
+
+    /// A request on the video track, a viewer's that the GOP cache could
+    /// not serve, reaches the camera as one PLI through the running
+    /// source; the requests of more viewers within the interval fold into
+    /// it, and the keyframe that comes answers them all.
+    #[tokio::test]
+    async fn rfc4585_6_3_1_viewers_keyframe_requests_reach_the_camera_as_one_pli() {
+        let _logs = logs();
+        let signaling = FakeSignaling::new(vec![LOOPBACK]);
+        let running = start(
+            serde_json::json!({ "audio": false }),
+            Some(signaling.clone()),
+            Arc::new(SystemClock),
+        );
+        let mut relay = within(signaling.next_signal()).await.unwrap();
+        let (offer, _) = read_offer(&mut relay).await;
+        let (mut camera, answer) = Live::answer(&offer, false).await;
+        relay
+            .incoming
+            .send(RemoteSignal::Answer(answer))
+            .await
+            .unwrap();
+        camera.connect().await;
+        let video = Arc::clone(&running.set.tracks()[0]);
+        while video.stats().keyframes == 0 {
+            camera.camera.frame(SystemClock.now(), true);
+            camera.pump(Duration::from_millis(100)).await;
+        }
+        // Past the startup PLI's interval.
+        for _ in 0..12 {
+            camera.camera.frame(SystemClock.now(), false);
+            camera.pump(Duration::from_millis(100)).await;
+        }
+        let asked = camera.camera.keyframe_requests;
+
+        assert_eq!(
+            video.request_keyframe(SystemClock.now()),
+            KeyframeOutcome::Forwarded
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                video.request_keyframe(SystemClock.now()),
+                KeyframeOutcome::Coalesced
+            );
+        }
+        for _ in 0..3 {
+            camera.camera.frame(SystemClock.now(), false);
+            camera.pump(Duration::from_millis(100)).await;
+        }
+        assert_eq!(camera.camera.keyframe_requests, asked + 1, "one PLI");
+        // The camera answers: nothing more goes out, past the interval too.
+        camera.camera.frame(SystemClock.now(), true);
+        camera.pump(Duration::from_millis(100)).await;
+        for _ in 0..12 {
+            camera.camera.frame(SystemClock.now(), false);
+            camera.pump(Duration::from_millis(100)).await;
+        }
+        assert_eq!(camera.camera.keyframe_requests, asked + 1);
+        let stats = video.stats();
+        assert_eq!(
+            (stats.keyframe_requests, stats.keyframe_requests_forwarded),
+            (6, 1)
+        );
         running.cancel.cancel();
         within(running.run).await.unwrap();
     }

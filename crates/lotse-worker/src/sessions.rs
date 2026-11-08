@@ -681,13 +681,8 @@ fn to_ipc(event: SessionEvent) -> Option<IpcEvent> {
             code: code.to_owned(),
             message,
         }),
-        SessionEvent::Connected => None,
-        SessionEvent::KeyframeRequest => {
-            // An upstream request (ONVIF) is an M6 optimization; until
-            // then the next camera keyframe repairs the picture.
-            tracing::debug!("keyframe wanted upstream");
-            None
-        }
+        // The worker's own: the join, and the track's keyframe request.
+        SessionEvent::Connected | SessionEvent::KeyframeRequest => None,
     }
 }
 
@@ -1546,6 +1541,16 @@ async fn drain(
                 if let Some(video) = &opened.video {
                     let gop = video.track.gop();
                     opened.engine.join(ctx.clock.now(), gop.as_deref());
+                }
+            }
+            SessionOutput::Event(SessionEvent::KeyframeRequest) => {
+                // The cache could not serve the viewer (the session bursts
+                // it on join when it can): the track asks the source
+                // feeding it, coalesced with its other viewers' requests.
+                // Recordings never ask: they wait for the next keyframe.
+                if let Some(video) = &opened.video {
+                    let outcome = video.track.request_keyframe(ctx.clock.now());
+                    tracing::trace!(?outcome, "keyframe wanted upstream");
                 }
             }
             SessionOutput::Event(SessionEvent::Closed { code, message }) => {
@@ -3427,7 +3432,7 @@ mod tests {
 
     /// A session drives its engine with every input it has: media, the
     /// supervisor's messages, datagrams and time; reports what the engine
-    /// says but a keyframe request, which stays in the worker; and closes
+    /// says but a keyframe request, which goes to the video track; and closes
     /// once its control queue goes, as the worker stops.
     #[tokio::test]
     #[expect(clippy::too_many_lines, reason = "one session's whole life")]
@@ -3452,7 +3457,9 @@ mod tests {
         assert!(poll_once(&mut session).await.is_pending());
         assert!(rig.script.called("video") && rig.script.called("audio"));
 
-        // What the engine says after the next input.
+        // What the engine says after the next input. The stream's source
+        // takes keyframe requests.
+        let requests = rig.track(Kind::Video).keyframe_requests();
         rig.script
             .then(SessionOutput::Event(SessionEvent::Connected));
         rig.script
@@ -3483,7 +3490,13 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(logs.count(Level::DEBUG, "keyframe wanted upstream"), 1);
+        // The viewer's keyframe request reached the stream's video track
+        // and through it the source.
+        let video = rig.track(Kind::Video).stats();
+        assert_eq!(video.keyframe_requests, 1);
+        assert_eq!(video.keyframe_requests_forwarded, 1);
+        assert!(requests.is_requested());
+        assert_eq!(rig.track(Kind::Audio).stats().keyframe_requests, 0);
 
         let relayed: SocketAddr = "203.0.113.5:40000".parse().unwrap();
         rig.control(Control::Orientation(Orientation::Rotate180));

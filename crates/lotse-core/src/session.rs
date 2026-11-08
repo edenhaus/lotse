@@ -224,7 +224,12 @@ pub enum SessionEvent {
     },
     /// ICE and DTLS are up: the worker joins the track now.
     Connected,
-    /// The viewer asked for a keyframe (PLI or FIR).
+    /// A keyframe would repair the viewer's picture: it asked for one (a
+    /// PLI or FIR, RFC 4585 §6.3.1, RFC 5104 §4.3.1), its join found no
+    /// cached keyframe fresh enough to burst, or it skips to the next
+    /// keyframe. The worker hands it to the video track
+    /// ([`Track::request_keyframe`](crate::track::Track::request_keyframe)),
+    /// which asks the source feeding it.
     KeyframeRequest,
     /// Non-fatal.
     Warning {

@@ -29,6 +29,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::clock_map::ticks_between;
 use crate::codec::{Codec, Kind};
+use crate::keyframe::{KEYFRAME_REQUEST_INTERVAL, KeyframeOutcome, KeyframeRequests};
 use crate::lateness::LatenessMeter;
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
 use crate::prerecord::{Prerecord, PrerecordShared, PrerecordSnapshot, PrerecordStats, Truncation};
@@ -260,6 +261,17 @@ pub struct TrackStats {
     /// libwebrtc receivers assemble, as the source reported them
     /// ([`Track::count_frame_over_browser_limit`]).
     pub frames_over_browser_limit: u64,
+    /// Keyframe requests the track's viewers made
+    /// ([`Track::request_keyframe`]).
+    pub keyframe_requests: u64,
+    /// Requests handed to the source feeding the track: one per
+    /// [`KEYFRAME_REQUEST_INTERVAL`] at most, those sent at an interval's
+    /// end for the ones folded in included.
+    pub keyframe_requests_forwarded: u64,
+    /// Requests folded into one forwarded within the interval.
+    pub keyframe_requests_coalesced: u64,
+    /// Requests dropped because no source feeding the track takes them.
+    pub keyframe_requests_dropped: u64,
     /// The pre-record ring, while a window is set ([`Track::set_prerecord`]).
     pub prerecord: Option<PrerecordStats>,
 }
@@ -281,6 +293,14 @@ struct Counters {
     frames_dropped_oversize: AtomicU64,
     /// See [`TrackStats::frames_over_browser_limit`].
     frames_over_browser_limit: AtomicU64,
+    /// See [`TrackStats::keyframe_requests`].
+    keyframe_requests: AtomicU64,
+    /// See [`TrackStats::keyframe_requests_forwarded`].
+    keyframe_requests_forwarded: AtomicU64,
+    /// See [`TrackStats::keyframe_requests_coalesced`].
+    keyframe_requests_coalesced: AtomicU64,
+    /// See [`TrackStats::keyframe_requests_dropped`].
+    keyframe_requests_dropped: AtomicU64,
 }
 
 impl Counters {
@@ -299,6 +319,10 @@ impl Counters {
             keyframes: self.keyframes.load(Ordering::Relaxed),
             frames_dropped_oversize: self.frames_dropped_oversize.load(Ordering::Relaxed),
             frames_over_browser_limit: self.frames_over_browser_limit.load(Ordering::Relaxed),
+            keyframe_requests: self.keyframe_requests.load(Ordering::Relaxed),
+            keyframe_requests_forwarded: self.keyframe_requests_forwarded.load(Ordering::Relaxed),
+            keyframe_requests_coalesced: self.keyframe_requests_coalesced.load(Ordering::Relaxed),
+            keyframe_requests_dropped: self.keyframe_requests_dropped.load(Ordering::Relaxed),
             prerecord: None,
         }
     }
@@ -719,6 +743,14 @@ pub struct Feeds {
     next_tag: AtomicU8,
     /// The armed staging set's tracks, for the switch.
     armed_tracks: Mutex<Vec<Weak<Track>>>,
+    /// The armed staging set, which becomes [`Self::feeding`] at the
+    /// switch.
+    armed_set: Mutex<Weak<crate::source::TrackSet>>,
+    /// The staging set whose source feeds the live tracks since the last
+    /// switch: where a live track's keyframe requests go
+    /// ([`Track::request_keyframe`]). Empty before any switch, when the
+    /// live set's own source feeds them.
+    feeding: Mutex<Weak<crate::source::TrackSet>>,
     /// The live set, for the switch.
     live: Weak<crate::source::TrackSet>,
     /// The tag last switched to, for whoever runs the sources.
@@ -735,6 +767,8 @@ impl Feeds {
             armed_has_video: AtomicBool::new(false),
             next_tag: AtomicU8::new(1),
             armed_tracks: Mutex::new(Vec::new()),
+            armed_set: Mutex::new(Weak::new()),
+            feeding: Mutex::new(Weak::new()),
             live,
             switched,
         }
@@ -756,9 +790,13 @@ impl Feeds {
         self.next_tag.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Arms the staging set with `tag` and `tracks`: it switches at its
-    /// first keyframe. Replaces a standby armed before.
-    pub(crate) fn arm(&self, tag: u8, tracks: &[Arc<Track>]) {
+    /// Arms the staging set `set` with `tag` and `tracks`, its tracks: it
+    /// switches at its first keyframe. Replaces a standby armed before.
+    pub(crate) fn arm(&self, tag: u8, set: Weak<crate::source::TrackSet>, tracks: &[Arc<Track>]) {
+        *self
+            .armed_set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = set;
         *self
             .armed_tracks
             .lock()
@@ -851,6 +889,13 @@ impl Feeds {
         if let Some(live) = &live {
             live.mark_ready(true);
         }
+        let armed_set = std::mem::take(
+            &mut *self
+                .armed_set
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        *self.feeding.lock().unwrap_or_else(PoisonError::into_inner) = armed_set;
         self.armed.store(0, Ordering::Release);
         self.armed_has_video.store(false, Ordering::Release);
         self.active.store(tag, Ordering::Release);
@@ -860,6 +905,21 @@ impl Feeds {
             "source switched: the standby feeds the tracks"
         );
         self.switched.send_replace(tag);
+    }
+}
+
+impl Feeds {
+    /// The track `id` of the staging set that feeds the live tracks since
+    /// the last switch, whose source takes the live track's keyframe
+    /// requests; `None` before any switch, or once that set is gone or
+    /// has no such track.
+    fn feeder(&self, id: TrackId) -> Option<Arc<Track>> {
+        let set = self
+            .feeding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .upgrade()?;
+        set.get(id)
     }
 }
 
@@ -963,6 +1023,29 @@ pub struct Track {
     /// The live counterpart a staging track forwards into, once its source
     /// is active; set at the switch for a track the live set lacked.
     forward_to: ArcSwapOption<Self>,
+    /// The keyframe requests this track's own source takes: bumped per
+    /// request forwarded, its receiver held by the source
+    /// ([`Self::keyframe_requests`]) while it can ask.
+    keyframe_tx: watch::Sender<u64>,
+    /// When the last keyframe request was forwarded, and the throttle of
+    /// the line of a dropped one. Taken by whoever asks (the sessions'
+    /// tasks) and, while a request is folded in, by the source's task at
+    /// each frame; never held across anything else.
+    keyframe_gate: Mutex<KeyframeGate>,
+    /// A request was folded in and goes out at the interval's end, unless
+    /// a keyframe comes first. Written under `keyframe_gate`; read
+    /// without it on every frame, so a track nobody asks costs one load.
+    keyframe_pending: AtomicBool,
+}
+
+/// A track's keyframe-request spacing ([`Track::request_keyframe`]).
+#[derive(Debug, Default)]
+struct KeyframeGate {
+    /// When the last request was forwarded, on the injected clock.
+    last_forwarded: Option<Instant>,
+    /// Rate-limits the line of a dropped request, which every viewer of a
+    /// source that cannot ask makes.
+    drops: Throttle,
 }
 
 impl Track {
@@ -1038,6 +1121,9 @@ impl Track {
             feeds,
             tag,
             forward_to: ArcSwapOption::new(forward_to),
+            keyframe_tx: watch::channel(0).0,
+            keyframe_gate: Mutex::default(),
+            keyframe_pending: AtomicBool::new(false),
         }
     }
 
@@ -1635,6 +1721,7 @@ impl Track {
             return false;
         }
         self.touch(frame.arrival);
+        let (keyframe, arrival) = (frame.keyframe, frame.arrival);
         self.counters.frames.fetch_add(1, Ordering::Relaxed);
         Counters::add_bytes(&self.counters.frame_bytes, bytes);
         if frame.keyframe {
@@ -1649,6 +1736,9 @@ impl Track {
         // As above: no subscriber is not an error.
         let _delivered_to = self.frames.send((self.frame_seq(), Some(frame)));
         drop(fed);
+        if self.keyframe_pending.load(Ordering::Acquire) {
+            self.settle_keyframe_request(keyframe, arrival);
+        }
         if let Some(truncation) = truncation {
             tracing::debug!(
                 track = %self.id,
@@ -1660,6 +1750,114 @@ impl Track {
             );
         }
         true
+    }
+
+    /// A viewer of this track wants a keyframe at `now` (on the injected
+    /// clock): forwarded to the source feeding the track, unless one was
+    /// within [`KEYFRAME_REQUEST_INTERVAL`], whose keyframe this request
+    /// then waits for too (`crate::keyframe` has the rules). A live track
+    /// fed by a standby since a switch forwards to the standby's source.
+    pub fn request_keyframe(&self, now: Instant) -> KeyframeOutcome {
+        self.counters
+            .keyframe_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let mut gate = self
+            .keyframe_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !spaced(gate.last_forwarded, now) {
+            self.keyframe_pending.store(true, Ordering::Release);
+            drop(gate);
+            self.counters
+                .keyframe_requests_coalesced
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(track = %self.id, "keyframe request coalesced: one is due");
+            return KeyframeOutcome::Coalesced;
+        }
+        let outcome = self.forward_keyframe_request(&mut gate, now, "a viewer asked");
+        drop(gate);
+        outcome
+    }
+
+    /// A frame arrived at `arrival` while a request was folded in: a
+    /// `keyframe` answers it; any other frame sends it once the interval
+    /// since the last one sent has passed.
+    fn settle_keyframe_request(&self, keyframe: bool, arrival: Instant) {
+        let mut gate = self
+            .keyframe_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if keyframe {
+            self.keyframe_pending.store(false, Ordering::Release);
+            tracing::trace!(track = %self.id, "keyframe request answered by a keyframe");
+        } else if self.keyframe_pending.load(Ordering::Acquire)
+            && spaced(gate.last_forwarded, arrival)
+        {
+            let _outcome = self.forward_keyframe_request(
+                &mut gate,
+                arrival,
+                "no keyframe within the interval",
+            );
+        }
+    }
+
+    /// Hands a request to the source feeding the track at `now`, for
+    /// `reason`, with `gate` held: forwarded, or dropped and counted when
+    /// that source takes none. Either way nothing stays folded in.
+    fn forward_keyframe_request(
+        &self,
+        gate: &mut KeyframeGate,
+        now: Instant,
+        reason: &'static str,
+    ) -> KeyframeOutcome {
+        self.keyframe_pending.store(false, Ordering::Release);
+        let sent = if self.fed() {
+            self.signal_keyframe()
+        } else {
+            self.feeds
+                .feeder(self.id)
+                .is_some_and(|feeder| feeder.signal_keyframe())
+        };
+        if !sent {
+            self.counters
+                .keyframe_requests_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(count) = gate.drops.hit(now) {
+                tracing::debug!(
+                    track = %self.id,
+                    count,
+                    "keyframe request dropped: the source feeding the track cannot ask for one; viewers wait for its next keyframe"
+                );
+            }
+            return KeyframeOutcome::Dropped;
+        }
+        gate.last_forwarded = Some(now);
+        self.counters
+            .keyframe_requests_forwarded
+            .fetch_add(1, Ordering::Relaxed);
+        // At most once per interval: no throttle needed.
+        tracing::debug!(track = %self.id, reason, "keyframe requested from the source");
+        KeyframeOutcome::Forwarded
+    }
+
+    /// Wakes this track's own source with a request; `false` when it holds
+    /// no [`KeyframeRequests`].
+    fn signal_keyframe(&self) -> bool {
+        if self.keyframe_tx.is_closed() {
+            return false;
+        }
+        self.keyframe_tx
+            .send_modify(|count| *count = count.wrapping_add(1));
+        true
+    }
+
+    /// The requests this track's source takes for the connection attempt
+    /// that holds the result: the source that declared it calls this when
+    /// its protocol can ask the camera for a keyframe and waits on
+    /// [`KeyframeRequests::requested`]. A source that cannot never calls
+    /// it, and the track drops the requests ([`Self::request_keyframe`]).
+    pub fn keyframe_requests(self: &Arc<Self>) -> KeyframeRequests {
+        KeyframeRequests::new(self.keyframe_tx.subscribe(), Arc::clone(self))
     }
 
     /// Publishes the next GOP snapshot for `frame`: a keyframe starts a
@@ -1747,6 +1945,12 @@ impl Track {
         }
         truncation
     }
+}
+
+/// Whether a keyframe request may go out at `now` after the last one
+/// forwarded at `last`: none yet, or [`KEYFRAME_REQUEST_INTERVAL`] since.
+fn spaced(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= KEYFRAME_REQUEST_INTERVAL)
 }
 
 impl fmt::Debug for Track {
