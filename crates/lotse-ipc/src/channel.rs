@@ -728,10 +728,19 @@ mod tests {
     async fn an_oversize_frame_is_refused_on_both_sides() {
         let (mut a_tx, _a_rx, _b_tx, _b_rx) = pair();
         let big = vec![0_u8; MAX_MESSAGE_BYTES + 1];
-        assert!(matches!(
-            a_tx.send(&big, &[]).await.unwrap_err(),
-            IpcError::TooLarge { .. }
-        ));
+        // Refused before any write, in its first poll: a send let through
+        // would wait for a reader that never comes.
+        let polled = {
+            let send = std::pin::pin!(a_tx.send(&big, &[]));
+            send.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        };
+        assert!(
+            matches!(
+                polled,
+                std::task::Poll::Ready(Err(IpcError::TooLarge { .. }))
+            ),
+            "{polled:?}"
+        );
         let fds: Vec<OwnedFd> = (0..=MAX_FDS)
             .map(|_| {
                 let (s, _t) = UnixStream::pair().unwrap();
@@ -760,9 +769,9 @@ mod tests {
     async fn a_frame_of_exactly_the_cap_goes_through() {
         let (mut a_tx, _a_rx, _b_tx, mut b_rx) = pair();
         let exact = vec![7_u8; MAX_MESSAGE_BYTES];
-        let (sent, received) = tokio::join!(a_tx.send(&exact, &[]), b_rx.recv());
-        sent.unwrap();
-        assert_eq!(received.unwrap().unwrap().payload, exact);
+        // A refused send ends the join at once; the receive would wait on.
+        let ((), received) = tokio::try_join!(a_tx.send(&exact, &[]), b_rx.recv()).unwrap();
+        assert_eq!(received.unwrap().payload, exact);
     }
 
     #[tokio::test]
