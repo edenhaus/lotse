@@ -5,11 +5,12 @@
 //! Sender Reports of those tracks, its deadlines and how it ended
 //! ([`IngestOutput`]).
 //!
-//! The offer (RFC 8829 §5.2.1): an `audio` m-line `recvonly` when the
-//! options ask for audio, a `video` m-line `recvonly`, then an
-//! `application` m-line when a data channel is configured, the order the
-//! cameras' integrations take (Nest refuses an offer without the data
-//! channel's m-line; observed in go2rtc's Nest client, 2026-10). Codecs:
+//! The offer (RFC 8829 §5.2.1): an `audio` m-line `recvonly`, a `video`
+//! m-line `recvonly`, then an `application` m-line when a data channel is
+//! configured, the order the cameras' integrations take (Nest refuses an
+//! offer without the data channel's m-line; observed in go2rtc's Nest
+//! client, 2026-10). A camera without audio rejects the audio m-line with
+//! port 0 (RFC 3264 §6): the source then has no audio track. Codecs:
 //! H.264 in several profiles and both packetization modes (RFC 6184
 //! §8.1), H.265 (RFC 7798 §7.1), Opus (RFC 7587), PCMU and PCMA (RFC 3551
 //! §4.5.14). The host candidates are in the offer, for integrations that
@@ -466,8 +467,9 @@ pub struct IngestEngine {
     offer: String,
     /// The first media section's mid, which the candidates name.
     first_mid: String,
-    /// The audio m-line, when offered.
-    audio_mid: Option<Mid>,
+    /// The audio m-line, always offered: a camera without audio rejects
+    /// it (RFC 3264 §6), and the source then has no audio track.
+    audio_mid: Mid,
     /// The video m-line.
     video_mid: Mid,
     /// The data channel, when offered, and its label.
@@ -783,9 +785,7 @@ impl IngestEngine {
             return Err(format!("no usable host candidate among {hosts:?}"));
         }
         let mut api = rtc.sdp_api();
-        let audio_mid = options
-            .audio
-            .then(|| api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None));
+        let audio_mid = api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
         let video_mid = api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
         let channel = options
             .data_channel
@@ -795,10 +795,9 @@ impl IngestEngine {
         let offer = offer.to_sdp_string();
         check_offer_mids(&offer)?;
         check_offer_size(&offer)?;
-        let first_mid = audio_mid.unwrap_or(video_mid).to_string();
+        let first_mid = audio_mid.to_string();
         tracing::debug!(
             candidates = local.len(),
-            audio = audio_mid.is_some(),
             data_channel = channel.is_some(),
             "webrtc: offer made"
         );
@@ -944,18 +943,17 @@ impl IngestEngine {
             .map_err(|err| err.to_string())?;
         let mut tracks = Vec::new();
         let rejected = |mid: Mid| stopped.contains(&mid.to_string().as_str());
-        if let Some(audio) = self.audio_mid {
-            let audio = (!rejected(audio))
-                .then(|| self.negotiated(audio, 0))
-                .flatten();
-            if audio.is_none() {
-                tracing::info!("webrtc: the camera sends no audio the source carries");
-            }
-            tracks.extend(audio);
+        // A camera without audio rejects the audio m-line (RFC 3264 §6):
+        // no audio track, and the video keeps its m-line's index.
+        let audio = (!rejected(self.audio_mid))
+            .then(|| self.negotiated(self.audio_mid, 0))
+            .flatten();
+        if audio.is_none() {
+            tracing::info!("webrtc: the camera sends no audio the source carries");
         }
-        let video_index = usize::from(self.audio_mid.is_some());
+        tracks.extend(audio);
         let video = (!rejected(self.video_mid))
-            .then(|| self.negotiated(self.video_mid, video_index))
+            .then(|| self.negotiated(self.video_mid, 1))
             .flatten()
             .ok_or("no video m-line the camera sends in H.264 or H.265")?;
         tracks.push(video);
@@ -1759,10 +1757,7 @@ mod tests {
     fn draft_ietf_mmusic_mdns_ice_candidates_3_2_1_an_mdns_name_is_refused_before_parsing() {
         let addr = "192.0.2.10:5000".parse().unwrap();
         let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
-        let options = WebRtcOptions {
-            data_channel: None,
-            audio: false,
-        };
+        let options = WebRtcOptions { data_channel: None };
         let engine = IngestEngine::offer(&options, &[addr], now, now).unwrap();
         // Told by the name alone, whatever str0m makes of the line.
         for mdns in [
@@ -1955,16 +1950,8 @@ mod tests {
     fn rfc3550_6_4_1_a_sender_report_without_a_wallclock_is_dropped() {
         let addr = "192.0.2.10:5000".parse().unwrap();
         let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
-        let mut engine = IngestEngine::offer(
-            &WebRtcOptions {
-                data_channel: None,
-                audio: false,
-            },
-            &[addr],
-            now,
-            now,
-        )
-        .unwrap();
+        let mut engine =
+            IngestEngine::offer(&WebRtcOptions { data_channel: None }, &[addr], now, now).unwrap();
         let mid = engine.video_mid;
         engine.streams.push(Stream {
             mid,
@@ -2024,10 +2011,7 @@ mod tests {
         const C: u32 = 0xc;
         let addr = "192.0.2.10:5000".parse().unwrap();
         let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
-        let options = WebRtcOptions {
-            data_channel: None,
-            audio: false,
-        };
+        let options = WebRtcOptions { data_channel: None };
         let mut engine = IngestEngine::offer(&options, &[addr], now, now).unwrap();
         let mid = engine.video_mid;
         engine.streams.push(Stream {
@@ -2081,10 +2065,7 @@ mod tests {
         const A: u32 = 0xa;
         let addr = "192.0.2.10:5000".parse().unwrap();
         let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
-        let options = WebRtcOptions {
-            data_channel: None,
-            audio: false,
-        };
+        let options = WebRtcOptions { data_channel: None };
         let mut engine = IngestEngine::offer(&options, &[addr], now, now).unwrap();
         let mid = engine.video_mid;
         engine.streams.push(Stream {
@@ -2186,10 +2167,7 @@ mod tests {
         let addr = "192.0.2.10:5000".parse().unwrap();
         let started = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
         let ended = |phase, err| {
-            let options = WebRtcOptions {
-                data_channel: None,
-                audio: false,
-            };
+            let options = WebRtcOptions { data_channel: None };
             let mut engine = IngestEngine::offer(&options, &[addr], started, started).unwrap();
             engine.phase = phase;
             engine.now = started + Duration::from_millis(23_456);
@@ -2202,10 +2180,7 @@ mod tests {
         // its own: llvm-cov's summary counts a function's lines by its
         // best-covered binary, not by all of them together.)
         let mut engine = IngestEngine::offer(
-            &WebRtcOptions {
-                data_channel: None,
-                audio: false,
-            },
+            &WebRtcOptions { data_channel: None },
             &[addr],
             started,
             started,

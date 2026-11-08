@@ -265,12 +265,13 @@ fuzz_target!(|data: &[u8]| {
     let Some([setup]) = take::<1>(&mut rest) else {
         return;
     };
-    // Bit 0: audio; bit 1: the data channel; bit 2: a camera answers;
-    // bit 3: one without audio (str0m rejects an audio m-line listing no
-    // format); bit 4: its video's first payload type renamed.
+    // Bit 0: unused (it chose the audio m-line, now always offered, so
+    // the corpus keeps the other bits' meaning); bit 1: the data channel;
+    // bit 2: a camera answers; bit 3: one without audio (str0m rejects an
+    // audio m-line listing no format); bit 4: its video's first payload
+    // type renamed.
     let options = WebRtcOptions {
         data_channel: (setup & 2 != 0).then(|| "dataSendChannel".to_owned()),
-        audio: setup & 1 != 0,
     };
     let t0 = Instant::now();
     let Ok(engine) = IngestEngine::offer(&options, &[ENGINE], t0, t0) else {
