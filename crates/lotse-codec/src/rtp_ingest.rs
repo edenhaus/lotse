@@ -282,14 +282,20 @@ impl RtpTracks {
         arrival: Instant,
         ctx: &SourceCtx,
     ) -> Result<(), SourceError> {
+        // One scan per packet: `new_timeline` restarts the tracks' state
+        // but never adds or removes one, so the position stays valid.
+        let Some(position) = self.tracks.iter().position(|(i, _)| *i == index) else {
+            return Ok(());
+        };
         let jumped = self
-            .entry_mut(index)
-            .and_then(|entry| entry.guard.observe(packet.ts, arrival));
+            .tracks
+            .get_mut(position)
+            .and_then(|(_, entry)| entry.guard.observe(packet.ts, arrival));
         if let Some(moved_ms) = jumped {
             self.new_timeline(index, ctx, moved_ms, arrival)?;
         }
         let normalized = &mut self.normalized;
-        if let Some((_, entry)) = self.tracks.iter_mut().find(|(i, _)| *i == index) {
+        if let Some((_, entry)) = self.tracks.get_mut(position) {
             on_rtp(entry, ctx, arrival, packet, normalized);
         }
         Ok(())
