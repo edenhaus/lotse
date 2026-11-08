@@ -151,6 +151,9 @@ exclude_re = [
     # The method's three groups of bits (RFC 8489 §5: M0-M3, M4-M6, M7-M11) are disjoint once
     # shifted, so `|` and `^` produce the same method.
     "net/stun.rs:.*replace \\| with \\^ in parse$",
+    # Only picks whether a skip to the next keyframe is logged at debug; the skip itself and its
+    # count are the same.
+    "writer.rs:.*replace != with == in VideoWriter::skip$",
     # `abi_of` only picks filesystem rights (`AccessFs::from_all`), and ABI 4 adds none to ABI 3's
     # (landlock(7), "Landlock ABI versions"): ABI 3 taken as 4 handles the same rights.
     "lotse-sandbox/src/linux.rs:.*delete match arm 3 in abi_of$",
