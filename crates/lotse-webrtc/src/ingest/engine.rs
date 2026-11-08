@@ -203,8 +203,8 @@ pub struct IngestStats {
     /// their track's, dropped.
     pub other_codec_packets: u64,
     /// RTP packets from before the camera's timestamps jumped, late or
-    /// of a former source, more than a second of media time off the
-    /// newest packet's, dropped (RFC 3550 §5.1).
+    /// of a former carried source, more than a second of media time off
+    /// the carried timeline's (see `Stream`), dropped (RFC 3550 §5.1).
     pub stale_packets: u64,
     /// RTP packets the sequence numbers say never arrived (RFC 3550
     /// §6.4.1): the numbers each source skipped.
@@ -216,8 +216,9 @@ pub struct IngestStats {
     pub sender_reports: u64,
     /// Sender Reports without a wallclock time, dropped.
     pub unusable_reports: u64,
-    /// Sender Reports of a source other than the stream's newest packet's
-    /// (a former one, or one that has sent no packet yet), dropped.
+    /// Sender Reports of a source other than the one the track carries (a
+    /// former one, or one none of whose packets was handed on yet),
+    /// dropped.
     pub other_source_reports: u64,
     /// Picture Loss Indications sent.
     pub plis: u64,
@@ -249,7 +250,31 @@ enum Phase {
     Ended,
 }
 
-/// One negotiated stream.
+/// One negotiated stream, and what its packets tell, in two states kept
+/// apart:
+///
+/// - **Receive accounting** ([`Stream::received`]): for each
+///   synchronization source of the m-line (RFC 3550 §8.2), the highest
+///   sequence number received, the latest source first, at most
+///   [`MAX_SOURCES`]. Fed by every packet in a format the answer accepted
+///   on the m-line, in the track's codec or another, that is not dropped
+///   as late or stale. It alone says how many packets one skips (lost,
+///   RFC 3550 §A.1), whether it is its source's first, and whether it is
+///   late (not ahead of its source's highest).
+/// - **Carried timeline** ([`Stream::carried`]): the sources whose
+///   packets were handed on to the track, the latest first, each with the
+///   timestamp of its newest one handed on, at most [`MAX_SOURCES`]. Fed
+///   only by packets handed on: one the track does not take (another
+///   codec) never moves it. The first is the timeline the track carries;
+///   staleness and the Sender Reports handed on are judged by it alone.
+///
+/// A packet is stale ([`Seen::Stale`]) when its timestamp is more than
+/// [`MAX_TIMESTAMP_JUMP`] off the carried timeline's and it is late or of
+/// a former carried source (one in `carried` that is not the first): sent
+/// before the camera's timestamps jumped. A source that has not been
+/// carried starts its own timeline with its first packet handed on (an
+/// encoder restart, RFC 3550 §8.2), and the carried source's own jump
+/// moves the timeline (RFC 3550 §5.1).
 #[derive(Debug, Clone)]
 struct Stream {
     /// Its m-line's mid.
@@ -265,10 +290,12 @@ struct Stream {
     video: bool,
     /// The track's RTP clock rate, ticks per second.
     clock_rate: u32,
-    /// The synchronization sources of the packets seen (RFC 3550 §3),
-    /// the latest first, each with the highest sequence number seen of
-    /// it and that packet's timestamp: at most [`MAX_SOURCES`].
-    sources: Vec<(u32, u16, u32)>,
+    /// The receive accounting: each source with its highest sequence
+    /// number received, the latest first.
+    received: Vec<(u32, u16)>,
+    /// The carried timeline: each source handed on with the timestamp of
+    /// its newest packet handed on, the latest first.
+    carried: Vec<(u32, u32)>,
 }
 
 /// Why a remote candidate is not handed to the agent
@@ -304,15 +331,15 @@ enum Seen {
     /// by consecutive numbers), and the next unit, complete, would read
     /// as following a gap and be dropped too.
     Late,
-    /// Late or repeated, or of a former source (one the stream knows
-    /// that is not the newest packet's), with a timestamp more than
-    /// [`MAX_TIMESTAMP_JUMP`] of media time from the newest packet's: it
-    /// was sent before the camera's timestamps jumped (an encoder restart,
-    /// RFC 3550 §5.1, §8.2) and arrived after, delayed or retransmitted;
-    /// a former source's packet may be ahead in its own numbering, never
-    /// having arrived before. Dropped, and its source's numbers left as
-    /// they were: handed on, it would take the stream back to its old
-    /// timeline and the next packet forward again, a new timeline each
+    /// Late or repeated, or of a former carried source, with a timestamp
+    /// more than [`MAX_TIMESTAMP_JUMP`] of media time from the carried
+    /// timeline's (see [`Stream`]): it was sent before the camera's
+    /// timestamps jumped (an encoder restart, RFC 3550 §5.1, §8.2) and
+    /// arrived after, delayed or retransmitted; a former source's packet
+    /// may be ahead in its own numbering, never having arrived before.
+    /// Dropped, and its source's numbers left as they were: handed on, it
+    /// would take the stream back to its old timeline and the next packet
+    /// forward again, a new timeline each
     /// (`lotse_codec::rtp_ingest::RtpTracks`).
     Stale,
 }
@@ -326,46 +353,52 @@ const MAX_SOURCES: usize = 4;
 
 impl Stream {
     /// Notes packet `seq` of synchronization source `ssrc`, timestamp
-    /// `ts`. Each source numbers its packets on its own (RFC 3550 §5.1,
-    /// §8.2), so a source's first packet is no loss, and a late or
-    /// repeated one (no more than half the sequence space behind) changes
-    /// nothing. It is [`Seen::Stale`] when its timestamp is off the newest
-    /// packet's timeline (the latest source's highest) and it is late or
-    /// of a former source: only the newest source moves the timeline (its
-    /// own jump is the camera's, RFC 3550 §5.1), and a source never seen
-    /// (or forgotten) starts its own (an encoder restart, RFC 3550 §8.2).
+    /// `ts`, in a format the answer accepted, in the receive accounting,
+    /// unless it is late or stale (see [`Stream`]). Each source numbers
+    /// its packets on its own (RFC 3550 §5.1, §8.2), so a source's first
+    /// packet is no loss, and a late or repeated one (no more than half
+    /// the sequence space behind) changes nothing.
     fn sequence(&mut self, ssrc: u32, seq: u16, ts: u32) -> Seen {
         let highest = self
-            .sources
+            .received
             .iter()
-            .find(|(seen, _, _)| *seen == ssrc)
-            .map(|(_, highest, _)| *highest);
+            .find(|(seen, _)| *seen == ssrc)
+            .map(|(_, highest)| *highest);
         let ahead = highest.map_or(1, |highest| seq.wrapping_sub(highest));
         let late = !(1..0x8000).contains(&ahead);
-        let newest = self.sources.first().copied();
-        let former = highest.is_some() && newest.is_some_and(|(newest, _, _)| newest != ssrc);
-        let off = newest.is_some_and(|(_, _, newest)| self.off_timeline(ts, newest));
+        let timeline = self.carried.first().copied();
+        let former = timeline.is_some_and(|(newest, _)| newest != ssrc)
+            && self.carried.iter().any(|(carried, _)| *carried == ssrc);
+        let off = timeline.is_some_and(|(_, newest)| self.off_timeline(ts, newest));
         if off && (late || former) {
             return Seen::Stale;
         }
         if late {
             return Seen::Late;
         }
-        self.sources.retain(|(seen, _, _)| *seen != ssrc);
-        self.sources.insert(0, (ssrc, seq, ts));
-        self.sources.truncate(MAX_SOURCES);
+        self.received.retain(|(seen, _)| *seen != ssrc);
+        self.received.insert(0, (ssrc, seq));
+        self.received.truncate(MAX_SOURCES);
         Seen::Ahead {
             lost: ahead.wrapping_sub(1),
             new_source: highest.is_none(),
         }
     }
 
-    /// Whether `ssrc` is the source of the stream's newest packet, the one
-    /// whose timeline the stream carries.
+    /// Notes that the packet of `ssrc` at timestamp `ts` was handed on to
+    /// the track: its source carries the timeline from now on.
+    fn carry(&mut self, ssrc: u32, ts: u32) {
+        self.carried.retain(|(carried, _)| *carried != ssrc);
+        self.carried.insert(0, (ssrc, ts));
+        self.carried.truncate(MAX_SOURCES);
+    }
+
+    /// Whether `ssrc` is the source the track carries, whose timeline
+    /// its Sender Reports map.
     fn is_newest(&self, ssrc: u32) -> bool {
-        self.sources
+        self.carried
             .first()
-            .is_some_and(|(newest, _, _)| *newest == ssrc)
+            .is_some_and(|(newest, _)| *newest == ssrc)
     }
 
     /// Whether `ts` is more than [`MAX_TIMESTAMP_JUMP`] of media time
@@ -958,7 +991,8 @@ impl IngestEngine {
             others,
             video: declared.kind == Kind::Video,
             clock_rate: declared.clock_rate,
-            sources: Vec::new(),
+            received: Vec::new(),
+            carried: Vec::new(),
         });
         Some(IngestTrack {
             index,
@@ -1266,16 +1300,18 @@ impl IngestEngine {
     /// dropped, as is one before 1970 (str0m 0.25 hands NTP zero over as
     /// the Unix epoch).
     ///
-    /// Only the reports of the stream's newest source are handed on (str0m
-    /// 0.25 keys a report by its sender's SSRC, `SenderInfo::ssrc`): the
-    /// report maps the timeline of the packets the stream carries, which
-    /// is that source's. A former source's report, delayed past an encoder
-    /// restart (RFC 3550 §8.2), maps the old timeline; after the new
-    /// source's jump reset the clock mapping it would be the first anchor
-    /// and misplace the current media. A report of a source that has sent
-    /// no packet yet is dropped too: until its first packet the stream
-    /// carries the former timeline, and its next report (RFC 3550 §6.2,
-    /// every few seconds) anchors the new one. A sender sends reports only
+    /// Only the reports of the source the track carries (the carried
+    /// timeline's, see [`Stream`]) are handed on (str0m 0.25 keys a report
+    /// by its sender's SSRC, `SenderInfo::ssrc`): the report maps the
+    /// timeline of the packets handed on, which is that source's. A former
+    /// source's report, delayed past an encoder restart (RFC 3550 §8.2),
+    /// maps the old timeline; after the new source's jump reset the clock
+    /// mapping it would be the first anchor and misplace the current media.
+    /// A report of a source none of whose packets was handed on yet (one
+    /// that has sent none, or only in another codec) is dropped too: until
+    /// its first packet handed on the track carries the former timeline,
+    /// and its next report (RFC 3550 §6.2, every few seconds) anchors the
+    /// new one. A sender sends reports only
     /// once it sends packets (§6.4), so the first anchor of an attempt
     /// waits at most one report.
     fn on_sender_report(&mut self, feedback: &SenderFeedback) {
@@ -1290,7 +1326,7 @@ impl IngestEngine {
                     index = stream.index,
                     ssrc,
                     count,
-                    "webrtc: Sender Report of a source other than the newest packet's dropped"
+                    "webrtc: Sender Report of a source other than the carried one dropped"
                 );
             }
             return;
@@ -1385,13 +1421,14 @@ impl IngestEngine {
     /// `mid` header extension) in a payload type of its track's codec,
     /// else counted and dropped, one in another codec the answer accepted
     /// with a warning; that one is still received, numbered and counted
-    /// in its source's sequence like the rest. A forward gap in the video's sequence numbers of
-    /// one synchronization source (RFC 3550 §A.1) is a lost picture, which
+    /// in its source's sequence like the rest, but moves no carried
+    /// timeline (see [`Stream`]). A forward gap in the video's sequence
+    /// numbers of one synchronization source (RFC 3550 §A.1) is a lost picture, which
     /// asks for a keyframe. A late or repeated packet is dropped
     /// ([`Seen::Late`]), as an RTSP source's reorderer drops every late
     /// packet (retina's `Reorderer`), and so is one from before the
-    /// camera's timestamps jumped, or one of a former source off the
-    /// newest source's timeline ([`Seen::Stale`]). New sources, late and
+    /// camera's timestamps jumped, or one of a former carried source off
+    /// the carried timeline ([`Seen::Stale`]). New sources, late and
     /// stale packets are logged at most once per summary interval.
     fn on_rtp(&mut self, packet: str0m::rtp::RtpPacket) {
         let header = &packet.header;
@@ -1421,9 +1458,13 @@ impl IngestEngine {
         let video = stream.video;
         // A packet in another codec the answer accepted is received: it
         // moves its source's numbers (no loss for it, RFC 3550 §A.1)
-        // before it is dropped from the track.
+        // before it is dropped from the track; only one handed on moves
+        // the carried timeline (see `Stream`).
         let carried = stream.pts.contains(&pt);
         let seen = stream.sequence(ssrc, seq, header.timestamp);
+        if carried && matches!(seen, Seen::Ahead { .. }) {
+            stream.carry(ssrc, header.timestamp);
+        }
         let Some(lost) = self.counted(seen, index, ssrc, seq) else {
             return;
         };
@@ -1601,7 +1642,8 @@ mod tests {
         assert_eq!(stream.sequence(B, 8, ts), Seen::Late, "a late one");
         // A's numbers are kept too: its gap after it comes back.
         assert_eq!(stream.sequence(A, 1_002, ts), ahead(1, false));
-        assert_eq!(stream.sources, [(A, 1_002, ts), (B, 10, ts)]);
+        assert_eq!(stream.received, [(A, 1_002), (B, 10)]);
+        assert_eq!(stream.carried, [], "nothing handed on");
         // Half the sequence space ahead is still ahead; more is behind.
         assert_eq!(
             stream.sequence(A, 1_002_u16.wrapping_add(0x7fff), ts),
@@ -1616,8 +1658,8 @@ mod tests {
         for ssrc in 1..u32::try_from(MAX_SOURCES).unwrap() {
             assert_eq!(stream.sequence(0x100 + ssrc, 1, ts), ahead(0, true));
         }
-        assert_eq!(stream.sources.len(), MAX_SOURCES);
-        assert!(!stream.sources.iter().any(|(ssrc, _, _)| *ssrc == B));
+        assert_eq!(stream.received.len(), MAX_SOURCES);
+        assert!(!stream.received.iter().any(|(ssrc, _)| *ssrc == B));
         assert_eq!(stream.sequence(B, 2_000, ts), ahead(0, true));
     }
 
@@ -1630,8 +1672,19 @@ mod tests {
             others: Vec::new(),
             video: true,
             clock_rate: 90_000,
-            sources: Vec::new(),
+            received: Vec::new(),
+            carried: Vec::new(),
         }
+    }
+
+    /// Packet `seq` of `ssrc` at `ts` in the track's codec, as `on_rtp`
+    /// takes it: numbered, and carried when it is handed on.
+    fn handed(stream: &mut Stream, ssrc: u32, seq: u16, ts: u32) -> Seen {
+        let seen = stream.sequence(ssrc, seq, ts);
+        if matches!(seen, Seen::Ahead { .. }) {
+            stream.carry(ssrc, ts);
+        }
+        seen
     }
 
     #[test]
@@ -1675,38 +1728,42 @@ mod tests {
         const B: u32 = 0xb;
         let mut stream = video_stream();
         assert!(matches!(
-            stream.sequence(A, 100, 900_000),
+            handed(&mut stream, A, 100, 900_000),
             Seen::Ahead { .. }
         ));
         // The camera's timestamps jumped back 10 s, its numbers went on.
-        assert!(matches!(stream.sequence(A, 101, 0), Seen::Ahead { .. }));
+        assert!(matches!(handed(&mut stream, A, 101, 0), Seen::Ahead { .. }));
         // A late packet of the old timeline: stale, either way of the
         // newest and across the 32-bit wrap.
-        assert_eq!(stream.sequence(A, 99, 900_000), Seen::Stale);
-        assert_eq!(stream.sequence(A, 99, u32::MAX - 90_000), Seen::Stale);
+        assert_eq!(handed(&mut stream, A, 99, 900_000), Seen::Stale);
+        assert_eq!(handed(&mut stream, A, 99, u32::MAX - 90_000), Seen::Stale);
         // Within MAX_TIMESTAMP_JUMP (1 s at 90 kHz) of the newest, either
         // way: reordered or repaired.
-        assert_eq!(stream.sequence(A, 99, 90_000), Seen::Late);
-        assert_eq!(stream.sequence(A, 99, u32::MAX - 89_999), Seen::Late);
-        assert_eq!(stream.sequence(A, 99, 90_001), Seen::Stale);
+        assert_eq!(handed(&mut stream, A, 99, 90_000), Seen::Late);
+        assert_eq!(handed(&mut stream, A, 99, u32::MAX - 89_999), Seen::Late);
+        assert_eq!(handed(&mut stream, A, 99, 90_001), Seen::Stale);
         // A new source after an encoder restart (RFC 3550 §8.2): a late
         // packet of the former one is measured against the newest source.
         assert!(matches!(
-            stream.sequence(B, 7, 45_000_000),
+            handed(&mut stream, B, 7, 45_000_000),
             Seen::Ahead { .. }
         ));
-        assert_eq!(stream.sequence(A, 100, 1_000), Seen::Stale);
-        assert_eq!(stream.sequence(A, 100, 45_000_000 - 90_000), Seen::Late);
-        assert_eq!(stream.sources, [(B, 7, 45_000_000), (A, 101, 0)]);
+        assert_eq!(handed(&mut stream, A, 100, 1_000), Seen::Stale);
+        assert_eq!(handed(&mut stream, A, 100, 45_000_000 - 90_000), Seen::Late);
+        assert_eq!(stream.received, [(B, 7), (A, 101)]);
+        assert_eq!(stream.carried, [(B, 45_000_000), (A, 0)]);
         // Audio at 8 kHz: one second is 8000 ticks.
         let mut audio = Stream {
             clock_rate: 8_000,
             video: false,
             ..video_stream()
         };
-        assert!(matches!(audio.sequence(A, 2, 16_000), Seen::Ahead { .. }));
-        assert_eq!(audio.sequence(A, 1, 8_000), Seen::Late);
-        assert_eq!(audio.sequence(A, 1, 7_999), Seen::Stale);
+        assert!(matches!(
+            handed(&mut audio, A, 2, 16_000),
+            Seen::Ahead { .. }
+        ));
+        assert_eq!(handed(&mut audio, A, 1, 8_000), Seen::Late);
+        assert_eq!(handed(&mut audio, A, 1, 7_999), Seen::Stale);
     }
 
     #[test]
@@ -1714,20 +1771,21 @@ mod tests {
         const A: u32 = 0xa;
         const B: u32 = 0xb;
         let mut stream = video_stream();
-        assert!(matches!(stream.sequence(A, 101, 0), Seen::Ahead { .. }));
+        assert!(matches!(handed(&mut stream, A, 101, 0), Seen::Ahead { .. }));
         // An encoder restart (RFC 3550 §8.2): a new source, a new timeline.
         assert!(matches!(
-            stream.sequence(B, 7, 45_000_000),
+            handed(&mut stream, B, 7, 45_000_000),
             Seen::Ahead { .. }
         ));
         // A packet of the former source never seen before, ahead in its
         // own numbering, off the newest source's timeline: stale, its
         // source's numbers kept and the newest source still the newest.
-        assert_eq!(stream.sequence(A, 102, 3_000), Seen::Stale);
-        assert_eq!(stream.sequence(A, 105, 6_000), Seen::Stale);
-        assert_eq!(stream.sources, [(B, 7, 45_000_000), (A, 101, 0)]);
+        assert_eq!(handed(&mut stream, A, 102, 3_000), Seen::Stale);
+        assert_eq!(handed(&mut stream, A, 105, 6_000), Seen::Stale);
+        assert_eq!(stream.received, [(B, 7), (A, 101)]);
+        assert_eq!(stream.carried, [(B, 45_000_000), (A, 0)]);
         assert_eq!(
-            stream.sequence(B, 8, 45_003_000),
+            handed(&mut stream, B, 8, 45_003_000),
             Seen::Ahead {
                 lost: 0,
                 new_source: false
@@ -1736,23 +1794,69 @@ mod tests {
         // On the newest source's timeline, the former source comes back
         // as the newest, its own gap a loss (RFC 3550 §A.1).
         assert_eq!(
-            stream.sequence(A, 103, 45_006_000),
+            handed(&mut stream, A, 103, 45_006_000),
             Seen::Ahead {
                 lost: 1,
                 new_source: false
             }
         );
-        assert_eq!(stream.sources, [(A, 103, 45_006_000), (B, 8, 45_003_000)]);
+        assert_eq!(stream.received, [(A, 103), (B, 8)]);
+        assert_eq!(stream.carried, [(A, 45_006_000), (B, 45_003_000)]);
         // The newest source's own jump moves the timeline (RFC 3550 §5.1),
         // and a source never seen starts its own (RFC 3550 §8.2).
-        assert!(matches!(stream.sequence(A, 104, 0), Seen::Ahead { .. }));
+        assert!(matches!(handed(&mut stream, A, 104, 0), Seen::Ahead { .. }));
         assert_eq!(
-            stream.sequence(0xc, 1, 90_000_000),
+            handed(&mut stream, 0xc, 1, 90_000_000),
             Seen::Ahead {
                 lost: 0,
                 new_source: true
             }
         );
+    }
+
+    #[test]
+    fn rfc3550_8_2_a_packet_the_track_does_not_take_moves_no_timeline() {
+        const A: u32 = 0xa;
+        const B: u32 = 0xb;
+        let mut stream = video_stream();
+        assert!(matches!(
+            handed(&mut stream, A, 100, 900_000),
+            Seen::Ahead { .. }
+        ));
+        // B's packet in another codec: received, numbered, not carried.
+        assert_eq!(
+            stream.sequence(B, 5, 3_000),
+            Seen::Ahead {
+                lost: 0,
+                new_source: true
+            }
+        );
+        assert_eq!(stream.received, [(B, 5), (A, 100)]);
+        assert_eq!(stream.carried, [(A, 900_000)]);
+        // A goes on on its timeline: nothing lost, nothing stale, and its
+        // reports are the ones handed on.
+        assert_eq!(
+            handed(&mut stream, A, 101, 903_000),
+            Seen::Ahead {
+                lost: 0,
+                new_source: false
+            }
+        );
+        assert!(stream.is_newest(A));
+        assert!(!stream.is_newest(B));
+        // B's first packet handed on starts its own timeline (an encoder
+        // restart, RFC 3550 §8.2): B was never carried, so not former.
+        assert_eq!(
+            handed(&mut stream, B, 6, 6_000),
+            Seen::Ahead {
+                lost: 0,
+                new_source: false
+            }
+        );
+        assert!(stream.is_newest(B));
+        // Now A is the former carried source: off B's timeline, stale.
+        assert_eq!(handed(&mut stream, A, 102, 906_000), Seen::Stale);
+        assert_eq!(stream.carried, [(B, 6_000), (A, 903_000)]);
     }
 
     #[test]
@@ -1795,8 +1899,10 @@ mod tests {
         engine.streams.push(Stream {
             mid,
             index: 3,
-            // Source 1's packets: its reports are the ones handed on.
-            sources: vec![(1, 0, 7)],
+            // Source 1's packets handed on: its reports are the ones
+            // handed on.
+            received: vec![(1, 0)],
+            carried: vec![(1, 7)],
             ..video_stream()
         });
         let report = |ntp_time| {
@@ -1883,13 +1989,13 @@ mod tests {
         engine.on_event(report(A, 900_000));
         assert_eq!(engine.queued.pop_front(), None);
         // A's packets, then its report: handed on.
-        engine.streams[0].sequence(A, 1_000, 900_000);
+        handed(&mut engine.streams[0], A, 1_000, 900_000);
         engine.on_event(report(A, 900_000));
         assert_eq!(engine.queued.pop_front(), Some(forwarded(900_000)));
         // The encoder restarted: B's packets on a new timeline. A report
         // of A delayed past it, and one of C that has sent no packet, are
         // dropped; B's is handed on.
-        engine.streams[0].sequence(B, 5, 3_000);
+        handed(&mut engine.streams[0], B, 5, 3_000);
         engine.on_event(report(A, 903_000));
         engine.on_event(report(C, 6_000));
         assert_eq!(engine.queued.pop_front(), None);
