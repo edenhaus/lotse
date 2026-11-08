@@ -1,6 +1,6 @@
 [package]
 name = "lotse-testing"
-description = "Fake RTSP camera, fake TURN server, conformance suites, headless WebRTC viewer, fixtures and load generator."
+description = "Fake RTSP and WebRTC cameras, fake TURN server, conformance suites, headless WebRTC viewer, fixtures and load generator."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,7 +25,7 @@ serde = { workspace = true } # the load generator's JSON report
 serde_json = { workspace = true } # the load generator's control-API frames and report
 sha1 = { workspace = true } # MESSAGE-INTEGRITY of the fake TURN server (RFC 8489 §14.5) and of the Safari ICE test's hand-made STUN requests
 sha2 = { workspace = true } # the fake camera's certificate fingerprint, computed independently of lotse-rtsp; the dev viewer's CSP hash-sources
-str0m = { workspace = true } # the headless viewer
+str0m = { workspace = true } # the headless viewer; the fake WebRTC camera
 tokio = { workspace = true, features = ["net", "io-util", "sync", "macros", "rt"] } # the fake camera's listener and connections; the dev viewer's runtime
 tokio-rustls = { workspace = true } # the fake camera's TLS mode (`rtsps`)
 tokio-tungstenite = { workspace = true } # the dev viewer's WebSocket to the daemon; the load generator's control connection

@@ -1,7 +1,8 @@
 # lotse
 
 A small, fast, memory-safe media daemon built for Home Assistant. It takes
-camera streams (RTSP, and HLS or MPEG-TS over HTTP) and serves them to
+camera streams (RTSP, HLS or MPEG-TS over HTTP, and WebRTC cameras such as
+Nest, Ring and Matter ones, whose signaling its client relays) and serves them to
 browsers over WebRTC, with two-way audio designed in from the start, and
 as event recordings: fragmented MP4 that starts before the event, from the
 seconds it keeps in memory, for its client to store. It does nothing
@@ -100,6 +101,27 @@ socket and nothing else.
 `--listen ADDR` serves it elsewhere than `127.0.0.1:8080`, on a loopback
 address only: anything that reaches the relay drives the daemon, so an
 address reachable from the network also needs `--insecure-listen`.
+
+A WebRTC camera (Home Assistant's native WebRTC cameras: Nest, Ring,
+Matter) has no address lotse could connect to, so a stream names it by
+protocol instead of a URL, `{"protocol": "webrtc", "options": {...}}`,
+and the stream is its identity (`info.signaled_protocols` lists the
+protocols); its options are `data_channel` (the data channel label the
+camera's integration asks for, `dataSendChannel` for Nest) and `audio`
+(default `true`). lotse makes the offer, but the camera's signaling is its
+cloud's, so the control-API client relays it: it subscribes with
+`signaling/subscribe`, takes each `offer` event (it names the stream) and
+each `candidate` event to the camera, and brings back the camera's answer, its
+candidates and its errors with `signaling/answer`, `signaling/candidate`
+and `signaling/error`; a `closed` event ends the camera's session. The
+media then comes straight from the camera to the worker over UDP: the
+source gathers its candidates on the host addresses of the WebRTC UDP
+front door (`--webrtc-udp-listen`; the `ready` event lists them), each on
+a port of its own, so the camera's media server must reach one of them.
+With no host address found, or without a subscribed client, the source
+reports `source_unreachable`.
+The dev viewer does not relay signaling, so such a source needs a client
+that does.
 
 ## License
 
