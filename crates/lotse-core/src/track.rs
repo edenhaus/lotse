@@ -1159,7 +1159,7 @@ impl Track {
     /// the ring's lock, so a recording's subscription, snapshot and descriptor
     /// ([`Self::subscribe_from_prerecord`]) are all on one side of the change.
     /// So does another clock rate: the ring's timestamps tick at the old
-    /// one (RFC 3550 §5.1).
+    /// one (RFC 3550 §5.1); its new epoch starts under that lock too.
     /// Under the same lock, a change `writer` (a source's tag) made is
     /// dropped once the track takes another source: the old source's,
     /// made while a switch ran, would label the standby's frames.
@@ -1195,12 +1195,15 @@ impl Track {
             codec: Arc::clone(&codec),
             clock_rate: rate,
         });
+        // The new epoch starts under the same lock as the writer check: once
+        // it is released a switch can hand the track to a standby, whose
+        // feed this writer's epoch would cut.
+        let epoch = rate_changed.then(|| self.start_epoch_inner());
         drop(fed);
         if clears && self.leads_prerecord() {
             self.prerecord_shared.set_floor(None);
         }
-        if rate_changed {
-            let epoch = self.start_epoch_inner();
+        if let Some(epoch) = epoch {
             tracing::info!(
                 track = %self.id,
                 codec = codec.name(),
