@@ -1384,7 +1384,8 @@ impl IngestEngine {
     /// negotiated m-line (str0m maps its SSRC by `a=ssrc` or the RFC 9143
     /// `mid` header extension) in a payload type of its track's codec,
     /// else counted and dropped, one in another codec the answer accepted
-    /// with a warning. A forward gap in the video's sequence numbers of
+    /// with a warning; that one is still received, numbered and counted
+    /// in its source's sequence like the rest. A forward gap in the video's sequence numbers of
     /// one synchronization source (RFC 3550 §A.1) is a lost picture, which
     /// asks for a keyframe. A late or repeated packet is dropped
     /// ([`Seen::Late`]), as an RTSP source's reorderer drops every late
@@ -1401,19 +1402,9 @@ impl IngestEngine {
             .map(|stream| stream.mid());
         let pt = *header.payload_type;
         let seq = header.sequence_number;
-        let Some(stream) = self
-            .streams
-            .iter_mut()
-            .find(|stream| Some(stream.mid) == mid && stream.pts.contains(&pt))
-        else {
-            let other = self
-                .streams
-                .iter()
-                .any(|stream| Some(stream.mid) == mid && stream.others.contains(&pt));
-            if other {
-                self.other_codec(pt);
-                return;
-            }
+        let Some(stream) = self.streams.iter_mut().find(|stream| {
+            Some(stream.mid) == mid && (stream.pts.contains(&pt) || stream.others.contains(&pt))
+        }) else {
             self.stats.foreign_packets = self.stats.foreign_packets.saturating_add(1);
             if let Some(count) = self.foreign.hit(self.now) {
                 tracing::debug!(
@@ -1428,23 +1419,31 @@ impl IngestEngine {
         let index = stream.index;
         let ssrc = *header.ssrc;
         let video = stream.video;
+        // A packet in another codec the answer accepted is received: it
+        // moves its source's numbers (no loss for it, RFC 3550 §A.1)
+        // before it is dropped from the track.
+        let carried = stream.pts.contains(&pt);
         let seen = stream.sequence(ssrc, seq, header.timestamp);
         let Some(lost) = self.counted(seen, index, ssrc, seq) else {
             return;
         };
         let lost = lost && video;
-        self.stats.rtp_packets = self.stats.rtp_packets.saturating_add(1);
-        self.queued.push_back(IngestOutput::Rtp {
-            index,
-            packet: RtpPacket {
-                seq,
-                ts: header.timestamp,
-                ssrc,
-                marker: header.marker,
-                payload: Bytes::from_owner(packet.payload),
-            },
-            arrival: packet.timestamp,
-        });
+        if carried {
+            self.stats.rtp_packets = self.stats.rtp_packets.saturating_add(1);
+            self.queued.push_back(IngestOutput::Rtp {
+                index,
+                packet: RtpPacket {
+                    seq,
+                    ts: header.timestamp,
+                    ssrc,
+                    marker: header.marker,
+                    payload: Bytes::from_owner(packet.payload),
+                },
+                arrival: packet.timestamp,
+            });
+        } else {
+            self.other_codec(pt);
+        }
         if lost && self.keyframe {
             let spaced = self
                 .last_pli
