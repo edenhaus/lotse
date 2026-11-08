@@ -1130,7 +1130,7 @@ impl Driver {
                         .forget_stopping_recordings(&self.spec.connection_id);
                     let shared = Arc::clone(&self.shared);
                     let stop = async move {
-                        let _status = worker.stop(shared.shutdown_budget, &shared.clock).await;
+                        let _status = worker.stop(shared.shutdown_budget).await;
                     };
                     let _handle =
                         spawn_named("worker.stop", self.shared.tracker.track_future(stop));
@@ -1578,9 +1578,7 @@ impl Driver {
         self.crash = None;
         self.window = None;
         if let Some(worker) = self.worker.take() {
-            let _status = worker
-                .stop(self.shared.shutdown_budget, &self.shared.clock)
-                .await;
+            let _status = worker.stop(self.shared.shutdown_budget).await;
         }
         tracing::info!("connection driver stopped");
     }
@@ -1624,8 +1622,8 @@ mod tests {
         let mut state = State::default();
         state.registrations = Some(Arc::new(Registrations::default()));
         Arc::new(Shared {
+            manager: WorkerManager::new(environment(binary).worker, None, Arc::clone(&clock)),
             clock,
-            manager: WorkerManager::new(environment(binary).worker, None),
             tracker: TaskTracker::new(),
             shutdown_budget: Duration::from_millis(200),
             connects: crate::connect::ConnectPermits::new(crate::DEFAULT_CONNECT_CONCURRENCY),
@@ -1870,7 +1868,7 @@ mod tests {
             received.windows(17).any(|w| w == b"tcp-handoff-ufrag"),
             "the ice-tcp hand-off was sent"
         );
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1946,7 +1944,7 @@ mod tests {
             received = std::fs::read(&out).unwrap_or_default();
         }
         assert!(received.ends_with(&expected), "{received:?}");
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
     }
 
     #[tokio::test]
@@ -2616,7 +2614,7 @@ mod tests {
         assert_eq!(messages, [lotse_ipc::ToWorker::ConnectGranted]);
         let worker = driver.worker.take().unwrap();
         drop(driver);
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2735,7 +2733,7 @@ mod tests {
         driver.on_worker_event(WorkerEvent::Exited(ExitStatus::from_raw(0)));
         assert_eq!(in_flight(), 0, "the worker's exit gives both back");
         drop(driver);
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2846,7 +2844,7 @@ mod tests {
                 "127.0.0.1:1".parse().unwrap(),
             ])))
             .await;
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         drop(driver);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2932,7 +2930,7 @@ mod tests {
             "no restart: {messages:?}"
         );
         let worker = driver.worker.take().unwrap();
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         drop(driver);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4148,7 +4146,7 @@ mod tests {
         assert_eq!(rest, b"");
         let worker = driver.worker.take().unwrap();
         drop(driver);
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4277,11 +4275,12 @@ mod tests {
         );
         assert!(!shared.lock().recording_start_wanted("k3", 4));
         assert!(shared.lock().recording_id_in_use("k3"));
-        let worker = driver.worker.take().unwrap();
+        let mut worker = driver.worker.take().unwrap();
         drop(driver);
-        // The shared clock is fake: the stop's budget needs a real one.
-        let real: Arc<dyn Clock> = Arc::new(SystemClock);
-        let _status = worker.stop(Duration::from_millis(200), &real).await;
+        // The shared clock is fake, so a stop's budget never runs out, and
+        // `cat` ignores the shutdown: the worker is killed instead.
+        worker.kill("test over");
+        while !matches!(worker.next_event().await, WorkerEvent::Exited(_)) {}
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4700,11 +4699,12 @@ mod tests {
         assert!(left[1].contains("duration_ms=1000"), "{left:?}");
         assert!(driver.recording_waits.is_empty());
         assert!(driver.recording_wait.is_none());
-        let worker = driver.worker.take().unwrap();
+        let mut worker = driver.worker.take().unwrap();
         drop(driver);
-        // The shared clock is fake: the stop's budget needs a real one.
-        let real: Arc<dyn Clock> = Arc::new(SystemClock);
-        let _status = worker.stop(Duration::from_millis(200), &real).await;
+        // The shared clock is fake, so a stop's budget never runs out, and
+        // `cat` ignores the shutdown: the worker is killed instead.
+        worker.kill("test over");
+        while !matches!(worker.next_event().await, WorkerEvent::Exited(_)) {}
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -163,6 +163,35 @@ pub enum ToWorker {
     },
 }
 
+impl ToWorker {
+    /// The message's kind, for the log: its variant's name in snake case,
+    /// without the fields, some of which are secrets or a peer's text.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::RunSource(_) => "run_source",
+            Self::ConnectGranted => "connect_granted",
+            Self::Shutdown { .. } => "shutdown",
+            Self::Sockets => "sockets",
+            Self::IceTcp { .. } => "ice_tcp",
+            Self::SwitchSource(_) => "switch_source",
+            Self::Backchannel { .. } => "backchannel",
+            Self::SwitchConnectGranted => "switch_connect_granted",
+            Self::ProbeConnectGranted { .. } => "probe_connect_granted",
+            Self::OpenSession(_) => "open_session",
+            Self::RemoteCandidate { .. } => "remote_candidate",
+            Self::Renegotiate { .. } => "renegotiate",
+            Self::RelayCandidate { .. } => "relay_candidate",
+            Self::RelayChannel { .. } => "relay_channel",
+            Self::SessionOrientation { .. } => "session_orientation",
+            Self::CloseSession { .. } => "close_session",
+            Self::ReleaseBackchannel { .. } => "release_backchannel",
+            Self::Prerecord { .. } => "prerecord",
+            Self::StartRecording(_) => "start_recording",
+            Self::StopRecording { .. } => "stop_recording",
+        }
+    }
+}
+
 /// An event recording to start: what the client asked for, checked against
 /// the limits by the supervisor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1007,6 +1036,126 @@ mod tests {
                 decode::<ToSupervisor>(&encode(&message).unwrap()).unwrap(),
                 message
             );
+        }
+    }
+
+    /// Every message's kind names its variant, and only that: a source's
+    /// URL and a session's offer stay out of the log.
+    #[test]
+    fn every_message_names_its_kind_without_its_fields() {
+        let source = SourceSpec {
+            connection_id: "c1".into(),
+            url: "rtsp://admin:hunter2@cam/main".into(),
+            options: "{}".into(),
+            peer_host: "cam".into(),
+            peer_addrs: vec![],
+            backoff: BackoffPosition::default(),
+            prerecord_ms: 0,
+        };
+        let session = SessionSpec {
+            session_id: "s1".into(),
+            kind: "webrtc".into(),
+            offer: "v=0".into(),
+            ice_ufrag: "ufrag".into(),
+            ice_pass: "p".repeat(24),
+            candidates: vec![],
+            tcp_candidates: vec![],
+            audio: false,
+            orientation: 1,
+        };
+        let addr: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+        let named = [
+            (ToWorker::RunSource(source.clone()), "run_source"),
+            (ToWorker::ConnectGranted, "connect_granted"),
+            (ToWorker::Shutdown { deadline_ms: 1 }, "shutdown"),
+            (ToWorker::Sockets, "sockets"),
+            (
+                ToWorker::IceTcp {
+                    local_ufrag: "u".into(),
+                    peer: addr,
+                    first_frame: vec![],
+                },
+                "ice_tcp",
+            ),
+            (ToWorker::SwitchSource(source), "switch_source"),
+            (ToWorker::Backchannel { asks: true }, "backchannel"),
+            (ToWorker::SwitchConnectGranted, "switch_connect_granted"),
+            (
+                ToWorker::ProbeConnectGranted { probe: 1 },
+                "probe_connect_granted",
+            ),
+            (ToWorker::OpenSession(session), "open_session"),
+            (
+                ToWorker::RemoteCandidate {
+                    session_id: "s1".into(),
+                    candidate: String::new(),
+                },
+                "remote_candidate",
+            ),
+            (
+                ToWorker::Renegotiate {
+                    session_id: "s1".into(),
+                    sdp: "v=0".into(),
+                },
+                "renegotiate",
+            ),
+            (
+                ToWorker::RelayCandidate {
+                    session_id: "s1".into(),
+                    relayed: addr,
+                    server: addr,
+                    local: addr,
+                    tcp: false,
+                },
+                "relay_candidate",
+            ),
+            (
+                ToWorker::RelayChannel {
+                    session_id: "s1".into(),
+                    relayed: addr,
+                    peer: addr,
+                    channel: 0x4000,
+                },
+                "relay_channel",
+            ),
+            (
+                ToWorker::SessionOrientation {
+                    session_id: "s1".into(),
+                    orientation: 1,
+                },
+                "session_orientation",
+            ),
+            (
+                ToWorker::CloseSession {
+                    session_id: "s1".into(),
+                    code: "gone".into(),
+                    message: String::new(),
+                },
+                "close_session",
+            ),
+            (
+                ToWorker::ReleaseBackchannel { session_id: None },
+                "release_backchannel",
+            ),
+            (ToWorker::Prerecord { ms: 0 }, "prerecord"),
+            (
+                ToWorker::StartRecording(RecordingSpec {
+                    recording_id: "k1".into(),
+                    prerecord_ms: 0,
+                    duration_ms: 1,
+                    audio: false,
+                }),
+                "start_recording",
+            ),
+            (
+                ToWorker::StopRecording {
+                    recording_id: "k1".into(),
+                },
+                "stop_recording",
+            ),
+        ];
+        for (message, name) in &named {
+            assert_eq!(message.name(), *name, "{message:?}");
         }
     }
 }
