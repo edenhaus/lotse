@@ -22,7 +22,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::hosts;
 
-/// The socket buffer size asked for; the kernel caps it at
+/// The socket buffer size asked for, 4 MiB; the kernel caps it at
 /// `net.core.rmem_max` / `wmem_max` without `CAP_NET_ADMIN`.
 pub const REQUESTED_BUFFER: usize = 4 << 20;
 
@@ -187,6 +187,13 @@ mod tests {
 
     use super::test_support::bind_dual_stack;
     use super::*;
+
+    #[test]
+    fn the_socket_buffers_asked_for_are_4_mib_and_dscp_is_af41() {
+        assert_eq!(REQUESTED_BUFFER, 4 * 1024 * 1024);
+        // RFC 2597: AF41 is DSCP 34, the TOS byte's upper six bits.
+        assert_eq!(DSCP_AF41_TOS, 0x88);
+    }
 
     /// What `bind_dual_stack` relies on: a dual-stack bind by number
     /// refuses a port an IPv4 socket holds, on macOS too, where the

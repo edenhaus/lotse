@@ -379,6 +379,7 @@ mod tests {
             "the highest descriptor a worker may hold"
         );
         assert_eq!(WORKER_CONTROL_FD, 0, "standard input");
+        assert_eq!(DECODER_ADDRESS_SPACE, 256 * 1024 * 1024);
         let config = SandboxConfig::default();
         assert_eq!((config.uid, config.gid), (65534, 65534));
         assert_eq!(config.worker_address_space, 1 << 30);
@@ -393,8 +394,9 @@ mod tests {
         };
         let report = apply(&Profile::Decoder, &config).unwrap();
         assert_eq!(report.mode, Mode::Off);
-        assert_eq!(report.uid, current_uid());
-        assert_eq!(report.gid, current_gid());
+        // The process's real ids, as the kernel has them.
+        assert_eq!(report.uid, rustix::process::getuid().as_raw());
+        assert_eq!(report.gid, rustix::process::getgid().as_raw());
         assert!(!report.no_new_privs);
         assert_eq!(report.seccomp, LayerStatus::Off);
         assert_eq!(report.landlock.fs, LayerStatus::Off);
@@ -422,7 +424,11 @@ mod tests {
         };
         let report = apply(&worker, &config).unwrap();
         assert!(!rustix::process::geteuid().is_root(), "still root");
-        assert_eq!((report.uid, report.gid), (current_uid(), current_gid()));
+        let real = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        assert_eq!((report.uid, report.gid), real);
         let dropped = (report.uid, report.gid, rustix::process::getegid().as_raw());
         assert!(
             !started_as_root || dropped == (4242, 4343, 4343),

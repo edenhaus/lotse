@@ -570,6 +570,30 @@ mod tests {
     }
 
     #[test]
+    fn an_sei_without_a_recovery_point_makes_no_keyframe_iso14496_10_d_2_7() {
+        // A user_data_unregistered message (payload type 5): a UUID, no recovery point.
+        let mut sei = vec![0x06, 5, 16];
+        sei.extend([0x5a; 16]);
+        sei.push(0x80);
+        let mut f = Feed::new();
+        f.push(1000, false, &sei);
+        f.push(1000, true, &slice(3));
+        assert!(!f.take()[0].keyframe);
+        assert_eq!(f.d.stats().keyframes, 0);
+    }
+
+    #[test]
+    fn access_units_of_one_timestamp_are_no_b_frames() {
+        // Two access units with the same RTP timestamp (RFC 6184 §5.1 lets
+        // them share one): the decode order never went back in time.
+        let mut f = Feed::new();
+        f.push(1000, true, &slice(3));
+        f.push(1000, true, &slice(4));
+        assert_eq!(f.take().len(), 2);
+        assert!(!f.d.stats().b_frames);
+    }
+
+    #[test]
     fn oversize_units_filler_and_violations_are_handled() {
         let mut f = Feed::new();
         f.d = Depacketizer::new(100, ParameterSets::default());
