@@ -1,9 +1,9 @@
 //! The RTSP source: one retina session per connection attempt on the
 //! source's own connection to the camera, its media TCP interleaved or,
-//! opt-in, RTP over UDP, the RTP receive path of `lotse-codec`
-//! ([`lotse_codec::rtp_ingest`]: the H.264 and H.265 normalizers, the
-//! side branch's depacketizers, the timelines) on its packets, RTCP Sender
-//! Reports as sync hints.
+//! opt-in, RTP over UDP, the RTP receive path of `lotse-codec` on its
+//! packets (see [`lotse_codec::rtp_ingest`], with the H.264 and H.265
+//! normalizers, the side branch's depacketizers and the timelines), RTCP
+//! Sender Reports as sync hints.
 //!
 //! Implements RFC 2326 (RTSP 1.0: DESCRIBE, SETUP, PLAY, TEARDOWN through
 //! retina), RFC 3550 §5.1 (packet header fields kept) and §6.4.1 (Sender
