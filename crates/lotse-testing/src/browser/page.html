@@ -89,7 +89,7 @@ function lotseSignaling() {
       out.daemon = { version: hello.version, api: hello.api };
       // Preloaded and live before the offer: the first frame comes from the
       // GOP cache, as for a preloaded camera.
-      await must({ type: "stream/put", stream_id: config.stream_id, sources: [{ protocol: config.url.slice(0, config.url.indexOf("://")), url: config.url }], preload: true });
+      await must({ type: "stream/put", stream_id: config.stream_id, sources: [{ protocol: config.url.slice(0, config.url.indexOf("://")).toLowerCase(), url: config.url }], preload: true });
       for (let i = 0; ; i++) {
         const stream = await must({ type: "stream/get", stream_id: config.stream_id });
         if (stream.state === "live") break;
