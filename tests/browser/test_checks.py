@@ -192,6 +192,40 @@ def test_each_shortfall_fails_alone(path: str, value: object, failure: str) -> N
     assert failures[0].startswith(failure), failures
 
 
+@pytest.mark.parametrize(
+    ("engine", "failures"),
+    [
+        ("safari", []),
+        ("chrome", ["a mean audio jitter-buffer delay above 0 and at most 250 ms"]),
+        (None, ["a mean audio jitter-buffer delay above 0 and at most 250 ms"]),
+    ],
+)
+def test_safari_alone_may_hold_audio_up_to_its_own_bound(
+    engine: str | None, failures: list[str]
+) -> None:
+    page = good_page()
+    # About the Safari 27.2 join case's 434.6 ms (nightly run of 2026-11-07): 442 ms.
+    set_path(page, f"{END_AUDIO}/jitterBufferDelay", 1_020 * 160 * 0.4346)
+    got = check(page, STREAM, engine=engine).failures
+    assert [failure.partition(" (got")[0] for failure in got] == failures
+
+
+def test_safari_audio_beyond_its_own_bound_fails() -> None:
+    page = good_page()
+    set_path(page, f"{END_AUDIO}/jitterBufferDelay", 1_020 * 160 * 0.501)
+    failures = check(page, STREAM, engine="safari").failures
+    assert len(failures) == 1, failures
+    assert failures[0].startswith("a mean audio jitter-buffer delay above 0 and at most 500 ms")
+
+
+def test_safari_video_keeps_the_common_bound() -> None:
+    page = good_page()
+    set_path(page, f"{END_VIDEO}/jitterBufferDelay", 610 * 0.2)
+    failures = check(page, STREAM, engine="safari").failures
+    assert len(failures) == 1, failures
+    assert failures[0].startswith("a mean video jitter-buffer delay above 0 and at most 150 ms")
+
+
 def test_one_lost_packet_in_a_thousand_passes() -> None:
     page = good_page()
     set_path(page, f"{END_AUDIO}/packetsLost", 1)

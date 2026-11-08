@@ -535,7 +535,7 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
         match next_event(&mut sub).await {
             TrackEvent::Frame(frame) if frame.epoch == 0 => {}
             TrackEvent::Frame(frame) => break frame,
-            TrackEvent::TrackChanged(codec) if control.is_empty() => {
+            TrackEvent::TrackChanged { codec, .. } if control.is_empty() => {
                 // The first attempt's in-band SPS, if subscribed before it.
                 assert!(
                     matches!(*codec, Codec::H264 { sps: Some(_), .. }),
