@@ -442,7 +442,7 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
     }
     let hosts = bind(&preferred(&channel.local_addrs)).await;
     let addrs: Vec<SocketAddr> = hosts.iter().map(|(addr, _)| *addr).collect();
-    let engine = match IngestEngine::offer(&options, &addrs, started, ctx.time.now()) {
+    let mut engine = match IngestEngine::offer(&options, &addrs, started, ctx.time.now()) {
         Ok(engine) => engine,
         Err(reason) => {
             let error = SourceError::Unreachable(format!("webrtc: {reason}"));
@@ -450,6 +450,9 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
             return error;
         }
     };
+    // Its losses and refusals in the connection's counters, as the RTSP
+    // source counts them.
+    engine.count_into(ctx.tracks.ingest());
     hand_over(&engine, &channel);
     let attempt = Attempt {
         engine,
