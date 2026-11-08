@@ -907,6 +907,162 @@
           ],
           "title": "RecordingCreateCommand",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`signaling/subscribe`: a subscription to the offers of one\nstream's signaled sources, or of every stream's. Its end\n(`unsubscribe`, the connection's close, a supersede) ends every\nsignal it holds at once, live ones included, without `closed`:\ntheir sources connect again after their backoff.",
+          "properties": {
+            "id": {
+              "description": "The command id, which becomes the subscription id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "description": "One stream, or all when absent.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "signaling/subscribe",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "title": "SignalingSubscribeCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`signaling/answer`: the camera's answer to a signal's offer.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sdp": {
+              "description": "The SDP answer.",
+              "maxLength": 65536,
+              "type": "string"
+            },
+            "signal_id": {
+              "description": "The signal, as its `offer` event named it.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "signaling/answer",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "signal_id",
+            "sdp"
+          ],
+          "title": "SignalingAnswerCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`signaling/candidate`: a candidate of the camera's for a signal.",
+          "properties": {
+            "candidate": {
+              "description": "The `candidate:` attribute value; empty is end-of-candidates\n(RFC 8838 §13).",
+              "maxLength": 1024,
+              "type": "string"
+            },
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sdp_mid": {
+              "description": "The media section, when the camera named it.",
+              "maxLength": 1024,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sdp_mline_index": {
+              "description": "The media section's index, when the camera named it.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "signal_id": {
+              "description": "The signal.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "signaling/candidate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "signal_id",
+            "candidate"
+          ],
+          "title": "SignalingCandidateCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`signaling/error`: the camera failed a signal, which ends; once\nper signal.",
+          "properties": {
+            "code": {
+              "description": "The client's code, `^[a-z0-9_]{1,64}$`; not `signal_rejected`,\nthe supervisor's own for a rejection of the source's signaling\n(`invalid_request`).",
+              "pattern": "^[a-z0-9_]{1,64}$",
+              "type": "string"
+            },
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "message": {
+              "description": "For humans.",
+              "maxLength": 1024,
+              "type": "string"
+            },
+            "signal_id": {
+              "description": "The signal.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "signaling/error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "signal_id",
+            "code",
+            "message"
+          ],
+          "title": "SignalingErrorCommand",
+          "type": "object"
         }
       ]
     },
@@ -1063,7 +1219,7 @@
       "type": "object"
     },
     "Empty": {
-      "description": "An empty result (`stream/delete`, `unsubscribe`, the subscriptions,\n`webrtc/candidate`, `session/close`).",
+      "description": "An empty result (`stream/delete`, `unsubscribe`, the subscriptions,\n`webrtc/candidate`, `session/close`, `signaling/answer`,\n`signaling/candidate`, `signaling/error`).",
       "type": "object"
     },
     "ErrorCode": {
@@ -1203,6 +1359,11 @@
           "const": "recording_already_fetched",
           "description": "`GET /v0/recording/{recording_id}` (HTTP 409) of a recording whose bytes another\nrequest already took: a recording has one body.",
           "type": "string"
+        },
+        {
+          "const": "signal_not_found",
+          "description": "`signaling/answer`, `signaling/candidate` or `signaling/error` of a\nsignal that is not open, or that another control connection owns.",
+          "type": "string"
         }
       ]
     },
@@ -1236,6 +1397,31 @@
       "properties": {
         "event": {
           "$ref": "#/$defs/SessionEvent",
+          "description": "The event."
+        },
+        "id": {
+          "description": "The subscription's command id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/EventTag",
+          "description": "`\"event\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "event"
+      ],
+      "type": "object"
+    },
+    "EventFrame_for_SignalingEvent": {
+      "description": "An `event` of a subscription; `id` is the subscribing command's.",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/SignalingEvent",
           "description": "The event."
         },
         "id": {
@@ -1450,7 +1636,7 @@
           "type": "array"
         },
         "signaled_protocols": {
-          "description": "The protocols of the sources whose signaling the client relays\n(`webrtc`), which `stream/put` names by `protocol` instead of a\nURL.",
+          "description": "The protocols of the sources whose signaling the client relays\n(`webrtc`), which `stream/put` names by `protocol` instead of a\nURL; their offers come through `signaling/subscribe`.",
           "items": {
             "type": "string"
           },
@@ -2420,9 +2606,64 @@
         }
       ]
     },
+    "SignalCloseCode": {
+      "description": "The code of a signaling `closed` event: every reason a signal may end,\nand nothing else.",
+      "oneOf": [
+        {
+          "const": "source_stopped",
+          "description": "The source stopped: no one wants the stream any more, it was\ndeleted, or the daemon shuts down.",
+          "type": "string"
+        },
+        {
+          "const": "answer_timeout",
+          "description": "The camera's answer did not come in time.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_answer",
+          "description": "The camera's answer could not be used.",
+          "type": "string"
+        },
+        {
+          "const": "ice_failed",
+          "description": "ICE found no working candidate pair in time (RFC 8445 §8.1).",
+          "type": "string"
+        },
+        {
+          "const": "consent_lost",
+          "description": "The camera stopped answering ICE consent checks (RFC 7675 §5.1).",
+          "type": "string"
+        },
+        {
+          "const": "peer_closed",
+          "description": "The camera closed the connection (a DTLS `close_notify` alert,\nRFC 5246 §7.2.1).",
+          "type": "string"
+        },
+        {
+          "const": "camera_error",
+          "description": "The client ended the signal with `signaling/error`, the camera's\nerror.",
+          "type": "string"
+        },
+        {
+          "const": "signaling_lost",
+          "description": "The source lost its signaling: the relay toward the client failed.",
+          "type": "string"
+        },
+        {
+          "const": "worker_gone",
+          "description": "The connection's worker process exited.",
+          "type": "string"
+        },
+        {
+          "const": "internal_error",
+          "description": "An invariant failed, or the worker reported a code the API does\nnot know; a bug, always logged with context.",
+          "type": "string"
+        }
+      ]
+    },
     "SignaledSource": {
       "additionalProperties": false,
-      "description": "A source whose signaling the client relays, named by its protocol: a\n`stream/put` source of a protocol in `info.signaled_protocols`.",
+      "description": "A source whose signaling the client relays, named by its protocol: a\n`stream/put` source of a protocol in `info.signaled_protocols`. Its\nconnection attempts offer through `signaling/subscribe`.",
       "properties": {
         "options": {
           "additionalProperties": true,
@@ -2439,6 +2680,127 @@
         "protocol"
       ],
       "type": "object"
+    },
+    "SignalingEvent": {
+      "description": "An event of `signaling/subscribe`. Never coalesced or shed: a client\ntoo slow to take one is disconnected (close code 1008), and the\nsignals of its subscription end. Each variant's schema title names the\nPython client's class for it.",
+      "oneOf": [
+        {
+          "description": "A connection attempt of a signaled source opened the signal\n`signal_id` and offers this SDP; the first event of every signal.\nThe signal belongs to this subscription: only its control\nconnection may answer, trickle or end it.",
+          "properties": {
+            "protocol": {
+              "description": "The signaled source's protocol (`webrtc`), one of\n`info.signaled_protocols`.",
+              "type": "string"
+            },
+            "sdp": {
+              "description": "The SDP offer (RFC 8829 §5.2).",
+              "type": "string"
+            },
+            "signal_id": {
+              "description": "The signal, a ULID, new for every connection attempt.",
+              "type": "string"
+            },
+            "stream_id": {
+              "description": "The stream whose source offers: the camera the client relays\nthe offer to, as a signaled source has no address.",
+              "type": "string"
+            },
+            "type": {
+              "const": "offer",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "signal_id",
+            "stream_id",
+            "protocol",
+            "sdp"
+          ],
+          "title": "SignalingEventOffer",
+          "type": "object"
+        },
+        {
+          "description": "A candidate of the source's, trickled after the offer (RFC 8838\n§8); an empty `candidate` is end-of-candidates for its media\nsection (§8.2, §13), after which none of that section follows.",
+          "properties": {
+            "candidate": {
+              "description": "The `candidate:` attribute value, or empty.",
+              "type": "string"
+            },
+            "sdp_mid": {
+              "description": "The media section it belongs to, when the source named it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sdp_mline_index": {
+              "description": "The media section's index; always set, 0 for the first.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "signal_id": {
+              "description": "The signal.",
+              "type": "string"
+            },
+            "type": {
+              "const": "candidate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "signal_id",
+            "candidate",
+            "sdp_mline_index"
+          ],
+          "title": "SignalingEventCandidate",
+          "type": "object"
+        },
+        {
+          "description": "The signal ended; nothing more about it follows, and the client\nends the camera's session. A source whose attempt ended connects\nagain after its backoff, with a new signal.",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/SignalCloseCode",
+              "description": "The stable code."
+            },
+            "message": {
+              "description": "For humans; may change.",
+              "type": "string"
+            },
+            "signal_id": {
+              "description": "The signal.",
+              "type": "string"
+            },
+            "type": {
+              "const": "closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "signal_id",
+            "code",
+            "message"
+          ],
+          "title": "SignalingEventClosed",
+          "type": "object"
+        },
+        {
+          "description": "Another `signaling/subscribe` took this subscription's scope (the\nsame stream, or every stream): the last event, after which the\nsubscription has ended and its signals with it, without a `closed`\neach; their sources connect again, offering to the new subscription.",
+          "properties": {
+            "type": {
+              "const": "superseded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "SignalingEventSuperseded",
+          "type": "object"
+        }
+      ]
     },
     "SourceBackchannel": {
       "description": "A source's backchannel as `stream/get` reports it: the camera's reverse\naudio path (an RTSP camera's ONVIF backchannel, ONVIF Streaming\nSpecification §5.3), one per connection.",
@@ -3743,6 +4105,9 @@
     "session/adopt": {
       "$ref": "#/$defs/EventFrame_for_SessionEvent"
     },
+    "signaling/subscribe": {
+      "$ref": "#/$defs/EventFrame_for_SignalingEvent"
+    },
     "stream/subscribe": {
       "$ref": "#/$defs/EventFrame_for_StreamEvent"
     },
@@ -3795,6 +4160,18 @@
     },
     "session/list": {
       "$ref": "#/$defs/Success_for_SessionList"
+    },
+    "signaling/answer": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "signaling/candidate": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "signaling/error": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "signaling/subscribe": {
+      "$ref": "#/$defs/Success_for_Empty"
     },
     "stream/delete": {
       "$ref": "#/$defs/Success_for_Empty"

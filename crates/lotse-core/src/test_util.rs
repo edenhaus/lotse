@@ -878,8 +878,9 @@ fn pcmu_packet(arrival: Instant, seq: u16) -> MediaPacket {
 }
 
 /// The offer a [`FakeSignaledSource`] sends: no SDP a peer could answer,
-/// but it starts as SDP does (`v=0`, RFC 8866 §5.1).
-pub const FAKE_SIGNALED_OFFER: &str = "v=0 fake signaled offer";
+/// but well-formed lines of it (RFC 8866 §5), its version line (§5.1)
+/// first, so the supervisor's check of a worker's offer passes it.
+pub const FAKE_SIGNALED_OFFER: &str = "v=0\r\ns=fake signaled offer\r\n";
 
 /// The priority of a fake host candidate on component 1: RFC 8445
 /// §5.1.2.1's formula with the host type preference 126 and the highest

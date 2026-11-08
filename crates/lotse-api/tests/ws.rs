@@ -144,7 +144,11 @@ impl Handler for FakeHandler {
             | Command::SessionList(_)
             | Command::SessionClose(_)
             | Command::SessionAdopt(_)
-            | Command::BackchannelRelease(_) => Outcome::Result(json!({})),
+            | Command::BackchannelRelease(_)
+            | Command::SignalingSubscribe(_)
+            | Command::SignalingAnswer(_)
+            | Command::SignalingCandidate(_)
+            | Command::SignalingError(_) => Outcome::Result(json!({})),
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)
@@ -570,6 +574,7 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
             6,
             json!({ "type": "recording/create", "stream_id": "a", "duration_ms": 1_000 }),
         ),
+        (7, json!({ "type": "signaling/subscribe" })),
     ] {
         let mut frame = frame;
         frame["id"] = json!(id);
@@ -586,14 +591,15 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
         .filter(|line| line.contains("subscription limit of the connection reached"))
         .map(str::to_owned)
         .collect();
-    assert_eq!(refusals.len(), 4, "{refusals:?}");
+    assert_eq!(refusals.len(), 5, "{refusals:?}");
     assert!(
         refusals[2].contains("id=5") && refusals[2].contains("session/adopt"),
         "{refusals:?}"
     );
     assert!(refusals[3].contains("recording/create"), "{refusals:?}");
+    assert!(refusals[4].contains("signaling/subscribe"), "{refusals:?}");
     // Other commands are not affected.
-    send(&mut ws, json!({ "id": 7, "type": "info" })).await;
+    send(&mut ws, json!({ "id": 8, "type": "info" })).await;
     assert_eq!(recv(&mut ws).await["result"]["version"], "0.0.0-test");
 
     // The session's channel closes: its subscription ended and frees a slot.
