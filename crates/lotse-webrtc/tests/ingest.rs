@@ -932,6 +932,82 @@ fn rfc3550_8_2_a_new_synchronization_source_s_losses_count_from_its_own_numbers(
     );
 }
 
+/// RFC 3550 §5.1: a late packet sent before the camera's timestamps
+/// jumped, delayed or retransmitted past the jump, is dropped: handed on,
+/// it would start a new timeline back and the next packet another one
+/// forward, and a few of them would end the attempt
+/// (`RtpTracks`' `MAX_TIMELINES`). One merely late on the current
+/// timeline is still handed on.
+#[test]
+fn rfc3550_5_1_a_late_packet_from_before_a_timestamp_jump_is_dropped() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false), |answer| answer);
+    pair.connect();
+    pair.step(Duration::from_millis(1));
+    // One packet `seq` at timestamp `ts`, through to the engine.
+    let send = |pair: &mut Pair, seq: u16, ts: u32| {
+        pair.camera().seq = seq;
+        pair.camera().ts = ts.wrapping_sub(3_000);
+        pair.frame(false);
+    };
+    // 1 001 to 1 005 delayed on the way, or lost and repaired later.
+    send(&mut pair, 1_000, 900_000);
+    // The camera's timestamps jumped back 10 s; its numbers went on.
+    send(&mut pair, 1_006, 3_000);
+    for n in 1..=5 {
+        // The packets from before arrive, among the new ones (str0m
+        // drops a repeated number itself).
+        send(&mut pair, 1_000 + n, 900_000 + 3_000 * u32::from(n));
+        send(&mut pair, 1_006 + 2 * n, 3_000 + 6_000 * u32::from(n));
+    }
+    // A late one of the new timeline: handed on.
+    send(&mut pair, 1_009, 9_000);
+    assert_eq!(pair.engine.stats().stale_packets, 5);
+    assert_eq!(
+        pair.rtp()
+            .iter()
+            .map(|(_, seq, _)| *seq)
+            .collect::<Vec<_>>(),
+        [1_000, 1_006, 1_008, 1_010, 1_012, 1_014, 1_016, 1_009]
+    );
+    assert!(pair.ended().is_none(), "{:?}", pair.ended());
+}
+
+/// A camera that keeps changing its SSRC (RFC 3550 §8.2) among more
+/// than the stream keeps the numbers of: every packet is a new source's
+/// first, logged at most once per summary interval.
+#[test]
+fn rfc3550_8_2_new_synchronization_sources_are_logged_once_per_interval() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish(),
+    );
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false), |answer| answer);
+    pair.connect();
+    pair.step(Duration::from_millis(1));
+    for round in 0..4_u32 {
+        for ssrc in 0..5_u32 {
+            pair.camera().new_ssrc(0x1000 + 2 * ssrc);
+            pair.camera().seq = u16::try_from(round).unwrap();
+            pair.frame(false);
+        }
+    }
+    assert_eq!(pair.engine.stats().rtp_packets, 20);
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("webrtc: a new synchronization source").count(),
+        1,
+        "{logs}"
+    );
+}
+
 #[test]
 fn an_offer_over_what_the_relay_takes_is_not_made() {
     let _logs = logs();
