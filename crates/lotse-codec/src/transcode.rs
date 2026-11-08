@@ -700,8 +700,12 @@ async fn run(mut chain: Chain, mut input: FrameSubscription, stop: CancellationT
     tracing::info!(track = %chain.output.id(), reason, "transcoder stopped");
 }
 
+/// The tests' log capture, shared with the RTP receive path's tests.
 #[cfg(test)]
-pub(crate) mod tests {
+pub(crate) use tests::Logs;
+
+#[cfg(test)]
+mod tests {
     #![allow(
         clippy::arithmetic_side_effects,
         clippy::missing_docs_in_private_items,

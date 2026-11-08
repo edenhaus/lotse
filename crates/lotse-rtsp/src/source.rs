@@ -369,13 +369,26 @@ fn refuse_decoding_order(declared: Declared, sdp: &[u8]) -> Declared {
     }
 }
 
+/// A stream of the `DESCRIBE` answer the source sets up: its index among
+/// the session's streams, its RTP payload type and the track it declares.
+/// The payload type is read when the stream is picked, so carrying it
+/// never looks the index up again.
+struct Chosen {
+    /// The stream's index among the session's streams.
+    index: usize,
+    /// The RTP payload type the SDP gave the stream.
+    pt: u8,
+    /// The track the stream declares.
+    declared: Declared,
+}
+
 /// Picks the first video and the first audio stream of the SDP the
 /// camera sends; `sdp` is the description retina parsed the streams from,
 /// read for what retina does not expose. The session never asks for the
 /// backchannel, so the camera describes none (ONVIF Streaming
 /// Specification §5.3.1) and every stream is one the camera sends.
-fn select(streams: &[Stream], sdp: &[u8]) -> Vec<(usize, Declared)> {
-    let mut chosen: Vec<(usize, Declared)> = Vec::new();
+fn select(streams: &[Stream], sdp: &[u8]) -> Vec<Chosen> {
+    let mut chosen: Vec<Chosen> = Vec::new();
     for (index, stream) in streams.iter().enumerate() {
         let (sets, extra) = parameters(stream);
         let Some(declared) = declare(
@@ -389,10 +402,14 @@ fn select(streams: &[Stream], sdp: &[u8]) -> Vec<(usize, Declared)> {
             continue;
         };
         let declared = refuse_decoding_order(declared, sdp);
-        if chosen.iter().any(|(_, d)| d.kind == declared.kind) {
+        if chosen.iter().any(|c| c.declared.kind == declared.kind) {
             continue;
         }
-        chosen.push((index, declared));
+        chosen.push(Chosen {
+            index,
+            pt: stream.rtp_payload_type(),
+            declared,
+        });
     }
     chosen
 }
@@ -427,29 +444,36 @@ pub(crate) async fn within_on<T>(
 
 /// The streams of the `DESCRIBE` answer to set up ([`select`]), or a
 /// protocol error when there is none.
-fn choose(streams: &[Stream], sdp: &[u8]) -> Result<Vec<(usize, Declared)>, SourceError> {
+fn choose(streams: &[Stream], sdp: &[u8]) -> Result<Vec<Chosen>, SourceError> {
     let chosen = select(streams, sdp);
     if chosen.is_empty() {
         return Err(SourceError::Protocol(
             "the SDP describes no video or audio stream".into(),
         ));
     }
-    for (index, declared) in &chosen {
+    for Chosen {
+        index, declared, ..
+    } in &chosen
+    {
         tracing::info!(index, kind = %declared.kind, codec = declared.codec.name(), clock_rate = declared.clock_rate, "rtsp: setting up");
     }
     Ok(chosen)
 }
 
 /// Declares a track for each of the `chosen` streams, set up by now:
-/// the receive path of each, by its stream index of `streams`.
-fn carry(streams: &[Stream], chosen: &[(usize, Declared)], ctx: &mut SourceCtx) -> RtpTracks {
+/// the receive path of each, by its stream index.
+fn carry(chosen: &[Chosen], ctx: &mut SourceCtx) -> RtpTracks {
     let mut carried = RtpTracks::new(PROTOCOL);
-    for (index, declared) in chosen {
+    for Chosen {
+        index,
+        pt,
+        declared,
+    } in chosen
+    {
         let track = ctx
             .tracks
             .declare(declared.kind, declared.codec.clone(), declared.clock_rate);
-        let pt = streams.get(*index).map_or(0, Stream::rtp_payload_type);
-        carried.carry(*index, track, pt, declared);
+        carried.carry(*index, track, *pt, declared);
     }
     carried
 }
@@ -495,7 +519,7 @@ async fn set_up(
     // `rtsps` with UDP is refused at validation: plain datagrams would
     // carry what the TLS session protects.
     let udp = ask.camera.options.transport == MediaTransport::Udp;
-    for (index, _) in &chosen {
+    for Chosen { index, .. } in &chosen {
         within(ctx, deadline, "SETUP", async {
             let set_up = if udp {
                 let pair = Pair::bind(ask.camera.addr.ip())?;
@@ -507,7 +531,7 @@ async fn set_up(
         })
         .await?;
     }
-    let carried = carry(driver.streams(), &chosen, ctx);
+    let carried = carry(&chosen, ctx);
     within(ctx, deadline, "PLAY", async {
         driver
             .play(play_options())
