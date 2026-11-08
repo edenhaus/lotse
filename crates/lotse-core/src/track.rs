@@ -1819,9 +1819,15 @@ impl Track {
     }
 
     /// Whether a request was made that no keyframe broadcast after it
-    /// answered yet ([`KeyframeRequests::is_wanted`]).
+    /// answered yet ([`KeyframeRequests::is_wanted`]). A staging track's
+    /// is its live counterpart's: the viewers ask that one, which hands
+    /// their requests to the standby's source after a switch and takes
+    /// the standby's keyframes that answer them.
     pub(crate) fn keyframe_wanted(&self) -> bool {
-        self.keyframe_wanted.load(Ordering::SeqCst)
+        match self.forwarded() {
+            Some(target) => target.keyframe_wanted(),
+            None => self.keyframe_wanted.load(Ordering::SeqCst),
+        }
     }
 
     /// Hands a request to the source feeding the track at `now`, for

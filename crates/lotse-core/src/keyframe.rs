@@ -329,6 +329,38 @@ mod tests {
         );
     }
 
+    /// After a switch the standby's source takes the live track's
+    /// requests, and asks whether one is still wanted where the viewers
+    /// ask and its keyframes land: the live track. A source that deferred
+    /// a request (the WebRTC ingest, under its PLI spacing) so keeps it
+    /// until a keyframe broadcast after it, not dropping it at once.
+    #[test]
+    fn after_a_standby_switch_its_source_sees_the_live_track_s_wanted_request() {
+        let t0 = SystemClock.now();
+        let set = TrackSet::new(TrackLimits::default(), t0);
+        let video = set.publisher().declare(Kind::Video, h264(), 90_000);
+        let staging = TrackSet::staging(&set);
+        let standby_video = staging.publisher().declare(Kind::Video, h264(), 90_000);
+        let standby_requests = standby_video.keyframe_requests();
+        staging.arm_switch();
+        // The standby's first keyframe switches.
+        assert!(standby_video.publish_frame(frame(true, t0 + ms(100))));
+        assert!(staging.is_active());
+        assert!(!standby_requests.is_wanted());
+
+        assert_eq!(
+            video.request_keyframe(t0 + ms(200)),
+            KeyframeOutcome::Forwarded
+        );
+        assert!(standby_requests.is_requested());
+        assert!(standby_requests.is_wanted(), "the live track's request");
+        // A delta frame answers nothing; the standby's next keyframe does.
+        assert!(standby_video.publish_frame(frame(false, t0 + ms(300))));
+        assert!(standby_requests.is_wanted());
+        assert!(standby_video.publish_frame(frame(true, t0 + ms(400))));
+        assert!(!standby_requests.is_wanted());
+    }
+
     #[test]
     fn during_a_standby_switch_requests_go_to_the_source_that_feeds_the_track() {
         let t0 = SystemClock.now();
