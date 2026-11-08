@@ -72,8 +72,21 @@
 //!
 //! A worker that can no longer be told what to do is killed, so its exit
 //! runs the crash path and the machine restarts it with backoff: one whose
-//! channel ended while it runs, and one that sent nothing for
-//! [`WORKER_SILENCE_LIMIT`] (a worker sends its counters every second).
+//! channel ended while it runs, one that sent nothing for
+//! [`WORKER_SILENCE_LIMIT`] (a worker sends its counters every second),
+//! and one that took no message within [`CONTROL_WRITE_DEADLINE`]. The
+//! driver writes to its worker inline, so a worker that stops reading its
+//! control channel would otherwise hold the driver, and with it the
+//! stream's demand, its worker's silence timer and its removal, for good;
+//! the worker's every write is bounded instead ([`Worker`]), and one that
+//! times out kills it. A write that fails is so followed by the worker's
+//! exit, which the call sites count on: they log the failure and leave the
+//! rest to the crash path. A wake waits on a write for at most the
+//! deadline, so the registry dropping the connection, and with it the
+//! supervisor's shutdown, waits behind one at most that long: within the
+//! shutdown budget the supervisor gives its drivers.
+//!
+//! [`CONTROL_WRITE_DEADLINE`]: crate::worker::CONTROL_WRITE_DEADLINE
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -821,7 +834,8 @@ impl Driver {
                 if let Some(worker) = self.worker.as_mut()
                     && let Err(err) = worker.grant_connect().await
                 {
-                    // The exit follows and gives the permit back.
+                    // The exit follows (a timed-out write killed the worker)
+                    // and gives the permit back.
                     tracing::warn!(pid = worker.pid(), error = %err, "connect grant could not be sent to the worker");
                 }
             }
@@ -829,7 +843,8 @@ impl Driver {
                 if let Some(worker) = self.worker.as_mut()
                     && let Err(err) = worker.grant_probe_connect(self.probe).await
                 {
-                    // The exit follows and gives the permit back.
+                    // The exit follows (a timed-out write killed the worker)
+                    // and gives the permit back.
                     tracing::warn!(pid = worker.pid(), error = %err, "probe connect grant could not be sent to the worker");
                 }
             }
@@ -4591,7 +4606,7 @@ mod tests {
         assert!(matches!(&wake, Wake::SwitchResolved(Ok(addrs)) if addrs.is_empty()));
         let worker = driver.worker.take().unwrap();
         drop(driver);
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4756,7 +4771,7 @@ mod tests {
         assert!(driver.signal_opens.is_empty());
         let worker = driver.worker.take().unwrap();
         drop(driver);
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4930,7 +4945,7 @@ mod tests {
         assert!(shared.lock().take_held_signals("c1", true).is_empty());
         let worker = driver.worker.take().unwrap();
         drop(driver);
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4988,7 +5003,7 @@ mod tests {
         );
         let worker = driver.worker.take().unwrap();
         drop(driver);
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5041,7 +5056,7 @@ mod tests {
         assert!(stale[0].contains("worker=1 running=2"), "{stale:?}");
         let worker = driver.worker.take().unwrap();
         drop(driver);
-        let _status = worker.stop(Duration::from_millis(200), &shared.clock).await;
+        let _status = worker.stop(Duration::from_millis(200)).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5054,6 +5069,86 @@ mod tests {
             queued.push(command);
         }
         queued
+    }
+
+    /// Regression (the Copilot finding on PR #112): a worker that opens
+    /// signaling requests and never reads the refusals filled its control
+    /// socket, and the driver's next refusal waited for room for good: the
+    /// stream could no longer follow its demand, time its worker's silence
+    /// or be removed. The write's deadline ends the wait, the worker is
+    /// killed and restarted as a crash, later writes fail at once, and the
+    /// driver goes on.
+    #[tokio::test]
+    async fn a_worker_that_reads_no_signaling_refusal_is_killed_and_the_driver_goes_on() {
+        use crate::test_support::{fill_control, settled};
+        use crate::worker::CONTROL_WRITE_DEADLINE;
+        let dir = private_dir("driver-deaf-signaling");
+        let clock = Arc::new(FakeClock::from_system());
+        let shared = shared_with(&worker_script(&dir, "exec sleep 30"), clock.clone());
+        let (demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = signaled_driver(&shared, demand);
+        demand_tx.send_replace(PRELOAD);
+        step(&mut driver).await;
+        assert_eq!(bounded_step(&mut driver).await, "resolved:true");
+        fill_control(driver.worker.as_mut().unwrap()).await;
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        // Two opens wait, a third is refused at once.
+        for request in [1, 2, 3] {
+            driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request }));
+        }
+        let refusal = next_wake(&mut driver).await;
+        assert!(
+            matches!(
+                &refusal,
+                Wake::Command(DriverCommand::Signal {
+                    command: SignalCommand::Refused { request: 3, .. },
+                    ..
+                })
+            ),
+            "the refusal of the third"
+        );
+        {
+            let mut handled = std::pin::pin!(driver.handle(refusal));
+            let real = Duration::from_millis(200);
+            assert!(
+                settled(&mut handled, real).await.is_none(),
+                "the refusal waits for room"
+            );
+            clock.advance(CONTROL_WRITE_DEADLINE);
+            assert!(
+                settled(&mut handled, Duration::from_secs(5))
+                    .await
+                    .is_some(),
+                "the deadline ends the wait"
+            );
+        }
+        assert_eq!(captured.lines("worker killed").len(), 1);
+        // The next refusal fails at once, the clock standing still.
+        driver.on_worker_event(WorkerEvent::Signal(SignalReport::Open { request: 4 }));
+        let refusal = next_wake(&mut driver).await;
+        {
+            let mut handled = std::pin::pin!(driver.handle(refusal));
+            assert!(
+                settled(&mut handled, Duration::from_secs(5))
+                    .await
+                    .is_some(),
+                "at once"
+            );
+        }
+        let unsent = captured.lines("signal command could not be sent to the worker");
+        assert_eq!(unsent.len(), 1, "rate-limited: {unsent:?}");
+        assert!(unsent[0].contains("abandoned"), "{unsent:?}");
+        // The kill's exit runs the crash path, and the driver follows its
+        // demand on.
+        assert_eq!(step_to_exit(&mut driver).await, "exited:Some(9)");
+        assert_eq!(driver.machine.crashes(), 1);
+        assert_eq!(driver.machine.state(), ConnectionState::Restarting);
+        demand_tx.send_replace(Demand::default());
+        step(&mut driver).await;
+        assert_eq!(driver.machine.state(), ConnectionState::Idle);
+        drop((driver, demand_tx));
+        wind_down(&shared, &clock, dir).await;
     }
 
     #[tokio::test]

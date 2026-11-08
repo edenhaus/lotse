@@ -13,8 +13,7 @@
 //! flood the log either.
 //!
 //! The worker must not hold the supervisor up either: every message to it
-//! goes out within [`CONTROL_WRITE_DEADLINE`] or not at all
-//! ([`Worker::send`]). A worker that stops reading its control channel
+//! goes out within [`CONTROL_WRITE_DEADLINE`] or not at all. A worker that stops reading its control channel
 //! fills the socket's send buffer, and a write would then wait for good;
 //! one that waited out the deadline gives up on the channel, so every later
 //! write fails at once, and kills the worker, whose exit runs the crash
@@ -57,7 +56,9 @@ use crate::worker_text::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES};
 pub(crate) const MAX_TRACKS: usize = 32;
 
 /// How long one message to a worker may wait for room in its control
-/// socket before the supervisor gives up on the worker ([`Worker::send`]).
+/// socket before the supervisor gives up on the worker: the write fails
+/// with [`IpcError::Stalled`], as does every later one, and the worker is
+/// killed.
 ///
 /// A healthy worker takes its control messages as its loop turns, and the
 /// socket's send buffer holds a few hundred of the usual ones (about
@@ -69,10 +70,10 @@ pub(crate) const MAX_TRACKS: usize = 32;
 /// ([`SHUTDOWN_BUDGET`](crate::SHUTDOWN_BUDGET)), the time a healthy worker
 /// is given to take its `Shutdown` and finish everything, so a driver held
 /// up by a write still stops within the time the supervisor waits for its
-/// drivers at shutdown; and a fifth of the
-/// [`WORKER_SILENCE_LIMIT`](crate::driver::WORKER_SILENCE_LIMIT) after which
-/// a worker that sends nothing is taken for hung.
-pub(crate) const CONTROL_WRITE_DEADLINE: Duration = Duration::from_secs(2);
+/// drivers at shutdown; and a fifth of the ten seconds after which a
+/// worker that sends nothing is taken for hung (the driver's
+/// `WORKER_SILENCE_LIMIT`).
+pub const CONTROL_WRITE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How a worker is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,7 +613,7 @@ impl Worker {
                 self.stalled = true;
                 tracing::warn!(
                     pid = self.pid,
-                    message = message.name(),
+                    kind = message.name(),
                     deadline_ms,
                     "worker took no control message within the deadline; its channel is given up on"
                 );
@@ -635,8 +636,7 @@ impl Worker {
     /// Tells the worker which source to run.
     pub async fn run_source(&mut self, spec: &SourceSpec) -> Result<(), IpcError> {
         self.send_pending_sockets().await?;
-        self.send(&ToWorker::RunSource(spec.clone()), &[])
-            .await
+        self.send(&ToWorker::RunSource(spec.clone()), &[]).await
     }
 
     /// Lets the connection attempt the worker announced go ahead: the
@@ -648,24 +648,21 @@ impl Worker {
     /// Tells the worker to connect `spec` as the standby of its source and
     /// switch to it at its first keyframe.
     pub async fn switch_source(&mut self, spec: &SourceSpec) -> Result<(), IpcError> {
-        self.send(&ToWorker::SwitchSource(spec.clone()), &[])
-            .await
+        self.send(&ToWorker::SwitchSource(spec.clone()), &[]).await
     }
 
     /// Tells the worker whether its connection asks for the camera's
     /// backchannel from now on (`asks`): its sources turn their probe on
     /// or off, and nothing restarts.
     pub async fn backchannel(&mut self, asks: bool) -> Result<(), IpcError> {
-        self.send(&ToWorker::Backchannel { asks }, &[])
-            .await
+        self.send(&ToWorker::Backchannel { asks }, &[]).await
     }
 
     /// Tells the worker its connection's pre-record window is `ms` from now
     /// on, 0 for none: its tracks keep or free their rings, and nothing
     /// reconnects.
     pub async fn prerecord(&mut self, ms: u32) -> Result<(), IpcError> {
-        self.send(&ToWorker::Prerecord { ms }, &[])
-            .await
+        self.send(&ToWorker::Prerecord { ms }, &[]).await
     }
 
     /// Starts the event recording `spec` on the worker's tracks, its bytes going
@@ -694,8 +691,7 @@ impl Worker {
 
     /// Lets the standby's announced attempt go ahead.
     pub async fn grant_switch_connect(&mut self) -> Result<(), IpcError> {
-        self.send(&ToWorker::SwitchConnectGranted, &[])
-            .await
+        self.send(&ToWorker::SwitchConnectGranted, &[]).await
     }
 
     /// Lets the probe `probe` the worker announced go ahead.
@@ -725,33 +721,32 @@ impl Worker {
     /// rest arrive as [`WorkerEvent::Session`] events.
     pub async fn open_session(&mut self, spec: &SessionSpec) -> Result<(), IpcError> {
         self.send_pending_sockets().await?;
-        self.send(&ToWorker::OpenSession(spec.clone()), &[])
-            .await
+        self.send(&ToWorker::OpenSession(spec.clone()), &[]).await
     }
 
     /// Passes a trickled remote candidate to a session.
     pub async fn candidate(&mut self, session_id: &str, candidate: &str) -> Result<(), IpcError> {
         self.send(
-                &ToWorker::RemoteCandidate {
-                    session_id: session_id.to_owned(),
-                    candidate: candidate.to_owned(),
-                },
-                &[],
-            )
-            .await
+            &ToWorker::RemoteCandidate {
+                session_id: session_id.to_owned(),
+                candidate: candidate.to_owned(),
+            },
+            &[],
+        )
+        .await
     }
 
     /// A re-offer for a session (`webrtc/renegotiate`); the worker
     /// answers with a `Renegotiated` or `RenegotiateRefused` report.
     pub async fn renegotiate(&mut self, session_id: &str, sdp: &str) -> Result<(), IpcError> {
         self.send(
-                &ToWorker::Renegotiate {
-                    session_id: session_id.to_owned(),
-                    sdp: sdp.to_owned(),
-                },
-                &[],
-            )
-            .await
+            &ToWorker::Renegotiate {
+                session_id: session_id.to_owned(),
+                sdp: sdp.to_owned(),
+            },
+            &[],
+        )
+        .await
     }
 
     /// Hands a session the relay candidate at `relayed`, on the
@@ -821,9 +816,7 @@ impl Worker {
     /// Tells the worker what the supervisor answers its signaled source's
     /// signaling with: an open's answer, or what the client relays.
     pub async fn signal(&mut self, command: &SignalCommand) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::Signal(command.clone()), &[])
-            .await
+        self.send(&ToWorker::Signal(command.clone()), &[]).await
     }
 
     /// Closes a session with this `closed` code.
@@ -834,14 +827,14 @@ impl Worker {
         message: &str,
     ) -> Result<(), IpcError> {
         self.send(
-                &ToWorker::CloseSession {
-                    session_id: session_id.to_owned(),
-                    code: code.to_owned(),
-                    message: message.to_owned(),
-                },
-                &[],
-            )
-            .await
+            &ToWorker::CloseSession {
+                session_id: session_id.to_owned(),
+                code: code.to_owned(),
+                message: message.to_owned(),
+            },
+            &[],
+        )
+        .await
     }
 
     /// The next event: a relayed message, or the exit. After `Exited`, every
@@ -859,7 +852,7 @@ impl Worker {
 
     /// Kills the process for `reason`, once: one whose channel ended, that
     /// went silent, or that took no message within the write deadline
-    /// ([`Worker::send`]) can no longer be told to stop. Its exit arrives as
+    /// ([`CONTROL_WRITE_DEADLINE`]) can no longer be told to stop. Its exit arrives as
     /// [`WorkerEvent::Exited`], which counts as a crash.
     pub fn kill(&mut self, reason: &'static str) {
         if self.killed {
@@ -876,9 +869,9 @@ impl Worker {
     ///
     /// The budget covers the whole stop, the `Shutdown` message included:
     /// a worker that takes no message is killed when the budget or the
-    /// write's own deadline ([`Worker::send`]) runs out, whichever comes
-    /// first, and one whose channel was given up on gets no message at
-    /// all.
+    /// write's own deadline ([`CONTROL_WRITE_DEADLINE`]) runs out,
+    /// whichever comes first, and one whose channel was given up on gets no
+    /// message at all.
     pub async fn stop(mut self, budget: Duration) -> ExitStatus {
         let deadline_ms = u32::try_from(budget.as_millis()).unwrap_or(u32::MAX);
         let pid = self.pid;
@@ -1718,6 +1711,173 @@ mod tests {
             "its channel is gone"
         );
         assert_eq!(captured.lines("worker exit could not be observed").len(), 1);
+    }
+
+    /// A worker at `dir/worker.sh` that never reads its control channel,
+    /// started on `clock`.
+    fn deaf_worker(dir: &std::path::Path, clock: Arc<dyn Clock>) -> Worker {
+        let script = dir.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut config = crate::test_support::environment("/bin/sh").worker;
+        config.binary = script;
+        WorkerManager::new(config, None, clock).spawn(&[]).unwrap()
+    }
+
+    /// Regression: a worker that stopped reading its control channel held
+    /// every write to it, and so its driver, for good. Once the socket's
+    /// send buffer is full a write waits for room (a non-blocking
+    /// `sendmsg(2)` on a full `AF_UNIX` stream socket fails with `EAGAIN`,
+    /// observed on Linux 6.18, 2026-11-08); the deadline, on the injected
+    /// clock, now ends the wait, kills the worker and gives its channel up,
+    /// so every later write fails at once.
+    #[tokio::test]
+    async fn a_write_to_a_worker_that_reads_nothing_ends_at_its_deadline_and_kills_the_worker() {
+        use crate::test_support::{fill_control, settled};
+        let dir = crate::test_support::private_dir("worker-deaf");
+        let clock = Arc::new(FakeClock::default());
+        let mut worker = deaf_worker(&dir, clock.clone());
+        fill_control(&mut worker).await;
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let deadline_ms = 2_000;
+        assert_eq!(CONTROL_WRITE_DEADLINE, Duration::from_millis(deadline_ms));
+        {
+            let mut write = std::pin::pin!(worker.grant_connect());
+            let real = Duration::from_millis(200);
+            assert!(settled(&mut write, real).await.is_none(), "the write waits");
+            clock.advance(
+                CONTROL_WRITE_DEADLINE
+                    .checked_sub(Duration::from_millis(1))
+                    .unwrap(),
+            );
+            assert!(
+                settled(&mut write, real).await.is_none(),
+                "not before the deadline"
+            );
+            clock.advance(Duration::from_millis(1));
+            let err = settled(&mut write, Duration::from_secs(5))
+                .await
+                .expect("the deadline ends the write")
+                .unwrap_err();
+            assert!(
+                matches!(err, IpcError::Stalled { deadline_ms: 2_000 }),
+                "{err}"
+            );
+        }
+        let lines = captured.lines("worker took no control message within the deadline");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let pid = worker.pid();
+        for field in [
+            format!("pid={pid}"),
+            "kind=\"connect_granted\"".to_owned(),
+            "deadline_ms=2000".to_owned(),
+        ] {
+            assert!(lines[0].contains(&field), "{field}: {lines:?}");
+        }
+        let killed = captured.lines("worker killed");
+        assert_eq!(killed.len(), 1, "{killed:?}");
+        assert!(killed[0].contains("control write timed out"), "{killed:?}");
+        // Every later write fails at once, the clock standing still, and
+        // the worker is killed only once.
+        let signal = SignalCommand::Gone {
+            signal_id: "01JSIG".into(),
+        };
+        {
+            let mut write = std::pin::pin!(worker.signal(&signal));
+            let err = settled(&mut write, Duration::from_secs(5))
+                .await
+                .expect("at once")
+                .unwrap_err();
+            assert!(
+                matches!(err, IpcError::Stalled { deadline_ms: 2_000 }),
+                "{err}"
+            );
+        }
+        let err = worker.prerecord(0).await.unwrap_err();
+        assert!(matches!(err, IpcError::Stalled { .. }), "{err}");
+        assert_eq!(captured.lines("worker killed").len(), 1);
+        assert_eq!(
+            captured
+                .lines("worker took no control message within the deadline")
+                .len(),
+            1
+        );
+        // Its exit counts as a crash.
+        let mut event = WorkerEvent::ChannelClosed;
+        while event == WorkerEvent::ChannelClosed {
+            event = worker.next_event().await;
+        }
+        assert!(
+            matches!(&event, WorkerEvent::Exited(status) if status.signal() == Some(9)),
+            "{event:?}"
+        );
+        // A stop sends nothing on the given-up channel.
+        let status = worker.stop(Duration::from_secs(1)).await;
+        assert_eq!(status.signal(), Some(9));
+        let unreachable = captured.lines("worker unreachable for shutdown");
+        assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+        assert!(unreachable[0].contains("abandoned"), "{unreachable:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A stop's budget covers its `Shutdown` too: a worker that reads
+    /// nothing is killed when the budget runs out, or the write's own
+    /// deadline when that comes first, and the stop ends then.
+    #[tokio::test]
+    async fn a_stop_of_a_worker_that_reads_nothing_ends_within_its_budget() {
+        use crate::test_support::{fill_control, settled};
+        let dir = crate::test_support::private_dir("worker-deaf-stop");
+        let captured = Captured::default();
+        let _logs = captured.install();
+        // A budget shorter than the write's deadline.
+        let clock = Arc::new(FakeClock::default());
+        let mut worker = deaf_worker(&dir, clock.clone());
+        fill_control(&mut worker).await;
+        let budget = Duration::from_millis(500);
+        let mut stop = std::pin::pin!(worker.stop(budget));
+        let real = Duration::from_millis(200);
+        assert!(settled(&mut stop, real).await.is_none(), "the write waits");
+        clock.advance(budget.checked_sub(Duration::from_millis(1)).unwrap());
+        assert!(
+            settled(&mut stop, real).await.is_none(),
+            "within the budget"
+        );
+        clock.advance(Duration::from_millis(1));
+        let status = settled(&mut stop, Duration::from_secs(5))
+            .await
+            .expect("the budget ends the stop");
+        assert_eq!(status.signal(), Some(9));
+        let missed = captured.lines("worker missed the shutdown budget");
+        assert_eq!(missed.len(), 1, "{missed:?}");
+        assert!(missed[0].contains("budget_ms=500"), "{missed:?}");
+        assert!(
+            captured.lines("worker killed").is_empty(),
+            "the stop's own kill"
+        );
+        // A budget longer than it: the write's deadline kills the worker.
+        let clock = Arc::new(FakeClock::default());
+        let mut worker = deaf_worker(&dir, clock.clone());
+        fill_control(&mut worker).await;
+        let mut stop = std::pin::pin!(worker.stop(Duration::from_secs(5)));
+        assert!(settled(&mut stop, real).await.is_none(), "the write waits");
+        clock.advance(CONTROL_WRITE_DEADLINE);
+        let status = settled(&mut stop, Duration::from_secs(5))
+            .await
+            .expect("the write's deadline ends the stop");
+        assert_eq!(status.signal(), Some(9));
+        let killed = captured.lines("worker killed");
+        assert_eq!(killed.len(), 1, "{killed:?}");
+        assert!(killed[0].contains("control write timed out"), "{killed:?}");
+        let unreachable = captured.lines("worker unreachable for shutdown");
+        assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+        assert_eq!(
+            captured.lines("worker missed the shutdown budget").len(),
+            1,
+            "the second budget did not run out"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

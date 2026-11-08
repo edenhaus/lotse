@@ -191,6 +191,7 @@ impl ToWorker {
             Self::Prerecord { .. } => "prerecord",
             Self::StartRecording(_) => "start_recording",
             Self::StopRecording { .. } => "stop_recording",
+            Self::Signal(_) => "signal",
         }
     }
 }
@@ -1481,19 +1482,58 @@ mod tests {
         }
     }
 
-    /// Every message's kind names its variant, and only that: a source's
-    /// URL and a session's offer stay out of the log.
-    #[test]
-    fn every_message_names_its_kind_without_its_fields() {
+    /// One message of each kind about the source, the worker or its
+    /// recordings, with the name it should have.
+    fn source_messages() -> Vec<(ToWorker, &'static str)> {
         let source = SourceSpec {
             connection_id: "c1".into(),
-            url: "rtsp://admin:hunter2@cam/main".into(),
+            target: SourceTarget::Url("rtsp://admin:hunter2@cam/main".into()),
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
             backoff: BackoffPosition::default(),
             prerecord_ms: 0,
         };
+        let recording = RecordingSpec {
+            recording_id: "k1".into(),
+            prerecord_ms: 0,
+            duration_ms: 1,
+            audio: false,
+        };
+        let gone = SignalCommand::Gone {
+            signal_id: "01JSIG".into(),
+        };
+        vec![
+            (ToWorker::RunSource(source.clone()), "run_source"),
+            (ToWorker::ConnectGranted, "connect_granted"),
+            (ToWorker::Shutdown { deadline_ms: 1 }, "shutdown"),
+            (ToWorker::Sockets, "sockets"),
+            (ToWorker::SwitchSource(source), "switch_source"),
+            (ToWorker::Backchannel { asks: true }, "backchannel"),
+            (ToWorker::SwitchConnectGranted, "switch_connect_granted"),
+            (
+                ToWorker::ProbeConnectGranted { probe: 1 },
+                "probe_connect_granted",
+            ),
+            (
+                ToWorker::ReleaseBackchannel { session_id: None },
+                "release_backchannel",
+            ),
+            (ToWorker::Prerecord { ms: 0 }, "prerecord"),
+            (ToWorker::StartRecording(recording), "start_recording"),
+            (
+                ToWorker::StopRecording {
+                    recording_id: "k1".into(),
+                },
+                "stop_recording",
+            ),
+            (ToWorker::Signal(gone), "signal"),
+        ]
+    }
+
+    /// One message of each kind about a viewer session, with the name it
+    /// should have.
+    fn session_messages() -> Vec<(ToWorker, &'static str)> {
         let session = SessionSpec {
             session_id: "s1".into(),
             kind: "webrtc".into(),
@@ -1506,11 +1546,8 @@ mod tests {
             orientation: 1,
         };
         let addr: SocketAddr = "192.0.2.1:3478".parse().unwrap();
-        let named = [
-            (ToWorker::RunSource(source.clone()), "run_source"),
-            (ToWorker::ConnectGranted, "connect_granted"),
-            (ToWorker::Shutdown { deadline_ms: 1 }, "shutdown"),
-            (ToWorker::Sockets, "sockets"),
+        let id = || String::from("s1");
+        vec![
             (
                 ToWorker::IceTcp {
                     local_ufrag: "u".into(),
@@ -1519,31 +1556,24 @@ mod tests {
                 },
                 "ice_tcp",
             ),
-            (ToWorker::SwitchSource(source), "switch_source"),
-            (ToWorker::Backchannel { asks: true }, "backchannel"),
-            (ToWorker::SwitchConnectGranted, "switch_connect_granted"),
-            (
-                ToWorker::ProbeConnectGranted { probe: 1 },
-                "probe_connect_granted",
-            ),
             (ToWorker::OpenSession(session), "open_session"),
             (
                 ToWorker::RemoteCandidate {
-                    session_id: "s1".into(),
+                    session_id: id(),
                     candidate: String::new(),
                 },
                 "remote_candidate",
             ),
             (
                 ToWorker::Renegotiate {
-                    session_id: "s1".into(),
+                    session_id: id(),
                     sdp: "v=0".into(),
                 },
                 "renegotiate",
             ),
             (
                 ToWorker::RelayCandidate {
-                    session_id: "s1".into(),
+                    session_id: id(),
                     relayed: addr,
                     server: addr,
                     local: addr,
@@ -1553,7 +1583,7 @@ mod tests {
             ),
             (
                 ToWorker::RelayChannel {
-                    session_id: "s1".into(),
+                    session_id: id(),
                     relayed: addr,
                     peer: addr,
                     channel: 0x4000,
@@ -1562,42 +1592,28 @@ mod tests {
             ),
             (
                 ToWorker::SessionOrientation {
-                    session_id: "s1".into(),
+                    session_id: id(),
                     orientation: 1,
                 },
                 "session_orientation",
             ),
             (
                 ToWorker::CloseSession {
-                    session_id: "s1".into(),
+                    session_id: id(),
                     code: "gone".into(),
                     message: String::new(),
                 },
                 "close_session",
             ),
-            (
-                ToWorker::ReleaseBackchannel { session_id: None },
-                "release_backchannel",
-            ),
-            (ToWorker::Prerecord { ms: 0 }, "prerecord"),
-            (
-                ToWorker::StartRecording(RecordingSpec {
-                    recording_id: "k1".into(),
-                    prerecord_ms: 0,
-                    duration_ms: 1,
-                    audio: false,
-                }),
-                "start_recording",
-            ),
-            (
-                ToWorker::StopRecording {
-                    recording_id: "k1".into(),
-                },
-                "stop_recording",
-            ),
-        ];
-        for (message, name) in &named {
-            assert_eq!(message.name(), *name, "{message:?}");
+        ]
+    }
+
+    /// Every message's kind names its variant, and only that: a source's
+    /// URL and a session's offer stay out of the log.
+    #[test]
+    fn every_message_names_its_kind_without_its_fields() {
+        for (message, name) in source_messages().into_iter().chain(session_messages()) {
+            assert_eq!(message.name(), name, "{message:?}");
         }
     }
 }
