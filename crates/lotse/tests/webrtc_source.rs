@@ -671,13 +671,25 @@ async fn rfc6347_4_2_7_a_camera_that_closes_ends_its_signal_and_the_source_offer
     let taken = WebRtcCameraStats::count(&camera.stats().remote_candidates);
     assert!(taken >= 1, "the source's candidates, with their index");
     let host = second.candidates[0]["candidate"].as_str().unwrap();
+    let dropped = WebRtcCameraStats::count(&camera.stats().dropped_candidates);
     assert_eq!(
         camera.add_remote_candidate(host, None),
         Err("a candidate without sdpMLineIndex".to_owned())
     );
+    // A line that does not parse (RFC 8839 §5.1) is refused with its
+    // index too.
+    assert!(
+        camera
+            .add_remote_candidate("candidate:1 1 udp nonsense", Some(0))
+            .is_err()
+    );
     assert_eq!(
         WebRtcCameraStats::count(&camera.stats().remote_candidates),
         taken
+    );
+    assert_eq!(
+        WebRtcCameraStats::count(&camera.stats().dropped_candidates),
+        dropped
     );
     let door = control
         .stream_where("door", |door| {

@@ -259,6 +259,18 @@ struct Stream {
     sources: Vec<(u32, u16, u32)>,
 }
 
+/// Why a remote candidate is not handed to the agent
+/// ([`IngestEngine::remote_candidate`]); logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refused {
+    /// Its connection-address is an mDNS name.
+    Mdns,
+    /// It does not parse: str0m's error.
+    Unreadable(String),
+    /// The viewer sessions' policy refuses its address, for the reason.
+    Address(SocketAddr, &'static str),
+}
+
 /// What a packet is to its stream's numbering ([`Stream::sequence`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seen {
@@ -928,34 +940,39 @@ impl IngestEngine {
         }
     }
 
-    /// Hands one remote candidate line to the agent unless the viewer
-    /// sessions' policy refuses its address
-    /// ([`crate::session`]'s `refused_address`, RFC 8445 §6.1.2.2); an
-    /// mDNS name is ignored (draft-ietf-mmusic-mdns-ice-candidates §3.2.1,
-    /// without a resolver), as is a line that does not parse.
+    /// Hands one remote candidate line to the agent unless
+    /// [`Self::remote_candidate`] refuses it.
     fn add_remote(&mut self, line: &str) {
-        let refused = match Candidate::from_sdp_string(line) {
+        match self.remote_candidate(line) {
             Ok(candidate) => {
                 let addr = candidate.addr();
-                if let Some(reason) = refused_address(addr.ip(), &self.scopes) {
-                    tracing::debug!(%addr, reason, "webrtc: remote candidate refused");
-                    true
-                } else {
-                    tracing::debug!(kind = ?candidate.kind(), %addr, "webrtc: remote candidate");
-                    self.rtc.add_remote_candidate(candidate);
-                    false
-                }
+                tracing::debug!(kind = ?candidate.kind(), %addr, "webrtc: remote candidate");
+                self.rtc.add_remote_candidate(candidate);
+                self.stats.remote_candidates = self.stats.remote_candidates.saturating_add(1);
             }
-            Err(err) => {
-                let mdns = is_mdns(line);
-                tracing::debug!(error = %err, mdns, "webrtc: remote candidate ignored");
-                true
+            Err(refused) => {
+                tracing::debug!(?refused, "webrtc: remote candidate ignored");
+                self.stats.refused_candidates = self.stats.refused_candidates.saturating_add(1);
             }
-        };
-        if refused {
-            self.stats.refused_candidates = self.stats.refused_candidates.saturating_add(1);
-        } else {
-            self.stats.remote_candidates = self.stats.remote_candidates.saturating_add(1);
+        }
+    }
+
+    /// The candidate of one remote candidate line, or why it is not taken:
+    /// an mDNS name, told before the line is parsed, so whatever str0m
+    /// makes of the name it is ignored
+    /// (draft-ietf-mmusic-mdns-ice-candidates §3.2.1, without a resolver);
+    /// a line that does not parse; an address the viewer sessions' policy
+    /// refuses ([`crate::session`]'s `refused_address`, RFC 8445 §6.1.2.2).
+    fn remote_candidate(&self, line: &str) -> Result<Candidate, Refused> {
+        if is_mdns(line) {
+            return Err(Refused::Mdns);
+        }
+        let candidate =
+            Candidate::from_sdp_string(line).map_err(|err| Refused::Unreadable(err.to_string()))?;
+        let addr = candidate.addr();
+        match refused_address(addr.ip(), &self.scopes) {
+            Some(reason) => Err(Refused::Address(addr, reason)),
+            None => Ok(candidate),
         }
     }
 
@@ -1483,6 +1500,41 @@ mod tests {
     }
 
     #[test]
+    fn draft_ietf_mmusic_mdns_ice_candidates_3_2_1_an_mdns_name_is_refused_before_parsing() {
+        let addr = "192.0.2.10:5000".parse().unwrap();
+        let now = lotse_core::clock::Clock::now(&lotse_core::clock::SystemClock);
+        let options = WebRtcOptions {
+            data_channel: None,
+            audio: false,
+        };
+        let engine = IngestEngine::offer(&options, &[addr], now, now).unwrap();
+        // Told by the name alone, whatever str0m makes of the line.
+        for mdns in [
+            "candidate:3 1 udp 2130706431 0a1b2c3d.local 6000 typ host",
+            "candidate:3 1 udp 2130706431 0a1b2c3d.LOCAL 6000 typ host",
+            "candidate:3 1 udp 2130706431 0a1b2c3d.local 6000 typ host generation 0",
+        ] {
+            assert_eq!(
+                engine.remote_candidate(mdns).unwrap_err(),
+                Refused::Mdns,
+                "{mdns}"
+            );
+        }
+        assert!(matches!(
+            engine.remote_candidate("nonsense"),
+            Err(Refused::Unreadable(_))
+        ));
+        assert!(matches!(
+            engine.remote_candidate("candidate:2 1 udp 2130706431 127.0.0.1 6000 typ host"),
+            Err(Refused::Address(_, _))
+        ));
+        let taken = engine
+            .remote_candidate("candidate:4 1 udp 2130706431 192.0.2.20 6001 typ host")
+            .unwrap();
+        assert_eq!(taken.addr(), "192.0.2.20:6001".parse().unwrap());
+    }
+
+    #[test]
     fn rfc3550_5_1_a_late_packet_off_the_newest_packet_s_timeline_is_stale() {
         const A: u32 = 0xa;
         const B: u32 = 0xb;
@@ -1702,6 +1754,24 @@ mod tests {
             // The close's transmits, if any, then the end, last.
             engine.queued.pop_back()
         };
+        // No error, no end. (This binary's `check` then runs every line on
+        // its own: llvm-cov's summary counts a function's lines by its
+        // best-covered binary, not by all of them together.)
+        let mut engine = IngestEngine::offer(
+            &WebRtcOptions {
+                data_channel: None,
+                audio: false,
+            },
+            &[addr],
+            started,
+            started,
+        )
+        .unwrap();
+        engine.phase = Phase::Answered;
+        let queued = engine.queued.len();
+        engine.check(Ok(()));
+        assert!(!engine.is_ended());
+        assert_eq!(engine.queued.len(), queued);
         let timeout = || str0m_dtls(dimpl::Error::Timeout(TimeoutError::Handshake));
         // Before the connection: not connected, as at the deadline.
         assert_eq!(
