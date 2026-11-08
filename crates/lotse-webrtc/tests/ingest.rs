@@ -177,6 +177,11 @@ impl Camera {
         }
     }
 
+    /// One datagram from `source`, whatever pair it came on: an agent
+    /// receives data on any of the candidates exchanged (RFC 8445 §12).
+    /// Behind `Rtc::accepts`, str0m 0.25 would drop the engine's first
+    /// DTLS flight when it comes before the camera's own check of the pair
+    /// succeeded, a race on loopback (observed 2026-11-08).
     fn receive(&mut self, now: Instant, source: SocketAddr, bytes: &[u8]) {
         let Ok(contents) = DatagramRecv::try_from(bytes) else {
             return;
@@ -190,7 +195,7 @@ impl Camera {
                 contents,
             },
         );
-        if self.rtc.accepts(&input) && self.rtc.handle_input(input).is_ok() {
+        if self.rtc.handle_input(input).is_ok() {
             self.drain();
         }
     }
@@ -633,13 +638,18 @@ fn rfc8445_6_1_1_the_offerer_controls_connects_and_carries_the_negotiated_tracks
     // The engine's keyframe is seen once; a second call changes nothing.
     pair.engine.keyframe_seen();
 
-    // RFC 3550 §6.4.1: the camera's Sender Reports, one each.
+    // RFC 3550 §6.4.1: the camera's Sender Reports, one each, from here
+    // on. A str0m 0.25 camera's first report of a stream is due at once
+    // (`StreamTx::sender_report_at`, read 2026-11-08), before its first
+    // packet and so with an RTP time of 0; whether it reaches the engine
+    // depends on when SRTP is up (observed 2026-11-08 in about one run of
+    // seven), so the reports before these are left out.
+    let (before, counted) = (pair.outputs.len(), pair.engine.stats().sender_reports);
     for _ in 0..20 {
         pair.frame(false);
         pair.step(Duration::from_millis(250));
     }
-    let reports: Vec<(usize, u64, u32)> = pair
-        .outputs
+    let reports: Vec<(usize, u64, u32)> = pair.outputs[before..]
         .iter()
         .filter_map(|output| match output {
             IngestOutput::SenderReport {
@@ -649,7 +659,10 @@ fn rfc8445_6_1_1_the_offerer_controls_connects_and_carries_the_negotiated_tracks
         })
         .collect();
     assert_ne!(reports, []);
-    assert_eq!(pair.engine.stats().sender_reports, reports.len() as u64);
+    assert_eq!(
+        pair.engine.stats().sender_reports - counted,
+        reports.len() as u64
+    );
     assert!(
         reports.iter().any(|(index, _, _)| *index == 1),
         "the video's"
@@ -678,7 +691,9 @@ fn rfc8445_6_1_1_the_offerer_controls_connects_and_carries_the_negotiated_tracks
     let id = pair.camera().channels[0].0;
     pair.camera().rtc.direct_api().close_data_channel(id);
     pair.camera().drain();
-    pair.run(Duration::from_millis(100));
+    // The close reaches the engine about 190 ms later between two str0m
+    // 0.25 peers, within 100 ms between two of 0.24 (observed 2026-11-08).
+    pair.run(Duration::from_millis(500));
     assert!(!pair.engine.stats().data_channel_open);
     // One the camera opens itself is not the offer's: it opens nothing
     // the engine counts (RFC 8832 §6, no renegotiation for a second).
@@ -993,7 +1008,9 @@ fn rfc8829_5_3_answers_the_engine_cannot_take_end_the_attempt_as_invalid() {
         (
             "an m-line short",
             |answer| answer[..answer.find("m=application").unwrap()].to_owned(),
-            "Differing m-line count in offer vs answer",
+            // str0m 0.25 counts the answer's BUNDLE group against its
+            // m-lines first.
+            "a=group mid count doesn't match m-line count 3 != 2",
         ),
         (
             "garbage",
@@ -1066,9 +1083,10 @@ fn rfc8866_5_14_a_format_less_rejected_m_line_beside_payload_type_0_reaches_no_e
     let _logs = logs();
     let mut pair = Pair::offer(&nest());
     // A camera without audio rejects the audio m-line listing no format
-    // (as str0m writes it); its video's first payload type renamed 0,
-    // `a=rtpmap:0 H264/90000`. The format the rejected m-line gets must
-    // not give 0 a second codec: str0m 0.24 panics on that.
+    // (as str0m 0.24 wrote it; 0.25 writes `0` there); its video's first
+    // payload type renamed 0, `a=rtpmap:0 H264/90000`. The format the
+    // rejected m-line gets must not give 0 a second codec: str0m 0.25
+    // panics on that.
     let answer = pair.answer(camera_config(false), |answer| {
         let video = answer
             .lines()
@@ -1084,7 +1102,11 @@ fn rfc8866_5_14_a_format_less_rejected_m_line_beside_payload_type_0_reaches_no_e
         answer
             .lines()
             .map(|line| format!("{}\r\n", renamed(line)))
-            .collect()
+            .collect::<String>()
+            .replace(
+                "m=audio 0 UDP/TLS/RTP/SAVPF 0\r\n",
+                "m=audio 0 UDP/TLS/RTP/SAVPF\r\n",
+            )
     });
     assert!(
         answer
@@ -1238,7 +1260,7 @@ fn rfc8445_8_ice_up_without_dtls_and_then_lost_is_ice_failed_at_the_deadline() {
     pair.answer(camera_config(false), |answer| answer);
     // STUN only (RFC 7983 §7: first byte 0 to 3): ICE pairs, DTLS never
     // gets through; then the link goes altogether. Not connected, the
-    // attempt ends at the connection deadline; str0m 0.24's agent going
+    // attempt ends at the connection deadline; str0m 0.25's agent going
     // Disconnected meanwhile ends nothing.
     pair.run(Duration::from_secs(1));
     assert!(!pair.engine.is_connected());
