@@ -22,9 +22,10 @@
 //! `a=setup:actpass` (RFC 5763 §5, RFC 8842 §5.2), so the camera picks its
 //! DTLS role; DTLS-SRTP keys the media (RFC 5764). Media is received in
 //! str0m's RTP mode: each packet goes to the caller as it arrived, mapped
-//! to the stream index its m-line has, except one from before the
-//! camera's timestamps jumped (RFC 3550 §5.1), late or of a former
-//! source, which is dropped. Picture Loss Indications (RFC 4585 §6.3.1)
+//! to the stream index its m-line has, in sequence order: a late or
+//! repeated one is dropped, as the RTSP source's reorderer drops it, and so
+//! is one from before the camera's timestamps jumped (RFC 3550 §5.1), late
+//! or of a former source. Picture Loss Indications (RFC 4585 §6.3.1)
 //! ask the camera for a keyframe once connected, every
 //! [`PLI_INTERVAL`] until one arrived (at most [`STARTUP_PLIS`]), and after
 //! a gap in the video's sequence numbers, rate-limited. Consent freshness
@@ -203,6 +204,9 @@ pub struct IngestStats {
     /// of a former source, more than a second of media time off the
     /// newest packet's, dropped (RFC 3550 §5.1).
     pub stale_packets: u64,
+    /// Other late or repeated RTP packets (reordered or repaired on the
+    /// way), dropped: the depacketizers take packets in sequence order.
+    pub late_packets: u64,
     /// Sender Reports handed on.
     pub sender_reports: u64,
     /// Sender Reports without a wallclock time, dropped.
@@ -286,7 +290,14 @@ enum Seen {
         new_source: bool,
     },
     /// Late or repeated within its source's numbering, near the newest
-    /// packet's timestamp: reordered or repaired on the way, handed on.
+    /// packet's timestamp: reordered or repaired on the way. Dropped, as
+    /// the RTSP source's reorderer drops a packet that arrives after a
+    /// later one (retina's `Reorderer` with `max_delay` zero, its
+    /// `Pushed::Late`; `lotse_rtsp`'s `udp_options`), so both sources hand
+    /// `RtpTracks` packets in sequence order: handed on, it would set a
+    /// depacketizer's last sequence number back (RFC 6184 §5.8 reassembles
+    /// by consecutive numbers), and the next unit, complete, would read
+    /// as following a gap and be dropped too.
     Late,
     /// Late or repeated, or of a former source (one the stream knows
     /// that is not the newest packet's), with a timestamp more than
@@ -418,6 +429,8 @@ pub struct IngestEngine {
     new_source: Throttle,
     /// The rate limit of the stale packets' log line.
     stale: Throttle,
+    /// The rate limit of the late packets' log line.
+    late: Throttle,
     /// The rate limit of the other sources' Sender Reports' log line.
     other_source: Throttle,
     /// The counters.
@@ -724,6 +737,7 @@ impl IngestEngine {
             other_codec: Throttle::default(),
             new_source: Throttle::default(),
             stale: Throttle::default(),
+            late: Throttle::default(),
             other_source: Throttle::default(),
             stats: IngestStats::default(),
         })
@@ -933,9 +947,15 @@ impl IngestEngine {
     /// handed to the agent with the answer, as the camera's ICE
     /// credentials come with it: a relay may pass on the camera's
     /// candidates ahead of its answer (RFC 8838 §10 lets them arrive in
-    /// any order). After the end, one is ignored.
+    /// any order). After the end, one is ignored. At or after the
+    /// answer's or the connection's deadline, the attempt ends by it
+    /// first, as for an answer or a datagram, and the candidate is not
+    /// taken.
     pub fn add_remote_candidate(&mut self, now: Instant, candidate: &SignalCandidate) {
         self.now = now;
+        if self.expired(now) {
+            return;
+        }
         if candidate.is_end_of_candidates() {
             tracing::debug!("webrtc: the camera's end of candidates");
             return;
@@ -1274,12 +1294,12 @@ impl IngestEngine {
     /// else counted and dropped, one in another codec the answer accepted
     /// with a warning. A forward gap in the video's sequence numbers of
     /// one synchronization source (RFC 3550 §A.1) is a lost picture, which
-    /// asks for a keyframe. A late packet from before the camera's
-    /// timestamps jumped, or one of a former source off the newest
-    /// source's timeline, is dropped ([`Seen::Stale`]), as an RTSP
-    /// source's reorderer drops every late packet (retina's `Reorderer`);
-    /// one merely reordered or repaired is handed on. New sources and stale
-    /// packets are logged at most once per summary interval.
+    /// asks for a keyframe. A late or repeated packet is dropped
+    /// ([`Seen::Late`]), as an RTSP source's reorderer drops every late
+    /// packet (retina's `Reorderer`), and so is one from before the
+    /// camera's timestamps jumped, or one of a former source off the
+    /// newest source's timeline ([`Seen::Stale`]). New sources, late and
+    /// stale packets are logged at most once per summary interval.
     fn on_rtp(&mut self, packet: str0m::rtp::RtpPacket) {
         let header = &packet.header;
         let mid = self
@@ -1323,7 +1343,19 @@ impl IngestEngine {
                 }
                 lost && video
             }
-            Seen::Late => false,
+            Seen::Late => {
+                self.stats.late_packets = self.stats.late_packets.saturating_add(1);
+                if let Some(count) = self.late.hit(self.now) {
+                    tracing::debug!(
+                        index,
+                        ssrc,
+                        seq,
+                        count,
+                        "webrtc: a late or repeated packet dropped"
+                    );
+                }
+                return;
+            }
             Seen::Stale => {
                 self.stats.stale_packets = self.stats.stale_packets.saturating_add(1);
                 if let Some(count) = self.stale.hit(self.now) {

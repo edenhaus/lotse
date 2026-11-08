@@ -768,11 +768,13 @@ fn rfc4585_6_3_1_a_keyframe_stops_the_startup_plis_and_a_loss_asks_again_rate_li
     pair.camera().seq += 1;
     pair.frame(false);
     assert_eq!(pair.engine.stats().plis, 2);
-    // A packet from before (reordered: one of the lost) is no loss.
+    // A packet from before (reordered: one of the lost) is no loss, and
+    // late: dropped.
     pair.camera().seq -= 4;
     let before = pair.rtp().len();
     pair.frame(false);
-    assert_eq!(pair.rtp().len(), before + 1, "it arrives");
+    assert_eq!(pair.rtp().len(), before, "dropped");
+    assert_eq!(pair.engine.stats().late_packets, 1);
     pair.camera().seq += 3;
     pair.step(PLI_INTERVAL);
     // The next in order after the highest: no loss either.
@@ -973,16 +975,165 @@ fn rfc3550_5_1_a_late_packet_from_before_a_timestamp_jump_is_dropped() {
         send(&mut pair, 1_000 + n, 900_000 + 3_000 * u32::from(n));
         send(&mut pair, 1_006 + 2 * n, 3_000 + 6_000 * u32::from(n));
     }
-    // A late one of the new timeline: handed on.
+    // A late one of the new timeline: dropped too, but as late, not
+    // stale.
     send(&mut pair, 1_009, 9_000);
     assert_eq!(pair.engine.stats().stale_packets, 5);
+    assert_eq!(pair.engine.stats().late_packets, 1);
     assert_eq!(
         pair.rtp()
             .iter()
             .map(|(_, seq, _)| *seq)
             .collect::<Vec<_>>(),
-        [1_000, 1_006, 1_008, 1_010, 1_012, 1_014, 1_016, 1_009]
+        [1_000, 1_006, 1_008, 1_010, 1_012, 1_014, 1_016]
     );
+    assert!(pair.ended().is_none(), "{:?}", pair.ended());
+}
+
+/// The source's receive path without its sockets: the engine's outputs
+/// carried into `RtpTracks` as `Attempt::drain` carries them, onto a
+/// track set.
+struct Receiver {
+    tracks: Arc<TrackSet>,
+    rtp: lotse_codec::rtp_ingest::RtpTracks,
+    ctx: SourceCtx,
+    /// The engine outputs carried so far.
+    taken: usize,
+}
+
+impl Receiver {
+    fn new(now: Instant) -> Self {
+        let tracks = TrackSet::new(TrackLimits::default(), now);
+        let (clock, _reports) = ClockInput::channel(Arc::new(ClockMapper::new()));
+        let ctx = SourceCtx {
+            peer: ResolvedPeer {
+                host: String::new(),
+                addrs: vec![],
+            },
+            tracks: tracks.publisher(),
+            clock,
+            time: Arc::new(SystemClock),
+            backchannel: BackchannelSlot::default(),
+            signaling: None,
+            cancel: CancellationToken::new(),
+        };
+        Self {
+            tracks,
+            rtp: lotse_codec::rtp_ingest::RtpTracks::new("webrtc"),
+            ctx,
+            taken: 0,
+        }
+    }
+
+    /// Carries the pair's outputs since the last call.
+    fn carry(&mut self, pair: &Pair) {
+        for output in &pair.outputs[self.taken..] {
+            match output {
+                IngestOutput::Tracks(tracks) => {
+                    for negotiated in tracks {
+                        let declared = &negotiated.declared;
+                        let track = self.ctx.tracks.declare(
+                            declared.kind,
+                            declared.codec.clone(),
+                            declared.clock_rate,
+                        );
+                        self.rtp
+                            .carry(negotiated.index, track, negotiated.pt, declared);
+                    }
+                }
+                IngestOutput::Rtp {
+                    index,
+                    packet,
+                    arrival,
+                } => self
+                    .rtp
+                    .receive(*index, packet.clone(), *arrival, &self.ctx)
+                    .unwrap(),
+                _ => {}
+            }
+        }
+        self.taken = pair.outputs.len();
+    }
+}
+
+/// The camera's datagrams of what `write` sends, held back from the
+/// engine.
+fn held(pair: &mut Pair, write: impl FnOnce(&mut Camera, Instant)) -> Vec<Datagram> {
+    let now = pair.now;
+    write(pair.camera(), now);
+    pair.camera().timeout(now);
+    std::mem::take(&mut pair.camera().out)
+}
+
+/// RFC 6184 §5.8: a FU-A of a non-IDR slice (type 1), its start, a middle
+/// part or its end.
+fn fu_a(start: bool, end: bool) -> Vec<u8> {
+    let header = (u8::from(start) << 7) | (u8::from(end) << 6) | 1;
+    vec![0x7c, header, 0x9a, 0x02, 0x04]
+}
+
+#[test]
+fn rfc6184_5_8_a_reordered_packet_damages_no_later_access_unit() {
+    let _logs = logs();
+    let mut pair = Pair::offer(&video_only());
+    pair.answer(camera_config(false), |answer| answer);
+    pair.connect();
+    pair.step(Duration::from_millis(1));
+    let mut receiver = Receiver::new(pair.now);
+    receiver.carry(&pair);
+    let video = receiver.tracks.tracks()[0].clone();
+    assert_eq!(video.kind(), Kind::Video);
+    // A keyframe, in order.
+    let keyframe = held(&mut pair, |camera, now| camera.frame(now, true));
+    pair.camera().out = keyframe;
+    pair.deliver();
+    receiver.carry(&pair);
+    assert_eq!((video.stats().frames, video.stats().keyframes), (1, 1));
+    // Single-packet units: the third arrives before the second.
+    let units: Vec<_> = (0..4)
+        .map(|_| held(&mut pair, |camera, now| camera.frame(now, false)))
+        .collect();
+    for at in [0, 2, 1, 3] {
+        pair.camera().out = units[at].clone();
+        pair.deliver();
+    }
+    receiver.carry(&pair);
+    // The second is lost to its late arrival and the third follows a
+    // gap; the fourth follows the third, complete.
+    assert_eq!(pair.engine.stats().late_packets, 1);
+    assert_eq!(video.stats().frames, 3, "the first and the fourth");
+    // Fragmented units (FU-A), the second's middle part late; the third
+    // follows it in order.
+    let pt = pair.camera().h264_pts()[0];
+    let mut fragmented = Vec::new();
+    for _ in 0..3 {
+        let packets = held(&mut pair, |camera, now| {
+            camera.ts = camera.ts.wrapping_add(3_000);
+            camera.write(now, pt, false, &fu_a(true, false));
+            camera.write(now, pt, false, &fu_a(false, false));
+            camera.write(now, pt, true, &fu_a(false, true));
+        });
+        assert_eq!(packets.len(), 3);
+        fragmented.push(packets);
+    }
+    let order = [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 2),
+        (1, 1),
+        (2, 0),
+        (2, 1),
+        (2, 2),
+    ];
+    for (unit, part) in order {
+        pair.camera().out = vec![fragmented[unit][part].clone()];
+        pair.deliver();
+    }
+    receiver.carry(&pair);
+    assert_eq!(pair.engine.stats().late_packets, 2);
+    assert_eq!(video.stats().frames, 5, "the first and the third");
     assert!(pair.ended().is_none(), "{:?}", pair.ended());
 }
 
@@ -1496,6 +1647,64 @@ fn rfc5763_5_a_wrong_fingerprint_fails_the_handshake_as_an_engine_error() {
     assert!(matches!(error, SourceError::Protocol(_)), "{error}");
     assert_eq!(code, close::INTERNAL_ERROR);
     assert!(message.starts_with("webrtc engine: "), "{message}");
+}
+
+#[test]
+fn rfc8445_8_a_candidate_at_a_deadline_ends_the_attempt_first_and_is_not_taken() {
+    let _logs = logs();
+    let candidate = |line: &str| SignalCandidate {
+        candidate: line.to_owned(),
+        sdp_mid: Some("0".into()),
+        sdp_mline_index: Some(0),
+    };
+    let line = "candidate:2 1 udp 2130706431 192.0.2.20 6001 typ host";
+    // The answer's deadline, the timeout not handled yet: a candidate just
+    // before it is held, the end-of-candidates indication at it ends the
+    // attempt.
+    let mut pair = Pair::offer(&video_only());
+    let started = pair.now;
+    pair.engine.add_remote_candidate(
+        started + ANSWER_TIMEOUT - Duration::from_millis(1),
+        &candidate(line),
+    );
+    pair.drain();
+    assert!(pair.ended().is_none(), "{:?}", pair.ended());
+    pair.engine.add_remote_candidate(
+        started + ANSWER_TIMEOUT,
+        &SignalCandidate::end_of_candidates(None, Some(0)),
+    );
+    pair.drain();
+    let (error, code, _) = pair.ended().unwrap();
+    assert_eq!(
+        error,
+        SourceError::Timeout("webrtc: no answer within 20 s".into())
+    );
+    assert_eq!(code, close::ANSWER_TIMEOUT);
+
+    // The connection's deadline: a candidate just before it goes to the
+    // agent, one at it ends the attempt and is not taken.
+    let mut pair = Pair::offer(&video_only());
+    let started = pair.now;
+    pair.link = false;
+    pair.answer(camera_config(false), |answer| answer);
+    let taken = pair.engine.stats().remote_candidates;
+    pair.engine.add_remote_candidate(
+        started + CONNECT_BY - Duration::from_millis(1),
+        &candidate(line),
+    );
+    pair.drain();
+    assert_eq!(pair.engine.stats().remote_candidates, taken + 1);
+    assert!(pair.ended().is_none(), "{:?}", pair.ended());
+    pair.engine
+        .add_remote_candidate(started + CONNECT_BY, &candidate(line));
+    pair.drain();
+    assert_eq!(pair.engine.stats().remote_candidates, taken + 1);
+    let (error, code, _) = pair.ended().unwrap();
+    assert_eq!(
+        error,
+        SourceError::Timeout("webrtc: not connected 27000 ms into the attempt".into())
+    );
+    assert_eq!(code, close::ICE_FAILED);
 }
 
 #[test]
