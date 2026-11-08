@@ -3204,7 +3204,7 @@ mod tests {
         let talk_only = factory.session_tracks("talk, no video", true);
         assert_eq!(talk_only.len(), 1);
         assert_eq!(talk_only[0].kind, Kind::Audio);
-        assert!(factory.session_tracks("talk, no video", false).is_empty());
+        assert_eq!(factory.session_tracks("talk, no video", false), []);
     }
 
     #[test]

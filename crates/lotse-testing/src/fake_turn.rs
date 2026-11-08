@@ -29,7 +29,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use lotse_core::clock::Clock;
 use lotse_core::task::spawn_named;
 use md5::{Digest as _, Md5};

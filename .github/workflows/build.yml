@@ -43,13 +43,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
-          version: 2026.9.15
+          version: 2026.11.0
           # What the build needs; the rest of mise.toml is for the checks.
           install_args: rust zig cmake github:rust-cross/cargo-zigbuild
           cache: ${{ !inputs.release }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !inputs.release }}
         with:
           shared-key: release-${{ matrix.arch }}
@@ -66,7 +66,7 @@ jobs:
           size=$(stat -c %s "$BIN")
           echo "lotse: $size bytes"
           test "$size" -lt 15728640
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lotse-${{ matrix.arch }}
           path: ${{ env.BIN }}

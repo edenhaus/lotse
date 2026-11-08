@@ -530,7 +530,7 @@ mod tests {
             [b"h2".to_vec(), b"http/1.1".to_vec()]
         );
         let none = client_config(Trust::Insecure, RootCertStore::empty(), &[]).unwrap();
-        assert!(none.alpn_protocols.is_empty());
+        assert_eq!(none.alpn_protocols, Vec::<Vec<u8>>::new());
     }
 
     #[test]

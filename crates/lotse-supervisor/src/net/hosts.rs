@@ -503,7 +503,10 @@ mod tests {
             addrs(&["192.168.1.2:18556"])
         );
         // No route, or only unusable addresses: nothing.
-        assert!(host_addresses("[::]:1".parse().unwrap(), true, &|_| None, &failed).is_empty());
+        assert_eq!(
+            host_addresses("[::]:1".parse().unwrap(), true, &|_| None, &failed),
+            []
+        );
         for unusable in [
             "127.0.0.1",
             "169.254.1.1",
@@ -518,8 +521,9 @@ mod tests {
         ] {
             let ip: IpAddr = unusable.parse().unwrap();
             assert!(!usable(ip), "{unusable}");
-            assert!(
-                host_addresses("[::]:1".parse().unwrap(), true, &|_| Some(ip), &failed).is_empty()
+            assert_eq!(
+                host_addresses("[::]:1".parse().unwrap(), true, &|_| Some(ip), &failed),
+                []
             );
         }
         for fine in [
