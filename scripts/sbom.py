@@ -14,13 +14,18 @@ for the target with the binary's default features, which is the build's own
 resolver, and the dependency edges between them, and prints what it dropped.
 
 SOURCE_DATE_EPOCH, when unset, is the commit time, so the document's timestamp
-is that of the source, not of the run. Runs on any Python 3.
+is that of the source, not of the run. With it set, cargo-cyclonedx 0.5.9 leaves
+out the random serialNumber, which actions/attest v4.2.2 requires of a CycloneDX
+document; the script sets a UUIDv5 of the document's content instead (CycloneDX
+1.5, serialNumber: an RFC 4122 URN), so the same build gives the same document.
+Runs on any Python 3.
 """
 
 import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -103,6 +108,13 @@ def prune(document, crates):
     return sorted(f"{c['name']} {c['version']}" for c in dropped)
 
 
+def serial_number(document):
+    """Set the serialNumber to a UUIDv5 of the document without it: reproducible, and new for new content."""
+    document.pop("serialNumber", None)
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
+    document["serialNumber"] = uuid.uuid5(uuid.NAMESPACE_URL, canonical).urn
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit("usage: scripts/sbom.py <target> <output>")
@@ -119,6 +131,7 @@ def main():
     crates = resolved(target)  # first: `--locked` fails on a stale lockfile before cargo-cyclonedx could update it
     document = cyclonedx(target, env)
     dropped = prune(document, crates)
+    serial_number(document)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(document, indent=2) + "\n")
     print(f"{output}: {len(document['components'])} components for {target}")
