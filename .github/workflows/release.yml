@@ -122,8 +122,14 @@ jobs:
       # The same binaries give the same image, byte for byte: buildx takes SOURCE_DATE_EPOCH from
       # the environment for the image's timestamps, and rewrite-timestamp (below) clamps the
       # layers' file times to it (checked 2026-11-09: two BuildKit v0.33.1 builds, one digest).
+      # `created` is the same instant in RFC 3339 (UTC), for the label and the index annotation.
       - name: Image timestamp
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+        run: |
+          epoch="$(git log -1 --format=%ct)"
+          {
+            echo "SOURCE_DATE_EPOCH=$epoch"
+            echo "CREATED=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee -a "$GITHUB_ENV"
       # mirror.gcr.io: Docker Hub's anonymous pull limit. No cache-binary: this workflow restores
       # no cache.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -147,7 +153,9 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.created=${{ env.CREATED }}
           annotations: |
+            index:org.opencontainers.image.created=${{ env.CREATED }}
             index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             index:org.opencontainers.image.description=Memory-safe media daemon for IP cameras.
             index:org.opencontainers.image.licenses=MIT OR Apache-2.0
