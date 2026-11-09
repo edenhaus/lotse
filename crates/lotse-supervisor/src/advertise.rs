@@ -12,23 +12,29 @@
 //! trickled candidates or in the answer's `a=candidate` lines, so the
 //! addresses behind the NAT stay inside it and the browser spends no
 //! checks on them; relay and server-reflexive candidates still pass.
+//! For the same reason the related address of every server-reflexive
+//! candidate told to the browser, advertised or STUN-learned, is withheld
+//! then ([`Advertisement::related`]), and a session tells each
+//! server-reflexive transport address once ([`srflx_address`]).
 //!
 //! Implements RFC 8445 §5.1.1.2 (a server-reflexive candidate and its
 //! base), §5.1.1.3 (its foundation), §5.1.2.1 (its priority, a local
 //! preference unique per candidate) and §5.1.3 (a candidate equal to a
 //! host candidate is redundant), RFC 6544 §4.2 (the local preference of a
 //! TCP candidate) and §4.5 (`tcptype`), and RFC 8839 §5.1 (the `candidate`
-//! attribute, which the host filter reads).
+//! attribute, which the host filter reads, and its related address,
+//! withheld for privacy as `0.0.0.0` or `::` at port 9).
 //!
 //! SPEC-DEVIATION: RFC 8445 §5.1.1.2 has an agent learn a server-reflexive
 //! candidate from a STUN server; these are configured instead, because the
 //! NAT of a container's bridge network maps the published ports to the
 //! host addresses whatever a STUN server would see, and a deployment
 //! without one must still be reachable. They behave as §5.1.1.2's do: a
-//! transport address on the NAT's public side, its base a host address.
+//! transport address on the NAT's public side, its base a host address
+//! (whose address the candidate withholds, RFC 8839 §5.1).
 
 use std::fmt;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
 use crate::gather::{COMPONENT, LOCAL_PREFERENCE, SRFLX_TYPE_PREFERENCE};
@@ -44,6 +50,10 @@ const TCP_DIRECTION_PREFERENCE: u32 = 2;
 /// The highest other-preference of a TCP candidate (RFC 6544 §4.2: 0 to
 /// 8191).
 const TCP_OTHER_PREFERENCE: u32 = 8_191;
+
+/// The port of a withheld related address (RFC 8839 §5.1: "the port to
+/// '9'" when an agent does not reveal it, for privacy).
+const WITHHELD_PORT: u16 = 9;
 
 /// One entry of `webrtc.advertise`: an IP address, and the port the NAT
 /// forwards to the front door's when it differs. No hostname, so nothing
@@ -155,7 +165,7 @@ impl FromStr for AdvertisedAddress {
 
 /// The transport of a candidate (RFC 8839 §5.1 `transport`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Protocol {
+pub(crate) enum Protocol {
     /// UDP, on the shared socket.
     Udp,
     /// Passive ICE-TCP, on the listener (RFC 6544).
@@ -252,7 +262,7 @@ impl Advertisement {
             self.kept.push((protocol, mapped));
             return;
         }
-        let line = candidate_line(index, protocol, mapped, *base);
+        let line = candidate_line(index, protocol, mapped);
         tracing::info!(%address, transport, candidate = line, "advertised candidate");
         self.lines.push(line);
     }
@@ -260,6 +270,14 @@ impl Advertisement {
     /// The candidates told to every browser.
     pub(crate) fn lines(&self) -> &[String] {
         &self.lines
+    }
+
+    /// The related address of a server-reflexive candidate at `mapped`
+    /// whose base is `base` (RFC 8839 §5.1): the base, unless an address
+    /// is advertised; then withheld, as §5.1 allows for privacy, so that
+    /// no candidate the browser is told names an address behind the NAT.
+    pub(crate) fn related(&self, mapped: SocketAddr, base: SocketAddr) -> SocketAddr {
+        if self.active { withheld(mapped) } else { base }
     }
 
     /// Whether the browser is told the worker's candidate `candidate` (a
@@ -303,7 +321,8 @@ impl Advertisement {
 }
 
 /// The `candidate` attribute value (RFC 8839 §5.1) of advertised address
-/// `index` at `mapped` over `protocol`, with its `base`: foundation `au`
+/// `index` at `mapped` over `protocol`, its base withheld ([`withheld`]):
+/// foundation `au`
 /// or `at` and the index, which no STUN-learned (`s`), relay or host one
 /// (the engine's, hexadecimal) shares (RFC 8445 §5.1.1.3); type
 /// preference that of a server-reflexive candidate (§5.1.2.2), local
@@ -311,12 +330,7 @@ impl Advertisement {
 /// one's, for TCP RFC 6544 §4.2's passive server-reflexive one, so a UDP
 /// candidate always comes first; a TCP one is passive (RFC 6544 §4.5, its
 /// `tcptype` after `raddr` and `rport`).
-fn candidate_line(
-    index: usize,
-    protocol: Protocol,
-    mapped: SocketAddr,
-    base: SocketAddr,
-) -> String {
+fn candidate_line(index: usize, protocol: Protocol, mapped: SocketAddr) -> String {
     let entry = u32::try_from(index).unwrap_or(u32::MAX);
     let (foundation, local_preference, tcptype) = match protocol {
         Protocol::Udp => (
@@ -335,14 +349,36 @@ fn candidate_line(
     let priority = (SRFLX_TYPE_PREFERENCE << 24)
         .saturating_add(local_preference.saturating_mul(256))
         .saturating_add(256 - COMPONENT);
+    let related = withheld(mapped);
     format!(
         "candidate:{foundation}{index} {COMPONENT} {} {priority} {} {} typ srflx raddr {} rport {}{tcptype}",
         protocol.name(),
         mapped.ip(),
         mapped.port(),
-        base.ip(),
-        base.port()
+        related.ip(),
+        related.port()
     )
+}
+
+/// The related address that reveals nothing for a candidate at
+/// `candidate` (RFC 8839 §5.1): `0.0.0.0` for an IPv4 candidate, `::` for
+/// an IPv6 one, at port 9.
+const fn withheld(candidate: SocketAddr) -> SocketAddr {
+    let ip = match candidate {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    SocketAddr::new(ip, WITHHELD_PORT)
+}
+
+/// The transport and transport address of a server-reflexive candidate
+/// line, which a session tells the browser once: a second candidate at
+/// the same one, with the same base, is redundant (RFC 8445 §5.1.3).
+/// `None` for another type or a malformed line.
+pub(crate) fn srflx_address(candidate: &str) -> Option<(Protocol, SocketAddr)> {
+    parse_candidate(candidate)
+        .filter(|(_, _, kind)| kind.eq_ignore_ascii_case("srflx"))
+        .map(|(protocol, addr, _)| (protocol, addr))
 }
 
 /// The transport, transport address (canonical) and type of a `candidate`
@@ -488,25 +524,25 @@ mod tests {
     }
 
     #[test]
-    fn advertised_candidates_carry_rfc_8445_5_1_2_1_and_rfc_6544_4_2_priorities() {
-        let base: SocketAddr = "172.17.0.2:18556".parse().unwrap();
+    fn advertised_candidates_carry_rfc_8445_5_1_2_1_and_rfc_6544_4_2_priorities_and_withhold_their_base_rfc_8839_5_1()
+     {
         // (2^24)·100 + (2^8)·(65535 − 1 − index) + 255
         assert_eq!(
-            candidate_line(0, Protocol::Udp, "203.0.113.7:18556".parse().unwrap(), base),
-            "candidate:au0 1 udp 1694498559 203.0.113.7 18556 typ srflx raddr 172.17.0.2 rport 18556"
+            candidate_line(0, Protocol::Udp, "203.0.113.7:18556".parse().unwrap()),
+            "candidate:au0 1 udp 1694498559 203.0.113.7 18556 typ srflx raddr 0.0.0.0 rport 9"
         );
         assert_eq!(
-            candidate_line(1, Protocol::Udp, "203.0.113.8:5".parse().unwrap(), base),
-            "candidate:au1 1 udp 1694498303 203.0.113.8 5 typ srflx raddr 172.17.0.2 rport 18556"
+            candidate_line(1, Protocol::Udp, "203.0.113.8:5".parse().unwrap()),
+            "candidate:au1 1 udp 1694498303 203.0.113.8 5 typ srflx raddr 0.0.0.0 rport 9"
         );
         // (2^24)·100 + (2^8)·((2^13)·2 + 8191 − index) + 255
         assert_eq!(
-            candidate_line(0, Protocol::Tcp, "203.0.113.7:18557".parse().unwrap(), base),
-            "candidate:at0 1 tcp 1684013055 203.0.113.7 18557 typ srflx raddr 172.17.0.2 rport 18556 tcptype passive"
+            candidate_line(0, Protocol::Tcp, "203.0.113.7:18557".parse().unwrap()),
+            "candidate:at0 1 tcp 1684013055 203.0.113.7 18557 typ srflx raddr 0.0.0.0 rport 9 tcptype passive"
         );
         assert_eq!(
-            candidate_line(2, Protocol::Tcp, "[2001:db8::7]:5".parse().unwrap(), base),
-            "candidate:at2 1 tcp 1684012543 2001:db8::7 5 typ srflx raddr 172.17.0.2 rport 18556 tcptype passive"
+            candidate_line(2, Protocol::Tcp, "[2001:db8::7]:5".parse().unwrap()),
+            "candidate:at2 1 tcp 1684012543 2001:db8::7 5 typ srflx raddr :: rport 9 tcptype passive"
         );
     }
 
@@ -524,9 +560,9 @@ mod tests {
         assert_eq!(
             advertisement.lines(),
             [
-                "candidate:au0 1 udp 1694498559 203.0.113.7 18556 typ srflx raddr 172.17.0.2 rport 18556",
-                "candidate:at0 1 tcp 1684013055 203.0.113.7 18557 typ srflx raddr 172.17.0.2 rport 18557 tcptype passive",
-                "candidate:au1 1 udp 1694498303 2001:db8::7 40000 typ srflx raddr fd00::2 rport 18556",
+                "candidate:au0 1 udp 1694498559 203.0.113.7 18556 typ srflx raddr 0.0.0.0 rport 9",
+                "candidate:at0 1 tcp 1684013055 203.0.113.7 18557 typ srflx raddr 0.0.0.0 rport 9 tcptype passive",
+                "candidate:au1 1 udp 1694498303 2001:db8::7 40000 typ srflx raddr :: rport 9",
             ]
         );
         // No IPv6 TCP base: that candidate is skipped, with a warning.
@@ -612,9 +648,48 @@ mod tests {
         }
         for shown in [
             "candidate:r1 1 udp 16777215 198.51.100.1 49152 typ relay raddr 172.17.0.2 rport 18556",
-            "candidate:s0 1 udp 1694498815 203.0.113.7 18556 typ srflx raddr 172.17.0.2 rport 18556",
+            "candidate:s0 1 udp 1694498815 203.0.113.7 18556 typ srflx raddr 0.0.0.0 rport 9",
         ] {
             assert!(advertisement.shows(shown), "{shown}");
+        }
+    }
+
+    #[test]
+    fn rfc_8839_5_1_the_related_address_is_withheld_only_with_an_address_advertised() {
+        let base: SocketAddr = "172.17.0.2:18556".parse().unwrap();
+        let none = Advertisement::default();
+        assert_eq!(none.related("203.0.113.9:4".parse().unwrap(), base), base);
+        let active = Advertisement::new(&[addr("203.0.113.7")], &[base], &[]);
+        assert_eq!(
+            active.related("203.0.113.9:4".parse().unwrap(), base),
+            "0.0.0.0:9".parse().unwrap()
+        );
+        assert_eq!(
+            active.related("[2001:db8::9]:4".parse().unwrap(), base),
+            "[::]:9".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn srflx_addresses_are_read_from_server_reflexive_lines_only() {
+        assert_eq!(
+            srflx_address(
+                "candidate:s0 1 UDP 1 ::ffff:203.0.113.7 40000 typ SRFLX raddr 0.0.0.0 rport 9"
+            ),
+            Some((Protocol::Udp, "203.0.113.7:40000".parse().unwrap()))
+        );
+        assert_eq!(
+            srflx_address(
+                "candidate:at0 1 tcp 1 203.0.113.7 18557 typ srflx raddr 0.0.0.0 rport 9 tcptype passive"
+            ),
+            Some((Protocol::Tcp, "203.0.113.7:18557".parse().unwrap()))
+        );
+        for other in [
+            "candidate:r1 1 udp 1 198.51.100.1 49152 typ relay raddr 0.0.0.0 rport 0",
+            "candidate:1 1 udp 1 172.17.0.2 18556 typ host",
+            "candidate:s0",
+        ] {
+            assert_eq!(srflx_address(other), None, "{other}");
         }
     }
 

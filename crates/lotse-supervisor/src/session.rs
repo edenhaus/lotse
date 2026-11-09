@@ -68,7 +68,7 @@ use tokio::sync::mpsc::OwnedPermit;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
-use crate::advertise::Advertisement;
+use crate::advertise::{Advertisement, Protocol, srflx_address};
 use crate::net::turn_client::Lease;
 use crate::worker_text::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES};
 
@@ -258,6 +258,11 @@ pub(crate) struct SessionEntry {
     /// The advertised addresses' candidates and which of the worker's
     /// host candidates the browser is told; by default all of them.
     advertisement: Arc<Advertisement>,
+    /// The server-reflexive transport addresses told or held for the
+    /// browser, advertised and STUN-learned: each is told once, the first
+    /// line at it kept (RFC 8445 §5.1.3). At most the advertised ones and
+    /// [`MAX_STUN_SERVERS`](crate::gather::MAX_STUN_SERVERS).
+    srflx: Vec<(Protocol, SocketAddr)>,
     /// The relay candidates handed to the worker.
     relays: Vec<SessionRelay>,
     /// The (relayed, peer) pairs a channel was asked for.
@@ -337,6 +342,7 @@ impl SessionEntry {
             held: Vec::new(),
             mid: None,
             advertisement: Arc::default(),
+            srflx: Vec::new(),
             relays: Vec::new(),
             channels: HashSet::new(),
             channels_refused: 0,
@@ -601,8 +607,32 @@ impl SessionEntry {
     /// end-of-candidates, RFC 8838 §13), and from now on filters the
     /// worker's host candidates through it.
     pub(crate) fn advertise(&mut self, advertisement: Arc<Advertisement>) {
-        self.held.extend(advertisement.lines().iter().cloned());
+        for line in advertisement.lines() {
+            if self.first_srflx(line) {
+                self.held.push(line.clone());
+            }
+        }
         self.advertisement = advertisement;
+    }
+
+    /// Whether `candidate` is the first line the session tells at its
+    /// server-reflexive transport address, which it then records; a later
+    /// one at the same address and base is redundant (RFC 8445 §5.1.3),
+    /// such as a STUN server's mapping of an advertised address. Every
+    /// other candidate is a first.
+    fn first_srflx(&mut self, candidate: &str) -> bool {
+        let Some(address) = srflx_address(candidate) else {
+            return true;
+        };
+        if self.srflx.contains(&address) {
+            tracing::debug!(
+                candidate,
+                "server-reflexive candidate already told at its address; redundant"
+            );
+            return false;
+        }
+        self.srflx.push(address);
+        true
     }
 
     /// `sdp`, an answer of the worker's, without the `a=candidate` lines
@@ -626,11 +656,14 @@ impl SessionEntry {
 
     /// A gather finished with `candidate`, or without one: the events to
     /// deliver. A candidate before the answer waits for it; one after
-    /// end-of-candidates is too late and dropped.
+    /// end-of-candidates is too late and dropped, and so is a
+    /// server-reflexive one at an address already told
+    /// ([`Self::first_srflx`]).
     pub(crate) fn gathered(&mut self, candidate: Option<String>) -> Vec<SessionEvent> {
         self.gathers = self.gathers.saturating_sub(1);
         let mut out = Vec::new();
-        if let Some(candidate) = candidate.filter(|_| !self.candidates_done) {
+        let candidate = candidate.filter(|line| !self.candidates_done && self.first_srflx(line));
+        if let Some(candidate) = candidate {
             if self.answered {
                 out.push(self.gathered_event(candidate));
             } else {
@@ -1872,6 +1905,49 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn rfc_8445_5_1_3_a_server_reflexive_address_is_told_once_the_first_line_kept() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let advertisement = Arc::new(Advertisement::new(
+            &["203.0.113.7:40000".parse().unwrap()],
+            &["172.17.0.2:18556".parse().unwrap()],
+            &[],
+        ));
+        let stun = |n: u32, ip: &str| {
+            format!("candidate:s{n} 1 udp 1694498815 {ip} 40000 typ srflx raddr 0.0.0.0 rport 9")
+        };
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        session.gathering(3);
+        session.advertise(Arc::clone(&advertisement));
+        // A STUN server mapping to the advertised address adds nothing;
+        // another address is held for the answer.
+        assert_eq!(session.gathered(Some(stun(0, "203.0.113.7"))), vec![]);
+        assert_eq!(session.gathered(Some(stun(1, "203.0.113.8"))), vec![]);
+        let answered = session.applied(WorkerSessionEvent::Answer {
+            sdp: "v=0\r\na=mid:0\r\n".into(),
+            talkback: None,
+        });
+        assert_eq!(
+            answered[1..],
+            [
+                candidate(&advertisement.lines()[0], Some("0")),
+                candidate(&stun(1, "203.0.113.8"), Some("0")),
+            ]
+        );
+        // After the answer too: a second STUN server at a told address.
+        assert_eq!(session.gathered(Some(stun(2, "203.0.113.8"))), vec![]);
+        assert_eq!(
+            captured
+                .lines("server-reflexive candidate already told at its address")
+                .len(),
+            2
+        );
+        // The gathers are done: the worker's end-of-candidates ends them.
+        assert_eq!(session.applied(end()), vec![candidate("", None)]);
     }
 
     #[test]

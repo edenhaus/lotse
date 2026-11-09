@@ -240,15 +240,21 @@ fn parse_stun(rest: &str) -> Option<StunServer> {
 }
 
 /// The `candidate` attribute value of a server-reflexive candidate
-/// (RFC 8839 §5.1), with the RFC 8445 §5.1.2.1 priority.
-pub(crate) fn srflx_candidate(foundation: usize, mapped: SocketAddr, base: SocketAddr) -> String {
+/// (RFC 8839 §5.1), with the RFC 8445 §5.1.2.1 priority and `related` as
+/// its related address: its base, or the withheld one §5.1 allows
+/// ([`Advertisement::related`](crate::advertise::Advertisement::related)).
+pub(crate) fn srflx_candidate(
+    foundation: usize,
+    mapped: SocketAddr,
+    related: SocketAddr,
+) -> String {
     let priority = (SRFLX_TYPE_PREFERENCE << 24) | (LOCAL_PREFERENCE << 8) | (256 - COMPONENT);
     format!(
         "candidate:s{foundation} {COMPONENT} udp {priority} {} {} typ srflx raddr {} rport {}",
         mapped.ip(),
         mapped.port(),
-        base.ip(),
-        base.port()
+        related.ip(),
+        related.port()
     )
 }
 
