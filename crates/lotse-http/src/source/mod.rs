@@ -37,6 +37,12 @@
 //! within the current await, whatever it waits for, and the fetch tasks
 //! and connections end with it. The URL's path, query and credentials
 //! never reach a log line or an error.
+//!
+//! HTTP has no way back to the camera: the source never takes its tracks'
+//! keyframe requests
+//! ([`Track::keyframe_requests`](lotse_core::track::Track::keyframe_requests)),
+//! which core counts and drops; viewers wait for the stream's next
+//! keyframe.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;

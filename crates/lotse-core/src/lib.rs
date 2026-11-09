@@ -4,7 +4,8 @@
 //! supervision (backoff, stall watchdog, hot swap), clock mapping and its
 //! skew watchdog, fan-out, the pre-record ring, a recording's reliable queue
 //! and interleaver and its container contract, track negotiation and a
-//! session's uplink track for talk-back.
+//! session's uplink track for talk-back, and the path of the viewers'
+//! keyframe requests to the source feeding a track.
 //!
 //! Runs inside a worker process. Knows nothing about RTSP, WebRTC, HTTP or
 //! processes: it defines the traits the protocol crates implement and never
@@ -13,6 +14,8 @@
 //! its `test-util` feature, never in `lotse-testing`.
 //!
 //! Standards: RFC 3550 (RTP timestamps, sequence numbers, Sender Reports);
+//! the keyframe requests stand for RFC 4585 §6.3.1 PLIs and RFC 5104
+//! §4.3.1 FIR messages, which the protocol crates send and receive;
 //! the signaling channel carries RFC 8829 (JSEP) offers and answers and
 //! RFC 8838 (Trickle ICE) candidates as opaque text.
 
@@ -26,6 +29,7 @@ pub mod fingerprint;
 pub mod id;
 pub mod ingest;
 pub mod interleave;
+pub mod keyframe;
 pub mod lateness;
 pub mod media;
 pub mod negotiate;

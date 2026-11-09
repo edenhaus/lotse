@@ -971,9 +971,10 @@ impl TrackSet {
 
     /// Arms this staging set: the connection switches to it at its video's
     /// first keyframe. The live set itself cannot be armed.
-    pub fn arm_switch(&self) {
+    pub fn arm_switch(self: &Arc<Self>) {
         if self.live.is_some() {
-            self.feeds.arm(self.tag, &self.tracks());
+            self.feeds
+                .arm(self.tag, Arc::downgrade(self), &self.tracks());
         }
     }
 

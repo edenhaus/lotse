@@ -608,6 +608,78 @@ async fn rfc8445_2_5_a_nest_like_ice_lite_camera_answers_the_offer_and_its_strea
     assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
 }
 
+/// A viewer that joins once the cached keyframe is too old for a
+/// catch-up burst (`webrtc.catchup_max_age`, 500 ms by default) gets it as
+/// a still, and its session asks for a keyframe: the video track hands
+/// the request to the WebRTC source, which sends the camera exactly one
+/// PLI (RFC 4585 §6.3.1), and the keyframe the camera answers with
+/// reaches the viewer. The camera's GOP is longer than the test, so no
+/// keyframe comes unasked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc4585_6_3_1_a_viewer_joining_on_a_stale_cache_gets_the_camera_one_pli() {
+    lotse_webrtc::install_crypto_provider();
+    let (daemon, dir) = daemon("webrtc-source-keyframe");
+    let socket = dir.join("lotse.sock");
+    let mut control = Control::connect(&socket).await;
+    let (signaling, _) = control
+        .subscribe(json!({ "type": "signaling/subscribe", "stream_id": "door" }))
+        .await;
+    control.call(put(&json!({}), 0)).await;
+    let offer = offer(&mut control, signaling).await;
+    let camera = answer(
+        &mut control,
+        &offer,
+        WebRtcCameraConfig {
+            gop: 100_000,
+            ..WebRtcCameraConfig::default()
+        },
+    )
+    .await;
+    control
+        .stream_where("door", |door| door["state"] == "live")
+        .await;
+    let stats = camera.stats();
+    // The startup PLI, which the camera answers with its first keyframe.
+    within("the startup keyframe request", async {
+        while WebRtcCameraStats::count(&stats.keyframe_requests) == 0 {
+            SystemClock.sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    // The cached keyframe grows stale, and the startup PLIs are over.
+    SystemClock.sleep(Duration::from_millis(1_500)).await;
+    let asked = WebRtcCameraStats::count(&stats.keyframe_requests);
+
+    let viewer_socket = UdpSocket::bind("127.0.0.1:0").await.expect("viewer socket");
+    let mut viewer =
+        Viewer::new(viewer_socket.local_addr().unwrap(), clock().now()).expect("a viewer");
+    let (session, _) = control
+        .subscribe(
+            json!({ "type": "webrtc/offer", "stream_id": "door", "session_id": "ha-1",
+                           "sdp": viewer.offer() }),
+        )
+        .await;
+    // The still, then the keyframe the camera sent for the request.
+    play(
+        &mut control,
+        session,
+        &mut viewer,
+        &viewer_socket,
+        |viewer| viewer.is_connected() && viewer.keyframe_starts() >= 2,
+    )
+    .await;
+    assert_eq!(
+        WebRtcCameraStats::count(&stats.keyframe_requests),
+        asked + 1,
+        "exactly one PLI for the join"
+    );
+
+    drop(control);
+    camera.stop().await;
+    let (code, rest) = daemon.terminate();
+    assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
+}
+
 /// A camera that closes its connection (DTLS `close_notify`, RFC 6347
 /// §4.2.7) once its stream is live ends the signal `peer_closed`; after
 /// its backoff the source offers again under a new signal, which a

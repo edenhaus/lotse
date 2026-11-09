@@ -25,6 +25,9 @@
 //! A cancel is honored at once: the engine closes (`close_notify`, RTCP
 //! BYE) and is disconnected, its close datagrams sent without waiting.
 //!
+//! The video track's keyframe requests, its viewers' coalesced by core,
+//! become PLIs through the engine, under the spacing its own PLIs keep.
+//!
 //! The tracks are declared at the answer and the source is ready once ICE
 //! and DTLS are up: until then the runner's ready timeout bounds the
 //! attempt, not its stall watchdog, so a camera that takes seconds to
@@ -34,10 +37,11 @@
 //! that never connects ends as `ice_failed`. The offer and its candidates
 //! go to the relay at once, at most [`MAX_HOSTS`] of them, which its queue
 //! holds, so nothing waits on the relay. The loop waits on the cancel,
-//! the signals, the host sockets (in turn, so a busy one starves none) and
-//! the engine's timeout; an engine timeout that came due meanwhile is
-//! handled before the I/O that woke the loop, so I/O that is always ready,
-//! or that came at or after a deadline, neither postpones nor replaces it.
+//! the signals, the host sockets (in turn, so a busy one starves none),
+//! the video's keyframe requests and the engine's timeout; an engine
+//! timeout that came due meanwhile is handled before the I/O that woke
+//! the loop, so I/O that is always ready, or that came at or after a
+//! deadline, neither postpones nor replaces it.
 
 use std::future::Future;
 use std::io;
@@ -48,6 +52,7 @@ use std::time::Instant;
 
 use lotse_codec::rtp_ingest::RtpTracks;
 use lotse_core::codec::Kind;
+use lotse_core::keyframe::KeyframeRequests;
 use lotse_core::signaling::{LocalSignal, REJECTED, RemoteSignal, SignalingChannel, close};
 use lotse_core::source::{Source, SourceCtx, SourceDescriptor, SourceError};
 use lotse_core::task::BoxFuture;
@@ -169,6 +174,8 @@ enum Woke {
     Signal(RemoteSignal),
     /// A datagram on host socket `.0`.
     Datagram(usize, io::Result<(SocketAddr, usize)>),
+    /// The video track's viewers want a keyframe.
+    Keyframe,
 }
 
 /// The end of an attempt by cancel.
@@ -200,6 +207,8 @@ struct Attempt {
     /// The video's index, its track and its keyframes before this
     /// attempt, while the attempt waits for its first.
     waiting: Option<(usize, Arc<Track>, u64)>,
+    /// The keyframe requests of the video track's viewers, once declared.
+    keyframes: Option<KeyframeRequests>,
     /// The receive buffer.
     buf: Vec<u8>,
     /// Datagrams the sockets did not take.
@@ -259,6 +268,7 @@ impl Attempt {
                     .declare(declared.kind, declared.codec.clone(), declared.clock_rate);
             if declared.kind == Kind::Video {
                 let before = track.stats().keyframes;
+                self.keyframes = Some(track.keyframe_requests());
                 self.waiting = Some((negotiated.index, Arc::clone(&track), before));
             }
             self.rtp
@@ -279,11 +289,41 @@ impl Attempt {
         }
     }
 
+    /// The engine's timeout at `now`. First, whether the viewers'
+    /// keyframe request it may have deferred is still wanted: core knows
+    /// whether a keyframe broadcast after it answered it.
+    fn timeout(&mut self, now: Instant) {
+        if self
+            .keyframes
+            .as_ref()
+            .is_some_and(|requests| !requests.is_wanted())
+        {
+            self.engine.keyframe_answered();
+        }
+        self.engine.handle_timeout(now);
+    }
+
     /// Takes what woke the loop at `now`; `Some` with how the attempt
     /// ended.
     fn woke(&mut self, event: Woke, now: Instant) -> Option<IngestEnd> {
         match event {
             Woke::Signal(RemoteSignal::Answer(sdp)) => self.engine.accept_answer(now, &sdp),
+            // The wake was taken (`requested`); a keyframe broadcast since
+            // the request, by this loop's own drain before it got here, may
+            // have answered it already: then no PLI.
+            Woke::Keyframe => {
+                if self
+                    .keyframes
+                    .as_ref()
+                    .is_some_and(KeyframeRequests::is_wanted)
+                {
+                    let _sent = self.engine.request_keyframe(now);
+                } else {
+                    tracing::debug!(
+                        "webrtc: keyframe request answered by a keyframe before the source took it"
+                    );
+                }
+            }
             Woke::Signal(RemoteSignal::Candidate(candidate)) => {
                 self.engine.add_remote_candidate(now, &candidate);
             }
@@ -462,6 +502,7 @@ async fn attempt(options: WebRtcOptions, mut ctx: SourceCtx) -> SourceError {
         },
         rtp: RtpTracks::new(PROTOCOL),
         waiting: None,
+        keyframes: None,
         buf: vec![0_u8; RECEIVE_BUFFER],
         dropped: 0,
     };
@@ -490,6 +531,15 @@ async fn run(
             biased;
             () = ctx.cancel.cancelled() => Err(cancelled()),
             signal = channel.incoming.recv() => signal.map(|signal| Some(Woke::Signal(signal))).ok_or_else(client_gone),
+            // Before the sockets, which may always be ready: a request
+            // comes once per interval at most, so it starves nothing.
+            // Never before the video is declared.
+            () = async {
+                match attempt.keyframes.as_mut() {
+                    Some(requests) => requests.requested().await,
+                    None => std::future::pending().await,
+                }
+            } => Ok(Some(Woke::Keyframe)),
             (index, received) = attempt.hosts.recv(&mut attempt.buf) => Ok(Some(Woke::Datagram(index, received))),
             () = &mut sleeping => Ok(None),
         };
@@ -497,7 +547,7 @@ async fn run(
         let end = match event {
             Err(end) => Some(end),
             Ok(None) => {
-                attempt.engine.handle_timeout(now);
+                attempt.timeout(now);
                 None
             }
             Ok(Some(event)) => {
@@ -506,7 +556,7 @@ async fn run(
                 // answer, a handshake's last datagram, after their
                 // deadline), neither postpones nor replaces a deadline.
                 if now >= wake {
-                    attempt.engine.handle_timeout(now);
+                    attempt.timeout(now);
                 }
                 if attempt.engine.is_ended() {
                     None
@@ -576,6 +626,7 @@ mod tests {
             },
             rtp: RtpTracks::new(PROTOCOL),
             waiting: None,
+            keyframes: None,
             buf: vec![0_u8; RECEIVE_BUFFER],
             dropped: 0,
         };
