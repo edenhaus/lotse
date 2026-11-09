@@ -248,6 +248,29 @@ checksum_source = "mise-versions"
 url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.24.1/cargo-zigbuild-aarch64-apple-darwin.tar.xz"
 url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/709674719"
 
+[[tools."github:rust-secure-code/cargo-auditable"]]
+version = "0.7.7"
+backend = "github:rust-secure-code/cargo-auditable"
+specifiers = ["0.7.7"]
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.linux-arm64"]
+checksum = "sha256:bcb2d46002a8dd8e94d0d669cb39d38c9651db2ae5d1f3f1f1bab516ee1e212c"
+checksum_source = "mise-versions"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.7/cargo-auditable-aarch64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/605646405"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.linux-x64"]
+checksum = "sha256:4c8d3b08c3c34e9f2333367224dbbfb4aab68067698b43de59fe19aded3416dd"
+checksum_source = "mise-versions"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.7/cargo-auditable-x86_64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/605646432"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.macos-arm64"]
+checksum = "sha256:a66ad6392861ca1abfe0b02b522622d91edf63e5d7b60f4d3088b5c23d240c72"
+checksum_source = "mise-versions"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.7/cargo-auditable-aarch64-apple-darwin.tar.xz"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/605646408"
+
 [[tools."github:taiki-e/cargo-hack"]]
 version = "0.6.46"
 backend = "github:taiki-e/cargo-hack"

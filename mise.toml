@@ -22,6 +22,7 @@ shellcheck = "0.11.0" # actionlint checks workflow scripts with it when it is on
 zizmor = "1.32.0" # the workflows' security audit: the prek hook offline, CI's Zizmor job online (one pin for both)
 "github:nextest-rs/nextest" = { version = "0.9.151", version_prefix = "cargo-nextest-" }
 "github:rust-cross/cargo-zigbuild" = "0.24.1"
+"github:rust-secure-code/cargo-auditable" = "0.7.7" # the release binary's dependency list, embedded for scanners and `cargo audit bin`
 zig = "0.17.1" # C compiler and linker for every musl build, tests included (see .cargo/config.toml)
 cmake = "4.4.5" # builds the bundled libopus (`opusic-sys`, behind the `opus` crate) on every host
 "github:taiki-e/cargo-llvm-cov" = "0.9.1" # line coverage gate
@@ -227,11 +228,11 @@ cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
 """
 
 [tasks.release-build]
-description = "Static musl binary (Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"
+description = "Static musl binary with its dependency list embedded (cargo auditable; Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"
 usage = 'arg "[arch]" help="x86_64 or aarch64" default="x86_64"'
 run = """
 [ "$(uname -s)" = Linux ] || { echo "release-build runs on Linux; CI builds both arches (build.yml)" >&2; exit 1; }
-cargo build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl
+cargo auditable build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl
 """
 
 # The release steps that need no tag, so a release can be checked and reproduced off CI;

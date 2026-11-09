@@ -75,7 +75,7 @@ workflow and job names start with a capital letter.
 | `mise run audit` | RustSec advisories, the root and the fuzz workspace (network) |
 | `mise run fuzz <target> [secs]` | one `cargo fuzz` target on the date-pinned nightly the task installs, under the contract's time and memory limits (`scripts/fuzz.sh`, as CI; cargo-fuzz installed by hand, the one nightly use) |
 | `mise run set-version <version>` | the workspace version and its lockfile entries; only a release build sets it, from the tag (the repository keeps `0.0.0-dev`) |
-| `mise run release-build [x86_64\|aarch64]` | static musl binary (Linux only); zig links every musl build (`.cargo/config.toml`) |
+| `mise run release-build [x86_64\|aarch64]` | static musl binary, its dependency list embedded by cargo-auditable for scanners (Linux only); zig links every musl build (`.cargo/config.toml`) |
 | `mise run sbom` / `mise run licenses` | a release's CycloneDX SBOMs and `THIRD_PARTY_LICENSES.md`, in `target/dist/` |
 | `mise run image` | `release-build` for the host's arch, then the release image from it, reproducibly (`Dockerfile`, which takes `target/image/<docker arch>/lotse`), into the local Podman, or Docker without it, as `lotse:dev` (Linux only) |
 | `mise run rootless-podman [binary] [arch]` | the release image under rootless Podman, read-only and without capabilities, as a start as its user and as root (`scripts/rootless-podman.sh`, CI's Rootless Podman job; Linux only, as an unprivileged user) |
