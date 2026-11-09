@@ -252,9 +252,11 @@ cargo about generate --locked --fail --config .cargo/about.toml --manifest-path 
 """
 
 [tasks.image]
-description = "The release image of the host's arch (Dockerfile), into the local Docker as lotse:dev (Linux only, as release-build)"
+description = "The release image of the host's arch (Dockerfile), into the local Podman, or Docker without it, as lotse:dev (Linux only, as release-build)"
 run = """
 mise run release-build "$(uname -m)"
 install -D target/$(uname -m)-unknown-linux-musl/release/lotse target/image/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/lotse
-docker build --tag lotse:dev .
+engine=docker
+if command -v podman >/dev/null; then engine=podman; fi
+"$engine" build --file Dockerfile --tag lotse:dev .
 """

@@ -37,7 +37,8 @@ is designed with.
 - **Isolated.** One sandboxed worker process per camera connection. A
   crash costs that camera's viewers, never the other cameras.
 - **Least privilege by default.** Started as root, it binds its sockets
-  and drops to an unprivileged uid. Every process runs under
+  and drops to an unprivileged uid; its container image starts as one and
+  needs no capability. Every process runs under
   seccomp and Landlock. C code that decodes camera bytes runs in a
   throwaway decoder process with no network and no files.
 - **Strict.** `#![forbid(unsafe_code)]` in all our crates; C libraries
@@ -150,6 +151,125 @@ With no host address found, or without a subscribed client, the source
 reports `source_unreachable`.
 The dev viewer does not relay signaling, so such a source needs a client
 that does.
+
+## Running in a container
+
+The release image (`ghcr.io/<owner>/lotse`, built from `Dockerfile`)
+holds the static binary alone and runs as uid and gid 65532 from the start.
+A rootless engine maps that uid from its default subordinate ids (any uid
+below 65536 is in them), so the daemon runs as nobody's root and with no
+capability at all, under its own sandbox: `LOTSE_SANDBOX=require` refuses
+to start without every layer. Podman is the engine this is written and
+tested for.
+
+As a rootless Podman Quadlet unit,
+`~/.config/containers/systemd/lotse.container`:
+
+```ini
+[Unit]
+Description=lotse media daemon
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=lotse
+Image=ghcr.io/<owner>/lotse:<version>@sha256:<digest>
+ReadOnly=true
+DropCapability=ALL
+NoNewPrivileges=true
+# The socket's directory, the container user's, mode 0700 as `serve` checks it.
+Tmpfs=/run/lotse:rw,mode=0700,U
+Volume=lotse-data:/data
+PublishPort=18556:18556/udp
+PublishPort=18556:18556/tcp
+# The control API over mutual TLS, for a client outside the container.
+PublishPort=18557:18557/tcp
+Environment=LOTSE_CONTROL_LISTEN=[::]:18557
+# The host's LAN address, which browsers are told.
+Environment=LOTSE_WEBRTC_ADVERTISE=192.168.1.10
+Environment=LOTSE_SANDBOX=require
+HealthCmd=["/lotse", "ctl", "--socket", "/run/lotse/lotse.sock", "info"]
+HealthInterval=30s
+PidsLimit=512
+Memory=1G
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+`systemctl --user daemon-reload && systemctl --user start lotse` starts
+it, and `loginctl enable-linger` starts it at boot without a login.
+`podman logs lotse` shows the first client's pairing code and
+`podman exec lotse /lotse pair` makes another. Without the TLS listener a
+client reaches the socket only from inside the container, or from a
+container that shares `/run/lotse` as a volume and runs as 65532 (or the
+uid `LOTSE_ALLOW_UID` names).
+
+- `HealthCmd` is a JSON array: the image has no shell, and Podman runs a
+  plain string through `/bin/sh -c`, which fails.
+- `Tmpfs=`'s `U` gives the tmpfs to the container's user; Podman refuses
+  `uid=` and `gid=` there.
+- `Memory=` needs Podman 5.5 or later (`PodmanArgs=--memory=1g` before),
+  and `Memory=` and `PidsLimit=` need the cgroup controllers a systemd user
+  session delegates. Size them for the cameras: each camera connection is
+  a worker process of its own.
+- No `UserNS=`: the default rootless user namespace already maps 65532,
+  and the daemon needs no host uid inside it.
+
+The same as one `podman run`:
+
+```sh
+podman run -d --name lotse --read-only --cap-drop=all --security-opt=no-new-privileges \
+  --tmpfs /run/lotse:rw,mode=0700,U -v lotse-data:/data \
+  -p 18556:18556/udp -p 18556:18556/tcp -p 18557:18557/tcp \
+  -e 'LOTSE_CONTROL_LISTEN=[::]:18557' -e LOTSE_WEBRTC_ADVERTISE=192.168.1.10 \
+  -e LOTSE_SANDBOX=require --pids-limit=512 --memory=1g \
+  ghcr.io/<owner>/lotse:<version>@sha256:<digest>
+```
+
+A compose file works the same way under podman-compose or docker compose,
+with the same settings (`read_only`, `cap_drop: [ALL]`,
+`security_opt: [no-new-privileges:true]`, the tmpfs, the volume, the
+ports, the environment, `pids_limit`, `mem_limit`); Docker's tmpfs takes
+`uid=65532,gid=65532` in place of `U`.
+
+Started as root instead (`--user 0`), the daemon binds and drops to
+`LOTSE_USER` and `LOTSE_GROUP`, which the image sets to 65532 too. It then
+needs CAP_SETUID and CAP_SETGID, and its socket and data directories may
+belong to root or to 65532: reaching 65532's as root takes
+CAP_DAC_OVERRIDE, and making the enrolled clients' directory for 65532
+takes CAP_CHOWN. The start as 65532 needs none of them.
+
+No host network is needed. Every browser session shares one UDP port and
+one ICE-TCP port, 18556, published as it is (keep the host's port the
+container's, or advertise `IP:PORT`). The daemon's own addresses are the
+container's, so `LOTSE_WEBRTC_ADVERTISE` names the host's LAN address that
+browsers are told instead, and with it set they are told none of the
+container's. What the rootless network does to this, observed on
+2026-11-09 with Podman 5.8.9 (pasta 2026-10-02) and Podman 4.9.3
+(Ubuntu 24.04: slirp4netns 1.2.1, pasta 2024-02-20):
+
+- pasta, the default from Podman 5.0, copies the host's address into the
+  container: the daemon listed the host's address and port 18556 as its
+  host candidate. A datagram or a connection to the published port from
+  another machine arrived with that machine's address and port, and the
+  answer left from the published port. So under pasta the host candidate
+  alone is reachable, without `LOTSE_WEBRTC_ADVERTISE`. Not verified: a
+  browser's ICE session end to end, a host with several addresses or
+  interfaces (pasta copies those of the default route's interface), and
+  the host's address changing while the container runs. Setting
+  `LOTSE_WEBRTC_ADVERTISE` keeps the candidate right whichever network the
+  engine uses.
+- slirp4netns, the default before Podman 5, gives the container 10.0.2.100
+  (and an `fd00::` address), which no browser reaches:
+  `LOTSE_WEBRTC_ADVERTISE` is required. Its default port forwarder replaces
+  the source of an inbound datagram or connection with 10.0.2.100 and a
+  port of its own; `--network slirp4netns:port_handler=slirp4netns` keeps
+  the browser's. Not verified: an ICE session through the default
+  forwarder.
 
 ## License
 
