@@ -38,11 +38,11 @@ jobs:
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "::error::$TAG is not v<SemVer>; Release Drafter names releases v<version>"
+          if ! printf '%s\n' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::$TAG is not a bare SemVer; Release Drafter tags releases <version>, no v"
             exit 1
           fi
-          echo "version=${TAG#v}" | tee -a "$GITHUB_OUTPUT"
+          echo "version=$TAG" | tee -a "$GITHUB_OUTPUT"
 
   build:
     name: Build

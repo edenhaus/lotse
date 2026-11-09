@@ -7,9 +7,9 @@
 # on their own. While the version is 0.x, a breaking change raises the minor version (Cargo's
 # reading of SemVer); from 1.0 it should raise the major one.
 
-name-template: "lotse $RESOLVED_VERSION"
-tag-template: "v$RESOLVED_VERSION"
-tag-prefix: "v"
+# The release, its title and its tag are the bare version (0.1.0), no "v".
+name-template: "$RESOLVED_VERSION"
+tag-template: "$RESOLVED_VERSION"
 change-template: "- $TITLE (#$NUMBER) $AUTHORS"
 change-title-escapes: '\<*_&' # Markdown in a title stays text; Release Drafter keeps @ and # from mentioning
 sort-direction: ascending
