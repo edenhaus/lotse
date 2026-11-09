@@ -1,6 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:best-practices", ":semanticCommits"],
+  "ignorePresets": [":ignoreModulesAndTests"],
   "labels": ["dependencies"],
   "lockFileMaintenance": { "enabled": true, "schedule": ["* * * * 1"] },
   "pre-commit": { "enabled": true },
@@ -11,19 +12,9 @@
       "groupName": "ruff"
     },
     {
-      "description": "psutil and its typeshed stubs, which follow its version",
-      "matchPackageNames": ["psutil", "types-psutil"],
-      "groupName": "psutil"
-    },
-    {
-      "description": "tracing and its sibling crates, which build on one tracing-core",
-      "matchPackageNames": ["tracing", "tracing-core", "tracing-subscriber", "tracing-log"],
-      "groupName": "tracing"
-    },
-    {
-      "description": "hyper and the hyperium crates around it, which share its body and service types",
-      "matchPackageNames": ["hyper", "hyper-util", "http-body-util"],
-      "groupName": "hyper"
+      "description": "go2rtc-client stays at the version its common deployment pins (tests/browser/pyproject.toml), moved by hand when that changes",
+      "matchPackageNames": ["go2rtc-client"],
+      "enabled": false
     },
     {
       "description": "rustls and tokio-rustls, which is built against one rustls minor",
