@@ -32,7 +32,8 @@ it may restore a cache), `scorecard.yml`, `pr-title.yml` and
 says why). Its Build job compiles the musl tests once per arch
 into a nextest archive that the Interop, TURN and Sandbox
 isolation jobs run without compiling, and its Rootless Podman job builds
-the release image from the Release build job's binary; its Coverage build job does the same
+the release image from the Release build job's binary, runs it rootless
+and scans it with Grype (as `release.yml` scans the pushed image); its Coverage build job does the same
 with coverage instrumentation for the Tests jobs, which gate on 100 % line
 coverage on each arch and upload the report to Codecov, which gates
 each arch at 100 % again on the PR (`.github/codecov.yml`, one flag per

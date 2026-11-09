@@ -361,11 +361,18 @@ jobs:
   # as root with CAP_SETUID and CAP_SETGID alone, then as root on the directories of the image's
   # user. `podman build` takes the Release build job's x86_64 binary, so the job compiles nothing
   # and takes about a minute: every push and PR runs it, since a change to the Dockerfile, the
-  # owner checks or the sandbox can break the image as no other job would notice.
+  # owner checks or the sandbox can break the image as no other job would notice. Then Grype scans
+  # the same image (scripts/scan-image.sh), reading the crates from the binary's cargo-auditable
+  # list, and fails on a HIGH or CRITICAL vulnerability with a fix; on main its findings go to code
+  # scanning, as Zizmor's do. Grype, not Trivy: Trivy's release credentials and GitHub Actions were
+  # compromised in March 2026 (CVE-2026-33634, a malicious v0.69.4 and rewritten action tags).
   rootless-podman:
     name: Rootless Podman
     needs: release-build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # uploading the scan's findings to code scanning, on main
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -381,6 +388,19 @@ jobs:
           grep "^$(id -un):" /etc/subuid /etc/subgid
       - name: Run the image rootless
         run: scripts/rootless-podman.sh artifacts/lotse x86_64
+      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          version: 2026.11.0
+          install_args: grype
+      - name: Scan the image
+        run: |
+          podman save --format oci-archive --output "$RUNNER_TEMP/lotse.tar" localhost/lotse:rootless-check
+          scripts/scan-image.sh "oci-archive:$RUNNER_TEMP/lotse.tar" "" grype.sarif
+      - if: ${{ !cancelled() && github.event_name == 'push' && hashFiles('grype.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: grype.sarif
+          category: grype
 
   # How many Mutants jobs the PR needs, from its changed lines' mutants (scripts/mutants-shards.sh):
   # up to 10 a job, at most 8 jobs, none when it has no mutants. Listing them builds nothing.
