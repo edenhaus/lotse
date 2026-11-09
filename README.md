@@ -160,7 +160,7 @@ A rootless engine maps that uid from its default subordinate ids (any uid
 below 65536 is in them), so the daemon runs as nobody's root and with no
 capability at all, under its own sandbox: `LOTSE_SANDBOX=require` refuses
 to start without every layer. Podman is the engine this is written and
-tested for.
+tested for (CI's Rootless Podman job runs the image this way).
 
 As a rootless Podman Quadlet unit,
 `~/.config/containers/systemd/lotse.container`:

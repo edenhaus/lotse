@@ -260,3 +260,14 @@ engine=docker
 if command -v podman >/dev/null; then engine=podman; fi
 "$engine" build --file Dockerfile --tag lotse:dev .
 """
+
+[tasks.rootless-podman]
+description = "The release image under rootless Podman, read-only and without capabilities, started as its user and as root (scripts/rootless-podman.sh, as CI's Rootless Podman job); Linux only, as an unprivileged user, after release-build"
+usage = '''
+arg "[binary]" help="The static release binary" default=""
+arg "[arch]" help="x86_64 or aarch64, the host's by default" default=""
+'''
+run = """
+arch="${usage_arch:-$(uname -m)}"
+scripts/rootless-podman.sh "${usage_binary:-target/$arch-unknown-linux-musl/release/lotse}" "$arch"
+"""

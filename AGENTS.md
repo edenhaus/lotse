@@ -31,7 +31,8 @@ it may restore a cache), `scorecard.yml`, `pr-title.yml` and
 `cleanup-caches.yml` (a closed PR's caches deleted) stand apart (each
 says why). Its Build job compiles the musl tests once per arch
 into a nextest archive that the Interop, TURN and Sandbox
-isolation jobs run without compiling; its Coverage build job does the same
+isolation jobs run without compiling, and its Rootless Podman job builds
+the release image from the Release build job's binary; its Coverage build job does the same
 with coverage instrumentation for the Tests jobs, which gate on 100 % line
 coverage on each arch and upload the report to Codecov, which gates
 each arch at 100 % again on the PR (`.github/codecov.yml`, one flag per
@@ -77,6 +78,7 @@ workflow and job names start with a capital letter.
 | `mise run release-build [x86_64\|aarch64]` | static musl binary (Linux only); zig links every musl build (`.cargo/config.toml`) |
 | `mise run sbom` / `mise run licenses` | a release's CycloneDX SBOMs and `THIRD_PARTY_LICENSES.md`, in `target/dist/` |
 | `mise run image` | `release-build` for the host's arch, then the release image from it (`Dockerfile`, which takes `target/image/<docker arch>/lotse`), into the local Podman, or Docker without it, as `lotse:dev` (Linux only) |
+| `mise run rootless-podman [binary] [arch]` | the release image under rootless Podman, read-only and without capabilities, as a start as its user and as root (`scripts/rootless-podman.sh`, CI's Rootless Podman job; Linux only, as an unprivileged user) |
 
 ## Layout
 

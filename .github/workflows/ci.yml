@@ -9,7 +9,7 @@ name: CI
 #
 # Build once: the Build job compiles the tests of the static musl target once per arch and
 # archives them (cargo nextest archive); Interop, TURN and Sandbox isolation run that archive and
-# compile nothing. Coverage build does the same with coverage instrumentation, for the Tests jobs,
+# compile nothing, and Rootless Podman builds the release image from Release build's binary. Coverage build does the same with coverage instrumentation, for the Tests jobs,
 # which check the coverage gate on each arch and upload the report to Codecov. Fuzz build compiles
 # the fuzz targets once for the Fuzz jobs, which run them up to 4 at a time. The other compiling
 # jobs build what only they need (clippy's check build, the release profile) and each keeps its
@@ -354,6 +354,33 @@ jobs:
             --volume "$PWD/$BIN:/lotse:ro" \
             --volume "$PWD/scripts/sandbox-isolation.sh:/check.sh:ro" \
             lotse-sandbox-check /bin/sh /check.sh
+
+  # The release image under rootless Podman, as the runner's unprivileged user and as README.md's
+  # "Running in a container" runs it (scripts/rootless-podman.sh): read-only, without capabilities,
+  # no_new_privs, the ports published and the sandbox required; started as the image's user, then
+  # as root with CAP_SETUID and CAP_SETGID alone, then as root on the directories of the image's
+  # user. `podman build` takes the Release build job's x86_64 binary, so the job compiles nothing
+  # and takes about a minute: every push and PR runs it, since a change to the Dockerfile, the
+  # owner checks or the sandbox can break the image as no other job would notice.
+  rootless-podman:
+    name: Rootless Podman
+    needs: release-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lotse-x86_64
+          path: artifacts
+      # The runner's own Podman, and the subordinate ids its rootless user namespace maps 65532 from.
+      - name: Podman and the runner's subordinate ids
+        run: |
+          podman version
+          grep "^$(id -un):" /etc/subuid /etc/subgid
+      - name: Run the image rootless
+        run: scripts/rootless-podman.sh artifacts/lotse x86_64
 
   # How many Mutants jobs the PR needs, from its changed lines' mutants (scripts/mutants-shards.sh):
   # up to 10 a job, at most 8 jobs, none when it has no mutants. Listing them builds nothing.
@@ -1034,6 +1061,7 @@ jobs:
       - interop
       - turn
       - sandbox
+      - rootless-podman
       - mutants-plan
       - mutants-cache
       - mutants
