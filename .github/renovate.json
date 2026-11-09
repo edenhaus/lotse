@@ -6,9 +6,17 @@
     "group:allNonMajor",
     "schedule:weekly"
   ],
+  "ignorePresets": [":pinDevDependencies"],
   "labels": ["dependencies"],
   "lockFileMaintenance": { "enabled": true },
   "pre-commit": { "enabled": true },
+  "packageRules": [
+    {
+      "description": "retina is pinned by hand to a revision of the edenhaus/retina fork (Cargo.toml says which and why); Renovate would move it to the fork's default branch, which is behind it",
+      "matchDepNames": ["retina"],
+      "enabled": false
+    }
+  ],
   "customManagers": [
     {
       "customType": "regex",
