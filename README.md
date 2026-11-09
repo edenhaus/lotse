@@ -102,6 +102,15 @@ socket and nothing else.
 address only: anything that reaches the relay drives the daemon, so an
 address reachable from the network also needs `--insecure-listen`.
 
+Browsers reach the daemon's WebRTC media at the host addresses of its UDP
+socket (`--webrtc-udp-listen`) and ICE-TCP listener
+(`--webrtc-tcp-listen`). Behind a container's bridge network, with those
+ports published instead of host networking, those addresses are the
+container's own, which no browser reaches: `--webrtc-advertise`
+(`LOTSE_WEBRTC_ADVERTISE`, `webrtc.advertise` in the config file) names up
+to eight addresses, `IP` or `IP:PORT`, that browsers are told instead, and
+with one set they are told none of the container's own.
+
 Every source of `stream/put` is named by its `protocol`, with that
 protocol's own fields beside it, and `stream/get` reports it in the same
 shape (its URL redacted); `info.protocols` lists the protocols a build

@@ -48,14 +48,14 @@ const STUN_PORT: u16 = 3478;
 
 /// The type preference of a server-reflexive candidate (RFC 8445
 /// §5.1.2.2 recommends 100).
-const SRFLX_TYPE_PREFERENCE: u32 = 100;
+pub(crate) const SRFLX_TYPE_PREFERENCE: u32 = 100;
 
 /// The local preference of the one base per family (RFC 8445 §5.1.2.1:
 /// 65535 when there is a single one).
-const LOCAL_PREFERENCE: u32 = 65_535;
+pub(crate) const LOCAL_PREFERENCE: u32 = 65_535;
 
 /// The RTP component; rtcp-mux leaves only this one (RFC 5761).
-const COMPONENT: u32 = 1;
+pub(crate) const COMPONENT: u32 = 1;
 
 /// A `stun:` server as its URI names it.
 #[derive(Debug, Clone, PartialEq, Eq)]

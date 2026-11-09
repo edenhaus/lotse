@@ -27,6 +27,12 @@
 //! worker repeating or flipping its state adds at most one frame to the
 //! queue.
 //!
+//! With addresses advertised (`webrtc.advertise`, [`crate::advertise`]),
+//! a session's browser is told their candidates, held like the
+//! STUN-learned ones until the answer and before end-of-candidates, and
+//! not the worker's host candidates, in its candidate reports or in the
+//! answers' `a=candidate` lines.
+//!
 //! A session holds a lease on the TURN allocation behind each of its relay
 //! candidates, and the channels its worker asked for on them, at most
 //! [`MAX_RELAY_CHANNELS`] (RFC 8656 §12); dropping the session releases
@@ -62,6 +68,7 @@ use tokio::sync::mpsc::OwnedPermit;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
+use crate::advertise::Advertisement;
 use crate::net::turn_client::Lease;
 use crate::worker_text::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES};
 
@@ -248,6 +255,9 @@ pub(crate) struct SessionEntry {
     held: Vec<String>,
     /// The answer's first media section, which the srflx candidates name.
     mid: Option<String>,
+    /// The advertised addresses' candidates and which of the worker's
+    /// host candidates the browser is told; by default all of them.
+    advertisement: Arc<Advertisement>,
     /// The relay candidates handed to the worker.
     relays: Vec<SessionRelay>,
     /// The (relayed, peer) pairs a channel was asked for.
@@ -326,6 +336,7 @@ impl SessionEntry {
             warnings_dropped: 0,
             held: Vec::new(),
             mid: None,
+            advertisement: Arc::default(),
             relays: Vec::new(),
             channels: HashSet::new(),
             channels_refused: 0,
@@ -585,6 +596,28 @@ impl SessionEntry {
         }
     }
 
+    /// Tells the browser `advertisement`'s candidates once the answer is
+    /// out (they are held for it like a gather's, so they precede
+    /// end-of-candidates, RFC 8838 §13), and from now on filters the
+    /// worker's host candidates through it.
+    pub(crate) fn advertise(&mut self, advertisement: Arc<Advertisement>) {
+        self.held.extend(advertisement.lines().iter().cloned());
+        self.advertisement = advertisement;
+    }
+
+    /// `sdp`, an answer of the worker's, without the `a=candidate` lines
+    /// the advertisement hides; logs how many it hid.
+    fn advertised_sdp(&self, sdp: String) -> String {
+        let (sdp, hidden) = self.advertisement.filter_sdp(sdp);
+        if hidden > 0 {
+            tracing::debug!(
+                hidden,
+                "host candidates left out of the answer: addresses are advertised"
+            );
+        }
+        sdp
+    }
+
     /// `count` STUN and TURN gathers started; end-of-candidates waits for
     /// them.
     pub(crate) const fn gathering(&mut self, count: usize) {
@@ -657,6 +690,7 @@ impl SessionEntry {
                     .lines()
                     .find_map(|line| line.strip_prefix("a=mid:"))
                     .map(|mid| mid.trim().to_owned());
+                let sdp = self.advertised_sdp(sdp);
                 let mut out = vec![SessionEvent::Answer { sdp }];
                 let held = std::mem::take(&mut self.held);
                 out.extend(held.into_iter().map(|line| self.gathered_event(line)));
@@ -667,24 +701,7 @@ impl SessionEntry {
                 Ok(self.finish_candidates().into_iter().collect())
             }
             WorkerSessionEvent::Candidate { candidate, mid } => {
-                if self.worker_done {
-                    // RFC 8838 §13: no candidate follows end-of-candidates.
-                    return Err("a candidate after the worker's end-of-candidates");
-                }
-                if self.worker_candidates >= MAX_WORKER_CANDIDATES {
-                    return Err("more candidates than a session allows");
-                }
-                self.charge(
-                    candidate
-                        .len()
-                        .saturating_add(mid.as_ref().map_or(0, String::len)),
-                )?;
-                self.worker_candidates = self.worker_candidates.saturating_add(1);
-                Ok(vec![SessionEvent::Candidate {
-                    candidate,
-                    sdp_mid: mid,
-                    sdp_mline_index: None,
-                }])
+                self.worker_candidate(candidate, mid)
             }
             WorkerSessionEvent::Relayed { relayed, candidate } => {
                 self.charge(candidate.as_ref().map_or(0, String::len))?;
@@ -725,7 +742,7 @@ impl SessionEntry {
                 };
                 self.declines_due = 1;
                 self.talkback = talkback.and_then(|codec| known(&TALKBACK_CODECS, &codec));
-                reply(waiting, Ok(sdp));
+                reply(waiting, Ok(self.advertised_sdp(sdp)));
                 Ok(Vec::new())
             }
             WorkerSessionEvent::RenegotiateRefused { code, message } => {
@@ -748,6 +765,40 @@ impl SessionEntry {
             WorkerSessionEvent::Warning { code, message } => self.warning(&code, &message),
             WorkerSessionEvent::Closed { code, message } => Ok(vec![closed_event(&code, &message)]),
         }
+    }
+
+    /// A candidate line of the worker's: counted and charged, then told to
+    /// the browser unless the advertisement hides it. None follows the
+    /// worker's end-of-candidates (RFC 8838 §13).
+    fn worker_candidate(
+        &mut self,
+        candidate: String,
+        mid: Option<String>,
+    ) -> Result<Vec<SessionEvent>, &'static str> {
+        if self.worker_done {
+            return Err("a candidate after the worker's end-of-candidates");
+        }
+        if self.worker_candidates >= MAX_WORKER_CANDIDATES {
+            return Err("more candidates than a session allows");
+        }
+        self.charge(
+            candidate
+                .len()
+                .saturating_add(mid.as_ref().map_or(0, String::len)),
+        )?;
+        self.worker_candidates = self.worker_candidates.saturating_add(1);
+        if !self.advertisement.shows(&candidate) {
+            tracing::debug!(
+                candidate,
+                "host candidate not told to the browser: addresses are advertised"
+            );
+            return Ok(Vec::new());
+        }
+        Ok(vec![SessionEvent::Candidate {
+            candidate,
+            sdp_mid: mid,
+            sdp_mline_index: None,
+        }])
     }
 
     /// Whether the line of the session's state, just changed, is due at
@@ -1728,6 +1779,99 @@ mod tests {
         assert_eq!(early.gathered(Some("c".into())), vec![candidate("c", None)]);
         // Without gathers the worker's end-of-candidates passes at once.
         assert_eq!(early.applied(end()), vec![candidate("", None)]);
+    }
+
+    #[test]
+    fn advertised_candidates_wait_for_the_answer_and_replace_the_host_ones_rfc_8838_13() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let advertisement = Arc::new(Advertisement::new(
+            &["203.0.113.7".parse().unwrap()],
+            &["172.17.0.2:18556".parse().unwrap()],
+            &[],
+        ));
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        session.advertise(Arc::clone(&advertisement));
+        let host = "candidate:1 1 udp 2130706431 172.17.0.2 18556 typ host";
+        let relay =
+            "candidate:r1 1 udp 16777215 198.51.100.1 49152 typ relay raddr 0.0.0.0 rport 0";
+        // The answer loses its host line; the advertised one follows it.
+        let answered = session.applied(WorkerSessionEvent::Answer {
+            sdp: format!("v=0\r\na=mid:0\r\na={host}\r\na={relay}\r\n"),
+            talkback: None,
+        });
+        assert_eq!(
+            answered,
+            vec![
+                SessionEvent::Answer {
+                    sdp: format!("v=0\r\na=mid:0\r\na={relay}\r\n")
+                },
+                candidate(&advertisement.lines()[0], Some("0")),
+            ]
+        );
+        assert_eq!(
+            captured
+                .lines("host candidates left out of the answer")
+                .len(),
+            1
+        );
+        // The worker's host candidate is counted and charged, not told.
+        assert_eq!(
+            session.applied(WorkerSessionEvent::Candidate {
+                candidate: host.into(),
+                mid: Some("0".into()),
+            }),
+            vec![]
+        );
+        assert_eq!(session.worker_candidates, 1);
+        assert_eq!(session.report_bytes, host.len() + 1);
+        assert_eq!(
+            captured
+                .lines("host candidate not told to the browser")
+                .len(),
+            1
+        );
+        assert_eq!(
+            session.applied(WorkerSessionEvent::Candidate {
+                candidate: relay.into(),
+                mid: None,
+            }),
+            vec![candidate(relay, None)]
+        );
+        assert_eq!(session.applied(end()), vec![candidate("", None)]);
+        // A re-offer's answer is filtered too.
+        let (reply, mut waiting) = oneshot::channel();
+        session.renegotiate(reply).unwrap();
+        session.applied(WorkerSessionEvent::Renegotiated {
+            sdp: format!("v=0\r\na={host}\r\n"),
+            talkback: None,
+        });
+        assert_eq!(waiting.try_recv().unwrap().unwrap(), "v=0\r\n");
+        assert_eq!(
+            captured
+                .lines("host candidates left out of the answer")
+                .len(),
+            2
+        );
+
+        // Without an advertisement the answer is the worker's, unlogged.
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plain = entry(tx);
+        let sdp = format!("v=0\r\na={host}\r\n");
+        assert_eq!(
+            plain.applied(WorkerSessionEvent::Answer {
+                sdp: sdp.clone(),
+                talkback: None,
+            }),
+            vec![SessionEvent::Answer { sdp }]
+        );
+        assert_eq!(
+            captured
+                .lines("host candidates left out of the answer")
+                .len(),
+            2
+        );
     }
 
     #[test]

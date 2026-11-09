@@ -50,6 +50,7 @@ fn supervisor_with(connects: NonZeroUsize) -> Supervisor {
         control_tls: None,
         udp_listen: "[::]:18556".parse().unwrap(),
         tcp_listen: None,
+        advertise: Vec::new(),
         limits: Limits {
             max_connections: 8,
             max_streams: 8,

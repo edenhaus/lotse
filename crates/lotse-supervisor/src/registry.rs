@@ -37,6 +37,7 @@ use lotse_ipc::{
 use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
 
+use crate::advertise::Advertisement;
 use crate::connect::ConnectPermits;
 use crate::driver::{Demand, DriverCommand, DriverSpec};
 use crate::gather::Relayed;
@@ -1598,6 +1599,9 @@ pub(crate) struct Shared {
     /// The passive ICE-TCP host candidates' addresses; empty with the
     /// listener off.
     pub(crate) tcp_hosts: Vec<SocketAddr>,
+    /// What `webrtc.advertise` makes of every session: its candidates and
+    /// the host filter.
+    pub(crate) advertisement: Arc<Advertisement>,
     /// The STUN client of srflx gathering; `None` without a front door.
     pub(crate) stun: Option<Arc<StunClient>>,
     /// The TURN client of relay gathering; `None` without a front door.

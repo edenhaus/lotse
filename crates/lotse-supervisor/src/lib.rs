@@ -4,7 +4,8 @@
 //! the event recordings (their pipes' read ends until fetched, the workers'
 //! reports checked and passed on, the counters, the pre-record window each
 //! connection keeps), the UDP receive and demux, ICE-TCP accept and srflx
-//! gathering with the STUN client, the TURN client (the codec, the
+//! gathering with the STUN client, the advertised addresses' candidates
+//! (`webrtc.advertise`) and the host candidates they hide, the TURN client (the codec, the
 //! long-term credential and
 //! the shared allocations over UDP and TCP, whose servers' relayed
 //! datagrams the demux or the TCP allocation's task unwraps as the peers',
@@ -38,6 +39,7 @@ use lotse_core::task::spawn_named;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+mod advertise;
 mod connect;
 mod driver;
 mod gather;
@@ -52,6 +54,7 @@ mod signaling;
 pub mod worker;
 mod worker_text;
 
+pub use advertise::{AdvertiseError, AdvertisedAddress, MAX_ADVERTISED};
 pub use handler::{Environment, FrontDoor, Identity, Supervisor};
 pub use lotse_api::Server as ApiServer;
 pub use lotse_api::TlsConfig as ControlTls;
@@ -118,6 +121,11 @@ pub struct Settings {
     pub udp_listen: SocketAddr,
     /// The ICE-TCP listener, or `None` for `off`.
     pub tcp_listen: Option<SocketAddr>,
+    /// `webrtc.advertise`: the addresses a NAT in front of the daemon
+    /// forwards to its host addresses, told to browsers in place of the
+    /// host candidates; at most [`MAX_ADVERTISED`], each once. Empty
+    /// advertises nothing and hides nothing.
+    pub advertise: Vec<AdvertisedAddress>,
     /// The limits.
     pub limits: Limits,
     /// `stream.linger`.
@@ -490,6 +498,7 @@ pub(crate) mod test_support {
             control_tls: None,
             udp_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             tcp_listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            advertise: Vec::new(),
             limits: Limits {
                 max_connections: 8,
                 max_streams: 2,

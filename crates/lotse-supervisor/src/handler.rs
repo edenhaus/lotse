@@ -51,6 +51,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 
+use crate::advertise::Advertisement;
 use crate::connect::ConnectPermits;
 use crate::driver::{COMMAND_QUEUE, Demand, Driver, DriverCommand, DriverSpec};
 use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnServer};
@@ -240,6 +241,7 @@ impl Supervisor {
         } else {
             RecordingLimits::NONE
         };
+        let advertisement = Arc::new(Advertisement::new(&settings.advertise, &hosts, &tcp_hosts));
         let shared = Arc::new(Shared {
             manager: WorkerManager::new(environment.worker, environment.udp, Arc::clone(&clock))
                 .with_turn(turn.clone()),
@@ -249,6 +251,7 @@ impl Supervisor {
             connects: ConnectPermits::new(settings.connect_concurrency),
             hosts,
             tcp_hosts,
+            advertisement,
             stun,
             turn,
             state: Mutex::new(state),
@@ -921,6 +924,7 @@ impl Supervisor {
             Arc::clone(&self.shared.clock),
         );
         entry.close_slot = close_slot;
+        entry.advertise(Arc::clone(&self.shared.advertisement));
         entry.deliver(
             &session_id,
             api_event(&SessionEvent::Session {
@@ -5215,6 +5219,67 @@ mod tests {
         assert_eq!(counted["addresses_moved"], 3, "{counted}");
         s.shutdown().await;
         demux.stop();
+    }
+
+    #[tokio::test]
+    async fn advertised_candidates_follow_the_answer_in_place_of_the_host_ones() {
+        let dir = private_dir("advertise");
+        let mut settings = session_settings();
+        settings.advertise = vec!["203.0.113.7".parse().unwrap()];
+        let door = FrontDoor {
+            registrations: Arc::new(Registrations::default()),
+            hosts: vec!["192.0.2.1:18556".parse().unwrap()],
+            tcp_hosts: vec!["192.0.2.1:18557".parse().unwrap()],
+            stun: None,
+            turn: None,
+            demux: None,
+        };
+        let s = Supervisor::new(
+            settings,
+            webrtc_environment(&blocking_worker(&dir), door),
+            Arc::new(SystemClock),
+        );
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        assert_eq!(next(&mut events).await["type"], "session");
+        let host = "candidate:1 1 udp 2130706431 192.0.2.1 18556 typ host";
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: format!("v=0\r\na=mid:0\r\na={host}\r\n"),
+                talkback: None,
+            },
+        );
+        let answer = next(&mut events).await;
+        assert_eq!(answer["sdp"], "v=0\r\na=mid:0\r\n", "{answer}");
+        let udp = next(&mut events).await;
+        assert_eq!(udp["sdp_mid"], "0");
+        assert_eq!(
+            udp["candidate"],
+            "candidate:au0 1 udp 1694498559 203.0.113.7 18556 typ srflx raddr 192.0.2.1 rport 18556"
+        );
+        let tcp = next(&mut events).await;
+        assert_eq!(
+            tcp["candidate"],
+            "candidate:at0 1 tcp 1684013055 203.0.113.7 18557 typ srflx raddr 192.0.2.1 rport 18557 tcptype passive"
+        );
+        // The worker's host candidate is not told; its end-of-candidates
+        // ends the browser's.
+        report(
+            &s,
+            "s1",
+            Report::Candidate {
+                candidate: host.into(),
+                mid: Some("0".into()),
+            },
+        );
+        report(&s, "s1", end_of_candidates());
+        assert_eq!(
+            next(&mut events).await,
+            json!({ "type": "candidate", "candidate": "" })
+        );
+        s.shutdown().await;
     }
 
     #[tokio::test]

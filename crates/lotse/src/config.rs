@@ -19,7 +19,8 @@ use clap::parser::ValueSource;
 use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::{Mode, SandboxConfig};
 use lotse_supervisor::{
-    ControlTls, DEFAULT_CONNECT_CONCURRENCY, Limits, RecordingLimits, SHUTDOWN_BUDGET,
+    AdvertisedAddress, ControlTls, DEFAULT_CONNECT_CONCURRENCY, Limits, MAX_ADVERTISED,
+    RecordingLimits, SHUTDOWN_BUDGET,
 };
 use serde::Deserialize;
 
@@ -146,6 +147,48 @@ impl<'de> Deserialize<'de> for TcpListen {
     }
 }
 
+/// An entry of `webrtc.advertise` in the file, a string parsed as the
+/// flag's entries are.
+#[derive(Debug)]
+struct FileAdvertised(AdvertisedAddress);
+
+impl<'de> Deserialize<'de> for FileAdvertised {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map(Self).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `webrtc.advertise`, each address once, in the order first given;
+/// printed comma-separated for the provenance log.
+#[derive(Debug, Default)]
+struct Advertised(Vec<AdvertisedAddress>);
+
+impl Advertised {
+    /// `addresses` without the repeats.
+    fn new(addresses: impl IntoIterator<Item = AdvertisedAddress>) -> Self {
+        let mut unique = Vec::new();
+        for address in addresses {
+            if !unique.contains(&address) {
+                unique.push(address);
+            }
+        }
+        Self(unique)
+    }
+}
+
+impl fmt::Display for Advertised {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, address) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{address}")?;
+        }
+        Ok(())
+    }
+}
+
 /// The logging settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogSettings {
@@ -234,6 +277,9 @@ pub(crate) enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// More advertised addresses than a session's candidates take.
+    #[error("webrtc.advertise takes at most {max} addresses, not {0}", max = MAX_ADVERTISED)]
+    TooManyAdvertised(usize),
     /// The config file is not valid.
     #[error("config file {path}: {source}")]
     Parse {
@@ -299,6 +345,8 @@ struct WebrtcFile {
     udp_listen: Option<SocketAddr>,
     /// `webrtc.tcp_listen`.
     tcp_listen: Option<TcpListen>,
+    /// `webrtc.advertise`.
+    advertise: Option<Vec<FileAdvertised>>,
 }
 
 /// `[limits]` in the file.
@@ -612,6 +660,26 @@ impl Resolver<'_> {
         }))
     }
 
+    /// `webrtc.advertise`, each address once; more than
+    /// [`MAX_ADVERTISED`] is an error.
+    fn advertise(
+        &mut self,
+        args: &ServeArgs,
+        file: Option<Vec<FileAdvertised>>,
+    ) -> Result<Vec<AdvertisedAddress>, ConfigError> {
+        let Advertised(advertise) = self.pick(
+            "webrtc.advertise",
+            "webrtc_advertise",
+            args.webrtc_advertise.clone().map(Advertised::new),
+            file.map(|list| Advertised::new(list.into_iter().map(|entry| entry.0))),
+            Advertised::default(),
+        );
+        if advertise.len() > MAX_ADVERTISED {
+            return Err(ConfigError::TooManyAdvertised(advertise.len()));
+        }
+        Ok(advertise)
+    }
+
     /// The `[log]` group. A valid `RUST_LOG` beats every other source of
     /// `log.level`; an invalid one is ignored and reported.
     fn log(&mut self, args: &ServeArgs, file: LogFile) -> LogSettings {
@@ -744,6 +812,7 @@ pub(crate) fn load(
         file.webrtc.tcp_listen,
         TcpListen::On(DEFAULT_LISTEN),
     );
+    let advertise = r.advertise(args, file.webrtc.advertise)?;
     let limits = r.limits(args, &file.limits);
     let linger = Duration::from_millis(r.pick(
         "stream.linger_ms",
@@ -776,6 +845,7 @@ pub(crate) fn load(
             control_tls,
             udp_listen,
             tcp_listen: tcp_listen.address(),
+            advertise,
             limits,
             linger,
             connect_concurrency,
@@ -901,6 +971,104 @@ mod tests {
             source_of(&provenance, "webrtc.tcp_listen"),
             ("[::]:18556".into(), Source::Default)
         );
+        assert_eq!(settings.supervisor.advertise, []);
+        assert_eq!(
+            source_of(&provenance, "webrtc.advertise"),
+            (String::new(), Source::Default)
+        );
+    }
+
+    #[test]
+    fn advertised_addresses_come_once_each_from_flags_over_the_file_and_are_capped() {
+        let addrs = |list: &[&str]| -> Vec<AdvertisedAddress> {
+            list.iter().map(|text| text.parse().unwrap()).collect()
+        };
+        let (settings, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/s",
+            "--webrtc-advertise",
+            "203.0.113.7,[2001:db8::7]:40000,203.0.113.7",
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.supervisor.advertise,
+            addrs(&["203.0.113.7", "[2001:db8::7]:40000"])
+        );
+        assert_eq!(
+            source_of(&provenance, "webrtc.advertise"),
+            ("203.0.113.7,[2001:db8::7]:40000".into(), Source::Flag)
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("lotse-config-advertise-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lotse.toml");
+        std::fs::write(
+            &path,
+            "socket = \"/s\"\n[webrtc]\nadvertise = [\"198.51.100.1:18556\", \"198.51.100.1:18556\"]\n",
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+        let (settings, provenance) = resolve(&["lotse", "serve", "--config", config]).unwrap();
+        assert_eq!(
+            settings.supervisor.advertise,
+            addrs(&["198.51.100.1:18556"])
+        );
+        assert_eq!(
+            source_of(&provenance, "webrtc.advertise"),
+            ("198.51.100.1:18556".into(), Source::File)
+        );
+        let (flagged, _) = resolve(&[
+            "lotse",
+            "serve",
+            "--config",
+            config,
+            "--webrtc-advertise",
+            "192.0.2.9",
+        ])
+        .unwrap();
+        assert_eq!(flagged.supervisor.advertise, addrs(&["192.0.2.9"]));
+
+        // A file entry is checked as a flag's is.
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[webrtc]\nadvertise = [\"cam.example\"]\n").unwrap();
+        let err = resolve(&["lotse", "serve", "--config", bad.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        assert!(
+            err.to_string().contains("hostnames are not resolved"),
+            "{err}"
+        );
+
+        // The cap counts each address once.
+        let nine: Vec<String> = (1..=9).map(|n| format!("192.0.2.{n}")).collect();
+        let err = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/s",
+            "--webrtc-advertise",
+            &nine.join(","),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::TooManyAdvertised(9)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "webrtc.advertise takes at most 8 addresses, not 9"
+        );
+        let repeated = format!("{},192.0.2.1", nine[..8].join(","));
+        let (settings, _) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/s",
+            "--webrtc-advertise",
+            &repeated,
+        ])
+        .unwrap();
+        assert_eq!(settings.supervisor.advertise.len(), MAX_ADVERTISED);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

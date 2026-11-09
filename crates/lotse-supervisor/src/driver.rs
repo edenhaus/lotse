@@ -2068,6 +2068,7 @@ mod tests {
             connects: crate::connect::ConnectPermits::new(crate::DEFAULT_CONNECT_CONCURRENCY),
             hosts: vec![],
             tcp_hosts: vec![],
+            advertisement: Arc::default(),
             stun: None,
             turn: None,
             state: Mutex::new(state),
