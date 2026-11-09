@@ -119,7 +119,9 @@ jobs:
           ACTOR: ${{ github.actor }}
           TOKEN: ${{ github.token }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
-      # The same binaries give the same image.
+      # The same binaries give the same image, byte for byte: buildx takes SOURCE_DATE_EPOCH from
+      # the environment for the image's timestamps, and rewrite-timestamp (below) clamps the
+      # layers' file times to it (checked 2026-11-09: two BuildKit v0.33.1 builds, one digest).
       - name: Image timestamp
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
       # mirror.gcr.io: Docker Hub's anonymous pull limit. No cache-binary: this workflow restores
