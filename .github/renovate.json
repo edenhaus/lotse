@@ -1,14 +1,41 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "config:best-practices",
-    ":semanticCommits",
-    "group:allNonMajor",
-    "schedule:weekly"
-  ],
+  "extends": ["config:best-practices", ":semanticCommits"],
   "labels": ["dependencies"],
-  "lockFileMaintenance": { "enabled": true },
+  "lockFileMaintenance": { "enabled": true, "schedule": ["* * * * 1"] },
   "pre-commit": { "enabled": true },
+  "packageRules": [
+    {
+      "description": "ruff in the pre-commit hook and in tests/browser/pyproject.toml, updated together so the hook and `uv run ruff` never disagree",
+      "matchPackageNames": ["ruff", "astral-sh/ruff-pre-commit"],
+      "groupName": "ruff"
+    },
+    {
+      "description": "psutil and its typeshed stubs, which follow its version",
+      "matchPackageNames": ["psutil", "types-psutil"],
+      "groupName": "psutil"
+    },
+    {
+      "description": "tracing and its sibling crates, which build on one tracing-core",
+      "matchPackageNames": ["tracing", "tracing-core", "tracing-subscriber", "tracing-log"],
+      "groupName": "tracing"
+    },
+    {
+      "description": "hyper and the hyperium crates around it, which share its body and service types",
+      "matchPackageNames": ["hyper", "hyper-util", "http-body-util"],
+      "groupName": "hyper"
+    },
+    {
+      "description": "rustls and tokio-rustls, which is built against one rustls minor",
+      "matchPackageNames": ["rustls", "tokio-rustls"],
+      "groupName": "rustls"
+    },
+    {
+      "description": "str0m, its DTLS stack dimpl and the RustCrypto crates lotse-webrtc's crypto provider implements str0m's traits with: a release of one needs the matching releases of the others",
+      "matchPackageNames": ["str0m", "dimpl", "aes", "aes-gcm", "ctr", "hmac", "sha1", "sha2"],
+      "groupName": "str0m and RustCrypto"
+    }
+  ],
   "customManagers": [
     {
       "customType": "regex",
