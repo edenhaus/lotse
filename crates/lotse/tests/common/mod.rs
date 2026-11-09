@@ -194,17 +194,23 @@ impl Daemon {
     /// Reads lines until one contains `needle`, or fails once the daemon
     /// stays silent for the timeout.
     pub(crate) fn wait_for(&mut self, needle: &str) -> String {
+        self.wait_for_any(&[needle])
+    }
+
+    /// Reads lines until one contains any of `needles`, or fails once the
+    /// daemon stays silent for the timeout.
+    pub(crate) fn wait_for_any(&mut self, needles: &[&str]) -> String {
         loop {
             match self.lines.recv_timeout(STEP_TIMEOUT) {
                 Ok(line) => {
                     self.seen.push(line.clone());
-                    if line.contains(needle) {
+                    if needles.iter().any(|needle| line.contains(needle)) {
                         return line;
                     }
                 }
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
                     panic!(
-                        "no line containing {needle:?}\nseen:\n{}",
+                        "no line containing any of {needles:?}\nseen:\n{}",
                         self.seen.join("\n")
                     );
                 }
