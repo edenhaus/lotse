@@ -45,7 +45,7 @@ fn supervisor() -> Supervisor {
 fn supervisor_with(connects: NonZeroUsize) -> Supervisor {
     let settings = Settings {
         socket: PathBuf::from("/nonexistent/lotse.sock"),
-        owner_uid: 0,
+        owners: lotse_supervisor::Owners::only(0),
         allow_uid: 0,
         control_tls: None,
         udp_listen: "[::]:18556".parse().unwrap(),

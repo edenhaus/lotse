@@ -51,7 +51,7 @@ const ANSWER: &str = "v=0\r\ns=camera\r\n";
 fn supervisor() -> Supervisor {
     let settings = Settings {
         socket: PathBuf::from("/nonexistent/lotse.sock"),
-        owner_uid: 0,
+        owners: lotse_supervisor::Owners::only(0),
         allow_uid: 0,
         control_tls: None,
         udp_listen: HOST.parse().unwrap(),

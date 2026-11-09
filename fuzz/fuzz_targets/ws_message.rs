@@ -23,7 +23,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use lotse_api::{Config, ConnectionId, Handler, Outcome, Server};
+use lotse_api::{Config, ConnectionId, Handler, Outcome, Owners, Server};
 use lotse_api_types::command::Command;
 use lotse_api_types::frame::{Hello, HelloTag};
 use lotse_core::clock::SystemClock;
@@ -66,7 +66,7 @@ fn socket() -> &'static PathBuf {
         let socket = dir.join("lotse.sock");
         let server = Server::bind(Config {
             socket: socket.clone(),
-            owner_uid: uid,
+            owners: Owners::only(uid),
             allow_uid: uid,
             max_connections: 1024,
             max_subscriptions: 1024,

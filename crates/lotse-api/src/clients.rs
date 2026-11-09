@@ -7,7 +7,8 @@
 //! daemon makes before the drop, owned by the uid it drops to and mode
 //! 0700; the sandbox lets the supervisor write beneath it and nowhere
 //! else. The data directory itself and the identity in it stay the
-//! starting uid's. The directory is opened before the drop and every write
+//! starting uid's, or, for a start as root, may be the uid it drops to's
+//! ([`crate::Owners`]). The directory is opened before the drop and every write
 //! is relative to that descriptor (`openat`, `renameat`), so the dropped
 //! uid needs no access to the directories above it. The directory is
 //! held under an exclusive `flock` for the store's lifetime, so a second
@@ -160,7 +161,9 @@ impl ClientStore {
     /// checked by the caller; `data_dir` only names it) if it is missing,
     /// owned by `runtime` (the uid and gid the daemon runs as after the
     /// drop) and mode 0700, checks it, locks it, and reads the enrolled
-    /// pins. Every step goes through a descriptor: [`CLIENTS_DIR`] is made
+    /// pins. A start that is not root owns what it makes and chowns it to
+    /// its own uid and gid, so it needs no capability. Every step goes
+    /// through a descriptor: [`CLIENTS_DIR`] is made
     /// and opened in `data`, [`PINS_FILE`] in [`CLIENTS_DIR`], neither
     /// through a link, and each is checked as opened, so no path is looked
     /// up twice. Runs before the drop.

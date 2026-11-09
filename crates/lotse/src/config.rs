@@ -840,7 +840,7 @@ pub(crate) fn load(
         log,
         supervisor: lotse_supervisor::Settings {
             socket,
-            owner_uid: starting_uid,
+            owners: lotse_supervisor::Owners::new(starting_uid, uid),
             allow_uid,
             control_tls,
             udp_listen,
@@ -856,7 +856,10 @@ pub(crate) fn load(
 }
 
 /// Who owns what the daemon writes at runtime: the ids it drops to
-/// (`drop_to`) when started as root, else its own.
+/// (`drop_to`) when started as root, else its own. Its uid is always one
+/// the directories checked before the drop may belong to
+/// ([`lotse_supervisor::Owners`]), and a start that is not root makes
+/// what it writes its own, which needs no capability.
 const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u32, u32) {
     if starting_uid == 0 {
         drop_to
@@ -1244,6 +1247,34 @@ mod tests {
     fn runtime_state_belongs_to_the_ids_the_daemon_runs_as() {
         assert_eq!(state_owner(0, (65534, 65533), 0), (65534, 65533));
         assert_eq!(state_owner(1000, (65534, 65533), 100), (1000, 100));
+        // The directories checked before the drop may belong to them too.
+        for starting in [0, 1000] {
+            let owners = lotse_supervisor::Owners {
+                starting,
+                drop_to: 65534,
+            };
+            assert!(owners.accepts(state_owner(starting, (65534, 65533), 100).0));
+        }
+    }
+
+    #[test]
+    fn the_private_directories_may_belong_to_the_starting_uid_or_the_drop_target() {
+        let (settings, _) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/lotse/lotse.sock",
+            "--user",
+            "4242",
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.supervisor.owners,
+            lotse_supervisor::Owners {
+                starting: rustix::process::getuid().as_raw(),
+                drop_to: 4242,
+            }
+        );
     }
 
     #[test]

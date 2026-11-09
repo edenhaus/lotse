@@ -25,7 +25,7 @@ use lotse_api::tls::{
     HANDSHAKE_TIMEOUT, MAX_HANDSHAKES_PER_ADDRESS, MAX_PENDING_HANDSHAKES, TlsConfig,
 };
 use lotse_api::{
-    BindError, CLOSE_TIMEOUT, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES, Outcome,
+    BindError, CLOSE_TIMEOUT, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES, Outcome, Owners,
     RecordingBody, RecordingBodyError, ServeError, Server, UPGRADE_TIMEOUT,
 };
 use lotse_api_types::command::Command;
@@ -171,7 +171,7 @@ fn config(dir: &Path, data: &Path, clients: Vec<Fingerprint>) -> Config {
     let uid = uid_of(dir);
     Config {
         socket: dir.join("lotse.sock"),
-        owner_uid: uid,
+        owners: Owners::only(uid),
         allow_uid: uid,
         max_connections: 8,
         max_subscriptions: 8,
@@ -200,7 +200,9 @@ fn start_in(dir: PathBuf, data: PathBuf, clients: Vec<Fingerprint>) -> Running {
     assert_eq!(opened.metadata().unwrap().ino(), checked);
     drop(opened);
     let addr = server.tls_local_addr().unwrap();
-    let server_pin = ServerIdentity::load(&data, uid_of(&dir)).unwrap().pin();
+    let server_pin = ServerIdentity::load(&data, Owners::only(uid_of(&dir)))
+        .unwrap()
+        .pin();
     let shutdown = CancellationToken::new();
     let clock = Arc::new(FakeClock::default());
     let task = lotse_core::task::spawn_named(

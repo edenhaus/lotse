@@ -10,15 +10,20 @@
 use std::process::ExitCode;
 
 use anyhow::Context as _;
-use lotse_supervisor::ServerIdentity;
+use lotse_supervisor::{Owners, ServerIdentity};
 
 use crate::cli::IdentityArgs;
 
-/// Reads the identity in `args.data_dir` as the uid this runs as, which
-/// must be the daemon's starting uid, and prints its pin.
+/// Reads the identity in `args.data_dir` as the uid this runs as, and
+/// prints its pin. The directory and the identity must belong to this uid
+/// or, run as root, to the uid `serve` drops to (`args.user`): the owners
+/// a start of the daemon as this uid accepts.
 pub(crate) fn run(args: &IdentityArgs) -> anyhow::Result<ExitCode> {
-    let uid = rustix::process::getuid().as_raw();
-    let identity = ServerIdentity::load(&args.data_dir, uid).context("control identity")?;
+    let owners = Owners {
+        starting: rustix::process::getuid().as_raw(),
+        drop_to: args.user.unwrap_or(lotse_sandbox::DEFAULT_UID),
+    };
+    let identity = ServerIdentity::load(&args.data_dir, owners).context("control identity")?;
     println!("{}", identity.pin());
     Ok(ExitCode::SUCCESS)
 }

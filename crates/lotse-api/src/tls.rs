@@ -65,6 +65,7 @@ use tokio_util::sync::CancellationToken;
 use crate::clients::ClientStore;
 use crate::identity::ServerIdentity;
 use crate::listener::{BindError, PeerInfo, accept_retrying};
+use crate::owners::Owners;
 use crate::pairing::{self, CODE_LIFETIME, PairContext, Pairing, Unpaired};
 use crate::recording::{BodyWatch, Watched};
 use crate::{UPGRADE_TIMEOUT, upgrade_slot};
@@ -128,11 +129,11 @@ pub(crate) struct BoundTls {
 }
 
 /// Loads (or makes) the server identity in `settings.data_dir`, which
-/// `owner_uid` must own, opens the client allowlist, and binds the
+/// one of `owners` must own, opens the client allowlist, and binds the
 /// listener. Without any client the listener still starts: only pairing
 /// is reachable then, and only while a code is open.
-pub(crate) fn bind(settings: &TlsConfig, owner_uid: u32) -> Result<BoundTls, BindError> {
-    let identity = ServerIdentity::load_or_create(&settings.data_dir, owner_uid)?;
+pub(crate) fn bind(settings: &TlsConfig, owners: Owners) -> Result<BoundTls, BindError> {
+    let identity = ServerIdentity::load_or_create(&settings.data_dir, owners)?;
     let certified = CertifiedKey::from_der(
         vec![identity.certificate.clone()],
         identity.key.clone_key(),
@@ -141,7 +142,7 @@ pub(crate) fn bind(settings: &TlsConfig, owner_uid: u32) -> Result<BoundTls, Bin
     .map_err(BindError::Tls)?;
     // Checked as the identity's was, and used through this descriptor
     // from here on.
-    let data = crate::identity::checked_directory(&settings.data_dir, owner_uid, false)?;
+    let data = crate::identity::checked_directory(&settings.data_dir, owners, false)?;
     let store = ClientStore::open(
         &data,
         &settings.data_dir,
@@ -751,7 +752,7 @@ mod tests {
             ),
         };
         (
-            bind(&settings, rustix::process::getuid().as_raw()).unwrap(),
+            bind(&settings, Owners::only(rustix::process::getuid().as_raw())).unwrap(),
             dir,
         )
     }
