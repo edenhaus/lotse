@@ -66,8 +66,9 @@ pub(crate) struct WorkerArgs {
     #[arg(long, value_name = "LEVEL", default_value = "info")]
     pub(crate) log_level: String,
 
-    /// Process isolation, as for `serve`.
-    #[arg(long, value_name = "on|require|off", default_value = "on")]
+    /// Process isolation, as for `serve`, whose effective mode the
+    /// supervisor always passes; the default is `serve`'s too.
+    #[arg(long, value_name = "on|require|off", default_value = "require")]
     pub(crate) sandbox: Mode,
 
     /// Tokio threads.
@@ -162,9 +163,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "LOTSE_DATA_DIR", value_name = "PATH")]
     pub(crate) data_dir: Option<PathBuf>,
 
-    /// Process isolation: `on` (best effort, reported), `require` (refuse to
-    /// start without every layer) or `off` (debugging only: no Landlock or
-    /// seccomp; the privilege drop still happens).
+    /// Process isolation: `require`, the default (refuse to start without
+    /// every layer: seccomp, Landlock's filesystem and TCP rules), `on`
+    /// (best effort: what the kernel lacks is reported) or `off` (debugging
+    /// only: no Landlock or seccomp; the privilege drop still happens).
     #[arg(long, env = "LOTSE_SANDBOX", value_name = "on|require|off")]
     pub(crate) sandbox: Option<Mode>,
 
@@ -342,7 +344,7 @@ mod tests {
         assert_eq!(args.connect_ports, [554, 80]);
         let bare: WorkerArgs = args_of(&["lotse", "worker"], "worker");
         assert_eq!(bare.connect_ports, Vec::<u16>::new());
-        assert_eq!(bare.sandbox, Mode::On);
+        assert_eq!(bare.sandbox, Mode::Require);
         assert_eq!(bare.max_sessions, 256);
         // A worker started by hand holds the daemon's default recording limits.
         assert_eq!(

@@ -3,10 +3,12 @@
 //! process kind (supervisor, worker, decoder).
 //!
 //! Applied by the binary in the main thread before any runtime starts, and
-//! reports which layers are enforced for `info.sandbox`. Linux-only: on
-//! macOS every layer reports `unavailable` so the workspace still builds and
-//! tests. Depends on nothing in the workspace: it runs before anything else
-//! exists in the process.
+//! reports which layers are enforced for `info.sandbox`. By default
+//! ([`Mode::Require`]) a process without every layer refuses to start.
+//! Linux-only: on macOS every layer reports `unavailable` (so only `on` and
+//! `off` start there) and the workspace still builds and tests. Depends on
+//! nothing in the workspace: it runs before anything else exists in the
+//! process.
 //!
 //! Standards: landlock(7), seccomp(2), prctl(2), setresuid(2), setrlimit(2),
 //! setpriority(2) and sched(7).
@@ -142,15 +144,19 @@ pub const DECODER_ADDRESS_SPACE: u64 = 256 << 20;
 /// `RLIMIT_CPU` for a decoder, in seconds.
 pub const DECODER_CPU_SECONDS: u64 = 5;
 
-/// The `sandbox` setting.
+/// The `sandbox` setting. The default is [`Mode::Require`]: a process
+/// that cannot enforce every layer does not start, so no deployment runs
+/// with less isolation than it was built for without saying so. `on` is
+/// the explicit choice for a kernel or container that lacks a layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Best effort: every layer the kernel offers is enforced, the rest is
     /// reported so a client can warn the user.
-    #[default]
     On,
-    /// Refuse to start if any layer is unavailable.
+    /// Refuse to start if any layer (seccomp, Landlock's filesystem rules,
+    /// Landlock's TCP rules) is unavailable; the default.
+    #[default]
     Require,
     /// Debugging only; warns on every start. Only the privilege drop
     /// applies: no rlimits, lower priority, `dumpable`, `no_new_privs`,
@@ -258,9 +264,11 @@ pub struct SandboxConfig {
 }
 
 impl Default for SandboxConfig {
+    /// [`Mode::Require`], dropping to [`DEFAULT_UID`]:[`DEFAULT_GID`], with
+    /// [`DEFAULT_WORKER_ADDRESS_SPACE`].
     fn default() -> Self {
         Self {
-            mode: Mode::On,
+            mode: Mode::default(),
             uid: DEFAULT_UID,
             gid: DEFAULT_GID,
             worker_address_space: DEFAULT_WORKER_ADDRESS_SPACE,
@@ -352,7 +360,25 @@ mod tests {
             err.to_string(),
             "sandbox mode must be `on`, `require` or `off`, not \"loud\""
         );
-        assert_eq!(Mode::default(), Mode::On);
+        assert_eq!(Mode::default(), Mode::Require);
+    }
+
+    /// `require` is the default, so its refusal is what a host without a
+    /// layer meets first: it names the layer, why it is missing, and every
+    /// way to choose `on` instead.
+    #[test]
+    fn a_required_layer_s_refusal_names_the_layer_and_the_way_to_on() {
+        let err = SandboxError::Required {
+            layer: "landlock.net",
+            reason: "landlock.net: TCP rules need ABI 4 (Linux 6.7); this kernel has ABI 3".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "sandbox layer landlock.net is unavailable and the sandbox mode is `require`, the default: \
+             landlock.net: TCP rules need ABI 4 (Linux 6.7); this kernel has ABI 3; \
+             to run with only the layers this host offers, set the mode to `on` \
+             (`--sandbox on`, `LOTSE_SANDBOX=on` or `sandbox = \"on\"` in the config file)"
+        );
     }
 
     #[test]
@@ -383,7 +409,7 @@ mod tests {
         let config = SandboxConfig::default();
         assert_eq!((config.uid, config.gid), (65534, 65534));
         assert_eq!(config.worker_address_space, 1 << 30);
-        assert_eq!(config.mode, Mode::On);
+        assert_eq!(config.mode, Mode::Require);
     }
 
     #[test]
@@ -489,7 +515,11 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn other_platforms_report_every_layer_unavailable() {
-        let report = apply(&Profile::Decoder, &SandboxConfig::default()).unwrap();
+        let on = SandboxConfig {
+            mode: Mode::On,
+            ..SandboxConfig::default()
+        };
+        let report = apply(&Profile::Decoder, &on).unwrap();
         assert_eq!(report.seccomp, LayerStatus::Unavailable);
         assert_eq!(report.landlock.fs, LayerStatus::Unavailable);
         assert_eq!(report.landlock.net, LayerStatus::Unavailable);
@@ -501,11 +531,7 @@ mod tests {
         );
         assert_ne!(report.notes, Vec::<String>::new());
 
-        let config = SandboxConfig {
-            mode: Mode::Require,
-            ..SandboxConfig::default()
-        };
-        let err = apply(&Profile::Decoder, &config).unwrap_err();
+        let err = apply(&Profile::Decoder, &SandboxConfig::default()).unwrap_err();
         assert!(
             matches!(
                 err,

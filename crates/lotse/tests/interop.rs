@@ -512,7 +512,10 @@ mod http {
     /// The daemon's log message for each attempt at an HTTP source.
     const FETCHING: &str = "http: fetching the source";
 
-    /// A daemon with its control connection.
+    /// A daemon with its control connection, sandboxed in `on` mode: the
+    /// interop runs check the media path under every layer the host
+    /// offers, on hosts that may lack one (the default, `require`, would
+    /// refuse there).
     async fn daemon(test: &str) -> (Daemon, Arc<Control>) {
         let dir = socket_dir(&format!("interop-{test}"));
         let socket = dir.join("lotse.sock");
@@ -524,6 +527,8 @@ mod http {
                 "off",
                 "--socket",
                 socket.to_str().unwrap(),
+                "--sandbox",
+                "on",
                 "--log-format",
                 "json",
             ],
