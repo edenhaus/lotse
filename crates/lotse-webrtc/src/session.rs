@@ -40,6 +40,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -447,22 +448,45 @@ pub(crate) fn build_config(
     audio_config(config, codecs)
 }
 
+/// The most `a=candidate` lines taken from one SDP, an offer or a
+/// camera's answer: as many as the control API lets a client trickle to a
+/// session in all. A browser offers a few per interface; without the bound
+/// an SDP of the 64 KiB the API takes names over a thousand addresses, and
+/// the agent sends a connectivity check to each (RFC 8445 §6.1.2.2).
+pub(crate) const MAX_SDP_CANDIDATES: usize = 64;
+
 /// `offer` without its `a=candidate` lines (RFC 8839 §5.1, session level
-/// or in any m-line), the text str0m answers from, and those candidates
-/// without their `a=`, in order. str0m hands every candidate of an offer
-/// it parses to the agent; taken out, they reach it through
-/// [`Session::add_remote`], under the same policy as trickled ones.
+/// or in any m-line), the text str0m answers from, and the first
+/// [`MAX_SDP_CANDIDATES`] of those candidates without their `a=`, in
+/// order; the rest are dropped and counted in one log line. str0m hands
+/// every candidate of an offer it parses to the agent; taken out, they
+/// reach it through [`Session::add_remote`], under the same policy as
+/// trickled ones.
 pub(crate) fn split_candidates(offer: &str) -> (String, Vec<&str>) {
     let mut rest = String::with_capacity(offer.len());
     let mut candidates = Vec::new();
+    let mut dropped = 0_usize;
     for line in offer.lines() {
         match line.strip_prefix("a=") {
-            Some(candidate) if candidate.starts_with("candidate:") => candidates.push(candidate),
+            Some(candidate) if candidate.starts_with("candidate:") => {
+                if candidates.len() < MAX_SDP_CANDIDATES {
+                    candidates.push(candidate);
+                } else {
+                    dropped = dropped.saturating_add(1);
+                }
+            }
             _ => {
                 rest.push_str(line);
                 rest.push_str("\r\n");
             }
         }
+    }
+    if let Some(dropped) = NonZeroUsize::new(dropped) {
+        tracing::warn!(
+            kept = candidates.len(),
+            dropped,
+            "candidates of an SDP dropped: more than a session takes"
+        );
     }
     (rest, candidates)
 }
@@ -1383,8 +1407,9 @@ impl Session {
             Ok(candidate) => {
                 let addr = candidate.addr();
                 if let Some(reason) = refused_address(addr.ip(), &self.scopes) {
-                    // At most 64 per session (the supervisor's cap), so the
-                    // log needs no rate limit.
+                    // At most 64 of an offer ([`MAX_SDP_CANDIDATES`]) and 64
+                    // trickled (the supervisor's cap), so the log needs no
+                    // rate limit.
                     tracing::debug!(kind = ?candidate.kind(), %addr, reason, "remote candidate refused");
                     return false;
                 }
@@ -1975,6 +2000,36 @@ mod tests {
                 "candidate:1 1 udp 1 192.0.2.2 2 typ host"
             ]
         );
+    }
+
+    /// Regression: every candidate of an offer, or of a camera's answer,
+    /// reached the agent, however many, while trickled ones are capped: an
+    /// SDP of the size the control API takes named over a thousand
+    /// addresses for the agent to send connectivity checks to.
+    #[test]
+    fn rfc8445_6_1_2_2_an_sdp_gives_the_agent_a_bounded_number_of_candidates() {
+        let line = |n: usize| format!("candidate:{n} 1 udp 1 192.0.2.1 {} typ host", n + 1);
+        let sdp = |count: usize| {
+            let mut sdp = String::from("v=0\r\nm=video 9 x 96\r\n");
+            for n in 0..count {
+                sdp.push_str("a=");
+                sdp.push_str(&line(n));
+                sdp.push_str("\r\n");
+            }
+            sdp.push_str("a=mid:v\r\n");
+            sdp
+        };
+        let at_limit = sdp(MAX_SDP_CANDIDATES);
+        let (rest, candidates) = split_candidates(&at_limit);
+        assert_eq!(rest, "v=0\r\nm=video 9 x 96\r\na=mid:v\r\n");
+        assert_eq!(candidates.len(), MAX_SDP_CANDIDATES);
+
+        let over = sdp(MAX_SDP_CANDIDATES + 6);
+        let (rest, candidates) = split_candidates(&over);
+        // The dropped ones are still out of what the engine parses.
+        assert_eq!(rest, "v=0\r\nm=video 9 x 96\r\na=mid:v\r\n");
+        let kept: Vec<String> = (0..MAX_SDP_CANDIDATES).map(line).collect();
+        assert_eq!(candidates, kept);
     }
 
     #[test]
