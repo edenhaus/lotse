@@ -45,7 +45,7 @@ uv = "0.13.7" # the browser test's Python, Selenium and pytest, and its checks (
 # go2rtc, the server the browser test is compared with (`mise run compare`, report only): the
 # release its common deployment pins, observed 2026-10-07. Its release binaries are UPX-packed;
 # they run as they are.
-"github:AlexxIT/go2rtc" = { version = "1.9.14", bin = "go2rtc", os = ["linux"], platforms = { linux-x64 = { asset_pattern = "go2rtc_linux_amd64", checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6" }, linux-arm64 = { asset_pattern = "go2rtc_linux_arm64", checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50" } } }
+"github:AlexxIT/go2rtc" = { version = "v1.9.15", bin = "go2rtc", os = ["linux"], platforms = { linux-x64 = { asset_pattern = "go2rtc_linux_amd64", checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6" }, linux-arm64 = { asset_pattern = "go2rtc_linux_arm64", checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50" } } }
 
 # Git hooks are installed on every `mise install`, so nobody has to remember.
 [hooks]
