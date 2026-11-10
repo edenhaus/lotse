@@ -253,8 +253,10 @@ pub(crate) struct SessionEntry {
     /// Candidate lines gathered before the answer: server-reflexive ones,
     /// and relay ones the worker made.
     held: Vec<String>,
-    /// The answer's first media section, which the srflx candidates name.
-    mid: Option<String>,
+    /// The answer's media section that carries its transport, as its `mid`
+    /// and m-line index, which the gathered candidates name
+    /// ([`transport_section`]).
+    transport: Option<(String, u32)>,
     /// The advertised addresses' candidates and which of the worker's
     /// host candidates the browser is told; by default all of them.
     advertisement: Arc<Advertisement>,
@@ -340,7 +342,7 @@ impl SessionEntry {
             renegotiation: None,
             warnings_dropped: 0,
             held: Vec::new(),
-            mid: None,
+            transport: None,
             advertisement: Arc::default(),
             srflx: Vec::new(),
             relays: Vec::new(),
@@ -674,13 +676,14 @@ impl SessionEntry {
         out
     }
 
-    /// A gathered candidate as an event, naming the answer's first media
-    /// section (BUNDLE: every section shares the transport).
+    /// A gathered candidate as an event, naming the media section that
+    /// carries the answer's transport ([`transport_section`]; BUNDLE: every
+    /// section of the group shares it).
     fn gathered_event(&self, candidate: String) -> SessionEvent {
         SessionEvent::Candidate {
             candidate,
-            sdp_mid: self.mid.clone(),
-            sdp_mline_index: self.mid.as_ref().map(|_| 0),
+            sdp_mid: self.transport.as_ref().map(|(mid, _)| mid.clone()),
+            sdp_mline_index: self.transport.as_ref().map(|&(_, index)| index),
         }
     }
 
@@ -719,10 +722,7 @@ impl SessionEntry {
                 self.answered = true;
                 self.declines_due = 1;
                 self.talkback = talkback.and_then(|codec| known(&TALKBACK_CODECS, &codec));
-                self.mid = sdp
-                    .lines()
-                    .find_map(|line| line.strip_prefix("a=mid:"))
-                    .map(|mid| mid.trim().to_owned());
+                self.transport = transport_section(&sdp);
                 let sdp = self.advertised_sdp(sdp);
                 let mut out = vec![SessionEvent::Answer { sdp }];
                 let held = std::mem::take(&mut self.held);
@@ -941,6 +941,41 @@ impl SessionEntry {
             },
         }
     }
+}
+
+/// The media section of an answer that carries its transport, as its
+/// `mid` and m-line index (0 for the first `m=` line), which a trickled
+/// candidate names: the answer's BUNDLE tag, the first identification tag
+/// of its `a=group:BUNDLE` (RFC 8843 §7.3.1), every section of the group
+/// sharing its transport. Without a group, or with a tag no section has,
+/// the first section that is not rejected, a zero port being a rejected
+/// one (RFC 8843 §7.3.3, RFC 3264 §6). Never a rejected one, even if tagged: it has no
+/// transport, so a browser told candidates for it alone, as one is with
+/// addresses advertised and the host lines left out, could not connect.
+/// Attributes before the first `m=` line count as the first section's.
+/// The worker's answer is untrusted text: nothing here indexes into it.
+fn transport_section(sdp: &str) -> Option<(String, u32)> {
+    let mut tag = None;
+    let mut sections = Vec::new();
+    let mut index = None;
+    let mut rejected = false;
+    for line in sdp.lines() {
+        if let Some(media) = line.strip_prefix("m=") {
+            index = Some(index.map_or(0, |i: u32| i.saturating_add(1)));
+            rejected = media.split_ascii_whitespace().nth(1) == Some("0");
+        } else if let Some(group) = line.strip_prefix("a=group:BUNDLE ") {
+            tag = tag.or_else(|| group.split_ascii_whitespace().next());
+        } else if let Some(mid) = line.strip_prefix("a=mid:") {
+            sections.push((mid.trim(), index.unwrap_or(0), rejected));
+        }
+    }
+    let tagged = tag.and_then(|tag| {
+        sections
+            .iter()
+            .find(|&&(mid, _, rejected)| mid == tag && !rejected)
+    });
+    let (mid, index, _) = tagged.or_else(|| sections.iter().find(|&&(.., rejected)| !rejected))?;
+    Some(((*mid).to_owned(), *index))
 }
 
 /// `value` as the known `&'static` name it equals.
@@ -1284,7 +1319,7 @@ mod tests {
             }),
             Err("a second answer")
         );
-        assert_eq!(session.mid.as_deref(), Some("0"), "nothing changed");
+        assert_eq!(session.transport, Some(("0".into(), 0)), "nothing changed");
     }
 
     /// A decline passes once per offer answered, with a known reason,
@@ -1812,6 +1847,80 @@ mod tests {
         assert_eq!(early.gathered(Some("c".into())), vec![candidate("c", None)]);
         // Without gathers the worker's end-of-candidates passes at once.
         assert_eq!(early.applied(end()), vec![candidate("", None)]);
+    }
+
+    #[test]
+    fn candidates_name_the_bundle_tag_never_a_rejected_section_rfc_8843_7_3_1() {
+        let section = |sdp: &str| transport_section(sdp);
+        let at = |mid: &str, index: u32| Some((mid.to_owned(), index));
+        let stopped_audio_first = "v=0\r\na=group:BUNDLE 1 2\r\n\
+            m=audio 0 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\n\
+            m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\n\
+            m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:2\r\n";
+        assert_eq!(section(stopped_audio_first), at("1", 1));
+        // The tag wins over an earlier live section.
+        assert_eq!(
+            section(
+                "v=0\r\na=group:BUNDLE 1 0\r\nm=audio 9 X 0\r\na=mid:0\r\nm=video 9 X 96\r\na=mid:1\r\n"
+            ),
+            at("1", 1)
+        );
+        // The first group line's tag; another group's semantics is no tag.
+        assert_eq!(
+            section(
+                "v=0\r\na=group:LS 1\r\na=group:BUNDLE 1\r\na=group:BUNDLE 0\r\nm=audio 9 X 0\r\na=mid:0\r\nm=video 9 X 96\r\na=mid:1\r\n"
+            ),
+            at("1", 1)
+        );
+        // Without a group, a tag no section has, an empty group or a
+        // tagged rejected section: the first live section.
+        for group in [
+            "",
+            "a=group:BUNDLE 7\r\n",
+            "a=group:BUNDLE \r\n",
+            "a=group:BUNDLE 0\r\n",
+        ] {
+            assert_eq!(
+                section(&format!(
+                    "v=0\r\n{group}m=audio 0 X 0\r\na=mid:0\r\nm=video 9 X 96\r\na=mid:1\r\n"
+                )),
+                at("1", 1),
+                "{group:?}"
+            );
+        }
+        // Attributes before any `m=` line are the first section's.
+        assert_eq!(section("v=0\r\na=mid: 0 \r\n"), at("0", 0));
+        // No mid, or every section rejected: none to name.
+        assert_eq!(section("v=0\r\nm=video 9 X 96\r\n"), None);
+        assert_eq!(section("v=0\r\nm=video 0 X 96\r\na=mid:0\r\n"), None);
+        assert_eq!(section(""), None);
+    }
+
+    #[test]
+    fn advertised_candidates_name_the_bundle_tag_after_a_rejected_first_section_rfc_8843_7_3_1() {
+        let advertisement = Arc::new(Advertisement::new(
+            &["203.0.113.7".parse().unwrap()],
+            &["172.17.0.2:18556".parse().unwrap()],
+            &[],
+        ));
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        session.advertise(Arc::clone(&advertisement));
+        let answered = session.applied(WorkerSessionEvent::Answer {
+            sdp: "v=0\r\na=group:BUNDLE 1\r\n\
+                  m=audio 0 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\n\
+                  m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\n"
+                .into(),
+            talkback: None,
+        });
+        assert_eq!(
+            answered[1],
+            SessionEvent::Candidate {
+                candidate: advertisement.lines()[0].clone(),
+                sdp_mid: Some("1".into()),
+                sdp_mline_index: Some(1),
+            }
+        );
     }
 
     #[test]
