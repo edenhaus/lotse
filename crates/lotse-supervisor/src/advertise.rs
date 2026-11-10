@@ -296,7 +296,12 @@ impl Advertisement {
     }
 
     /// `sdp` without the `a=candidate` lines [`Self::shows`] hides, line
-    /// endings kept, and how many it hid.
+    /// endings kept, and how many it hid. It also loses any
+    /// `a=end-of-candidates`: the advertised candidates trickle after the
+    /// answer, and after the indication a browser takes no more of a
+    /// section's candidates (RFC 8838 §8.2, §13), so the session's own
+    /// end-of-candidates follows them instead. The worker's engine writes
+    /// none (str0m 0.25, observed 2026-11-10), but its answer is untrusted.
     pub(crate) fn filter_sdp(&self, sdp: String) -> (String, usize) {
         if !self.active {
             return (sdp, 0);
@@ -305,11 +310,15 @@ impl Advertisement {
         let kept = sdp
             .split_inclusive('\n')
             .filter(|line| {
-                let shown = line
-                    .trim_end()
-                    .strip_prefix("a=")
-                    .filter(|attribute| attribute.starts_with("candidate:"))
-                    .is_none_or(|candidate| self.shows(candidate));
+                let Some(attribute) = line.trim_end().strip_prefix("a=") else {
+                    return true;
+                };
+                if attribute == "end-of-candidates" {
+                    return false;
+                }
+                let shown = attribute
+                    .strip_prefix("candidate:")
+                    .is_none_or(|_| self.shows(attribute));
                 if !shown {
                     hidden = hidden.saturating_add(1);
                 }
@@ -694,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn the_answer_loses_its_hidden_candidate_lines_and_keeps_the_rest() {
+    fn the_answer_loses_its_hidden_candidate_lines_and_end_of_candidates_rfc_8838_8_2() {
         let advertisement =
             Advertisement::new(&[addr("203.0.113.7")], &sockets(&["172.17.0.2:18556"]), &[]);
         let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nc=IN IP4 0.0.0.0\r\n\
@@ -703,6 +712,8 @@ mod tests {
                    a=candidate:2 1 tcp 1518280447 172.17.0.2 18557 typ host tcptype passive\r\n\
                    a=candidate:r1 1 udp 16777215 198.51.100.1 49152 typ relay raddr 0.0.0.0 rport 0\r\n\
                    a=candidates-are-not-these\r\n\
+                   a=end-of-candidates\r\n\
+                   a=end-of-candidates-not\r\n\
                    a=end-of-candidates";
         let (filtered, hidden) = advertisement.filter_sdp(sdp.to_owned());
         assert_eq!(hidden, 2);
@@ -712,7 +723,7 @@ mod tests {
              a=mid:0\r\n\
              a=candidate:r1 1 udp 16777215 198.51.100.1 49152 typ relay raddr 0.0.0.0 rport 0\r\n\
              a=candidates-are-not-these\r\n\
-             a=end-of-candidates"
+             a=end-of-candidates-not\r\n"
         );
     }
 }
