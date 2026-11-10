@@ -797,7 +797,7 @@ pub(crate) fn load(
     let own_gid = rustix::process::getgid().as_raw();
     let state_owner = state_owner(starting_uid, (uid, gid), own_gid);
     let control_tls = r.control(args, file.data_dir, file.control, state_owner)?;
-    let mode = r.pick("sandbox", "sandbox", args.sandbox, file.sandbox, Mode::On);
+    let mode = r.pick("sandbox", "sandbox", args.sandbox, file.sandbox, SANDBOX);
     let udp_listen = r.pick(
         "webrtc.udp_listen",
         "webrtc_udp_listen",
@@ -864,6 +864,10 @@ const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u
         (starting_uid, own_gid)
     }
 }
+
+/// The default of `sandbox`: the sandbox crate's, `require`, so a host
+/// without every layer refuses to start unless `on` is chosen.
+const SANDBOX: Mode = Mode::Require;
 
 /// The default of `webrtc.udp_listen` and `webrtc.tcp_listen`: dual-stack,
 /// port 18556, so the daemon can run beside another WebRTC server that
@@ -950,7 +954,12 @@ mod tests {
             settings.supervisor.allow_uid,
             rustix::process::getuid().as_raw()
         );
-        assert_eq!(settings.sandbox.mode, Mode::On);
+        assert_eq!(settings.sandbox.mode, Mode::Require);
+        assert_eq!(SANDBOX, Mode::default(), "the sandbox crate's default");
+        assert_eq!(
+            source_of(&provenance, "sandbox"),
+            ("require".into(), Source::Default)
+        );
         assert_eq!((settings.sandbox.uid, settings.sandbox.gid), (65534, 65534));
         assert_eq!(settings.log.format, LogFormat::Json);
         assert_eq!(settings.log.level, "info");

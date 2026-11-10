@@ -217,6 +217,55 @@ fn sandbox_require_refuses_to_start_off_linux() {
     assert!(stderr.contains("require"), "{stderr}");
 }
 
+/// `require` is the default: started with no sandbox setting, the daemon
+/// either enforces every layer or refuses to start, naming the layer it
+/// lacks and how to choose `on`. Which one depends on the host's kernel
+/// (and outside Linux it always refuses), so the test takes the branch the
+/// daemon took and checks it.
+#[test]
+fn sandbox_defaults_to_require_every_layer_or_no_start() {
+    let dir = socket_dir("default-sandbox");
+    let socket = dir.join("lotse.sock");
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "127.0.0.1:0",
+            "--socket",
+            socket.to_str().expect("utf-8"),
+            "--log-format",
+            "json",
+        ],
+        &[],
+    );
+    let setting = json(&daemon.wait_for("\"setting\":\"sandbox\""));
+    assert_eq!(setting["value"], "require");
+    assert_eq!(setting["source"], "default");
+    let outcome = json(&daemon.wait_for_any(&["sandbox applied", "lotse failed"]));
+    if outcome["message"] == "sandbox applied" {
+        for layer in ["seccomp", "landlock_fs", "landlock_net"] {
+            assert_eq!(outcome[layer], "enforced", "{layer}: {outcome}");
+        }
+        daemon.wait_for("\"event\":\"ready\"");
+        let (code, _) = daemon.terminate();
+        assert_eq!(code, Some(0));
+    } else {
+        let error = outcome["error"].as_str().unwrap_or_default();
+        assert!(error.starts_with("sandbox: sandbox layer "), "{outcome}");
+        assert!(
+            error.contains("is unavailable and the sandbox mode is `require`, the default"),
+            "{outcome}"
+        );
+        assert!(
+            error.contains("`--sandbox on`, `LOTSE_SANDBOX=on`"),
+            "{outcome}"
+        );
+        let (code, _) = daemon.exit();
+        assert_eq!(code, Some(1));
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn sandbox_on_lets_the_supervisor_run_under_its_profile() {

@@ -9,7 +9,9 @@
 # priority than the supervisor's and an `RLIMIT_NICE` pinned to 0, that a crashing worker is
 # restarted without touching the other stream, and that the daemon stops cleanly on SIGTERM.
 # First, as root with `--sandbox off`, which must still drop the supervisor and its
-# workers to 65534: no mode parses camera bytes as root.
+# workers to 65534: no mode parses camera bytes as root. Last, with no sandbox setting: the
+# default, `require`, starts exactly where `on` found every layer enforced, and otherwise
+# refuses, naming the missing layer and `--sandbox on`.
 #
 # Needs a `lotse` built with `--features source-fake`, at $LOTSE (default /lotse), and a
 # container started with `--ulimit nice=20:20`: a raised `RLIMIT_NICE` would let a worker undo
@@ -35,15 +37,18 @@ field() {
   printf '%s' "$1" | grep -o "\"$2\":[^,}]*" | head -n 1 | cut -d: -f2- | tr -d '"'
 }
 
-# `start <mode>`: the daemon as root in sandbox mode <mode>, up once `hello` answers.
+# `start <mode>`: the daemon as root in sandbox mode <mode> (`default`: no sandbox setting), up
+# once `hello` answers.
 start() {
-  "$LOTSE" serve --socket "$SOCKET" --sandbox "$1" --user 65534 --group 65534 \
+  mode="$1"
+  if [ "$mode" = default ]; then set --; else set -- --sandbox "$mode"; fi
+  "$LOTSE" serve --socket "$SOCKET" "$@" --user 65534 --group 65534 \
     --linger-ms 200 --log-format json --log-level debug 2>"$DIR/lotse.log" &
   DAEMON=$!
   i=0
   until [ -S "$SOCKET" ] && ctl info >/dev/null 2>&1; do
     i=$((i + 1))
-    [ "$i" -lt 100 ] || { cat "$DIR/lotse.log" >&2; fail "the daemon did not come up ($1)"; }
+    [ "$i" -lt 100 ] || { cat "$DIR/lotse.log" >&2; fail "the daemon did not come up ($mode)"; }
     sleep 0.1
   done
 }
@@ -149,7 +154,8 @@ echo "sandbox: $sandbox"
 [ "$(field "$sandbox" no_new_privs)" = "true" ] || fail "no_new_privs is not set"
 [ "$(field "$sandbox" seccomp)" = "enforced" ] || fail "seccomp is not enforced under the container's profile"
 [ "$(field "$sandbox" fs)" = "enforced" ] || fail "Landlock fs rules are not enforced"
-echo "landlock net: $(field "$sandbox" net) (abi $(field "$sandbox" abi))"
+net="$(field "$sandbox" net)"
+echo "landlock net: $net (abi $(field "$sandbox" abi))"
 
 # A sandboxed worker on the fake source goes live.
 ctl stream put front --url fake://127.0.0.1/ --preload >/dev/null
@@ -180,3 +186,30 @@ kill -TERM "$DAEMON"
 wait "$DAEMON" || fail "the daemon did not exit cleanly"
 grep -q '"event":"ready"' "$DIR/lotse.log" || fail "no ready event in the log"
 echo "OK: sandbox enforced, workers isolated, clean stop"
+
+# No sandbox setting: `require`, the default. `on` above found seccomp and Landlock's filesystem
+# rules enforced, so only Landlock's TCP rules (Linux 6.7) decide whether it starts.
+if [ "$net" = "enforced" ]; then
+  start default
+  sandbox="$(ctl info | grep -o '"sandbox":{.*}' | head -n 1)"
+  echo "sandbox default: $sandbox"
+  [ "$(field "$sandbox" mode)" = "require" ] || fail "the default sandbox mode is not require"
+  ctl stream put front --url fake://127.0.0.1/ --preload >/dev/null
+  wait_live front
+  all_unprivileged 2
+  ctl stream delete front >/dev/null
+  kill -TERM "$DAEMON"
+  wait "$DAEMON" || fail "the daemon did not exit cleanly (default)"
+  echo "OK: the default, require, starts with every layer enforced"
+else
+  # Refused, it exits with 1 at once; one that starts is ended by `timeout`, with another status.
+  status=0
+  timeout 10 "$LOTSE" serve --socket "$SOCKET" --user 65534 --group 65534 --log-format json \
+    2>"$DIR/lotse.log" || status=$?
+  [ "$status" = 1 ] || { cat "$DIR/lotse.log" >&2; fail "the default exited with $status, not 1"; }
+  grep -q 'sandbox layer landlock.net is unavailable' "$DIR/lotse.log" ||
+    { cat "$DIR/lotse.log" >&2; fail "the refusal does not name landlock.net"; }
+  grep -q -- '--sandbox on' "$DIR/lotse.log" ||
+    { cat "$DIR/lotse.log" >&2; fail "the refusal does not say how to choose on"; }
+  echo "OK: the default, require, refuses without landlock.net and names the way to on"
+fi
