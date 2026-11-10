@@ -11,6 +11,9 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# An exemption that matches no dependency fails the check, so it is deleted with the update that
+# makes it unnecessary and cannot hide the advisory if the vulnerable version comes back.
+unused-ignored-advisory = "deny"
 ignore = []
 
 [licenses]
