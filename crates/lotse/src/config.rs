@@ -797,7 +797,7 @@ pub(crate) fn load(
     let own_gid = rustix::process::getgid().as_raw();
     let state_owner = state_owner(starting_uid, (uid, gid), own_gid);
     let control_tls = r.control(args, file.data_dir, file.control, state_owner)?;
-    let mode = r.pick("sandbox", "sandbox", args.sandbox, file.sandbox, Mode::On);
+    let mode = r.pick("sandbox", "sandbox", args.sandbox, file.sandbox, SANDBOX);
     let udp_listen = r.pick(
         "webrtc.udp_listen",
         "webrtc_udp_listen",
@@ -868,6 +868,10 @@ const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u
     }
 }
 
+/// The default of `sandbox`: the sandbox crate's, `require`, so a host
+/// without every layer refuses to start unless `on` is chosen.
+const SANDBOX: Mode = Mode::Require;
+
 /// The default of `webrtc.udp_listen` and `webrtc.tcp_listen`: dual-stack,
 /// port 30415. IANA has not assigned it (30401–30831 are unassigned), it
 /// needs no privilege (above 1023), and it is below Linux's ephemeral range
@@ -928,14 +932,6 @@ mod tests {
         let (settings, provenance) =
             resolve(&["lotse", "serve", "--socket", "/run/z.sock"]).unwrap();
         assert_eq!(settings.supervisor.socket, PathBuf::from("/run/z.sock"));
-        assert_eq!(
-            settings.supervisor.udp_listen,
-            "[::]:30415".parse().unwrap()
-        );
-        assert_eq!(
-            settings.supervisor.tcp_listen,
-            Some("[::]:30415".parse().unwrap())
-        );
         assert_eq!(settings.supervisor.limits.max_connections, 8);
         assert_eq!(settings.supervisor.limits.max_streams, 256);
         assert_eq!(settings.supervisor.limits.max_sessions, 256);
@@ -955,7 +951,12 @@ mod tests {
             settings.supervisor.allow_uid,
             rustix::process::getuid().as_raw()
         );
-        assert_eq!(settings.sandbox.mode, Mode::On);
+        assert_eq!(settings.sandbox.mode, Mode::Require);
+        assert_eq!(SANDBOX, Mode::default(), "the sandbox crate's default");
+        assert_eq!(
+            source_of(&provenance, "sandbox"),
+            ("require".into(), Source::Default)
+        );
         assert_eq!((settings.sandbox.uid, settings.sandbox.gid), (65534, 65534));
         assert_eq!(settings.log.format, LogFormat::Json);
         assert_eq!(settings.log.level, "info");
@@ -971,6 +972,22 @@ mod tests {
         assert_eq!(
             source_of(&provenance, "limits.max_streams"),
             ("256".into(), Source::Default)
+        );
+    }
+
+    /// The `webrtc` rows of the table, apart so that neither test grows
+    /// past clippy's cognitive-complexity limit.
+    #[test]
+    fn webrtc_defaults_follow_the_documented_table() {
+        let (settings, provenance) =
+            resolve(&["lotse", "serve", "--socket", "/run/z.sock"]).unwrap();
+        assert_eq!(
+            settings.supervisor.udp_listen,
+            "[::]:30415".parse().unwrap()
+        );
+        assert_eq!(
+            settings.supervisor.tcp_listen,
+            Some("[::]:30415".parse().unwrap())
         );
         assert_eq!(
             source_of(&provenance, "webrtc.tcp_listen"),

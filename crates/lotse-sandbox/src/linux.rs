@@ -563,6 +563,16 @@ mod tests {
         output
     }
 
+    /// The default settings in `on` mode: a child that applies a whole
+    /// profile must pass on a host or container without every layer too,
+    /// where the default, `require`, would refuse.
+    fn best_effort() -> SandboxConfig {
+        SandboxConfig {
+            mode: Mode::On,
+            ..SandboxConfig::default()
+        }
+    }
+
     /// The soft and the hard limit of `resource`.
     fn limits(resource: Resource) -> (Option<u64>, Option<u64>) {
         let limit = rustix::process::getrlimit(resource);
@@ -836,7 +846,7 @@ mod tests {
         let worker = Profile::Worker {
             connect_ports: vec![554],
         };
-        let report = crate::apply(&worker, &SandboxConfig::default()).unwrap();
+        let report = crate::apply(&worker, &best_effort()).unwrap();
         let notes = report.notes;
         assert!(notes.contains(&STDERR_IS_A_FILE.to_owned()), "noted");
         assert_eq!(limits(Resource::Fsize), file_size);
@@ -864,7 +874,7 @@ mod tests {
             binary: std::env::current_exe().unwrap(),
             state_dir: None,
         };
-        let report = crate::apply(&supervisor, &SandboxConfig::default()).unwrap();
+        let report = crate::apply(&supervisor, &best_effort()).unwrap();
         assert_eq!(limits(Resource::Fsize), file_size);
         // Only workers and decoders die with their parent (prctl(2)
         // `PR_SET_PDEATHSIG`; their filter refuses `PR_GET_PDEATHSIG`): the

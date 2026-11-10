@@ -39,7 +39,9 @@ is designed with.
 - **Least privilege by default.** Started as root, it binds its sockets
   and drops to an unprivileged uid; its container image starts as one and
   needs no capability. Every process runs under
-  seccomp and Landlock. C code that decodes camera bytes runs in a
+  seccomp and Landlock, and by default (`--sandbox require`) refuses to
+  start on a kernel that lacks a layer; `--sandbox on` runs with the
+  layers it has and reports the rest. C code that decodes camera bytes runs in a
   throwaway decoder process with no network and no files.
 - **Strict.** `#![forbid(unsafe_code)]` in all our crates; C libraries
   (libopus, mimalloc, OpenH264) only through existing safe wrappers.
@@ -69,9 +71,13 @@ over RTSP/TCP, on the LAN or through a STUN-only NAT.
 
 ```sh
 mkdir -m 700 /tmp/lotse     # the control socket's directory must be private
-cargo run -p lotse -- serve --socket /tmp/lotse/lotse.sock --log-format text
+cargo run -p lotse -- serve --socket /tmp/lotse/lotse.sock --log-format text --sandbox on
 cargo run -p lotse-testing --bin lotse-dev-viewer -- --socket /tmp/lotse/lotse.sock
 ```
+
+`--sandbox on`: a development host (macOS, or a kernel without every
+seccomp and Landlock layer) cannot meet the default, `require`, which
+refuses to start and names the missing layer.
 
 Open <http://127.0.0.1:8080>, enter the camera's `rtsp://user:pass@host/path`
 URL and press Play. The video fills the window beside the controls (below

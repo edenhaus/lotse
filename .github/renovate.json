@@ -1,14 +1,32 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "config:best-practices",
-    ":semanticCommits",
-    "group:allNonMajor",
-    "schedule:weekly"
-  ],
+  "extends": ["config:best-practices", ":semanticCommits"],
+  "ignorePresets": [":ignoreModulesAndTests"],
   "labels": ["dependencies"],
-  "lockFileMaintenance": { "enabled": true },
+  "lockFileMaintenance": { "enabled": true, "schedule": ["* * * * 1"] },
   "pre-commit": { "enabled": true },
+  "packageRules": [
+    {
+      "description": "ruff in the pre-commit hook and in tests/browser/pyproject.toml, updated together so the hook and `uv run ruff` never disagree",
+      "matchPackageNames": ["ruff", "astral-sh/ruff-pre-commit"],
+      "groupName": "ruff"
+    },
+    {
+      "description": "go2rtc-client stays at the version its common deployment pins (tests/browser/pyproject.toml), moved by hand when that changes",
+      "matchPackageNames": ["go2rtc-client"],
+      "enabled": false
+    },
+    {
+      "description": "rustls and tokio-rustls, which is built against one rustls minor",
+      "matchPackageNames": ["rustls", "tokio-rustls"],
+      "groupName": "rustls"
+    },
+    {
+      "description": "str0m, its DTLS stack dimpl and the RustCrypto crates lotse-webrtc's crypto provider implements str0m's traits with: a release of one needs the matching releases of the others",
+      "matchPackageNames": ["str0m", "dimpl", "aes", "aes-gcm", "ctr", "hmac", "sha1", "sha2"],
+      "groupName": "str0m and RustCrypto"
+    }
+  ],
   "customManagers": [
     {
       "customType": "regex",

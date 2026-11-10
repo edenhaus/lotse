@@ -49,6 +49,16 @@ const NICE_PROBE: &str = "LOTSE_SANDBOX_NICE_PROBE";
 /// `SIGSYS`, without pulling libc into the test.
 const SIGSYS: i32 = 31;
 
+/// The default settings in `on` mode: each probe checks what the layers
+/// this kernel enforces deny, and must run on one without every layer too,
+/// where the default, `require`, would refuse.
+fn best_effort() -> SandboxConfig {
+    SandboxConfig {
+        mode: Mode::On,
+        ..SandboxConfig::default()
+    }
+}
+
 /// The child: sandbox itself as a worker, print the report, then try to
 /// read a file and to run a program.
 #[test]
@@ -63,8 +73,7 @@ fn probe_child() {
     let profile = Profile::Worker {
         connect_ports: vec![554],
     };
-    let report =
-        lotse_sandbox::apply(&profile, &SandboxConfig::default()).expect("worker profile applies");
+    let report = lotse_sandbox::apply(&profile, &best_effort()).expect("worker profile applies");
     println!(
         "{}",
         serde_json::to_string(&report).expect("report serializes")
@@ -94,8 +103,7 @@ fn nice_probe_child() {
     let profile = Profile::Worker {
         connect_ports: vec![554],
     };
-    let report =
-        lotse_sandbox::apply(&profile, &SandboxConfig::default()).expect("worker profile applies");
+    let report = lotse_sandbox::apply(&profile, &best_effort()).expect("worker profile applies");
     println!(
         "{}",
         serde_json::to_string(&report).expect("report serializes")
@@ -187,8 +195,8 @@ fn supervisor_probe_child() {
             fd,
         }),
     };
-    let report = lotse_sandbox::apply(&profile, &SandboxConfig::default())
-        .expect("supervisor profile applies");
+    let report =
+        lotse_sandbox::apply(&profile, &best_effort()).expect("supervisor profile applies");
     println!(
         "{}",
         serde_json::to_string(&report).expect("report serializes")
@@ -221,7 +229,7 @@ fn supervisor_probe_child() {
     let worker = Profile::Worker {
         connect_ports: vec![camera_port],
     };
-    let report = lotse_sandbox::apply(&worker, &SandboxConfig::default())
+    let report = lotse_sandbox::apply(&worker, &best_effort())
         .expect("worker profile applies under the supervisor's");
     println!(
         "worker:{}",
@@ -272,8 +280,7 @@ fn escape_probe_child() {
     let profile = Profile::Worker {
         connect_ports: vec![554],
     };
-    let report =
-        lotse_sandbox::apply(&profile, &SandboxConfig::default()).expect("worker profile applies");
+    let report = lotse_sandbox::apply(&profile, &best_effort()).expect("worker profile applies");
     println!(
         "{}",
         serde_json::to_string(&report).expect("report serializes")
@@ -366,8 +373,7 @@ fn shared_probe_child() {
     let profile = Profile::Worker {
         connect_ports: vec![554],
     };
-    let report =
-        lotse_sandbox::apply(&profile, &SandboxConfig::default()).expect("worker profile applies");
+    let report = lotse_sandbox::apply(&profile, &best_effort()).expect("worker profile applies");
     println!(
         "{}",
         serde_json::to_string(&report).expect("report serializes")
