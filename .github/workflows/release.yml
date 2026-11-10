@@ -68,7 +68,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
         with:
-          version: 2026.11.5
+          version: 2026.11.6
           install_args: rust github:EmbarkStudios/cargo-about github:CycloneDX/cyclonedx-rust-cargo
           cache: false
       - run: mise run set-version "$VERSION"
