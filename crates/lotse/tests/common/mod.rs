@@ -220,12 +220,20 @@ impl Daemon {
 
     /// Sends `SIGTERM`, waits for the exit and returns the code with every
     /// line logged after the last `wait_for`.
-    pub(crate) fn terminate(mut self) -> (Option<i32>, Vec<String>) {
+    pub(crate) fn terminate(self) -> (Option<i32>, Vec<String>) {
         rustix::process::kill_process(
             rustix::process::Pid::from_child(&self.child),
             rustix::process::Signal::TERM,
         )
         .expect("SIGTERM delivered");
+        self.exit()
+    }
+
+    /// Waits for a daemon that exits on its own, such as one refusing to
+    /// start, and returns the code with every line logged after the last
+    /// `wait_for`. No signal: a `SIGTERM` racing a refusal's exit would
+    /// end it with the signal before its code.
+    pub(crate) fn exit(mut self) -> (Option<i32>, Vec<String>) {
         let status = self.child.wait().expect("daemon exits");
         let mut rest = Vec::new();
         while let Ok(line) = self.lines.recv_timeout(Duration::from_secs(2)) {

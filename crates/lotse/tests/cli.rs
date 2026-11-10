@@ -261,7 +261,7 @@ fn sandbox_defaults_to_require_every_layer_or_no_start() {
             error.contains("`--sandbox on`, `LOTSE_SANDBOX=on`"),
             "{outcome}"
         );
-        let (code, _) = daemon.terminate();
+        let (code, _) = daemon.exit();
         assert_eq!(code, Some(1));
     }
 }
