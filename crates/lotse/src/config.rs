@@ -872,10 +872,7 @@ const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u
 /// port 30415. IANA has not assigned it (30401–30831 are unassigned), it
 /// needs no privilege (above 1023), and it is below Linux's ephemeral range
 /// (32768–60999, `net.ipv4.ip_local_port_range`'s default), so no outgoing
-/// connection holds it when the daemon binds. It is inside Kubernetes'
-/// default `NodePort` range (30000–32767), which matters only on a node that
-/// gives a Service this port; `webrtc.udp_listen` and `webrtc.tcp_listen`
-/// move it.
+/// connection holds it when the daemon binds.
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(
     std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
     30_415,
