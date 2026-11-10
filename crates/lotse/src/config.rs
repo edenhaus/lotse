@@ -927,14 +927,6 @@ mod tests {
         let (settings, provenance) =
             resolve(&["lotse", "serve", "--socket", "/run/z.sock"]).unwrap();
         assert_eq!(settings.supervisor.socket, PathBuf::from("/run/z.sock"));
-        assert_eq!(
-            settings.supervisor.udp_listen,
-            "[::]:18556".parse().unwrap()
-        );
-        assert_eq!(
-            settings.supervisor.tcp_listen,
-            Some("[::]:18556".parse().unwrap())
-        );
         assert_eq!(settings.supervisor.limits.max_connections, 8);
         assert_eq!(settings.supervisor.limits.max_streams, 256);
         assert_eq!(settings.supervisor.limits.max_sessions, 256);
@@ -975,6 +967,22 @@ mod tests {
         assert_eq!(
             source_of(&provenance, "limits.max_streams"),
             ("256".into(), Source::Default)
+        );
+    }
+
+    /// The `webrtc` rows of the table, apart so that neither test grows
+    /// past clippy's cognitive-complexity limit.
+    #[test]
+    fn webrtc_defaults_follow_the_documented_table() {
+        let (settings, provenance) =
+            resolve(&["lotse", "serve", "--socket", "/run/z.sock"]).unwrap();
+        assert_eq!(
+            settings.supervisor.udp_listen,
+            "[::]:18556".parse().unwrap()
+        );
+        assert_eq!(
+            settings.supervisor.tcp_listen,
+            Some("[::]:18556".parse().unwrap())
         );
         assert_eq!(
             source_of(&provenance, "webrtc.tcp_listen"),
