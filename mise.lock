@@ -105,29 +105,29 @@ url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09
 url_api = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/600951759"
 
 [[tools."github:CycloneDX/cyclonedx-rust-cargo"]]
-version = "0.5.9"
+version = "0.5.10"
 backend = "github:CycloneDX/cyclonedx-rust-cargo"
-specifiers = ["0.5.9"]
+specifiers = ["0.5.10"]
 
 [tools."github:CycloneDX/cyclonedx-rust-cargo".options]
 version_prefix = "cargo-cyclonedx-"
 
 [tools."github:CycloneDX/cyclonedx-rust-cargo"."platforms.linux-arm64"]
-checksum = "sha256:7bf131ca5389b07a4f10c182bcf8a5ad339d64408b6f0d8f6834a0bd6120a06a"
-url = "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.9/cargo-cyclonedx-aarch64-unknown-linux-gnu.tar.xz"
-url_api = "https://api.github.com/repos/CycloneDX/cyclonedx-rust-cargo/releases/assets/377060331"
+checksum = "sha256:6931b234914fa9be8686f46bd1ce71358b4be6d4cd3ce6b7082bec2313e59a8e"
+url = "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.10/cargo-cyclonedx-aarch64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/CycloneDX/cyclonedx-rust-cargo/releases/assets/730879154"
 provenance = "github-attestations"
 
 [tools."github:CycloneDX/cyclonedx-rust-cargo"."platforms.linux-x64"]
-checksum = "sha256:fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8"
-url = "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.9/cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz"
-url_api = "https://api.github.com/repos/CycloneDX/cyclonedx-rust-cargo/releases/assets/377060340"
+checksum = "sha256:2e4ef64a53c0a38d4b7d805c593b5f47ecd29821e98d81e484d03abaa0edb95f"
+url = "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.10/cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/CycloneDX/cyclonedx-rust-cargo/releases/assets/730879213"
 provenance = "github-attestations"
 
 [tools."github:CycloneDX/cyclonedx-rust-cargo"."platforms.macos-arm64"]
-checksum = "sha256:4c53dfa21e70b65bf7f8d2592aadde3bcb02c1a40b6ec63b877e5ca65a29e180"
-url = "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.9/cargo-cyclonedx-aarch64-apple-darwin.tar.xz"
-url_api = "https://api.github.com/repos/CycloneDX/cyclonedx-rust-cargo/releases/assets/377060329"
+checksum = "sha256:4c39e13494d51c9d7f63e2923e7afdb5648a7a806a9ed7684dbe3786d2e2d1da"
+url = "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.10/cargo-cyclonedx-aarch64-apple-darwin.tar.xz"
+url_api = "https://api.github.com/repos/CycloneDX/cyclonedx-rust-cargo/releases/assets/730879159"
 provenance = "github-attestations"
 
 [[tools."github:EmbarkStudios/cargo-about"]]
