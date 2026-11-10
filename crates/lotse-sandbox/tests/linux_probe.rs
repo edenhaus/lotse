@@ -333,6 +333,16 @@ fn escape_probe_child() {
             let written = std::io::Write::write(&mut file, b"x").map_err(|e| e.raw_os_error());
             println!("write_file:{written:?}");
         }
+        "mptcp" => {
+            // A stream socket Landlock's TCP port rules do not cover.
+            let opened = rustix::net::socket(
+                rustix::net::AddressFamily::INET,
+                rustix::net::SocketType::STREAM,
+                Some(rustix::net::ipproto::MPTCP),
+            )
+            .map(drop);
+            println!("mptcp:{opened:?}");
+        }
         "setpriority" => {
             // Back to nice 0: should the call get through, refused
             // (`EACCES`) for want of `CAP_SYS_NICE` and of an `RLIMIT_NICE`
@@ -602,6 +612,16 @@ fn a_worker_cannot_reach_the_supervisor_or_undo_its_sandbox() {
         let profiler_needs_it = act == "pdeathsig" && cfg!(coverage);
         assert_escape_is_killed(act, profiler_needs_it);
     }
+}
+
+/// Regression: a worker's `socket` was checked for its domain alone, and
+/// an MPTCP socket connected to ports, and listened on ports, that
+/// Landlock's TCP rules refuse a TCP socket (observed on Linux 6.18,
+/// Landlock ABI 7, on 2026-11-10). Under the worker's allowlist opening
+/// one ends the worker with `SIGSYS`.
+#[test]
+fn a_worker_cannot_open_a_socket_landlocks_tcp_rules_do_not_cover() {
+    assert_escape_is_killed("mptcp", false);
 }
 
 /// Regression for SBX-20: a worker could create a memfd and fill it with

@@ -1,6 +1,6 @@
 //! The seccomp-bpf allowlists per process kind (seccomp(2)). Anything not
-//! listed kills the process; a worker's `socket` is limited to
-//! `AF_INET`/`AF_INET6` and its `clone` to threads, and no worker or
+//! listed kills the process; a worker's `socket` is limited to TCP and UDP
+//! sockets of `AF_INET`/`AF_INET6` and its `clone` to threads, and no worker or
 //! decoder may `execve`, `ptrace` or read another process's memory.
 //!
 //! Every lotse process runs as one uid, so a call that takes a pid reaches
@@ -199,12 +199,48 @@ fn arg(value: libc::c_int) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-/// `socket(domain, ..)` with `domain` `AF_INET` or `AF_INET6`.
+/// The bits of `socket`'s `type` that name the socket type; the rest are
+/// the `SOCK_NONBLOCK` and `SOCK_CLOEXEC` flags (socket(2), and
+/// `SOCK_TYPE_MASK` in the kernel's `linux/net.h`).
+const SOCK_TYPE_MASK: u64 = 0xf;
+
+/// `socket(domain, type, protocol)` with `domain` `AF_INET` or `AF_INET6`
+/// and a TCP or a UDP socket: `SOCK_STREAM` with protocol 0 or
+/// `IPPROTO_TCP`, `SOCK_DGRAM` with protocol 0 or `IPPROTO_UDP`
+/// (ip(7): protocol 0 is the type's default).
+///
+/// The protocol matters as much as the domain: Landlock's port rules
+/// (`LANDLOCK_ACCESS_NET_BIND_TCP`, `LANDLOCK_ACCESS_NET_CONNECT_TCP`)
+/// cover `IPPROTO_TCP` sockets alone, so a stream socket of another
+/// protocol connects to and listens on any port. Observed on Linux 6.18
+/// (Landlock ABI 7) on 2026-11-10: `socket(AF_INET, SOCK_STREAM,
+/// IPPROTO_MPTCP)` connected to a port the ruleset refused a TCP socket,
+/// and bound and listened where TCP got `EACCES`. Raw, packet and ICMP
+/// sockets are closed with it. `domain`, `type` and `protocol` are `int`s,
+/// so the kernel reads the arguments' low 32 bits and so do the
+/// comparisons.
 fn inet_only() -> Result<Vec<SeccompRule>, BackendError> {
-    [libc::AF_INET, libc::AF_INET6]
-        .into_iter()
-        .map(|domain| SeccompRule::new(vec![equals(0, SeccompCmpArgLen::Dword, arg(domain))?]))
-        .collect()
+    let mut rules = Vec::new();
+    for domain in [libc::AF_INET, libc::AF_INET6] {
+        for (kind, protocol) in [
+            (libc::SOCK_STREAM, 0),
+            (libc::SOCK_STREAM, libc::IPPROTO_TCP),
+            (libc::SOCK_DGRAM, 0),
+            (libc::SOCK_DGRAM, libc::IPPROTO_UDP),
+        ] {
+            rules.push(SeccompRule::new(vec![
+                equals(0, SeccompCmpArgLen::Dword, arg(domain))?,
+                SeccompCondition::new(
+                    1,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                    arg(kind),
+                )?,
+                equals(2, SeccompCmpArgLen::Dword, arg(protocol))?,
+            ])?);
+        }
+    }
+    Ok(rules)
 }
 
 /// `clone(flags, ..)` with `CLONE_THREAD` set: a thread, never a process.
@@ -676,8 +712,8 @@ mod tests {
     fn the_interpreter_agrees_with_the_unconditional_and_conditional_rules() {
         assert!(allows(&worker(), libc::SYS_read, [0; 6]));
         assert!(!allows(&worker(), libc::SYS_execve, [0; 6]));
-        let inet = [arg(libc::AF_INET), 0, 0, 0, 0, 0];
-        let unix = [arg(libc::AF_UNIX), 0, 0, 0, 0, 0];
+        let inet = [arg(libc::AF_INET), arg(libc::SOCK_STREAM), 0, 0, 0, 0];
+        let unix = [arg(libc::AF_UNIX), arg(libc::SOCK_STREAM), 0, 0, 0, 0];
         assert!(allows(&worker(), libc::SYS_socket, inet));
         assert!(!allows(&worker(), libc::SYS_socket, unix));
         assert!(allows(&supervisor(), libc::SYS_socket, unix));
@@ -688,6 +724,50 @@ mod tests {
             libc::SYS_clone,
             [arg(libc::SIGCHLD), 0, 0, 0, 0, 0]
         ));
+    }
+
+    /// Regression: a worker's `socket` was checked for its domain alone, so
+    /// `socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP)` gave it a stream socket
+    /// that Landlock's TCP port rules do not cover: it connected to any
+    /// port of any host and listened on any port. Only TCP and UDP sockets
+    /// pass, with or without the flags `socket` takes in its type.
+    #[test]
+    fn a_worker_opens_tcp_and_udp_sockets_and_no_other_protocol() {
+        let flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+        let socket = |domain, kind, protocol| {
+            let args = [arg(domain), arg(kind), arg(protocol), 0, 0, 0];
+            allows(&worker(), libc::SYS_socket, args)
+        };
+        for domain in [libc::AF_INET, libc::AF_INET6] {
+            for kind in [libc::SOCK_STREAM, libc::SOCK_STREAM | flags] {
+                assert!(socket(domain, kind, 0));
+                assert!(socket(domain, kind, libc::IPPROTO_TCP));
+                assert!(!socket(domain, kind, libc::IPPROTO_MPTCP));
+                assert!(!socket(domain, kind, libc::IPPROTO_UDP));
+                assert!(!socket(domain, kind, libc::IPPROTO_SCTP));
+            }
+            for kind in [libc::SOCK_DGRAM, libc::SOCK_DGRAM | flags] {
+                assert!(socket(domain, kind, 0));
+                assert!(socket(domain, kind, libc::IPPROTO_UDP));
+                assert!(!socket(domain, kind, libc::IPPROTO_TCP));
+                assert!(!socket(domain, kind, libc::IPPROTO_ICMP));
+                assert!(!socket(domain, kind, libc::IPPROTO_ICMPV6));
+            }
+            for kind in [libc::SOCK_RAW, libc::SOCK_SEQPACKET, libc::SOCK_RDM] {
+                assert!(!socket(domain, kind, 0));
+                assert!(!socket(domain, kind, libc::IPPROTO_TCP));
+                assert!(!socket(domain, kind, libc::IPPROTO_UDP));
+            }
+        }
+        let mptcp = [
+            arg(libc::AF_INET),
+            arg(libc::SOCK_STREAM),
+            arg(libc::IPPROTO_MPTCP),
+            0,
+            0,
+            0,
+        ];
+        assert!(allows(&supervisor(), libc::SYS_socket, mptcp));
     }
 
     /// Regression for SBX-20: a worker allowed `memfd_create` could fill
@@ -1139,7 +1219,7 @@ mod tests {
     fn negative_constants_never_match_an_argument() {
         assert_eq!(arg(-1), u64::MAX);
         assert_eq!(arg(libc::AF_INET), 2);
-        assert_eq!(inet_only().unwrap().len(), 2);
+        assert_eq!(inet_only().unwrap().len(), 8);
         assert_eq!(threads_only().unwrap().len(), 1);
     }
 
