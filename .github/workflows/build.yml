@@ -45,7 +45,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
-          version: 2026.11.5
+          version: 2026.11.6
           # What the build needs; the rest of mise.toml is for the checks.
           install_args: rust zig cmake github:rust-cross/cargo-zigbuild github:rust-secure-code/cargo-auditable
           cache: ${{ !inputs.release }}
