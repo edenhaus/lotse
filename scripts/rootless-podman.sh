@@ -127,10 +127,11 @@ processes() {
   echo "$all"
 }
 
-# `unprivileged <count>`: at least <count> processes in the container, each with real, effective,
-# saved and filesystem uid and gid $ID as the container sees them (the host's ids through the
-# user namespace's map), no capability in its effective, permitted or bounding set, no_new_privs
-# and a seccomp filter. Read from the host's /proc: `podman top` needs a cgroup, which a rootless
+# `unprivileged <count> <bounding>`: at least <count> processes in the container, each with real,
+# effective, saved and filesystem uid and gid $ID as the container sees them (the host's ids
+# through the user namespace's map), no capability in its effective or permitted set, exactly the
+# bounding set <bounding> (CapBnd's hex mask: what the start was given, which the drop to $ID does
+# not shrink), no_new_privs and a seccomp filter. Read from the host's /proc: `podman top` needs a cgroup, which a rootless
 # container without delegated controllers does not get.
 unprivileged() {
   n=0
@@ -155,7 +156,7 @@ unprivileged() {
     echo "pid $pid: $line"
     want="lotse uids $ID $ID $ID $ID gids $ID $ID $ID $ID eff 0000000000000000 prm 0000000000000000"
     case "$line" in
-      "$want bnd "*" nnp 1 seccomp 2") ;;
+      "$want bnd $2 nnp 1 seccomp 2") ;;
       *) fail "pid $pid is not unprivileged: $line" ;;
     esac
     n=$((n + 1))
@@ -179,7 +180,7 @@ until [ "$(ctl stream get front | jq -r '.last_error.code // empty')" = source_u
   sleep 0.2
 done
 echo "front: $(ctl stream get front)"
-unprivileged 1
+unprivileged 1 0000000000000000 # nothing
 pin="$(podman exec "$NAME" /lotse identity)"
 podman logs "$NAME" 2>&1 | grep -q "\"server_pin\":\"$pin\"" || fail "lotse identity read $pin, not the served pin"
 echo "OK: lotse identity reads the volume's identity, $pin"
@@ -190,7 +191,7 @@ stop
 start --user 0 --cap-drop=all --cap-add=SETUID,SETGID --tmpfs /run/lotse:rw,mode=0700
 echo "OK: ready as root with CAP_SETUID and CAP_SETGID"
 sandboxed
-unprivileged 1
+unprivileged 1 00000000000000c0 # CAP_SETUID (7) and CAP_SETGID (6)
 stop
 
 # 3. As root on the directories of the uid it drops to.
@@ -200,6 +201,6 @@ start --user 0 --cap-drop=all --cap-add=SETUID,SETGID,DAC_OVERRIDE \
 echo "OK: ready as root on the directories of $ID"
 sandboxed
 podman logs "$NAME" 2>&1 | grep -q "\"server_pin\":\"$pin\"" || fail "the start as root did not serve the identity $pin"
-unprivileged 1
+unprivileged 1 00000000000000c2 # and CAP_DAC_OVERRIDE (1)
 stop
 echo "OK: the release image runs rootless, read-only and without capabilities"

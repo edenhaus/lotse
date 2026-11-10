@@ -205,8 +205,9 @@ it, and `loginctl enable-linger` starts it at boot without a login.
 `podman logs lotse` shows the first client's pairing code and
 `podman exec lotse /lotse pair` makes another. Without the TLS listener a
 client reaches the socket only from inside the container, or from a
-container that shares `/run/lotse` as a volume and runs as 65532 (or the
-uid `LOTSE_ALLOW_UID` names).
+container that shares `/run/lotse` as a volume and runs as 65532: the
+directory is 0700 and the socket 0600, both 65532's, so another uid
+cannot open it, whatever `LOTSE_ALLOW_UID` admits.
 
 - `HealthCmd` is a JSON array: the image has no shell, and Podman runs a
   plain string through `/bin/sh -c`, which fails.
@@ -242,6 +243,15 @@ needs CAP_SETUID and CAP_SETGID, and its socket and data directories may
 belong to root or to 65532: reaching 65532's as root takes
 CAP_DAC_OVERRIDE, and making the enrolled clients' directory for 65532
 takes CAP_CHOWN. The start as 65532 needs none of them.
+
+A data volume of the 0.0.1 image, which started as root and dropped to
+65534, belongs to root and 65534 and is no use to 65532. Give it to 65532
+once, before the first start of the new image:
+
+```sh
+podman run --rm -v lotse-data:/data mirror.gcr.io/library/busybox:1.37.0 \
+  chown -R 65532:65532 /data
+```
 
 No host network is needed. Every browser session shares one UDP port and
 one ICE-TCP port, 30415, published as it is (keep the host's port the

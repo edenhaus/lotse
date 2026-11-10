@@ -8,7 +8,7 @@
 # container", has the same as a Podman Quadlet unit, and says why no host network is needed):
 #
 #   podman run -d --name lotse --read-only --cap-drop=all --security-opt=no-new-privileges \
-#     --tmpfs /run/lotse:rw,mode=0700,uid=65532,gid=65532 -v lotse-data:/data \
+#     --tmpfs /run/lotse:rw,mode=0700,U -v lotse-data:/data \
 #     -p 30415:30415/udp -p 30415:30415/tcp -p 18557:18557/tcp \
 #     -e LOTSE_WEBRTC_ADVERTISE=<the host's LAN address> -e LOTSE_SANDBOX=require \
 #     -e LOTSE_CONTROL_LISTEN='[::]:18557' --pids-limit=512 --memory=1g \
