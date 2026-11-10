@@ -28,7 +28,7 @@
 # and COPY sets the mode of a directory it makes differently in BuildKit and Buildah, so a stage
 # makes them and the image takes them with their owner and mode. On the build's own platform: it
 # runs no code of the target's, and nothing of busybox reaches the image.
-FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec AS dirs
+FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4 AS dirs
 RUN mkdir -p /rootfs/run/lotse /rootfs/data \
  && chown 65532:65532 /rootfs/run/lotse /rootfs/data \
  && chmod 0700 /rootfs/run/lotse /rootfs/data
