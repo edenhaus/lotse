@@ -69,7 +69,7 @@ echo "resource limits: ${limits:-none (no delegated memory and pids controllers)
 start() {
   # shellcheck disable=SC2086 # $limits is a list of options
   podman run --detach --name "$NAME" --read-only --security-opt=no-new-privileges \
-    --publish 18556:18556/udp --publish 18556:18556/tcp --publish 18557:18557/tcp \
+    --publish 30415:30415/udp --publish 30415:30415/tcp --publish 18557:18557/tcp \
     --env LOTSE_SANDBOX=require --env LOTSE_WEBRTC_ADVERTISE=192.0.2.10 \
     $limits "$@" "$IMAGE" >/dev/null
   i=0

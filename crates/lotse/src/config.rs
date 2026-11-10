@@ -124,7 +124,7 @@ impl fmt::Display for TcpListen {
 
 /// Why a string is not a [`TcpListen`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("tcp listen must be `off` or an address like `[::]:18556`, not {0:?}")]
+#[error("tcp listen must be `off` or an address like `[::]:30415`, not {0:?}")]
 pub(crate) struct ParseTcpListenError(String);
 
 impl FromStr for TcpListen {
@@ -869,11 +869,16 @@ const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u
 }
 
 /// The default of `webrtc.udp_listen` and `webrtc.tcp_listen`: dual-stack,
-/// port 18556, so the daemon can run beside another WebRTC server that
-/// holds 18555 on the same host.
+/// port 30415. IANA has not assigned it (30401–30831 are unassigned), it
+/// needs no privilege (above 1023), and it is below Linux's ephemeral range
+/// (32768–60999, `net.ipv4.ip_local_port_range`'s default), so no outgoing
+/// connection holds it when the daemon binds. It is inside Kubernetes'
+/// default `NodePort` range (30000–32767), which matters only on a node that
+/// gives a Service this port; `webrtc.udp_listen` and `webrtc.tcp_listen`
+/// move it.
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(
     std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-    18_556,
+    30_415,
 );
 
 /// Logs every effective setting with its source, at startup, and a
@@ -928,11 +933,11 @@ mod tests {
         assert_eq!(settings.supervisor.socket, PathBuf::from("/run/z.sock"));
         assert_eq!(
             settings.supervisor.udp_listen,
-            "[::]:18556".parse().unwrap()
+            "[::]:30415".parse().unwrap()
         );
         assert_eq!(
             settings.supervisor.tcp_listen,
-            Some("[::]:18556".parse().unwrap())
+            Some("[::]:30415".parse().unwrap())
         );
         assert_eq!(settings.supervisor.limits.max_connections, 8);
         assert_eq!(settings.supervisor.limits.max_streams, 256);
@@ -972,7 +977,7 @@ mod tests {
         );
         assert_eq!(
             source_of(&provenance, "webrtc.tcp_listen"),
-            ("[::]:18556".into(), Source::Default)
+            ("[::]:30415".into(), Source::Default)
         );
         assert_eq!(settings.supervisor.advertise, []);
         assert_eq!(

@@ -9,7 +9,7 @@
 #
 #   podman run -d --name lotse --read-only --cap-drop=all --security-opt=no-new-privileges \
 #     --tmpfs /run/lotse:rw,mode=0700,uid=65532,gid=65532 -v lotse-data:/data \
-#     -p 18556:18556/udp -p 18556:18556/tcp -p 18557:18557/tcp \
+#     -p 30415:30415/udp -p 30415:30415/tcp -p 18557:18557/tcp \
 #     -e LOTSE_WEBRTC_ADVERTISE=<the host's LAN address> -e LOTSE_SANDBOX=require \
 #     -e LOTSE_CONTROL_LISTEN='[::]:18557' --pids-limit=512 --memory=1g \
 #     ghcr.io/<owner>/lotse:<version>@sha256:<digest>
@@ -44,6 +44,6 @@ ENV LOTSE_SOCKET=/run/lotse/lotse.sock \
     LOTSE_USER=65532 \
     LOTSE_GROUP=65532
 USER 65532:65532
-EXPOSE 18556/udp 18556/tcp 18557/tcp
+EXPOSE 30415/udp 30415/tcp 18557/tcp
 ENTRYPOINT ["/lotse"]
 CMD ["serve"]

@@ -180,8 +180,8 @@ NoNewPrivileges=true
 # The socket's directory, the container user's, mode 0700 as `serve` checks it.
 Tmpfs=/run/lotse:rw,mode=0700,U
 Volume=lotse-data:/data
-PublishPort=18556:18556/udp
-PublishPort=18556:18556/tcp
+PublishPort=30415:30415/udp
+PublishPort=30415:30415/tcp
 # The control API over mutual TLS, for a client outside the container.
 PublishPort=18557:18557/tcp
 Environment=LOTSE_CONTROL_LISTEN=[::]:18557
@@ -224,7 +224,7 @@ The same as one `podman run`:
 ```sh
 podman run -d --name lotse --read-only --cap-drop=all --security-opt=no-new-privileges \
   --tmpfs /run/lotse:rw,mode=0700,U -v lotse-data:/data \
-  -p 18556:18556/udp -p 18556:18556/tcp -p 18557:18557/tcp \
+  -p 30415:30415/udp -p 30415:30415/tcp -p 18557:18557/tcp \
   -e 'LOTSE_CONTROL_LISTEN=[::]:18557' -e LOTSE_WEBRTC_ADVERTISE=192.168.1.10 \
   -e LOTSE_SANDBOX=require --pids-limit=512 --memory=1g \
   ghcr.io/<owner>/lotse:<version>@sha256:<digest>
@@ -244,7 +244,7 @@ CAP_DAC_OVERRIDE, and making the enrolled clients' directory for 65532
 takes CAP_CHOWN. The start as 65532 needs none of them.
 
 No host network is needed. Every browser session shares one UDP port and
-one ICE-TCP port, 18556, published as it is (keep the host's port the
+one ICE-TCP port, 30415, published as it is (keep the host's port the
 container's, or advertise `IP:PORT`). The daemon's own addresses are the
 container's, so `LOTSE_WEBRTC_ADVERTISE` names the host's LAN address that
 browsers are told instead, and with it set they are told none of the
@@ -253,8 +253,8 @@ container's. What the rootless network does to this, observed on
 (Ubuntu 24.04: slirp4netns 1.2.1, pasta 2024-02-20):
 
 - pasta, the default from Podman 5.0, copies the host's address into the
-  container: the daemon listed the host's address and port 18556 as its
-  host candidate. A datagram or a connection to the published port from
+  container: the daemon listed the host's address, at the published port,
+  as its host candidate. A datagram or a connection to the published port from
   another machine arrived with that machine's address and port, and the
   answer left from the published port. So under pasta the host candidate
   alone is reachable, without `LOTSE_WEBRTC_ADVERTISE`. Not verified: a
