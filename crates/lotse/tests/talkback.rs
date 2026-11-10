@@ -1859,6 +1859,7 @@ impl Api {
             control_tls: None,
             udp_listen: bound.local,
             tcp_listen: None,
+            advertise: Vec::new(),
             limits: Limits {
                 max_connections: 8,
                 max_streams: 8,

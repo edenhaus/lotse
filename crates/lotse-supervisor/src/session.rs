@@ -27,6 +27,12 @@
 //! worker repeating or flipping its state adds at most one frame to the
 //! queue.
 //!
+//! With addresses advertised (`webrtc.advertise`, [`crate::advertise`]),
+//! a session's browser is told their candidates, held like the
+//! STUN-learned ones until the answer and before end-of-candidates, and
+//! not the worker's host candidates, in its candidate reports or in the
+//! answers' `a=candidate` lines.
+//!
 //! A session holds a lease on the TURN allocation behind each of its relay
 //! candidates, and the channels its worker asked for on them, at most
 //! [`MAX_RELAY_CHANNELS`] (RFC 8656 §12); dropping the session releases
@@ -62,6 +68,7 @@ use tokio::sync::mpsc::OwnedPermit;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
+use crate::advertise::{Advertisement, Protocol, srflx_address};
 use crate::net::turn_client::Lease;
 use crate::worker_text::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES};
 
@@ -246,8 +253,18 @@ pub(crate) struct SessionEntry {
     /// Candidate lines gathered before the answer: server-reflexive ones,
     /// and relay ones the worker made.
     held: Vec<String>,
-    /// The answer's first media section, which the srflx candidates name.
-    mid: Option<String>,
+    /// The answer's media section that carries its transport, as its `mid`
+    /// and m-line index, which the gathered candidates name
+    /// ([`transport_section`]).
+    transport: Option<(String, u32)>,
+    /// The advertised addresses' candidates and which of the worker's
+    /// host candidates the browser is told; by default all of them.
+    advertisement: Arc<Advertisement>,
+    /// The server-reflexive transport addresses told or held for the
+    /// browser, advertised and STUN-learned: each is told once, the first
+    /// line at it kept (RFC 8445 §5.1.3). At most the advertised ones and
+    /// [`MAX_STUN_SERVERS`](crate::gather::MAX_STUN_SERVERS).
+    srflx: Vec<(Protocol, SocketAddr)>,
     /// The relay candidates handed to the worker.
     relays: Vec<SessionRelay>,
     /// The (relayed, peer) pairs a channel was asked for.
@@ -325,7 +342,9 @@ impl SessionEntry {
             renegotiation: None,
             warnings_dropped: 0,
             held: Vec::new(),
-            mid: None,
+            transport: None,
+            advertisement: Arc::default(),
+            srflx: Vec::new(),
             relays: Vec::new(),
             channels: HashSet::new(),
             channels_refused: 0,
@@ -585,6 +604,52 @@ impl SessionEntry {
         }
     }
 
+    /// Tells the browser `advertisement`'s candidates once the answer is
+    /// out (they are held for it like a gather's, so they precede
+    /// end-of-candidates, RFC 8838 §13), and from now on filters the
+    /// worker's host candidates through it.
+    pub(crate) fn advertise(&mut self, advertisement: Arc<Advertisement>) {
+        for line in advertisement.lines() {
+            if self.first_srflx(line) {
+                self.held.push(line.clone());
+            }
+        }
+        self.advertisement = advertisement;
+    }
+
+    /// Whether `candidate` is the first line the session tells at its
+    /// server-reflexive transport address, which it then records; a later
+    /// one at the same address and base is redundant (RFC 8445 §5.1.3),
+    /// such as a STUN server's mapping of an advertised address. Every
+    /// other candidate is a first.
+    fn first_srflx(&mut self, candidate: &str) -> bool {
+        let Some(address) = srflx_address(candidate) else {
+            return true;
+        };
+        if self.srflx.contains(&address) {
+            tracing::debug!(
+                candidate,
+                "server-reflexive candidate already told at its address; redundant"
+            );
+            return false;
+        }
+        self.srflx.push(address);
+        true
+    }
+
+    /// `sdp`, an answer of the worker's, without the `a=candidate` lines
+    /// the advertisement hides; logs how many it hid.
+    fn advertised_sdp(&self, sdp: String) -> String {
+        let (sdp, hidden) = self.advertisement.filter_sdp(sdp);
+        if hidden > 0 {
+            tracing::debug!(
+                hidden,
+                "host candidates left out of the answer: addresses are advertised"
+            );
+        }
+        sdp
+    }
+
     /// `count` STUN and TURN gathers started; end-of-candidates waits for
     /// them.
     pub(crate) const fn gathering(&mut self, count: usize) {
@@ -593,11 +658,14 @@ impl SessionEntry {
 
     /// A gather finished with `candidate`, or without one: the events to
     /// deliver. A candidate before the answer waits for it; one after
-    /// end-of-candidates is too late and dropped.
+    /// end-of-candidates is too late and dropped, and so is a
+    /// server-reflexive one at an address already told
+    /// ([`Self::first_srflx`]).
     pub(crate) fn gathered(&mut self, candidate: Option<String>) -> Vec<SessionEvent> {
         self.gathers = self.gathers.saturating_sub(1);
         let mut out = Vec::new();
-        if let Some(candidate) = candidate.filter(|_| !self.candidates_done) {
+        let candidate = candidate.filter(|line| !self.candidates_done && self.first_srflx(line));
+        if let Some(candidate) = candidate {
             if self.answered {
                 out.push(self.gathered_event(candidate));
             } else {
@@ -608,13 +676,14 @@ impl SessionEntry {
         out
     }
 
-    /// A gathered candidate as an event, naming the answer's first media
-    /// section (BUNDLE: every section shares the transport).
+    /// A gathered candidate as an event, naming the media section that
+    /// carries the answer's transport ([`transport_section`]; BUNDLE: every
+    /// section of the group shares it).
     fn gathered_event(&self, candidate: String) -> SessionEvent {
         SessionEvent::Candidate {
             candidate,
-            sdp_mid: self.mid.clone(),
-            sdp_mline_index: self.mid.as_ref().map(|_| 0),
+            sdp_mid: self.transport.as_ref().map(|(mid, _)| mid.clone()),
+            sdp_mline_index: self.transport.as_ref().map(|&(_, index)| index),
         }
     }
 
@@ -653,10 +722,8 @@ impl SessionEntry {
                 self.answered = true;
                 self.declines_due = 1;
                 self.talkback = talkback.and_then(|codec| known(&TALKBACK_CODECS, &codec));
-                self.mid = sdp
-                    .lines()
-                    .find_map(|line| line.strip_prefix("a=mid:"))
-                    .map(|mid| mid.trim().to_owned());
+                self.transport = transport_section(&sdp);
+                let sdp = self.advertised_sdp(sdp);
                 let mut out = vec![SessionEvent::Answer { sdp }];
                 let held = std::mem::take(&mut self.held);
                 out.extend(held.into_iter().map(|line| self.gathered_event(line)));
@@ -667,24 +734,7 @@ impl SessionEntry {
                 Ok(self.finish_candidates().into_iter().collect())
             }
             WorkerSessionEvent::Candidate { candidate, mid } => {
-                if self.worker_done {
-                    // RFC 8838 §13: no candidate follows end-of-candidates.
-                    return Err("a candidate after the worker's end-of-candidates");
-                }
-                if self.worker_candidates >= MAX_WORKER_CANDIDATES {
-                    return Err("more candidates than a session allows");
-                }
-                self.charge(
-                    candidate
-                        .len()
-                        .saturating_add(mid.as_ref().map_or(0, String::len)),
-                )?;
-                self.worker_candidates = self.worker_candidates.saturating_add(1);
-                Ok(vec![SessionEvent::Candidate {
-                    candidate,
-                    sdp_mid: mid,
-                    sdp_mline_index: None,
-                }])
+                self.worker_candidate(candidate, mid)
             }
             WorkerSessionEvent::Relayed { relayed, candidate } => {
                 self.charge(candidate.as_ref().map_or(0, String::len))?;
@@ -725,7 +775,7 @@ impl SessionEntry {
                 };
                 self.declines_due = 1;
                 self.talkback = talkback.and_then(|codec| known(&TALKBACK_CODECS, &codec));
-                reply(waiting, Ok(sdp));
+                reply(waiting, Ok(self.advertised_sdp(sdp)));
                 Ok(Vec::new())
             }
             WorkerSessionEvent::RenegotiateRefused { code, message } => {
@@ -748,6 +798,40 @@ impl SessionEntry {
             WorkerSessionEvent::Warning { code, message } => self.warning(&code, &message),
             WorkerSessionEvent::Closed { code, message } => Ok(vec![closed_event(&code, &message)]),
         }
+    }
+
+    /// A candidate line of the worker's: counted and charged, then told to
+    /// the browser unless the advertisement hides it. None follows the
+    /// worker's end-of-candidates (RFC 8838 §13).
+    fn worker_candidate(
+        &mut self,
+        candidate: String,
+        mid: Option<String>,
+    ) -> Result<Vec<SessionEvent>, &'static str> {
+        if self.worker_done {
+            return Err("a candidate after the worker's end-of-candidates");
+        }
+        if self.worker_candidates >= MAX_WORKER_CANDIDATES {
+            return Err("more candidates than a session allows");
+        }
+        self.charge(
+            candidate
+                .len()
+                .saturating_add(mid.as_ref().map_or(0, String::len)),
+        )?;
+        self.worker_candidates = self.worker_candidates.saturating_add(1);
+        if !self.advertisement.shows(&candidate) {
+            tracing::debug!(
+                candidate,
+                "host candidate not told to the browser: addresses are advertised"
+            );
+            return Ok(Vec::new());
+        }
+        Ok(vec![SessionEvent::Candidate {
+            candidate,
+            sdp_mid: mid,
+            sdp_mline_index: None,
+        }])
     }
 
     /// Whether the line of the session's state, just changed, is due at
@@ -857,6 +941,41 @@ impl SessionEntry {
             },
         }
     }
+}
+
+/// The media section of an answer that carries its transport, as its
+/// `mid` and m-line index (0 for the first `m=` line), which a trickled
+/// candidate names: the answer's BUNDLE tag, the first identification tag
+/// of its `a=group:BUNDLE` (RFC 8843 §7.3.1), every section of the group
+/// sharing its transport. Without a group, or with a tag no section has,
+/// the first section that is not rejected, a zero port being a rejected
+/// one (RFC 8843 §7.3.3, RFC 3264 §6). Never a rejected one, even if tagged: it has no
+/// transport, so a browser told candidates for it alone, as one is with
+/// addresses advertised and the host lines left out, could not connect.
+/// Attributes before the first `m=` line count as the first section's.
+/// The worker's answer is untrusted text: nothing here indexes into it.
+fn transport_section(sdp: &str) -> Option<(String, u32)> {
+    let mut tag = None;
+    let mut sections = Vec::new();
+    let mut index = None;
+    let mut rejected = false;
+    for line in sdp.lines() {
+        if let Some(media) = line.strip_prefix("m=") {
+            index = Some(index.map_or(0, |i: u32| i.saturating_add(1)));
+            rejected = media.split_ascii_whitespace().nth(1) == Some("0");
+        } else if let Some(group) = line.strip_prefix("a=group:BUNDLE ") {
+            tag = tag.or_else(|| group.split_ascii_whitespace().next());
+        } else if let Some(mid) = line.strip_prefix("a=mid:") {
+            sections.push((mid.trim(), index.unwrap_or(0), rejected));
+        }
+    }
+    let tagged = tag.and_then(|tag| {
+        sections
+            .iter()
+            .find(|&&(mid, _, rejected)| mid == tag && !rejected)
+    });
+    let (mid, index, _) = tagged.or_else(|| sections.iter().find(|&&(.., rejected)| !rejected))?;
+    Some(((*mid).to_owned(), *index))
 }
 
 /// `value` as the known `&'static` name it equals.
@@ -1200,7 +1319,7 @@ mod tests {
             }),
             Err("a second answer")
         );
-        assert_eq!(session.mid.as_deref(), Some("0"), "nothing changed");
+        assert_eq!(session.transport, Some(("0".into(), 0)), "nothing changed");
     }
 
     /// A decline passes once per offer answered, with a known reason,
@@ -1728,6 +1847,216 @@ mod tests {
         assert_eq!(early.gathered(Some("c".into())), vec![candidate("c", None)]);
         // Without gathers the worker's end-of-candidates passes at once.
         assert_eq!(early.applied(end()), vec![candidate("", None)]);
+    }
+
+    #[test]
+    fn candidates_name_the_bundle_tag_never_a_rejected_section_rfc_8843_7_3_1() {
+        let section = |sdp: &str| transport_section(sdp);
+        let at = |mid: &str, index: u32| Some((mid.to_owned(), index));
+        let stopped_audio_first = "v=0\r\na=group:BUNDLE 1 2\r\n\
+            m=audio 0 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\n\
+            m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\n\
+            m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:2\r\n";
+        assert_eq!(section(stopped_audio_first), at("1", 1));
+        // The tag wins over an earlier live section.
+        assert_eq!(
+            section(
+                "v=0\r\na=group:BUNDLE 1 0\r\nm=audio 9 X 0\r\na=mid:0\r\nm=video 9 X 96\r\na=mid:1\r\n"
+            ),
+            at("1", 1)
+        );
+        // The first group line's tag; another group's semantics is no tag.
+        assert_eq!(
+            section(
+                "v=0\r\na=group:LS 1\r\na=group:BUNDLE 1\r\na=group:BUNDLE 0\r\nm=audio 9 X 0\r\na=mid:0\r\nm=video 9 X 96\r\na=mid:1\r\n"
+            ),
+            at("1", 1)
+        );
+        // Without a group, a tag no section has, an empty group or a
+        // tagged rejected section: the first live section.
+        for group in [
+            "",
+            "a=group:BUNDLE 7\r\n",
+            "a=group:BUNDLE \r\n",
+            "a=group:BUNDLE 0\r\n",
+        ] {
+            assert_eq!(
+                section(&format!(
+                    "v=0\r\n{group}m=audio 0 X 0\r\na=mid:0\r\nm=video 9 X 96\r\na=mid:1\r\n"
+                )),
+                at("1", 1),
+                "{group:?}"
+            );
+        }
+        // Attributes before any `m=` line are the first section's.
+        assert_eq!(section("v=0\r\na=mid: 0 \r\n"), at("0", 0));
+        // No mid, or every section rejected: none to name.
+        assert_eq!(section("v=0\r\nm=video 9 X 96\r\n"), None);
+        assert_eq!(section("v=0\r\nm=video 0 X 96\r\na=mid:0\r\n"), None);
+        assert_eq!(section(""), None);
+    }
+
+    #[test]
+    fn advertised_candidates_name_the_bundle_tag_after_a_rejected_first_section_rfc_8843_7_3_1() {
+        let advertisement = Arc::new(Advertisement::new(
+            &["203.0.113.7".parse().unwrap()],
+            &["172.17.0.2:18556".parse().unwrap()],
+            &[],
+        ));
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        session.advertise(Arc::clone(&advertisement));
+        let answered = session.applied(WorkerSessionEvent::Answer {
+            sdp: "v=0\r\na=group:BUNDLE 1\r\n\
+                  m=audio 0 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\n\
+                  m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\n"
+                .into(),
+            talkback: None,
+        });
+        assert_eq!(
+            answered[1],
+            SessionEvent::Candidate {
+                candidate: advertisement.lines()[0].clone(),
+                sdp_mid: Some("1".into()),
+                sdp_mline_index: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn advertised_candidates_wait_for_the_answer_and_replace_the_host_ones_rfc_8838_13() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let advertisement = Arc::new(Advertisement::new(
+            &["203.0.113.7".parse().unwrap()],
+            &["172.17.0.2:18556".parse().unwrap()],
+            &[],
+        ));
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        session.advertise(Arc::clone(&advertisement));
+        let host = "candidate:1 1 udp 2130706431 172.17.0.2 18556 typ host";
+        let relay =
+            "candidate:r1 1 udp 16777215 198.51.100.1 49152 typ relay raddr 0.0.0.0 rport 0";
+        // The answer loses its host line; the advertised one follows it.
+        let answered = session.applied(WorkerSessionEvent::Answer {
+            sdp: format!("v=0\r\na=mid:0\r\na={host}\r\na={relay}\r\n"),
+            talkback: None,
+        });
+        assert_eq!(
+            answered,
+            vec![
+                SessionEvent::Answer {
+                    sdp: format!("v=0\r\na=mid:0\r\na={relay}\r\n")
+                },
+                candidate(&advertisement.lines()[0], Some("0")),
+            ]
+        );
+        assert_eq!(
+            captured
+                .lines("host candidates left out of the answer")
+                .len(),
+            1
+        );
+        // The worker's host candidate is counted and charged, not told.
+        assert_eq!(
+            session.applied(WorkerSessionEvent::Candidate {
+                candidate: host.into(),
+                mid: Some("0".into()),
+            }),
+            vec![]
+        );
+        assert_eq!(session.worker_candidates, 1);
+        assert_eq!(session.report_bytes, host.len() + 1);
+        assert_eq!(
+            captured
+                .lines("host candidate not told to the browser")
+                .len(),
+            1
+        );
+        assert_eq!(
+            session.applied(WorkerSessionEvent::Candidate {
+                candidate: relay.into(),
+                mid: None,
+            }),
+            vec![candidate(relay, None)]
+        );
+        assert_eq!(session.applied(end()), vec![candidate("", None)]);
+        // A re-offer's answer is filtered too.
+        let (reply, mut waiting) = oneshot::channel();
+        session.renegotiate(reply).unwrap();
+        session.applied(WorkerSessionEvent::Renegotiated {
+            sdp: format!("v=0\r\na={host}\r\n"),
+            talkback: None,
+        });
+        assert_eq!(waiting.try_recv().unwrap().unwrap(), "v=0\r\n");
+        assert_eq!(
+            captured
+                .lines("host candidates left out of the answer")
+                .len(),
+            2
+        );
+
+        // Without an advertisement the answer is the worker's, unlogged.
+        let (tx, _rx) = mpsc::channel(8);
+        let mut plain = entry(tx);
+        let sdp = format!("v=0\r\na={host}\r\n");
+        assert_eq!(
+            plain.applied(WorkerSessionEvent::Answer {
+                sdp: sdp.clone(),
+                talkback: None,
+            }),
+            vec![SessionEvent::Answer { sdp }]
+        );
+        assert_eq!(
+            captured
+                .lines("host candidates left out of the answer")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rfc_8445_5_1_3_a_server_reflexive_address_is_told_once_the_first_line_kept() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let advertisement = Arc::new(Advertisement::new(
+            &["203.0.113.7:40000".parse().unwrap()],
+            &["172.17.0.2:18556".parse().unwrap()],
+            &[],
+        ));
+        let stun = |n: u32, ip: &str| {
+            format!("candidate:s{n} 1 udp 1694498815 {ip} 40000 typ srflx raddr 0.0.0.0 rport 9")
+        };
+        let (tx, _rx) = mpsc::channel(8);
+        let mut session = entry(tx);
+        session.gathering(3);
+        session.advertise(Arc::clone(&advertisement));
+        // A STUN server mapping to the advertised address adds nothing;
+        // another address is held for the answer.
+        assert_eq!(session.gathered(Some(stun(0, "203.0.113.7"))), vec![]);
+        assert_eq!(session.gathered(Some(stun(1, "203.0.113.8"))), vec![]);
+        let answered = session.applied(WorkerSessionEvent::Answer {
+            sdp: "v=0\r\na=mid:0\r\n".into(),
+            talkback: None,
+        });
+        assert_eq!(
+            answered[1..],
+            [
+                candidate(&advertisement.lines()[0], Some("0")),
+                candidate(&stun(1, "203.0.113.8"), Some("0")),
+            ]
+        );
+        // After the answer too: a second STUN server at a told address.
+        assert_eq!(session.gathered(Some(stun(2, "203.0.113.8"))), vec![]);
+        assert_eq!(
+            captured
+                .lines("server-reflexive candidate already told at its address")
+                .len(),
+            2
+        );
+        // The gathers are done: the worker's end-of-candidates ends them.
+        assert_eq!(session.applied(end()), vec![candidate("", None)]);
     }
 
     #[test]

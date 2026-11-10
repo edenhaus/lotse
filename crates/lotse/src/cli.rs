@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::Mode;
+use lotse_supervisor::AdvertisedAddress;
 
 use crate::config::{LogFormat, TcpListen};
 use crate::ctl::{CtlArgs, PairArgs};
@@ -177,6 +178,20 @@ pub(crate) struct ServeArgs {
     /// The ICE-TCP listener, or `off`.
     #[arg(long, env = "LOTSE_WEBRTC_TCP_LISTEN", value_name = "ADDR|off")]
     pub(crate) webrtc_tcp_listen: Option<TcpListen>,
+
+    /// Addresses a NAT in front of the daemon forwards to the WebRTC UDP
+    /// socket and the ICE-TCP listener (a container bridge network's
+    /// published ports), comma-separated, at most eight: browsers are told
+    /// these instead of the daemon's own addresses. `IP` takes each
+    /// listener's port, `IP:PORT` (`[IPv6]:PORT`) that port for both; no
+    /// hostnames. None by default.
+    #[arg(
+        long,
+        env = "LOTSE_WEBRTC_ADVERTISE",
+        value_name = "IP[:PORT],...",
+        value_delimiter = ','
+    )]
+    pub(crate) webrtc_advertise: Option<Vec<AdvertisedAddress>>,
 
     /// Control connections at once.
     #[arg(long, env = "LOTSE_MAX_CONNECTIONS", value_name = "N")]
@@ -669,6 +684,13 @@ mod tests {
         let err =
             Cli::try_parse_from(["lotse", "serve", "--connect-concurrency", "0"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        // An advertised address is an IP: no hostname, no wildcard, no
+        // port 0, each entry of the list checked.
+        for bad in ["cam.example", "203.0.113.7,0.0.0.0", "203.0.113.7:0"] {
+            let err =
+                Cli::try_parse_from(["lotse", "serve", "--webrtc-advertise", bad]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+        }
         let err = Cli::try_parse_from(["lotse"]).unwrap_err();
         assert_eq!(
             err.kind(),
