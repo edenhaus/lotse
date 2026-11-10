@@ -228,16 +228,15 @@ fn inet_only() -> Result<Vec<SeccompRule>, BackendError> {
             (libc::SOCK_DGRAM, 0),
             (libc::SOCK_DGRAM, libc::IPPROTO_UDP),
         ] {
-            rules.push(SeccompRule::new(vec![
-                equals(0, SeccompCmpArgLen::Dword, arg(domain))?,
-                SeccompCondition::new(
-                    1,
-                    SeccompCmpArgLen::Dword,
-                    SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
-                    arg(kind),
-                )?,
-                equals(2, SeccompCmpArgLen::Dword, arg(protocol))?,
-            ])?);
+            let in_domain = equals(0, SeccompCmpArgLen::Dword, arg(domain))?;
+            let of_kind = SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                arg(kind),
+            );
+            let with_protocol = equals(2, SeccompCmpArgLen::Dword, arg(protocol))?;
+            rules.push(SeccompRule::new(vec![in_domain, of_kind?, with_protocol])?);
         }
     }
     Ok(rules)

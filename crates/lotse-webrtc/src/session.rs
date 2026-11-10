@@ -2002,6 +2002,21 @@ mod tests {
         );
     }
 
+    /// What a test's subscriber writes, shared with the test.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// Regression: every candidate of an offer, or of a camera's answer,
     /// reached the agent, however many, while trickled ones are capped: an
     /// SDP of the size the control API takes named over a thousand
@@ -2025,11 +2040,27 @@ mod tests {
         assert_eq!(candidates.len(), MAX_SDP_CANDIDATES);
 
         let over = sdp(MAX_SDP_CANDIDATES + 6);
-        let (rest, candidates) = split_candidates(&over);
+        let mut captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let (rest, candidates) =
+            tracing::subscriber::with_default(subscriber, || split_candidates(&over));
         // The dropped ones are still out of what the engine parses.
         assert_eq!(rest, "v=0\r\nm=video 9 x 96\r\na=mid:v\r\n");
         let kept: Vec<String> = (0..MAX_SDP_CANDIDATES).map(line).collect();
         assert_eq!(candidates, kept);
+        std::io::Write::flush(&mut captured).unwrap();
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains(
+                "candidates of an SDP dropped: more than a session takes kept=64 dropped=6"
+            ),
+            "{logs}"
+        );
     }
 
     #[test]
