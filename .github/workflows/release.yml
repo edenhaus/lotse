@@ -119,9 +119,17 @@ jobs:
           ACTOR: ${{ github.actor }}
           TOKEN: ${{ github.token }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
-      # The same binaries give the same image.
+      # The same binaries give the same image, byte for byte: buildx takes SOURCE_DATE_EPOCH from
+      # the environment for the image's timestamps, and rewrite-timestamp (below) clamps the
+      # layers' file times to it (checked 2026-11-09: two BuildKit v0.33.1 builds, one digest).
+      # `created` is the same instant in RFC 3339 (UTC), for the label and the index annotation.
       - name: Image timestamp
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+        run: |
+          epoch="$(git log -1 --format=%ct)"
+          {
+            echo "SOURCE_DATE_EPOCH=$epoch"
+            echo "CREATED=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee -a "$GITHUB_ENV"
       # mirror.gcr.io: Docker Hub's anonymous pull limit. No cache-binary: this workflow restores
       # no cache.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -145,10 +153,27 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.created=${{ env.CREATED }}
           annotations: |
+            index:org.opencontainers.image.created=${{ env.CREATED }}
             index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             index:org.opencontainers.image.description=Memory-safe media daemon for IP cameras.
             index:org.opencontainers.image.licenses=MIT OR Apache-2.0
+      # The pushed image, each platform, before it is attested: a HIGH or CRITICAL vulnerability
+      # with a fix stops the release (scripts/scan-image.sh). Grype reads the registry with the
+      # login above; mise installs it without its cache, as everything in this workflow.
+      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          version: 2026.11.0
+          install_args: grype
+          cache: false
+      - name: Scan the pushed image
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}@${{ steps.push.outputs.digest }}
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            scripts/scan-image.sh "registry:$IMAGE" "$platform"
+          done
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.name.outputs.image }}

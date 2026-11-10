@@ -55,6 +55,7 @@ mod connection;
 pub mod identity;
 mod listener;
 mod outbox;
+mod owners;
 pub mod pairing;
 mod recording;
 #[cfg(feature = "test-util")]
@@ -63,6 +64,7 @@ pub mod tls;
 
 pub use clients::ClientsError;
 pub use listener::{BindError, PeerInfo};
+pub use owners::Owners;
 pub use recording::{RecordingBody, RecordingBodyError};
 pub use tls::TlsConfig;
 
@@ -232,11 +234,13 @@ pub trait Handler: Send + Sync + 'static {
 /// The server's settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The socket path; its directory must be 0700 and owned by `owner_uid`.
+    /// The socket path; its directory must be 0700 and owned by one of
+    /// `owners`.
     pub socket: PathBuf,
-    /// The uid the daemon started as: owns the socket directory and may
-    /// always connect.
-    pub owner_uid: u32,
+    /// The uid the daemon started as, which may always connect, and the
+    /// one it drops to: who may own the socket's directory and the data
+    /// directory.
+    pub owners: Owners,
     /// A second uid allowed to connect (`--allow-uid`).
     pub allow_uid: u32,
     /// Control connections at once.
@@ -318,15 +322,16 @@ pub enum ServeError {
 
 impl Server {
     /// Binds the Unix socket synchronously, with the control plane's checks:
-    /// no abstract namespace, a 0700 directory owned by `owner_uid`, umask
+    /// no abstract namespace, a 0700 directory owned by one of
+    /// [`Config::owners`], umask
     /// 0177 around the bind. With [`Config::tls`], also loads or makes the
     /// server identity and binds the TLS listener ([`tls`]).
     pub fn bind(config: Config) -> Result<Self, BindError> {
-        let unix = listener::bind_unix(&config.socket, config.owner_uid)?;
+        let unix = listener::bind_unix(&config.socket, config.owners)?;
         let tls = config
             .tls
             .as_ref()
-            .map(|settings| tls::bind(settings, config.owner_uid))
+            .map(|settings| tls::bind(settings, config.owners))
             .transpose()?;
         Ok(Self { unix, tls, config })
     }
@@ -360,7 +365,7 @@ impl Server {
         clock: Arc<dyn Clock>,
         shutdown: CancellationToken,
     ) -> Result<(), ServeError> {
-        let allowed = [self.config.owner_uid, self.config.allow_uid];
+        let allowed = [self.config.owners.starting, self.config.allow_uid];
         let mut unix = listener::CheckedUnix::new(self.unix, allowed, Arc::clone(&clock))
             .map_err(ServeError::Register)?;
         let pending = Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES)));
@@ -767,7 +772,7 @@ mod tests {
             handler: Arc::new(Minimal),
             config: Config {
                 socket: PathBuf::from("/run/lotse/lotse.sock"),
-                owner_uid: 0,
+                owners: Owners::only(0),
                 allow_uid: 0,
                 max_connections,
                 max_subscriptions: 1,

@@ -20,8 +20,10 @@ prek = "0.5.10"
 cargo-deny = "0.20.2"
 shellcheck = "0.11.0" # actionlint checks workflow scripts with it when it is on PATH, as on the CI runners
 zizmor = "1.32.0" # the workflows' security audit: the prek hook offline, CI's Zizmor job online (one pin for both)
+grype = "0.121.2" # the release image's vulnerability scan (scripts/scan-image.sh: CI's Rootless Podman job, release.yml)
 "github:nextest-rs/nextest" = { version = "0.9.151", version_prefix = "cargo-nextest-" }
 "github:rust-cross/cargo-zigbuild" = "0.24.1"
+"github:rust-secure-code/cargo-auditable" = "0.7.7" # the release binary's dependency list, embedded for scanners and `cargo audit bin`
 zig = "0.17.1" # C compiler and linker for every musl build, tests included (see .cargo/config.toml)
 cmake = "4.4.5" # builds the bundled libopus (`opusic-sys`, behind the `opus` crate) on every host
 "github:taiki-e/cargo-llvm-cov" = "0.9.1" # line coverage gate
@@ -227,11 +229,11 @@ cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
 """
 
 [tasks.release-build]
-description = "Static musl binary (Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"
+description = "Static musl binary with its dependency list embedded (cargo auditable; Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"
 usage = 'arg "[arch]" help="x86_64 or aarch64" default="x86_64"'
 run = """
 [ "$(uname -s)" = Linux ] || { echo "release-build runs on Linux; CI builds both arches (build.yml)" >&2; exit 1; }
-cargo build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl
+cargo auditable build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl
 """
 
 # The release steps that need no tag, so a release can be checked and reproduced off CI;
@@ -251,10 +253,33 @@ cargo about generate --locked --fail --config .cargo/about.toml --manifest-path 
   --output-file target/dist/THIRD_PARTY_LICENSES.md .cargo/about.hbs
 """
 
+# Reproducible, as release.yml builds it: every timestamp is the commit's, so the same binary gives
+# the same image. Podman from 5.1 clamps the layers' timestamps to --source-date-epoch; before, its
+# --timestamp sets them all. Docker: BuildKit's rewrite-timestamp, and no provenance attestation,
+# which records the build's own time.
 [tasks.image]
-description = "The release image of the host's arch (Dockerfile), into the local Docker as lotse:dev (Linux only, as release-build)"
+description = "The release image of the host's arch (Dockerfile), reproducibly, into the local Podman, or Docker without it, as lotse:dev (Linux only, as release-build)"
 run = """
 mise run release-build "$(uname -m)"
 install -D target/$(uname -m)-unknown-linux-musl/release/lotse target/image/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/lotse
-docker build --tag lotse:dev .
+epoch="$(git log -1 --format=%ct)"
+if ! command -v podman >/dev/null; then
+  SOURCE_DATE_EPOCH="$epoch" docker buildx build --file Dockerfile --provenance=false --sbom=false \
+    --output type=docker,name=lotse:dev,rewrite-timestamp=true .
+elif podman build --help | grep -q -- --rewrite-timestamp; then
+  podman build --file Dockerfile --source-date-epoch "$epoch" --rewrite-timestamp --tag lotse:dev .
+else
+  podman build --file Dockerfile --timestamp "$epoch" --tag lotse:dev .
+fi
+"""
+
+[tasks.rootless-podman]
+description = "The release image under rootless Podman, read-only and without capabilities, started as its user and as root (scripts/rootless-podman.sh, as CI's Rootless Podman job); Linux only, as an unprivileged user, after release-build"
+usage = '''
+arg "[binary]" help="The static release binary" default=""
+arg "[arch]" help="x86_64 or aarch64, the host's by default" default=""
+'''
+run = """
+arch="${usage_arch:-$(uname -m)}"
+scripts/rootless-podman.sh "${usage_binary:-target/$arch-unknown-linux-musl/release/lotse}" "$arch"
 """

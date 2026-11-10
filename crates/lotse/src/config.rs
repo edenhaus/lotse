@@ -124,7 +124,7 @@ impl fmt::Display for TcpListen {
 
 /// Why a string is not a [`TcpListen`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("tcp listen must be `off` or an address like `[::]:18556`, not {0:?}")]
+#[error("tcp listen must be `off` or an address like `[::]:30415`, not {0:?}")]
 pub(crate) struct ParseTcpListenError(String);
 
 impl FromStr for TcpListen {
@@ -840,7 +840,7 @@ pub(crate) fn load(
         log,
         supervisor: lotse_supervisor::Settings {
             socket,
-            owner_uid: starting_uid,
+            owners: lotse_supervisor::Owners::new(starting_uid, uid),
             allow_uid,
             control_tls,
             udp_listen,
@@ -856,7 +856,10 @@ pub(crate) fn load(
 }
 
 /// Who owns what the daemon writes at runtime: the ids it drops to
-/// (`drop_to`) when started as root, else its own.
+/// (`drop_to`) when started as root, else its own. Its uid is always one
+/// the directories checked before the drop may belong to
+/// ([`lotse_supervisor::Owners`]), and a start that is not root makes
+/// what it writes its own, which needs no capability.
 const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u32, u32) {
     if starting_uid == 0 {
         drop_to
@@ -870,11 +873,13 @@ const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u
 const SANDBOX: Mode = Mode::Require;
 
 /// The default of `webrtc.udp_listen` and `webrtc.tcp_listen`: dual-stack,
-/// port 18556, so the daemon can run beside another WebRTC server that
-/// holds 18555 on the same host.
+/// port 30415. IANA has not assigned it (30401–30831 are unassigned), it
+/// needs no privilege (above 1023), and it is below Linux's ephemeral range
+/// (32768–60999, `net.ipv4.ip_local_port_range`'s default), so no outgoing
+/// connection holds it when the daemon binds.
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(
     std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-    18_556,
+    30_415,
 );
 
 /// Logs every effective setting with its source, at startup, and a
@@ -978,15 +983,15 @@ mod tests {
             resolve(&["lotse", "serve", "--socket", "/run/z.sock"]).unwrap();
         assert_eq!(
             settings.supervisor.udp_listen,
-            "[::]:18556".parse().unwrap()
+            "[::]:30415".parse().unwrap()
         );
         assert_eq!(
             settings.supervisor.tcp_listen,
-            Some("[::]:18556".parse().unwrap())
+            Some("[::]:30415".parse().unwrap())
         );
         assert_eq!(
             source_of(&provenance, "webrtc.tcp_listen"),
-            ("[::]:18556".into(), Source::Default)
+            ("[::]:30415".into(), Source::Default)
         );
         assert_eq!(settings.supervisor.advertise, []);
         assert_eq!(
@@ -1261,6 +1266,34 @@ mod tests {
     fn runtime_state_belongs_to_the_ids_the_daemon_runs_as() {
         assert_eq!(state_owner(0, (65534, 65533), 0), (65534, 65533));
         assert_eq!(state_owner(1000, (65534, 65533), 100), (1000, 100));
+        // The directories checked before the drop may belong to them too.
+        for starting in [0, 1000] {
+            let owners = lotse_supervisor::Owners {
+                starting,
+                drop_to: 65534,
+            };
+            assert!(owners.accepts(state_owner(starting, (65534, 65533), 100).0));
+        }
+    }
+
+    #[test]
+    fn the_private_directories_may_belong_to_the_starting_uid_or_the_drop_target() {
+        let (settings, _) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/lotse/lotse.sock",
+            "--user",
+            "4242",
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.supervisor.owners,
+            lotse_supervisor::Owners {
+                starting: rustix::process::getuid().as_raw(),
+                drop_to: 4242,
+            }
+        );
     }
 
     #[test]

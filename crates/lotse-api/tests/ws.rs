@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use futures_util::{SinkExt as _, StreamExt as _};
 use lotse_api::{
     CLOSE_TIMEOUT, Config, ConnectionId, Event, EventClass, Handler, MAX_MESSAGE_BYTES,
-    MAX_PENDING_UPGRADES, Outcome, ServeError, Server, UPGRADE_TIMEOUT,
+    MAX_PENDING_UPGRADES, Outcome, Owners, ServeError, Server, UPGRADE_TIMEOUT,
 };
 use lotse_api_types::command::Command;
 use lotse_api_types::error::{ApiError, ErrorCode};
@@ -212,7 +212,7 @@ fn start_limited(
     let uid = owner_uid(&dir);
     let server = Server::bind(Config {
         socket: socket.clone(),
-        owner_uid: uid,
+        owners: Owners::only(uid),
         allow_uid: uid,
         max_connections,
         max_subscriptions,

@@ -47,7 +47,7 @@ jobs:
         with:
           version: 2026.11.5
           # What the build needs; the rest of mise.toml is for the checks.
-          install_args: rust zig cmake github:rust-cross/cargo-zigbuild
+          install_args: rust zig cmake github:rust-cross/cargo-zigbuild github:rust-secure-code/cargo-auditable
           cache: ${{ !inputs.release }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !inputs.release }}

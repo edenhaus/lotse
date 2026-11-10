@@ -338,16 +338,21 @@ fn the_control_tls_listener_starts_with_its_identity_and_identity_prints_its_pin
     let (code, rest) = daemon.terminate();
     assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
 
-    let output = lotse()
-        .arg("identity")
-        .env("LOTSE_DATA_DIR", data)
-        .output()
-        .expect("runs");
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        bound["server_pin"].as_str().unwrap()
-    );
+    // The drop target, as `serve` takes it, changes nothing for a start
+    // that is not root.
+    for user in [None, Some("4242")] {
+        let mut identity = lotse();
+        identity.arg("identity").env("LOTSE_DATA_DIR", data);
+        if let Some(user) = user {
+            identity.env("LOTSE_USER", user);
+        }
+        let output = identity.output().expect("runs");
+        assert!(output.status.success(), "{user:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            bound["server_pin"].as_str().unwrap()
+        );
+    }
 }
 
 #[test]

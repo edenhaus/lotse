@@ -56,6 +56,7 @@ mod worker_text;
 
 pub use advertise::{AdvertiseError, AdvertisedAddress, MAX_ADVERTISED};
 pub use handler::{Environment, FrontDoor, Identity, Supervisor};
+pub use lotse_api::Owners;
 pub use lotse_api::Server as ApiServer;
 pub use lotse_api::TlsConfig as ControlTls;
 pub use lotse_api::identity::{IdentityError, ServerIdentity};
@@ -110,9 +111,10 @@ pub struct Limits {
 pub struct Settings {
     /// The control socket path.
     pub socket: PathBuf,
-    /// The uid the daemon started as: owns the socket directory and may
-    /// always connect.
-    pub owner_uid: u32,
+    /// The uid the daemon started as, which may always connect, and the
+    /// one it drops to: who may own the socket directory and the data
+    /// directory ([`Owners`]).
+    pub owners: Owners,
     /// The peer uid allowed on the control socket.
     pub allow_uid: u32,
     /// The control API's mutual-TLS listener, if configured.
@@ -226,7 +228,7 @@ pub fn bind(settings: &Settings) -> Result<Listeners, BindError> {
     };
     let api = ApiServer::bind(lotse_api::Config {
         socket: settings.socket.clone(),
-        owner_uid: settings.owner_uid,
+        owners: settings.owners,
         allow_uid: settings.allow_uid,
         max_connections: settings.limits.max_connections,
         // One per session, one `stream/subscribe` and one
@@ -493,7 +495,7 @@ pub(crate) mod test_support {
             .map_or(0, |meta| meta.uid());
         Settings {
             socket,
-            owner_uid: uid,
+            owners: Owners::only(uid),
             allow_uid: uid,
             control_tls: None,
             udp_listen: SocketAddr::from(([127, 0, 0, 1], 0)),

@@ -53,6 +53,11 @@ pub(crate) struct IdentityArgs {
     /// The daemon's data directory, as `serve` has it.
     #[arg(long, env = "LOTSE_DATA_DIR", value_name = "PATH")]
     pub(crate) data_dir: PathBuf,
+
+    /// The uid `serve` drops to, as it has it: run as root, this reads a
+    /// data directory that belongs to that uid, as a start as root does.
+    #[arg(long, env = "LOTSE_USER", value_name = "UID")]
+    pub(crate) user: Option<u32>,
 }
 
 /// `lotse worker`: the flags the supervisor passes. No environment, no
@@ -123,7 +128,8 @@ pub(crate) struct ServeArgs {
     pub(crate) config: Option<PathBuf>,
 
     /// Path of the control socket. Its directory must exist, be 0700 and be
-    /// owned by the uid the daemon starts as.
+    /// owned by the uid the daemon starts as (or, started as root, by
+    /// `--user`).
     #[arg(long, env = "LOTSE_SOCKET", value_name = "PATH")]
     pub(crate) socket: Option<PathBuf>,
 
@@ -160,7 +166,8 @@ pub(crate) struct ServeArgs {
 
     /// Where the daemon keeps what outlives a restart: the control TLS
     /// listener's key and certificate. Must exist, belong to the starting uid
-    /// and give the group and others no access (mode 0700 or stricter).
+    /// (or, started as root, to `--user`) and give the group and others no
+    /// access (mode 0700 or stricter).
     #[arg(long, env = "LOTSE_DATA_DIR", value_name = "PATH")]
     pub(crate) data_dir: Option<PathBuf>,
 
