@@ -41,10 +41,14 @@ is designed with.
   needs no capability. Every process runs under
   seccomp and Landlock, and by default (`--sandbox require`) refuses to
   start on a kernel that lacks a layer; `--sandbox on` runs with the
-  layers it has and reports the rest. C code that decodes camera bytes runs in a
-  throwaway decoder process with no network and no files.
+  layers it has and reports the rest. C code that decodes camera bytes is to
+  run in a throwaway decoder process with no network and no files; none
+  exists yet, as nothing decodes camera bytes in C: the one C library,
+  libopus, runs in the camera's worker, where it encodes audio and decodes
+  the talk-back audio a viewer sends.
 - **Strict.** `#![forbid(unsafe_code)]` in all our crates; C libraries
-  (libopus, mimalloc, OpenH264) only through existing safe wrappers.
+  (libopus today; OpenH264 with snapshots) only through existing safe
+  wrappers.
   Pedantic Clippy. No panics on network input. Fuzzed parsers.
 - **Safe control plane.** Filesystem Unix socket in a private per-spawn
   directory, peer-credential checks. Over the network only when asked,

@@ -6,7 +6,8 @@
 //! A worker's messages are untrusted: every field is mapped onto a known
 //! value here (an error code onto a `SourceError` variant, for example)
 //! and never used as a path or a command, and what is kept is bounded
-//! here: at most 32 tracks and track counters with short names, error
+//! here: at most 32 tracks and track counters with short names, a
+//! backchannel codec and talk-back session ids that are short names, error
 //! text and a signal's close cut and on one line, signal ids short. The frame cap alone would let a
 //! worker hand the API a quarter MiB per `stream/get`. A trim is logged
 //! once per worker, so a worker repeating an over-long message cannot
@@ -505,18 +506,27 @@ fn declared(tracks: Vec<TrackInfo>, logged: &mut bool) -> Vec<TrackInfo> {
 }
 
 /// A worker's counters with at most [`MAX_TRACKS`] tracks whose ids fit
-/// [`MAX_NAME_BYTES`]. A trim is logged unless `logged` says one was
-/// already, and sets it.
+/// [`MAX_NAME_BYTES`], and a backchannel codec and talk-back session ids
+/// that are short names ([`is_signal_id`]): the codec goes into
+/// `stream/get` as it is, so one that is no name is dropped whole. A trim
+/// is logged unless `logged` says one was already, and sets it.
 fn counted(mut stats: WorkerStats, logged: &mut bool) -> WorkerStats {
     let reported = stats.tracks.len();
     stats.tracks.retain(|(id, _)| id.len() <= MAX_NAME_BYTES);
     stats.tracks.truncate(MAX_TRACKS);
-    if stats.tracks.len() < reported && !std::mem::replace(logged, true) {
+    let sessions = stats.talkback.len();
+    stats.talkback.retain(|(id, _)| is_signal_id(id));
+    let unnamed = sessions.saturating_sub(stats.talkback.len());
+    let codec = stats.backchannel.take_if(|codec| !is_signal_id(codec));
+    let trimmed = stats.tracks.len() < reported || unnamed > 0 || codec.is_some();
+    if trimmed && !std::mem::replace(logged, true) {
         tracing::warn!(
             reported,
             kept = stats.tracks.len(),
             limit = MAX_TRACKS,
-            "a worker counted too many tracks or over-long ids; the rest dropped, and later ones without a log"
+            talkback_dropped = unnamed,
+            backchannel_dropped = codec.is_some(),
+            "a worker counted too many tracks or over-long ids, or named a talk-back session or a backchannel codec with no short name; the rest dropped, and later ones without a log"
         );
     }
     stats
@@ -1173,6 +1183,69 @@ mod tests {
             lines[0].contains("reported=40 kept=32 limit=32"),
             "{lines:?}"
         );
+    }
+
+    /// Regression: `counted` trimmed the track counters alone, so the
+    /// backchannel codec, which `stream/get` reports as the worker gave
+    /// it, could be a quarter MiB of any characters, and so could a
+    /// talk-back session's id.
+    #[test]
+    fn a_worker_s_backchannel_codec_and_talkback_sessions_are_short_names() {
+        let talkback = lotse_ipc::TalkbackStats::default();
+        let stats = |codec: Option<&str>, sessions: &[&str]| WorkerStats {
+            talkback: sessions
+                .iter()
+                .map(|id| ((*id).to_owned(), talkback))
+                .collect(),
+            backchannel: codec.map(str::to_owned),
+            ..WorkerStats::default()
+        };
+        let long = "x".repeat(MAX_NAME_BYTES + 1);
+        let named = "x".repeat(MAX_NAME_BYTES);
+        let captured = Captured::default();
+        let _logs = captured.install();
+
+        let kept = stats(Some("pcmu"), &["01JD0000000000000000000000", &named]);
+        assert_eq!(counted(kept.clone(), &mut false), kept);
+        assert_eq!(
+            counted(stats(Some(&named), &[]), &mut false),
+            stats(Some(&named), &[])
+        );
+        assert_eq!(captured.lines("counted too many tracks"), [""; 0]);
+
+        for codec in [long.as_str(), "", "pcmu\nlevel=ERROR forged", "pc mu"] {
+            let mut logged = false;
+            assert_eq!(
+                counted(stats(Some(codec), &["s1"]), &mut logged),
+                stats(None, &["s1"]),
+                "{codec:?}"
+            );
+            assert!(logged, "{codec:?}");
+        }
+        let lines = captured.lines("backchannel_dropped=true");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].contains("talkback_dropped=0"), "{lines:?}");
+
+        let mut logged = false;
+        assert_eq!(
+            counted(
+                stats(Some("opus"), &["s1", &long, "", "s 2", "s2"]),
+                &mut logged
+            ),
+            stats(Some("opus"), &["s1", "s2"])
+        );
+        assert!(logged);
+        let lines = captured.lines("talkback_dropped=3");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("backchannel_dropped=false"), "{lines:?}");
+
+        // Once per worker, as for the tracks.
+        let mut logged = true;
+        assert_eq!(
+            counted(stats(Some(&long), &[&long]), &mut logged),
+            stats(None, &[])
+        );
+        assert_eq!(captured.lines("talkback_dropped=1").len(), 0);
     }
 
     /// Regression for SUP-30: every trimmed declaration or counter report
