@@ -51,30 +51,32 @@ url = "https://github.com/Kitware/CMake/releases/download/v4.4.5/cmake-4.4.5-mac
 url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/682699600"
 
 [[tools."github:AlexxIT/go2rtc"]]
-version = "1.9.14"
+version = "1.9.15"
 backend = "github:AlexxIT/go2rtc"
-specifiers = ["1.9.14"]
+specifiers = ["v1.9.15"]
 
 [tools."github:AlexxIT/go2rtc".options]
 asset_pattern = "go2rtc_linux_arm64"
 
 [tools."github:AlexxIT/go2rtc"."platforms.linux-arm64"]
-checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50"
-url = "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_arm64"
-url_api = "https://api.github.com/repos/AlexxIT/go2rtc/releases/assets/342672062"
+checksum = "sha256:af416f22b21a24ab83b8d78642190b4932ae695b4e386853f11d1b0319781763"
+checksum_source = "mise-versions"
+url = "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.15/go2rtc_linux_arm64"
+url_api = "https://api.github.com/repos/AlexxIT/go2rtc/releases/assets/674996355"
 
 [[tools."github:AlexxIT/go2rtc"]]
-version = "1.9.14"
+version = "1.9.15"
 backend = "github:AlexxIT/go2rtc"
-specifiers = ["1.9.14"]
+specifiers = ["v1.9.15"]
 
 [tools."github:AlexxIT/go2rtc".options]
 asset_pattern = "go2rtc_linux_amd64"
 
 [tools."github:AlexxIT/go2rtc"."platforms.linux-x64"]
-checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6"
-url = "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_amd64"
-url_api = "https://api.github.com/repos/AlexxIT/go2rtc/releases/assets/342672036"
+checksum = "sha256:20b46c6910734cb05ecefb234066f36868ff19b42ba1418a7a32e13a3e035712"
+checksum_source = "mise-versions"
+url = "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.15/go2rtc_linux_amd64"
+url_api = "https://api.github.com/repos/AlexxIT/go2rtc/releases/assets/674996190"
 
 [[tools."github:BtbN/FFmpeg-Builds"]]
 version = "autobuild-2026-09-30-13-08"
