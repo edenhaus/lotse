@@ -32,7 +32,7 @@ cmake = "4.4.5" # builds the bundled libopus (`opusic-sys`, behind the `opus` cr
 "github:boshen/cargo-shear" = "1.14.0" # fails on unused dependencies
 "github:EmbarkStudios/cargo-about" = "0.9.3" # THIRD_PARTY_LICENSES.md of a release (`mise run licenses`)
 "github:CycloneDX/cyclonedx-rust-cargo" = { version = "0.5.10", version_prefix = "cargo-cyclonedx-" } # the CycloneDX SBOM of a release (`mise run sbom`)
-uv = "0.13.7" # the browser test's Python, Selenium and pytest, and its checks (tests/browser/uv.lock)
+uv = "0.13.8" # the browser test's Python, Selenium and pytest, and its checks (tests/browser/uv.lock)
 
 # The camera of the browser and interop tests: ffmpeg encodes and publishes, MediaMTX serves RTSP
 # and HLS; ffmpeg alone serves raw MPEG-TS over HTTP.
