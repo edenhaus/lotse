@@ -177,11 +177,11 @@ impl SessionOpenError {
     }
 }
 
-/// Why a re-offer ([`SessionEngine::renegotiate`]) was not applied; the
-/// session goes on as it was. Each maps to a `webrtc/renegotiate` error
+/// Why a re-offer ([`SessionEngine::reoffer`]) was not applied; the
+/// session goes on as it was. Each maps to a `webrtc/reoffer` error
 /// code.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum RenegotiateError {
+pub enum ReofferError {
     /// The re-offer is not an SDP the engine accepts.
     #[error("invalid re-offer: {0}")]
     InvalidSdp(String),
@@ -195,7 +195,7 @@ pub enum RenegotiateError {
     NoVideoTrack,
 }
 
-impl RenegotiateError {
+impl ReofferError {
     /// The error code.
     pub const fn code(&self) -> &'static str {
         match self {
@@ -407,7 +407,7 @@ pub trait SessionEngine: fmt::Debug + Send {
     /// [`OutputFactory::talkback_request`]: crate::output::OutputFactory::talkback_request
     fn talkback_request(&self, offer: &str) -> crate::output::TalkbackJudge;
 
-    /// A re-offer (`webrtc/renegotiate`): the answer to it, or why it was
+    /// A re-offer (`webrtc/reoffer`): the answer to it, or why it was
     /// not applied, the session then going on as it was. Only the audio
     /// m-lines may change; talk-back is negotiated again from them, with
     /// `backchannel` what the camera offers now and `claim` whether the
@@ -415,13 +415,13 @@ pub trait SessionEngine: fmt::Debug + Send {
     /// ([`SessionRequest::backchannel`], [`SessionRequest::claim`]);
     /// the video m-line must be the one the session opened with, and a
     /// session that opened without one takes none.
-    fn renegotiate(
+    fn reoffer(
         &mut self,
         now: Instant,
         offer: &str,
         backchannel: Option<TalkbackTarget>,
         claim: TalkbackClaim,
-    ) -> Result<String, RenegotiateError>;
+    ) -> Result<String, ReofferError>;
 }
 
 /// What a session does with one event of its video subscription, or with
@@ -586,19 +586,16 @@ mod tests {
             SessionOpenError::VideoCodecUnsupported("h265".into()).code(),
             "video_codec_unsupported"
         );
+        assert_eq!(ReofferError::InvalidSdp("x".into()).code(), "invalid_sdp");
         assert_eq!(
-            RenegotiateError::InvalidSdp("x".into()).code(),
+            ReofferError::VideoChanged("mid".into()).code(),
             "invalid_sdp"
         );
         assert_eq!(
-            RenegotiateError::VideoChanged("mid".into()).code(),
-            "invalid_sdp"
-        );
-        assert_eq!(
-            RenegotiateError::VideoChanged("mid".into()).to_string(),
+            ReofferError::VideoChanged("mid".into()).to_string(),
             "the re-offer changes the video m-line: mid"
         );
-        assert_eq!(RenegotiateError::NoVideoTrack.code(), "no_video_track");
+        assert_eq!(ReofferError::NoVideoTrack.code(), "no_video_track");
         assert_eq!(
             SessionLimits::default().max_packet_age,
             Duration::from_millis(150)

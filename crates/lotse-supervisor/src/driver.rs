@@ -212,8 +212,8 @@ pub(crate) enum DriverCommand {
         /// The candidate; empty is end-of-candidates.
         candidate: String,
     },
-    /// A re-offer from the browser (`webrtc/renegotiate`).
-    Renegotiate {
+    /// A re-offer from the browser (`webrtc/reoffer`).
+    Reoffer {
         /// The session.
         session_id: String,
         /// The SDP re-offer.
@@ -299,7 +299,7 @@ impl DriverCommand {
         match self {
             Self::OpenSession(spec) => Some(&spec.session_id),
             Self::Candidate { session_id, .. }
-            | Self::Renegotiate { session_id, .. }
+            | Self::Reoffer { session_id, .. }
             | Self::Orientation { session_id, .. }
             | Self::CloseSession { session_id, .. }
             | Self::RelayCandidate { session_id, .. }
@@ -1905,9 +1905,7 @@ impl Driver {
                 session_id,
                 candidate,
             } => worker.candidate(&session_id, &candidate).await,
-            DriverCommand::Renegotiate { session_id, sdp } => {
-                worker.renegotiate(&session_id, &sdp).await
-            }
+            DriverCommand::Reoffer { session_id, sdp } => worker.reoffer(&session_id, &sdp).await,
             DriverCommand::Orientation {
                 session_id,
                 orientation,
@@ -2198,7 +2196,7 @@ mod tests {
         );
         driver.queue(DriverCommand::OpenSession(spec("a")));
         driver.queue(candidate("a"));
-        driver.queue(DriverCommand::Renegotiate {
+        driver.queue(DriverCommand::Reoffer {
             session_id: "a".into(),
             sdp: "v=0".into(),
         });
@@ -2351,7 +2349,7 @@ mod tests {
             &mut worker,
             &shared,
             &commands,
-            DriverCommand::Renegotiate {
+            DriverCommand::Reoffer {
                 session_id: "s1".into(),
                 sdp: "v=0".into(),
             },
@@ -2365,7 +2363,7 @@ mod tests {
             lotse_ipc::ToWorker::ReleaseBackchannel {
                 session_id: Some("s1".into()),
             },
-            lotse_ipc::ToWorker::Renegotiate {
+            lotse_ipc::ToWorker::Reoffer {
                 session_id: "s1".into(),
                 sdp: "v=0".into(),
             },

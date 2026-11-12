@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use lotse_api::{ConnectionId, Event, Handler, Outcome, RecordingBody, RecordingBodyError};
 use lotse_api_types::API_VERSION;
 use lotse_api_types::command::{
-    Command, RecordingCreate, StreamPut, WebrtcCandidate, WebrtcOffer, WebrtcRenegotiate,
+    Command, RecordingCreate, StreamPut, WebrtcCandidate, WebrtcOffer, WebrtcReoffer,
 };
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Hello, HelloTag};
@@ -35,7 +35,7 @@ use lotse_api_types::info::{
     SupervisorMetrics,
 };
 use lotse_api_types::recording::{RecordingCloseReason, RecordingCreateResult, recording_path};
-use lotse_api_types::session::{CloseCode, SessionEvent, SessionList, WebrtcRenegotiateResult};
+use lotse_api_types::session::{CloseCode, SessionEvent, SessionList, WebrtcReofferResult};
 use lotse_api_types::source::SourceSpec;
 use lotse_api_types::stream::{AudioMode, BackchannelReleaseResult, StreamList, StreamPutResult};
 use lotse_core::clock::Clock;
@@ -104,9 +104,9 @@ const AUDIO_CODECS: [CodecFamily; 5] = [
 /// Extra time the shutdown waits for drivers past the workers' budget.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
-/// How long `webrtc/renegotiate` waits for the worker's answer: a worker
+/// How long `webrtc/reoffer` waits for the worker's answer: a worker
 /// answers a re-offer in milliseconds, so this only bounds a stuck one.
-const RENEGOTIATE_TIMEOUT: Duration = Duration::from_secs(10);
+const REOFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What `hello` and `info` say about this build and process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1097,18 +1097,14 @@ impl Supervisor {
         Outcome::Result(serde_json::Value::Object(serde_json::Map::new()))
     }
 
-    /// `webrtc/renegotiate`: passed on to the session's worker, whose
+    /// `webrtc/reoffer`: passed on to the session's worker, whose
     /// answer or refusal is the result; waited for up to
-    /// [`RENEGOTIATE_TIMEOUT`] on the daemon's clock. Like
+    /// [`REOFFER_TIMEOUT`] on the daemon's clock. Like
     /// `webrtc/candidate`, only the connection that owns the session may
     /// send one, and only once the session is answered; a session has one
     /// re-offer out at a time, until the worker answers it, even when its
-    /// command gave up ([`SessionEntry::renegotiate`]).
-    async fn webrtc_renegotiate(
-        &self,
-        connection: ConnectionId,
-        command: WebrtcRenegotiate,
-    ) -> Outcome {
+    /// command gave up ([`SessionEntry::reoffer`]).
+    async fn webrtc_reoffer(&self, connection: ConnectionId, command: WebrtcReoffer) -> Outcome {
         let session_id = command.session_id;
         let (reply, waiting) = oneshot::channel();
         {
@@ -1131,14 +1127,14 @@ impl Supervisor {
                     .with_detail("session_id", session_id.as_str()),
                 );
             }
-            if let Err(error) = session.renegotiate(reply) {
+            if let Err(error) = session.reoffer(reply) {
                 return Outcome::Error(error.with_detail("session_id", session_id.as_str()));
             }
             let connection = session.connection.clone();
             let queued = state.connections.get(&connection).is_some_and(|entry| {
                 entry
                     .commands
-                    .try_send(DriverCommand::Renegotiate {
+                    .try_send(DriverCommand::Reoffer {
                         session_id: session_id.clone(),
                         sdp: command.sdp,
                     })
@@ -1146,7 +1142,7 @@ impl Supervisor {
             });
             if !queued {
                 if let Some(session) = state.sessions.get_mut(&session_id) {
-                    session.renegotiation_unsent();
+                    session.reoffer_unsent();
                 }
                 return Outcome::Error(
                     ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
@@ -1156,7 +1152,7 @@ impl Supervisor {
             drop(state);
         }
         tracing::info!(
-            event = "session_renegotiate",
+            event = "session_reoffered",
             session.id = %session_id,
             "re-offer handed to the worker"
         );
@@ -1165,7 +1161,7 @@ impl Supervisor {
             // The re-offer stays out until the worker's report, which
             // then goes nowhere: the next re-offer is refused till then,
             // so a late report never answers it.
-            () = self.shared.clock.sleep(RENEGOTIATE_TIMEOUT) => {
+            () = self.shared.clock.sleep(REOFFER_TIMEOUT) => {
                 tracing::warn!(session.id = %session_id, "re-offer not answered by the worker in time");
                 return Outcome::Error(
                     ApiError::new(ErrorCode::InternalError, "the worker did not answer the re-offer")
@@ -1176,12 +1172,12 @@ impl Supervisor {
         match answer {
             Ok(Ok(sdp)) => {
                 tracing::info!(
-                    event = "session_renegotiated",
+                    event = "session_reoffer_answered",
                     session.id = %session_id,
                     "re-offer answered"
                 );
                 Outcome::Result(
-                    serde_json::to_value(WebrtcRenegotiateResult { sdp }).unwrap_or_default(),
+                    serde_json::to_value(WebrtcReofferResult { sdp }).unwrap_or_default(),
                 )
             }
             Ok(Err(error)) => {
@@ -1462,9 +1458,7 @@ impl Supervisor {
                 Err(error) => Outcome::Error(error),
             },
             Command::WebrtcCandidate(candidate) => self.webrtc_candidate(connection, &candidate),
-            Command::WebrtcRenegotiate(renegotiate) => {
-                self.webrtc_renegotiate(connection, renegotiate).await
-            }
+            Command::WebrtcReoffer(reoffer) => self.webrtc_reoffer(connection, reoffer).await,
             Command::SessionGet(get) => self.session_get(&get.session_id),
             Command::SessionList(_) => self.session_list(),
             Command::SessionClose(close) => self.session_close(&close.session_id),
@@ -3373,37 +3367,37 @@ mod tests {
         s.shutdown().await;
     }
 
-    fn renegotiate(id: u64, session_id: &str) -> Value {
-        json!({ "id": id, "type": "webrtc/renegotiate", "session_id": session_id, "sdp": "v=0\r\n" })
+    fn reoffer(id: u64, session_id: &str) -> Value {
+        json!({ "id": id, "type": "webrtc/reoffer", "session_id": session_id, "sdp": "v=0\r\n" })
     }
 
     /// Yields until the session `session_id` of `s` has a re-offer
     /// waiting for its worker, which the worker then answers.
     async fn until_waiting(s: &Supervisor, session_id: &str) {
         let mut yields = 0;
-        while !s.shared.lock().sessions[session_id].renegotiating() {
+        while !s.shared.lock().sessions[session_id].reoffer_pending() {
             assert!(yields < 10_000, "no re-offer waiting");
             yields += 1;
             tokio::task::yield_now().await;
         }
     }
 
-    /// `webrtc/renegotiate` is for the session's owner, after the answer:
+    /// `webrtc/reoffer` is for the session's owner, after the answer:
     /// the worker's answer is its result, a refusal its error, and a
     /// session that closes meanwhile, or a worker that never answers, end
     /// the wait too.
     #[tokio::test]
     #[expect(clippy::too_many_lines, reason = "every end of a re-offer")]
     async fn a_re_offer_is_answered_by_the_worker_or_refused() {
-        let dir = private_dir("renegotiate");
+        let dir = private_dir("reoffer");
         let clock = Arc::new(FakeClock::default());
         let s = Arc::new(with_webrtc(&blocking_worker(&dir), clock.clone()));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
         next(&mut events).await;
-        let err = error(call_on(&s, 1, &renegotiate(3, "ghost")).await);
+        let err = error(call_on(&s, 1, &reoffer(3, "ghost")).await);
         assert_eq!(err.code, ErrorCode::SessionNotFound);
-        let err = error(call_on(&s, 2, &renegotiate(3, "s1")).await);
+        let err = error(call_on(&s, 2, &reoffer(3, "s1")).await);
         assert_eq!(
             (err.code, err.message.as_str()),
             (
@@ -3411,7 +3405,7 @@ mod tests {
                 "the session is not this connection's"
             )
         );
-        let err = error(within(call_on(&s, 1, &renegotiate(4, "s1"))).await);
+        let err = error(within(call_on(&s, 1, &reoffer(4, "s1"))).await);
         assert_eq!(
             (err.code, err.message.as_str()),
             (ErrorCode::InvalidRequest, "the session has no answer yet")
@@ -3430,17 +3424,17 @@ mod tests {
         // reports the talk-back it negotiated.
         let waiting = {
             let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(5, "s1")).await
+            spawn_named("test.reoffer", async move {
+                call_on(&s, 1, &reoffer(5, "s1")).await
             })
         };
         until_waiting(&s, "s1").await;
-        let err = error(within(call_on(&s, 1, &renegotiate(6, "s1"))).await);
+        let err = error(within(call_on(&s, 1, &reoffer(6, "s1"))).await);
         assert_eq!(err.code, ErrorCode::InvalidRequest, "one at a time");
         report(
             &s,
             "s1",
-            Report::Renegotiated {
+            Report::ReofferAnswered {
                 sdp: "v=0\r\na=mid:0\r\n".into(),
                 talkback: Some("pcmu".into()),
             },
@@ -3470,15 +3464,15 @@ mod tests {
         // The worker refuses: the error is the result.
         let waiting = {
             let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(8, "s1")).await
+            spawn_named("test.reoffer", async move {
+                call_on(&s, 1, &reoffer(8, "s1")).await
             })
         };
         until_waiting(&s, "s1").await;
         report(
             &s,
             "s1",
-            Report::RenegotiateRefused {
+            Report::ReofferRefused {
                 code: "no_video_track".into(),
                 message: "no video".into(),
             },
@@ -3492,12 +3486,12 @@ mod tests {
         // A re-offer (A) loses its client: it is still out, so the retry
         // (B) is refused until the worker answers A, and A's late answer
         // goes nowhere; B gets its own.
-        let a = renegotiate(14, "s1");
+        let a = reoffer(14, "s1");
         tokio::select! {
             outcome = call_on(&s, 1, &a) => panic!("answered: {outcome:?}"),
             () = until_waiting(&s, "s1") => {}
         }
-        let err = error(within(call_on(&s, 1, &renegotiate(15, "s1"))).await);
+        let err = error(within(call_on(&s, 1, &reoffer(15, "s1"))).await);
         assert_eq!(
             (err.code, err.message.as_str()),
             (
@@ -3508,22 +3502,22 @@ mod tests {
         report(
             &s,
             "s1",
-            Report::RenegotiateRefused {
+            Report::ReofferRefused {
                 code: "invalid_sdp".into(),
                 message: "A".into(),
             },
         );
         let b = {
             let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(16, "s1")).await
+            spawn_named("test.reoffer", async move {
+                call_on(&s, 1, &reoffer(16, "s1")).await
             })
         };
         until_waiting(&s, "s1").await;
         report(
             &s,
             "s1",
-            Report::Renegotiated {
+            Report::ReofferAnswered {
                 sdp: "v=0\r\na=mid:B\r\n".into(),
                 talkback: None,
             },
@@ -3551,8 +3545,8 @@ mod tests {
         // The session closes while the re-offer waits.
         let waiting = {
             let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(10, "s1")).await
+            spawn_named("test.reoffer", async move {
+                call_on(&s, 1, &reoffer(10, "s1")).await
             })
         };
         until_waiting(&s, "s1").await;
@@ -3578,12 +3572,12 @@ mod tests {
             &mut s.shared.lock().connections.get_mut("c1").unwrap().commands,
             full,
         );
-        let err = error(within(call_on(&s, 1, &renegotiate(13, "s2"))).await);
+        let err = error(within(call_on(&s, 1, &reoffer(13, "s2"))).await);
         assert_eq!(
             (err.code, &err.details["limit"]),
             (ErrorCode::LimitReached, &json!("connection_queue"))
         );
-        assert!(!s.shared.lock().sessions["s2"].renegotiating());
+        assert!(!s.shared.lock().sessions["s2"].reoffer_pending());
         s.shared.lock().connections.get_mut("c1").unwrap().commands = commands;
 
         // The worker never answers: the daemon's clock bounds the wait.
@@ -3599,11 +3593,11 @@ mod tests {
         // close is the last thing the test waits for.
         worker_pid(&s).await;
         {
-            let a = renegotiate(9, "s2");
+            let a = reoffer(9, "s2");
             let mut waiting = std::pin::pin!(call_on(&s, 1, &a));
             assert!(poll_alone(waiting.as_mut()).is_pending());
-            assert!(s.shared.lock().sessions["s2"].renegotiating());
-            clock.advance(RENEGOTIATE_TIMEOUT);
+            assert!(s.shared.lock().sessions["s2"].reoffer_pending());
+            clock.advance(REOFFER_TIMEOUT);
             let_assert!(Poll::Ready(outcome) = poll_alone(waiting));
             let err = error(outcome);
             assert_eq!(
@@ -3614,8 +3608,8 @@ mod tests {
                 )
             );
         }
-        assert!(s.shared.lock().sessions["s2"].renegotiating());
-        let retry = renegotiate(17, "s2");
+        assert!(s.shared.lock().sessions["s2"].reoffer_pending());
+        let retry = reoffer(17, "s2");
         let_assert!(Poll::Ready(outcome) = poll_alone(std::pin::pin!(call_on(&s, 1, &retry))));
         let err = error(outcome);
         assert_eq!(
@@ -3625,12 +3619,12 @@ mod tests {
         report(
             &s,
             "s2",
-            Report::Renegotiated {
+            Report::ReofferAnswered {
                 sdp: "v=0\r\na=mid:A\r\n".into(),
                 talkback: None,
             },
         );
-        assert!(!s.shared.lock().sessions["s2"].renegotiating());
+        assert!(!s.shared.lock().sessions["s2"].reoffer_pending());
         assert_eq!(
             next(&mut s2).await,
             json!({ "type": "closed", "code": "worker_crashed",

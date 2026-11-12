@@ -13,8 +13,8 @@
 //! have the client disconnected: one answer, at most
 //! [`MAX_WORKER_CANDIDATES`] candidate lines and none after its
 //! end-of-candidates (RFC 8838 §13), one warning per code, one answer
-//! per re-offer handed to the worker (`webrtc/renegotiate`, answered
-//! through the entry's [`SessionEntry::renegotiate`]), and one
+//! per re-offer handed to the worker (`webrtc/reoffer`, answered
+//! through the entry's [`SessionEntry::reoffer`]), and one
 //! `backchannel_declined` per offer or re-offer answered; the client
 //! asked for each of these last three, so they are bounded by its
 //! requests and not charged. Messages are cut to
@@ -124,7 +124,7 @@ pub(crate) const fn close_code(error: &ConnectionError) -> CloseCode {
 
 /// The error codes a worker may refuse a re-offer with; any other is an
 /// `internal_error`.
-const RENEGOTIATE_CODES: [(&str, ErrorCode); 2] = [
+const REOFFER_CODES: [(&str, ErrorCode); 2] = [
     ("invalid_sdp", ErrorCode::InvalidSdp),
     ("no_video_track", ErrorCode::NoVideoTrack),
 ];
@@ -242,11 +242,11 @@ pub(crate) struct SessionEntry {
     /// report that answers no request allows none.
     declines_due: u32,
     /// The re-offer handed to the worker whose answer or refusal has not
-    /// come, with the way back to its `webrtc/renegotiate`. Held until
+    /// come, with the way back to its `webrtc/reoffer`. Held until
     /// that report, even once the command gave up or lost its client
     /// (the sender then closed), so a late report answers the re-offer
     /// it belongs to and never the next one.
-    renegotiation: Option<oneshot::Sender<Result<String, ApiError>>>,
+    pending_reoffer: Option<oneshot::Sender<Result<String, ApiError>>>,
     /// Warnings dropped, repeated or unknown; only the first is logged,
     /// so a worker cannot flood the log either.
     warnings_dropped: u32,
@@ -339,7 +339,7 @@ impl SessionEntry {
             report_bytes: 0,
             warned: Vec::new(),
             declines_due: 0,
-            renegotiation: None,
+            pending_reoffer: None,
             warnings_dropped: 0,
             held: Vec::new(),
             transport: None,
@@ -486,16 +486,16 @@ impl SessionEntry {
         self.candidates_done
     }
 
-    /// Takes a `webrtc/renegotiate` for the session: `reply` gets the
-    /// worker's answer or refusal ([`WorkerSessionEvent::Renegotiated`],
-    /// [`WorkerSessionEvent::RenegotiateRefused`]). Refused before the
+    /// Takes a `webrtc/reoffer` for the session: `reply` gets the
+    /// worker's answer or refusal ([`WorkerSessionEvent::ReofferAnswered`],
+    /// [`WorkerSessionEvent::ReofferRefused`]). Refused before the
     /// answer (a browser cannot re-offer before it has one) and while the
     /// worker has not answered the last re-offer, even one whose command
     /// gave up or lost its client: the reports carry no request of their
     /// own, so only one re-offer may be out. The worker answers every
     /// re-offer it is handed, and its sessions close when it exits, so
     /// only a stuck worker keeps the next one out.
-    pub(crate) fn renegotiate(
+    pub(crate) fn reoffer(
         &mut self,
         reply: oneshot::Sender<Result<String, ApiError>>,
     ) -> Result<(), ApiError> {
@@ -505,32 +505,32 @@ impl SessionEntry {
                 "the session has no answer yet",
             ));
         }
-        if self.renegotiation.is_some() {
+        if self.pending_reoffer.is_some() {
             return Err(ApiError::new(
                 ErrorCode::InvalidRequest,
                 "a re-offer of the session is still being answered",
             ));
         }
-        self.renegotiation = Some(reply);
+        self.pending_reoffer = Some(reply);
         Ok(())
     }
 
-    /// The re-offer [`Self::renegotiate`] took never reached the worker
+    /// The re-offer [`Self::reoffer`] took never reached the worker
     /// (its connection's queue was full): no answer comes for it.
-    pub(crate) fn renegotiation_unsent(&mut self) {
-        self.renegotiation = None;
+    pub(crate) fn reoffer_unsent(&mut self) {
+        self.pending_reoffer = None;
     }
 
     /// Whether a re-offer waits for the worker's answer, for tests.
     #[cfg(test)]
-    pub(crate) const fn renegotiating(&self) -> bool {
-        self.renegotiation.is_some()
+    pub(crate) const fn reoffer_pending(&self) -> bool {
+        self.pending_reoffer.is_some()
     }
 
     /// The re-offer a worker's answer or refusal answers: `None`, and the
     /// report dropped, when none is out.
-    fn answered_renegotiation(&mut self) -> Option<oneshot::Sender<Result<String, ApiError>>> {
-        let waiting = self.renegotiation.take();
+    fn answered_reoffer(&mut self) -> Option<oneshot::Sender<Result<String, ApiError>>> {
+        let waiting = self.pending_reoffer.take();
         if waiting.is_none() {
             tracing::debug!(
                 stream.id = %self.stream_id,
@@ -766,11 +766,11 @@ impl SessionEntry {
             // counts against the worker's text budget; the answer is
             // bounded by `worker_text::check`, the message cut to size.
             // One that answers no re-offer is dropped and changes nothing.
-            WorkerSessionEvent::Renegotiated { sdp, talkback } => {
+            WorkerSessionEvent::ReofferAnswered { sdp, talkback } => {
                 if !self.answered {
                     return Err("a re-offer answered before the offer");
                 }
-                let Some(waiting) = self.answered_renegotiation() else {
+                let Some(waiting) = self.answered_reoffer() else {
                     return Ok(Vec::new());
                 };
                 self.declines_due = 1;
@@ -778,12 +778,12 @@ impl SessionEntry {
                 reply(waiting, Ok(self.advertised_sdp(sdp)));
                 Ok(Vec::new())
             }
-            WorkerSessionEvent::RenegotiateRefused { code, message } => {
-                let Some(waiting) = self.answered_renegotiation() else {
+            WorkerSessionEvent::ReofferRefused { code, message } => {
+                let Some(waiting) = self.answered_reoffer() else {
                     return Ok(Vec::new());
                 };
                 let message = plain(&message, MAX_MESSAGE_BYTES);
-                let code = RENEGOTIATE_CODES
+                let code = REOFFER_CODES
                     .iter()
                     .find(|(name, _)| *name == code)
                     .map_or(ErrorCode::InternalError, |(_, code)| *code);
@@ -987,7 +987,7 @@ fn known(names: &[&'static str], value: &str) -> Option<&'static str> {
     found
 }
 
-/// Hands a re-offer's answer or refusal to its `webrtc/renegotiate`,
+/// Hands a re-offer's answer or refusal to its `webrtc/reoffer`,
 /// which may have given up or lost its client meanwhile: then it goes
 /// nowhere.
 fn reply(waiting: oneshot::Sender<Result<String, ApiError>>, answer: Result<String, ApiError>) {
@@ -1337,11 +1337,11 @@ mod tests {
         // Before the answer: no re-offer, and no decline either.
         let (reply, _waiting) = oneshot::channel();
         assert_eq!(
-            session.renegotiate(reply).unwrap_err().code,
+            session.reoffer(reply).unwrap_err().code,
             ErrorCode::InvalidRequest
         );
         assert_eq!(
-            session.apply(WorkerSessionEvent::Renegotiated {
+            session.apply(WorkerSessionEvent::ReofferAnswered {
                 sdp: "v=0".into(),
                 talkback: None,
             }),
@@ -1371,7 +1371,7 @@ mod tests {
         // An answer to a re-offer never handed to the worker is dropped:
         // it changes the talk-back no more than it allows a decline.
         assert_eq!(
-            session.applied(WorkerSessionEvent::Renegotiated {
+            session.applied(WorkerSessionEvent::ReofferAnswered {
                 sdp: "v=0".into(),
                 talkback: Some("opus".into()),
             }),
@@ -1384,14 +1384,14 @@ mod tests {
         // A re-offer: answered to the command waiting, which `session/get`
         // follows; the next decline passes again.
         let (reply, mut waiting) = oneshot::channel();
-        session.renegotiate(reply).unwrap();
+        session.reoffer(reply).unwrap();
         let (again, _again) = oneshot::channel();
         assert_eq!(
-            session.renegotiate(again).unwrap_err().message,
+            session.reoffer(again).unwrap_err().message,
             "a re-offer of the session is still being answered"
         );
         assert_eq!(
-            session.applied(WorkerSessionEvent::Renegotiated {
+            session.applied(WorkerSessionEvent::ReofferAnswered {
                 sdp: "v=0\r\na=mid:0\r\n".into(),
                 talkback: Some("opus".into()),
             }),
@@ -1433,9 +1433,9 @@ mod tests {
             ("made_up", ErrorCode::InternalError),
         ] {
             let (reply, mut waiting) = oneshot::channel();
-            session.renegotiate(reply).unwrap();
+            session.reoffer(reply).unwrap();
             assert_eq!(
-                session.applied(WorkerSessionEvent::RenegotiateRefused {
+                session.applied(WorkerSessionEvent::ReofferRefused {
                     code: code.into(),
                     message: "no\nway".into(),
                 }),
@@ -1447,29 +1447,29 @@ mod tests {
         // A: its command gives up, or loses its client; B, the retry, is
         // refused until A's answer comes, which goes nowhere.
         for late in [
-            WorkerSessionEvent::Renegotiated {
+            WorkerSessionEvent::ReofferAnswered {
                 sdp: "a".into(),
                 talkback: None,
             },
-            WorkerSessionEvent::RenegotiateRefused {
+            WorkerSessionEvent::ReofferRefused {
                 code: "invalid_sdp".into(),
                 message: "a".into(),
             },
         ] {
             let (reply, waiting) = oneshot::channel();
-            session.renegotiate(reply).unwrap();
+            session.reoffer(reply).unwrap();
             drop(waiting);
             let (reply, _b) = oneshot::channel();
             assert_eq!(
-                session.renegotiate(reply).unwrap_err().message,
+                session.reoffer(reply).unwrap_err().message,
                 "a re-offer of the session is still being answered"
             );
             assert_eq!(session.applied(late), vec![]);
-            assert!(!session.renegotiating());
+            assert!(!session.reoffer_pending());
             // B is answered with its own answer.
             let (reply, mut b) = oneshot::channel();
-            session.renegotiate(reply).unwrap();
-            session.applied(WorkerSessionEvent::Renegotiated {
+            session.reoffer(reply).unwrap();
+            session.applied(WorkerSessionEvent::ReofferAnswered {
                 sdp: "b".into(),
                 talkback: None,
             });
@@ -1478,7 +1478,7 @@ mod tests {
         // A refusal that answers no re-offer is dropped, and the next one
         // still gets its own.
         assert_eq!(
-            session.applied(WorkerSessionEvent::RenegotiateRefused {
+            session.applied(WorkerSessionEvent::ReofferRefused {
                 code: "invalid_sdp".into(),
                 message: "none".into(),
             }),
@@ -1486,12 +1486,12 @@ mod tests {
         );
         // One that never reached the worker is not in the way.
         let (reply, _waiting) = oneshot::channel();
-        session.renegotiate(reply).unwrap();
-        session.renegotiation_unsent();
-        assert!(!session.renegotiating());
+        session.reoffer(reply).unwrap();
+        session.reoffer_unsent();
+        assert!(!session.reoffer_pending());
         let (reply, mut waiting) = oneshot::channel();
-        session.renegotiate(reply).unwrap();
-        session.applied(WorkerSessionEvent::Renegotiated {
+        session.reoffer(reply).unwrap();
+        session.applied(WorkerSessionEvent::ReofferAnswered {
             sdp: "c".into(),
             talkback: None,
         });
@@ -1521,9 +1521,9 @@ mod tests {
         // More declines than the budget has bytes for, cut to size each.
         for _ in 0..=MAX_REPORT_TEXT_BYTES / MAX_MESSAGE_BYTES {
             let (reply, mut waiting) = oneshot::channel();
-            session.renegotiate(reply).unwrap();
+            session.reoffer(reply).unwrap();
             assert_eq!(
-                session.apply(WorkerSessionEvent::Renegotiated {
+                session.apply(WorkerSessionEvent::ReofferAnswered {
                     sdp: "v=0".into(),
                     talkback: None,
                 }),
@@ -1542,9 +1542,9 @@ mod tests {
                 "one warning, cut to size: {events:?}"
             );
             let (reply, mut waiting) = oneshot::channel();
-            session.renegotiate(reply).unwrap();
+            session.reoffer(reply).unwrap();
             assert_eq!(
-                session.apply(WorkerSessionEvent::RenegotiateRefused {
+                session.apply(WorkerSessionEvent::ReofferRefused {
                     code: "invalid_sdp".into(),
                     message: "no way".into(),
                 }),
@@ -1984,8 +1984,8 @@ mod tests {
         assert_eq!(session.applied(end()), vec![candidate("", None)]);
         // A re-offer's answer is filtered too.
         let (reply, mut waiting) = oneshot::channel();
-        session.renegotiate(reply).unwrap();
-        session.applied(WorkerSessionEvent::Renegotiated {
+        session.reoffer(reply).unwrap();
+        session.applied(WorkerSessionEvent::ReofferAnswered {
             sdp: format!("v=0\r\na={host}\r\n"),
             talkback: None,
         });

@@ -8,7 +8,7 @@
 //! can carry audio back, and one [`Talkback`] per session on it.
 //!
 //! - **Claim.** An offer that asks for talk-back the backchannel takes
-//!   (`webrtc/offer` or `webrtc/renegotiate`, judged by the output's
+//!   (`webrtc/offer` or `webrtc/reoffer`, judged by the output's
 //!   `talkback_request`) claims the channel for its session while nobody
 //!   holds it ([`Claimant::claim`], [`ChangeReason::Claimed`]), before the
 //!   engine answers, so the answer carries the outcome; first offer wins.
@@ -33,7 +33,7 @@
 //! - **Hold.** The talker keeps the channel, silent or muted, until its
 //!   session closes ([`ChangeReason::SessionClosed`]; a deleted stream
 //!   closes its sessions), its re-offer drops talk-back
-//!   ([`Talkback::let_go`], [`ChangeReason::Renegotiated`]), the client
+//!   ([`Talkback::let_go`], [`ChangeReason::Reoffered`]), the client
 //!   releases it ([`Arbiter::release`], [`ChangeReason::Released`]): from
 //!   whoever holds it, or only from the session the release names,
 //!   decided against the claims under one lock; or no stream on the
@@ -113,8 +113,8 @@ pub(crate) enum ChangeReason {
     SessionClosed,
     /// The client released the channel (`backchannel/release`).
     Released,
-    /// The talker's re-offer dropped talk-back (`webrtc/renegotiate`).
-    Renegotiated,
+    /// The talker's re-offer dropped talk-back (`webrtc/reoffer`).
+    Reoffered,
     /// The device refused the talker's backchannel session, it did not
     /// open in time, or it ended on the device's side while held.
     Refused,
@@ -129,7 +129,7 @@ impl ChangeReason {
             Self::Claimed => "claimed",
             Self::SessionClosed => "session_closed",
             Self::Released => "released",
-            Self::Renegotiated => "renegotiated",
+            Self::Reoffered => "reoffered",
             Self::Refused => "refused",
             Self::OptedOut => "opted_out",
         }
@@ -1363,11 +1363,11 @@ impl Talkback {
     }
 
     /// The session's re-offer dropped talk-back: lets go of the
-    /// backchannel if the session holds it ([`ChangeReason::Renegotiated`]).
+    /// backchannel if the session holds it ([`ChangeReason::Reoffered`]).
     pub(crate) fn let_go(&mut self) {
         if let Some(claim) = self.claim.take() {
             self.arbiter
-                .let_go(&self.session, claim, ChangeReason::Renegotiated);
+                .let_go(&self.session, claim, ChangeReason::Reoffered);
         }
     }
 
@@ -1909,7 +1909,7 @@ mod tests {
         assert_eq!(ChangeReason::Claimed.code(), "claimed");
         assert_eq!(ChangeReason::SessionClosed.code(), "session_closed");
         assert_eq!(ChangeReason::Released.code(), "released");
-        assert_eq!(ChangeReason::Renegotiated.code(), "renegotiated");
+        assert_eq!(ChangeReason::Reoffered.code(), "reoffered");
         assert_eq!(ChangeReason::Refused.code(), "refused");
         assert_eq!(ChangeReason::OptedOut.code(), "opted_out");
     }
@@ -2056,10 +2056,7 @@ mod tests {
         a.let_go();
         assert!(!holds(&a));
         let (session, reason) = change(&mut events);
-        assert_eq!(
-            (session.as_str(), reason),
-            ("a", ChangeReason::Renegotiated)
-        );
+        assert_eq!((session.as_str(), reason), ("a", ChangeReason::Reoffered));
         talk(&mut a, 1);
         assert_eq!(load(&a.stats.packets_dropped_busy), 1);
         assert!(device.try_recv().is_none(), "the route stopped");
@@ -2071,7 +2068,7 @@ mod tests {
         assert_eq!(within(device.recv()).await.unwrap().rtp.seq, 2);
         // Or another session's, once a let go.
         a.let_go();
-        assert_eq!(change(&mut events).1, ChangeReason::Renegotiated);
+        assert_eq!(change(&mut events).1, ChangeReason::Reoffered);
         claims(&mut b).await;
         assert_eq!(change(&mut events).0, "b");
         // a's stale claim is gone: letting go again, or closing, frees
@@ -2160,7 +2157,7 @@ mod tests {
         assert_eq!(change(&mut events).1, ChangeReason::Claimed);
         assert!(holds(&a));
         a.let_go();
-        assert_eq!(change(&mut events).1, ChangeReason::Renegotiated);
+        assert_eq!(change(&mut events).1, ChangeReason::Reoffered);
         assert!(!holds(&a), "the channel is free again");
     }
 
@@ -2310,10 +2307,7 @@ mod tests {
         assert!(!device.session().close.is_cancelled());
         // Its re-offer dropping talk-back closes it.
         a.let_go();
-        assert_eq!(
-            change(&mut events),
-            ("a".into(), ChangeReason::Renegotiated)
-        );
+        assert_eq!(change(&mut events), ("a".into(), ChangeReason::Reoffered));
         assert!(device.session().close.is_cancelled(), "closed");
         // The next claim opens a session on the offer there is now.
         claims(&mut b).await;
@@ -3073,7 +3067,7 @@ mod tests {
             (ChangeReason::Claimed, "claimed"),
             (ChangeReason::SessionClosed, "session_closed"),
             (ChangeReason::Released, "released"),
-            (ChangeReason::Renegotiated, "renegotiated"),
+            (ChangeReason::Reoffered, "reoffered"),
             (ChangeReason::Refused, "refused"),
         ] {
             let change = talker_change(TalkerChanged {

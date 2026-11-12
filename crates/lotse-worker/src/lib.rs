@@ -515,8 +515,8 @@ impl Serving<'_> {
                     manager.candidate(&session_id, candidate);
                 }
             }
-            ToWorker::Renegotiate { session_id, sdp } => {
-                self.on_renegotiate(session_id, sdp).await?;
+            ToWorker::Reoffer { session_id, sdp } => {
+                self.on_reoffer(session_id, sdp).await?;
             }
             ToWorker::RelayCandidate {
                 session_id,
@@ -742,7 +742,7 @@ impl Serving<'_> {
         }
     }
 
-    /// `Renegotiate`: a re-offer for a session, which its session answers.
+    /// `Reoffer`: a re-offer for a session, which its session answers.
     /// One without a manager, for no session or for one whose queue is
     /// full is refused here, straight to the supervisor, never through
     /// the session events this loop alone drains, so a full queue of them
@@ -750,13 +750,13 @@ impl Serving<'_> {
     /// answer that cannot come. The refusal may overtake that session's
     /// queued events, which is harmless: the supervisor has one re-offer
     /// out per session, and this refusal is its only answer.
-    async fn on_renegotiate(&mut self, session_id: String, sdp: String) -> Result<(), Error> {
+    async fn on_reoffer(&mut self, session_id: String, sdp: String) -> Result<(), Error> {
         let message = match &self.sessions {
-            Some(manager) if manager.renegotiate(&session_id, sdp) => return Ok(()),
+            Some(manager) if manager.reoffer(&session_id, sdp) => return Ok(()),
             Some(_) => "the session is gone or busy",
             None => "the worker holds no sockets",
         };
-        refuse_renegotiation(&mut self.tx, session_id, message).await
+        refuse_reoffer(&mut self.tx, session_id, message).await
     }
 
     /// `Shutdown`: ends the recordings, closes every session, stops the standby
@@ -1158,16 +1158,12 @@ async fn refuse_recording(
 
 /// Refuses a re-offer for `session_id` that no session takes, saying why
 /// in `message`.
-async fn refuse_renegotiation(
-    tx: &mut Sender,
-    session_id: String,
-    message: &str,
-) -> Result<(), Error> {
+async fn refuse_reoffer(tx: &mut Sender, session_id: String, message: &str) -> Result<(), Error> {
     tracing::debug!(session = %session_id, message, "re-offer refused by the worker");
     tx.send_msg(
         &ToSupervisor::Session {
             session_id,
-            event: SessionEvent::RenegotiateRefused {
+            event: SessionEvent::ReofferRefused {
                 code: "internal_error".to_owned(),
                 message: message.to_owned(),
             },
@@ -2589,7 +2585,7 @@ mod tests {
         let samples = |packets: Vec<lotse_core::media::MediaPacket>| -> Vec<u8> {
             packets.iter().map(|packet| packet.payload[0]).collect()
         };
-        let renegotiate = |session: &str, sdp: &str| ToWorker::Renegotiate {
+        let reoffer = |session: &str, sdp: &str| ToWorker::Reoffer {
             session_id: session.into(),
             sdp: sdp.into(),
         };
@@ -2628,15 +2624,13 @@ mod tests {
         .await
         .unwrap();
         seen.extend(messages_until(&mut h, |seen| closed(seen, "a")).await);
-        h.tx.send_msg(&renegotiate("b", "v=0 talk"), &[])
-            .await
-            .unwrap();
+        h.tx.send_msg(&reoffer("b", "v=0 talk"), &[]).await.unwrap();
         let answered = |seen: &[ToSupervisor]| {
             session_events(seen).any(|(session, event)| {
                 session == "b"
                     && *event
-                        == SessionEvent::Renegotiated {
-                            sdp: "v=0 echo renegotiated backchannel=pcmu".into(),
+                        == SessionEvent::ReofferAnswered {
+                            sdp: "v=0 echo reoffer answer backchannel=pcmu".into(),
                             talkback: Some("pcmu".into()),
                         }
             })
@@ -2681,9 +2675,7 @@ mod tests {
             })
         };
         seen.extend(messages_until(&mut h, dropped).await);
-        h.tx.send_msg(&renegotiate("b", "v=0 talk"), &[])
-            .await
-            .unwrap();
+        h.tx.send_msg(&reoffer("b", "v=0 talk"), &[]).await.unwrap();
         let claimed_again = |seen: &[ToSupervisor]| {
             seen.iter().any(|message| {
                 matches!(message, ToSupervisor::Talker(change) if change.reason == "claimed")
@@ -2698,14 +2690,14 @@ mod tests {
         );
         // A re-offer that drops talk-back lets go; one the engine refuses
         // is refused; one for no session is refused too.
-        h.tx.send_msg(&renegotiate("b", "v=0"), &[]).await.unwrap();
+        h.tx.send_msg(&reoffer("b", "v=0"), &[]).await.unwrap();
         // Answered without talk-back, b stays in the stats with all it
         // counted: `session/get`'s counters never go back.
         let let_go = |seen: &[ToSupervisor]| {
             seen.iter().any(|message| {
-                matches!(message, ToSupervisor::Talker(change) if change.reason == "renegotiated")
+                matches!(message, ToSupervisor::Talker(change) if change.reason == "reoffered")
             }) && session_events(seen).any(|(session, event)| {
-                session == "b" && matches!(event, SessionEvent::Renegotiated { talkback: None, .. })
+                session == "b" && matches!(event, SessionEvent::ReofferAnswered { talkback: None, .. })
             })
         };
         seen.extend(messages_until(&mut h, let_go).await);
@@ -2727,20 +2719,18 @@ mod tests {
             )]
         );
         seen.extend(pushed);
-        h.tx.send_msg(&renegotiate("b", "refuse"), &[])
-            .await
-            .unwrap();
-        h.tx.send_msg(&renegotiate("zz", "v=0"), &[]).await.unwrap();
+        h.tx.send_msg(&reoffer("b", "refuse"), &[]).await.unwrap();
+        h.tx.send_msg(&reoffer("zz", "v=0"), &[]).await.unwrap();
         let refused = |seen: &[ToSupervisor]| {
             session_events(seen)
-                .filter(|(_, event)| matches!(event, SessionEvent::RenegotiateRefused { .. }))
+                .filter(|(_, event)| matches!(event, SessionEvent::ReofferRefused { .. }))
                 .count()
                 == 2
         };
         seen.extend(messages_until(&mut h, refused).await);
         let mut refusals: Vec<(&str, &str, &str)> = session_events(&seen)
             .filter_map(|(session, event)| match event {
-                SessionEvent::RenegotiateRefused { code, message } => {
+                SessionEvent::ReofferRefused { code, message } => {
                     Some((session, code.as_str(), message.as_str()))
                 }
                 _ => None,
@@ -2791,7 +2781,7 @@ mod tests {
                 ("b", "claimed"),
                 ("b", "released"),
                 ("b", "claimed"),
-                ("b", "renegotiated"),
+                ("b", "reoffered"),
             ]
         );
     }
@@ -2802,7 +2792,7 @@ mod tests {
         let mut h = start_with_settings(echo_registries(), quiet_settings());
         h.next().await;
         h.tx.send_msg(
-            &ToWorker::Renegotiate {
+            &ToWorker::Reoffer {
                 session_id: "s".into(),
                 sdp: "v=0".into(),
             },
@@ -2810,13 +2800,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let refused = session_event_where(&mut h, |e| {
-            matches!(e, SessionEvent::RenegotiateRefused { .. })
-        })
-        .await;
+        let refused =
+            session_event_where(&mut h, |e| matches!(e, SessionEvent::ReofferRefused { .. })).await;
         assert_eq!(
             refused,
-            SessionEvent::RenegotiateRefused {
+            SessionEvent::ReofferRefused {
                 code: "internal_error".into(),
                 message: "the worker holds no sockets".into(),
             }
@@ -2856,7 +2844,7 @@ mod tests {
         )
         .unwrap();
         serving.sessions = Some(manager);
-        within(serving.on_renegotiate("ghost".into(), "v=0".into()))
+        within(serving.on_reoffer("ghost".into(), "v=0".into()))
             .await
             .unwrap();
         let (message, _) = within(rx.recv_msg::<ToSupervisor>())
@@ -2867,7 +2855,7 @@ mod tests {
             message,
             ToSupervisor::Session {
                 session_id: "ghost".into(),
-                event: SessionEvent::RenegotiateRefused {
+                event: SessionEvent::ReofferRefused {
                     code: "internal_error".into(),
                     message: "the session is gone or busy".into(),
                 },

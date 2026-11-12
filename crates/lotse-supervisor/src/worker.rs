@@ -746,11 +746,11 @@ impl Worker {
         .await
     }
 
-    /// A re-offer for a session (`webrtc/renegotiate`); the worker
-    /// answers with a `Renegotiated` or `RenegotiateRefused` report.
-    pub async fn renegotiate(&mut self, session_id: &str, sdp: &str) -> Result<(), IpcError> {
+    /// A re-offer for a session (`webrtc/reoffer`); the worker
+    /// answers with a `ReofferAnswered` or `ReofferRefused` report.
+    pub async fn reoffer(&mut self, session_id: &str, sdp: &str) -> Result<(), IpcError> {
         self.send(
-            &ToWorker::Renegotiate {
+            &ToWorker::Reoffer {
                 session_id: session_id.to_owned(),
                 sdp: sdp.to_owned(),
             },
