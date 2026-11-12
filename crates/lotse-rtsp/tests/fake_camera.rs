@@ -903,16 +903,21 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
     assert_eq!(now.len(), 1);
     assert!(Arc::ptr_eq(&now[0], &v0));
     assert_eq!(v0.epoch(), 1);
-    // Subscribers see the loss, the epoch and the restore, then the new
-    // connection's frames, a keyframe first.
+    // Subscribers see the loss and the epoch before the new connection's
+    // frames, a keyframe first, and the restore. The restore is told once
+    // the runner sees the connection ready, which may be after the source
+    // published its first frames (`SourceRunner::run_once`), so it may
+    // come on either side of them.
     let mut control = Vec::new();
-    let first = loop {
+    let mut first = None;
+    while first.is_none() || !control.contains(&TrackEvent::SourceRestored) {
         match next_event(&mut sub).await {
             TrackEvent::Frame(frame) if frame.epoch == 0 => {}
-            TrackEvent::Frame(frame) => break frame,
+            TrackEvent::Frame(frame) => _ = first.get_or_insert(frame),
             event => control.push(event),
         }
-    };
+    }
+    let first = first.unwrap();
     assert_eq!(
         control,
         [
@@ -1015,14 +1020,18 @@ async fn rfc3550_5_1_a_reconnect_follows_the_audio_s_clock_rate_and_one_without_
         (a0.codec(), a0.clock_rate()),
         (Arc::new(Codec::Pcmu), 8_000)
     );
+    // The restore may come on either side of the new epoch's first packet
+    // (see `a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them`).
     let mut control = Vec::new();
-    let first = loop {
+    let mut first = None;
+    while first.is_none() || !control.contains(&TrackEvent::SourceRestored) {
         match next_event(&mut sub).await {
             TrackEvent::Packet(packet) if packet.epoch < 2 => {}
-            TrackEvent::Packet(packet) => break packet,
+            TrackEvent::Packet(packet) => _ = first.get_or_insert(packet),
             event => control.push(event),
         }
-    };
+    }
+    let first = first.unwrap();
     assert_eq!(
         control,
         [
