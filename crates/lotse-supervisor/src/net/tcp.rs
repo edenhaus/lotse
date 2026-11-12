@@ -122,6 +122,49 @@ struct Pending {
     per_ip: Mutex<HashMap<IpAddr, usize>>,
 }
 
+/// Which limit refused a connection at accept; each has its own rate
+/// limit in the log, so a flood from one address does not hide that the
+/// total is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// [`IceTcpConfig::max_pending`].
+    Total,
+    /// [`IceTcpConfig::max_per_ip`].
+    PerIp,
+}
+
+impl Refusal {
+    /// The limit's name in the log.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Total => "max_pending",
+            Self::PerIp => "max_per_ip",
+        }
+    }
+}
+
+/// The log lines of the connections refused at accept, which any network
+/// peer makes once per connect: the first of each [`Refusal`], then a
+/// summary per [`lotse_core::throttle::SUMMARY_INTERVAL`].
+#[derive(Debug, Default)]
+struct RefusalLines {
+    /// Over [`IceTcpConfig::max_pending`].
+    total: Throttle,
+    /// Over [`IceTcpConfig::max_per_ip`].
+    per_ip: Throttle,
+}
+
+impl RefusalLines {
+    /// Counts one `refusal` at `now`: `Some(count)` when its line is due
+    /// ([`Throttle::hit`]).
+    fn hit(&mut self, refusal: Refusal, now: Instant) -> Option<u64> {
+        match refusal {
+            Refusal::Total => self.total.hit(now),
+            Refusal::PerIp => self.per_ip.hit(now),
+        }
+    }
+}
+
 impl Pending {
     /// Counts one more pending connection for `ip` unless it is at the
     /// limit; `true` when over.
@@ -163,12 +206,13 @@ impl Drop for Slot {
 }
 
 impl Pending {
-    /// Takes a slot for `ip`, if the limits allow.
-    fn take(self: &Arc<Self>, ip: IpAddr, config: &IceTcpConfig) -> Option<Slot> {
+    /// Takes a slot for `ip`, if the limits allow; else the one that
+    /// refused it.
+    fn take(self: &Arc<Self>, ip: IpAddr, config: &IceTcpConfig) -> Result<Slot, Refusal> {
         let total = self.total.fetch_add(1, Ordering::AcqRel);
         if total >= config.max_pending {
             self.total.fetch_sub(1, Ordering::AcqRel);
-            return None;
+            return Err(Refusal::Total);
         }
         let over_ip = Self::claim_ip(
             &mut self.per_ip.lock().unwrap_or_else(PoisonError::into_inner),
@@ -177,9 +221,9 @@ impl Pending {
         );
         if over_ip {
             self.total.fetch_sub(1, Ordering::AcqRel);
-            return None;
+            return Err(Refusal::PerIp);
         }
-        Some(Slot {
+        Ok(Slot {
             pending: Arc::clone(self),
             ip,
         })
@@ -204,7 +248,8 @@ struct Acceptor {
 
 /// Accepts connections until cancelled. A failed `accept` is retried
 /// after a pause on `clock`, the [`AcceptBackoff`] schedule (10 ms doubling
-/// to 1 s), reset by the next success.
+/// to 1 s), reset by the next success. A connection over a limit is
+/// closed at once and logged rate-limited, each limit on its own.
 pub async fn accept_loop(
     listener: TcpListener,
     registrations: Arc<Registrations>,
@@ -222,6 +267,7 @@ pub async fn accept_loop(
         over_budget_log: Mutex::default(),
     });
     let mut backoff = AcceptBackoff::new();
+    let mut refusal_lines = RefusalLines::default();
     loop {
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -250,11 +296,16 @@ pub async fn accept_loop(
         // peer is the address the UDP path and the host candidates use.
         let peer = canonical(peer);
         acceptor.stats.accepted.fetch_add(1, Ordering::Relaxed);
-        let Some(slot) = pending.take(peer.ip(), &acceptor.config) else {
-            acceptor.stats.refused.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(%peer, "ice-tcp connection refused: pending limit");
-            drop(stream);
-            continue;
+        let slot = match pending.take(peer.ip(), &acceptor.config) {
+            Ok(slot) => slot,
+            Err(refusal) => {
+                acceptor.stats.refused.fetch_add(1, Ordering::Relaxed);
+                if let Some(refused) = refusal_lines.hit(refusal, acceptor.clock.now()) {
+                    tracing::warn!(%peer, limit = refusal.name(), refused, "ice-tcp connection refused: pending limit");
+                }
+                drop(stream);
+                continue;
+            }
         };
         let _task = spawn_named(
             "ice_tcp.pending",
@@ -350,9 +401,12 @@ mod tests {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
     use tokio::io::AsyncWriteExt as _;
 
+    use lotse_core::throttle::SUMMARY_INTERVAL;
+
     use super::super::demux::test_support::MemorySink;
     use super::*;
     use crate::net::stun::{Builder, Class, METHOD_BINDING};
+    use crate::test_support::Captured;
 
     struct Running {
         addr: SocketAddr,
@@ -435,15 +489,15 @@ mod tests {
         let a: IpAddr = "192.0.2.1".parse().unwrap();
         let b: IpAddr = "192.0.2.2".parse().unwrap();
         let first = pending.take(a, &config).unwrap();
-        assert!(
-            pending.take(a, &config).is_none(),
+        assert_eq!(
+            pending.take(a, &config).err(),
+            Some(Refusal::PerIp),
             "over the per-address limit"
         );
         let second = pending.take(b, &config).unwrap();
-        assert!(
-            pending
-                .take("192.0.2.3".parse().unwrap(), &config)
-                .is_none(),
+        assert_eq!(
+            pending.take("192.0.2.3".parse().unwrap(), &config).err(),
+            Some(Refusal::Total),
             "over the total"
         );
         assert_eq!(pending.total.load(Ordering::Acquire), 2);
@@ -712,6 +766,71 @@ mod tests {
         settle(&running.stats, |s| IceTcpStats::get(&s.rejected), 2).await;
         drop((first, second, third));
         assert_eq!(IceTcpStats::get(&running.stats.accepted), 3);
+        running.cancel.cancel();
+    }
+
+    /// Any network peer is refused once per connect at a limit, so the
+    /// refusal is logged as the first of each limit, then one summary per
+    /// interval on the clock with the count since the last line; a flood
+    /// from one address does not hide that the total is reached.
+    #[tokio::test]
+    async fn refusals_at_accept_are_logged_rate_limited_per_limit() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let clock = Arc::new(FakeClock::default());
+        let std_listener = super::super::udp::bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+        // The silent connections hold their slots past every move of the
+        // clock here.
+        let running = start_with_clock(
+            TcpListener::from_std(std_listener).unwrap(),
+            IceTcpConfig {
+                max_pending: 2,
+                max_per_ip: 1,
+                first_frame_deadline: Duration::from_secs(3600),
+            },
+            clock.clone(),
+        );
+        // Linux routes all of 127.0.0.0/8 to the loopback.
+        let from = async |ip: &str| {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket
+                .bind(SocketAddr::new(ip.parse().unwrap(), 0))
+                .unwrap();
+            socket.connect(running.addr).await.unwrap()
+        };
+        let refused = |limit: &str| -> Vec<String> {
+            captured
+                .lines("ice-tcp connection refused: pending limit")
+                .into_iter()
+                .filter(|line| line.contains(limit))
+                .collect()
+        };
+        let _held = from("127.0.0.1").await;
+        settle(&running.stats, |s| IceTcpStats::get(&s.accepted), 1).await;
+        let _over_ip = (from("127.0.0.1").await, from("127.0.0.1").await);
+        settle(&running.stats, |s| IceTcpStats::get(&s.refused), 2).await;
+        let per_ip = refused("max_per_ip");
+        assert_eq!(per_ip.len(), 1, "the second within the interval is counted");
+        assert!(per_ip[0].ends_with("refused=1"), "{per_ip:?}");
+        // The total is its own line.
+        let other = from("127.0.0.2").await;
+        settle(&running.stats, |s| IceTcpStats::get(&s.accepted), 4).await;
+        let _over_total = from("127.0.0.2").await;
+        settle(&running.stats, |s| IceTcpStats::get(&s.refused), 3).await;
+        let total = refused("max_pending");
+        assert_eq!(total.len(), 1, "{total:?}");
+        assert!(total[0].ends_with("refused=1"), "{total:?}");
+        // After the interval, with room in the total again, the next
+        // refusal at the address limit is its summary.
+        clock.advance(SUMMARY_INTERVAL);
+        drop(other);
+        settle(&running.stats, |s| IceTcpStats::get(&s.rejected), 1).await;
+        let _again = from("127.0.0.1").await;
+        settle(&running.stats, |s| IceTcpStats::get(&s.refused), 4).await;
+        let per_ip = refused("max_per_ip");
+        assert_eq!(per_ip.len(), 2, "{per_ip:?}");
+        assert!(per_ip[1].ends_with("refused=2"), "{per_ip:?}");
+        assert_eq!(refused("max_pending").len(), 1);
         running.cancel.cancel();
     }
 
