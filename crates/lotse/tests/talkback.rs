@@ -1898,6 +1898,7 @@ impl Api {
                 registrations: demux.registrations(),
                 hosts: bound.hosts,
                 tcp_hosts: vec![],
+                scan: None,
                 stun: None,
                 turn: None,
                 demux: Some(demux.stats()),

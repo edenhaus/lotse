@@ -51,10 +51,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 
-use crate::advertise::Advertisement;
 use crate::connect::ConnectPermits;
 use crate::driver::{COMMAND_QUEUE, Demand, Driver, DriverCommand, DriverSpec};
 use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnServer};
+use crate::host_cache::{HostCache, HostScan, HostSnapshot};
 use crate::memory::{Memory, MemoryProbe};
 use crate::net::demux::{DemuxStats, Registrations};
 use crate::net::stun_client::StunClient;
@@ -141,11 +141,14 @@ pub struct Environment {
 pub struct FrontDoor {
     /// The demux's sessions, which the drivers register with.
     pub registrations: Arc<Registrations>,
-    /// The host candidates' addresses.
+    /// The host candidates' addresses, as found when the socket was bound.
     pub hosts: Vec<SocketAddr>,
     /// The passive ICE-TCP host candidates' addresses: the host addresses
     /// at the listener's port; empty with the listener off.
     pub tcp_hosts: Vec<SocketAddr>,
+    /// How an offer reads both again ([`HostScan`]); `None`
+    /// keeps them as given.
+    pub scan: Option<HostScan>,
     /// The STUN client of server-reflexive gathering, on the shared socket.
     pub stun: Option<Arc<StunClient>>,
     /// The TURN client of relay gathering, on the shared socket.
@@ -212,28 +215,32 @@ impl Supervisor {
     /// A supervisor with no streams.
     pub fn new(settings: Settings, environment: Environment, clock: Arc<dyn Clock>) -> Self {
         let started = clock.now();
-        let (registrations, hosts, tcp_hosts, stun, turn, demux) = environment.front_door.map_or(
-            (None, Vec::new(), Vec::new(), None, None, None),
-            |door| {
-                (
-                    Some(door.registrations),
-                    door.hosts,
-                    door.tcp_hosts,
-                    door.stun,
-                    door.turn,
-                    door.demux,
-                )
-            },
-        );
+        let (registrations, hosts, tcp_hosts, scan, stun, turn, demux) =
+            environment.front_door.map_or(
+                (None, Vec::new(), Vec::new(), None, None, None, None),
+                |door| {
+                    (
+                        Some(door.registrations),
+                        door.hosts,
+                        door.tcp_hosts,
+                        door.scan,
+                        door.stun,
+                        door.turn,
+                        door.demux,
+                    )
+                },
+            );
+        let hosts = Arc::new(HostCache::new(
+            HostSnapshot::new(hosts, tcp_hosts, &settings.advertise),
+            scan,
+            &settings.advertise,
+            &clock,
+        ));
         let mut state = State::default();
         state.registrations = registrations;
         state.signaling.clock = Arc::clone(&clock);
         // A signaled source gathers on the hosts sessions answer with.
-        for ip in hosts.iter().map(SocketAddr::ip) {
-            if !state.signaling.local_addrs.contains(&ip) {
-                state.signaling.local_addrs.push(ip);
-            }
-        }
+        state.signaling.hosts = Arc::clone(&hosts);
         // Without a recording output the workers refuse every recording: no window
         // and no recording is accepted, which `info` reports.
         state.recording_limits = if environment.registries.recording.is_some() {
@@ -241,7 +248,6 @@ impl Supervisor {
         } else {
             RecordingLimits::NONE
         };
-        let advertisement = Arc::new(Advertisement::new(&settings.advertise, &hosts, &tcp_hosts));
         let shared = Arc::new(Shared {
             manager: WorkerManager::new(environment.worker, environment.udp, Arc::clone(&clock))
                 .with_turn(turn.clone()),
@@ -250,8 +256,6 @@ impl Supervisor {
             shutdown_budget: settings.shutdown_budget,
             connects: ConnectPermits::new(settings.connect_concurrency),
             hosts,
-            tcp_hosts,
-            advertisement,
             stun,
             turn,
             state: Mutex::new(state),
@@ -878,6 +882,9 @@ impl Supervisor {
         let mut ice = crate::gather::plan(offer.ice_servers.as_deref().unwrap_or_default())?;
         let (stun_servers, turn_servers) = self.gatherable(&mut ice);
         let (ice_ufrag, ice_pass) = ice_credentials().map_err(internal)?;
+        // The session answers with the host addresses of now, and keeps
+        // them for its life.
+        let hosts = self.shared.hosts.current();
 
         let mut state = self.shared.lock();
         let stream = state.streams.get(stream_id.as_str()).ok_or_else(|| {
@@ -904,8 +911,8 @@ impl Supervisor {
             offer: offer.sdp,
             ice_ufrag: ice_ufrag.clone(),
             ice_pass,
-            candidates: self.shared.hosts.clone(),
-            tcp_candidates: self.shared.tcp_hosts.clone(),
+            candidates: hosts.hosts.clone(),
+            tcp_candidates: hosts.tcp_hosts.clone(),
             audio,
             orientation: orientation.code(),
         };
@@ -924,7 +931,7 @@ impl Supervisor {
             Arc::clone(&self.shared.clock),
         );
         entry.close_slot = close_slot;
-        entry.advertise(Arc::clone(&self.shared.advertisement));
+        entry.advertise(Arc::clone(&hosts.advertisement));
         entry.deliver(
             &session_id,
             api_event(&SessionEvent::Session {
@@ -942,7 +949,6 @@ impl Supervisor {
         state.sessions.insert(session_id.clone(), entry);
         state.refresh_connection(&connection_id);
         drop(state);
-        let hosts = self.shared.hosts.len();
         tracing::info!(
             event = "session_opened",
             session.id = %session_id,
@@ -951,10 +957,10 @@ impl Supervisor {
             control.connection = connection.0,
             audio,
             orientation = ?orientation,
-            hosts,
+            hosts = hosts.hosts.len(),
             "session opened; offer handed to the connection"
         );
-        self.start_gathering(&session_id, serial, stun_servers, turn_servers);
+        self.start_gathering(&session_id, serial, stun_servers, turn_servers, &hosts);
         Ok(rx)
     }
 
@@ -978,15 +984,17 @@ impl Supervisor {
     }
 
     /// Gathers a server-reflexive candidate from each of `stun` and a
-    /// relay candidate from each of `turn` for session `serial`, and
-    /// releases end-of-candidates after [`GATHER_DEADLINE`] whatever they
-    /// did; a lease that comes later than that is released.
+    /// relay candidate from each of `turn` for session `serial`, on a base
+    /// among the session's `hosts`, and releases end-of-candidates after
+    /// [`GATHER_DEADLINE`] whatever they did; a lease that comes later
+    /// than that is released.
     fn start_gathering(
         &self,
         session_id: &str,
         serial: u64,
         stun: Vec<StunServer>,
         turn: Vec<TurnServer>,
+        hosts: &Arc<HostSnapshot>,
     ) {
         if self.shared.stun.is_none() && self.shared.turn.is_none() {
             return;
@@ -996,14 +1004,16 @@ impl Supervisor {
             for (index, server) in stun.into_iter().enumerate() {
                 let client = Arc::clone(client);
                 let shared = Arc::clone(&self.shared);
+                let hosts = Arc::clone(hosts);
                 let id = session_id.to_owned();
                 let _handle = spawn_named("session.gather", async move {
-                    let candidate = crate::gather::gather(&client, &server, &shared.hosts)
-                        .await
-                        .map(|(mapped, base)| {
-                            let related = shared.advertisement.related(mapped, base);
-                            crate::gather::srflx_candidate(index, mapped, related)
-                        });
+                    let candidate =
+                        crate::gather::gather(&client, &server, &hosts.hosts, hosts.generation)
+                            .await
+                            .map(|(mapped, base)| {
+                                let related = hosts.advertisement.related(mapped, base);
+                                crate::gather::srflx_candidate(index, mapped, related)
+                            });
                     shared.lock().session_gathered(&id, serial, candidate);
                 });
             }
@@ -1012,10 +1022,11 @@ impl Supervisor {
             for server in turn {
                 let client = Arc::clone(client);
                 let shared = Arc::clone(&self.shared);
+                let hosts = Arc::clone(hosts);
                 let id = session_id.to_owned();
                 let _handle = spawn_named("session.relay", async move {
                     let relayed = tokio::select! {
-                        relayed = crate::gather::relay(&client, &server, &shared.hosts) => relayed,
+                        relayed = crate::gather::relay(&client, &server, &hosts.hosts, hosts.generation) => relayed,
                         () = shared.clock.sleep(GATHER_DEADLINE) => None,
                     };
                     shared.lock().session_relayed(&id, serial, relayed);
@@ -1959,6 +1970,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::host_cache::test_support::Interfaces;
     use crate::test_support::{Captured, environment, private_dir, settings};
 
     #[test]
@@ -2059,6 +2071,7 @@ mod tests {
             registrations: Arc::new(Registrations::default()),
             hosts: vec!["192.0.2.1:18556".parse().unwrap()],
             tcp_hosts: vec!["192.0.2.1:18557".parse().unwrap()],
+            scan: None,
             stun: None,
             turn: None,
             demux: None,
@@ -2302,6 +2315,7 @@ mod tests {
             registrations: Arc::new(Registrations::default()),
             hosts: vec!["192.0.2.1:18556".parse().unwrap()],
             tcp_hosts: Vec::new(),
+            scan: None,
             stun: None,
             turn: None,
             demux: None,
@@ -3879,6 +3893,7 @@ mod tests {
                 "[2001:db8::1]:18556".parse().unwrap(),
             ],
             tcp_hosts: vec![],
+            scan: None,
             stun: None,
             turn: None,
             demux: None,
@@ -3889,7 +3904,7 @@ mod tests {
             Arc::new(SystemClock),
         );
         assert_eq!(
-            s.shared.lock().signaling.local_addrs,
+            s.shared.lock().signaling.hosts.latest().local_addrs,
             [
                 "192.0.2.1".parse::<std::net::IpAddr>().unwrap(),
                 "2001:db8::1".parse().unwrap()
@@ -4946,6 +4961,112 @@ mod tests {
         s.shutdown().await;
     }
 
+    /// A supervisor like [`with_webrtc`]'s whose host addresses `scan`
+    /// reads again, at first `192.0.2.1`, on `clock`; its connection `c1`
+    /// of stream `front` sends its driver commands to the receiver.
+    async fn with_rescan(
+        binary: &str,
+        scan: HostScan,
+        clock: &Arc<FakeClock>,
+    ) -> (Supervisor, mpsc::Receiver<DriverCommand>) {
+        let door = FrontDoor {
+            registrations: Arc::new(Registrations::default()),
+            hosts: vec!["192.0.2.1:18556".parse().unwrap()],
+            tcp_hosts: vec!["192.0.2.1:18557".parse().unwrap()],
+            scan: Some(scan),
+            stun: None,
+            turn: None,
+            demux: None,
+        };
+        let mut settings = session_settings();
+        settings.limits.max_sessions_per_stream = 8;
+        settings.limits.max_sessions = 8;
+        let s = Supervisor::new(
+            settings,
+            webrtc_environment(binary, door),
+            Arc::<FakeClock>::clone(clock),
+        );
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let (tx, rx) = mpsc::channel(8);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        (s, rx)
+    }
+
+    /// The host addresses of the session `rx`'s next offer answers with.
+    async fn offered_hosts(
+        rx: &mut mpsc::Receiver<DriverCommand>,
+    ) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+        let_assert!(
+            Some(DriverCommand::OpenSession(spec)) = rx.recv().await,
+            "an offer"
+        );
+        (spec.candidates, spec.tcp_candidates)
+    }
+
+    #[tokio::test]
+    async fn rfc8445_5_1_1_1_each_offer_answers_with_the_host_addresses_of_now() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let dir = private_dir("rescan");
+        let clock = Arc::new(FakeClock::default());
+        let interfaces = Interfaces::with(&["192.0.2.1"]);
+        let (s, mut rx) = with_rescan(
+            &blocking_worker(&dir),
+            interfaces.scan("[::]:18556", Some("[::]:18557")),
+            &clock,
+        )
+        .await;
+        let addrs = |list: &[&str]| -> Vec<SocketAddr> {
+            list.iter().map(|a| a.parse().unwrap()).collect()
+        };
+        let before = (addrs(&["192.0.2.1:18556"]), addrs(&["192.0.2.1:18557"]));
+        // An interface comes up; within the max age two offers read nothing
+        // and answer with the addresses found at the start.
+        interfaces.set(&["192.0.2.1", "2001:db8:1::2"]);
+        let _s1 = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        let _s2 = subscription(call_on(&s, 1, &offer(3, "front", Some("s2"))).await);
+        assert_eq!(offered_hosts(&mut rx).await, before);
+        assert_eq!(offered_hosts(&mut rx).await, before);
+        assert_eq!(interfaces.reads(), 0);
+        // Past it the next offer reads them once, and gets the new one.
+        clock.advance(crate::host_cache::MAX_AGE);
+        let _s3 = subscription(call_on(&s, 1, &offer(4, "front", Some("s3"))).await);
+        let _s4 = subscription(call_on(&s, 1, &offer(5, "front", Some("s4"))).await);
+        let after = (
+            addrs(&["192.0.2.1:18556", "[2001:db8:1::2]:18556"]),
+            addrs(&["192.0.2.1:18557", "[2001:db8:1::2]:18557"]),
+        );
+        assert_eq!(offered_hosts(&mut rx).await, after);
+        assert_eq!(offered_hosts(&mut rx).await, after);
+        assert_eq!(interfaces.reads(), 1, "a burst reads once");
+        // A signaled source opened from now on gathers on them too.
+        assert_eq!(
+            s.shared.lock().signaling.hosts.latest().local_addrs,
+            [
+                "192.0.2.1".parse::<std::net::IpAddr>().unwrap(),
+                "2001:db8:1::2".parse().unwrap()
+            ]
+        );
+        let changed = captured.lines("host addresses changed");
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert!(changed[0].contains("INFO"), "{changed:?}");
+        s.shutdown().await;
+
+        // An explicitly bound address is never re-read.
+        let interfaces = Interfaces::with(&["192.0.2.1", "192.0.2.2"]);
+        let (s, mut rx) = with_rescan(
+            &blocking_worker(&dir),
+            interfaces.scan("192.0.2.1:18556", Some("192.0.2.1:18557")),
+            &clock,
+        )
+        .await;
+        clock.advance(crate::host_cache::MAX_AGE);
+        let _e1 = subscription(call_on(&s, 1, &offer(2, "front", Some("e1"))).await);
+        assert_eq!(offered_hosts(&mut rx).await, before);
+        assert_eq!(interfaces.reads(), 0);
+        s.shutdown().await;
+    }
+
     #[tokio::test]
     async fn the_driver_gets_the_offer_with_credentials_hosts_and_audio_and_the_closes() {
         let dir = private_dir("to-driver");
@@ -5127,6 +5248,7 @@ mod tests {
             registrations: demux.registrations(),
             hosts: bound.hosts,
             tcp_hosts: vec![],
+            scan: None,
             stun: Some(Arc::new(StunClient::new(
                 bound.socket,
                 demux.responses(),
@@ -5165,6 +5287,123 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A STUN server answering every Binding with `mapped`, and how many
+    /// it answered.
+    fn counting_stun_server(
+        mapped: SocketAddr,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&answered);
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 1500];
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                let request = crate::net::stun::parse(&buf[..n]).unwrap();
+                let reply = crate::net::stun::Builder::new(
+                    crate::net::stun::Class::Success,
+                    crate::net::stun::METHOD_BINDING,
+                    request.transaction_id,
+                )
+                .xor_mapped_address(mapped)
+                .build();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _sent = socket.send_to(&reply, from);
+            }
+        });
+        (addr, answered)
+    }
+
+    #[tokio::test]
+    async fn rfc8445_5_1_1_2_the_first_offer_after_a_host_address_change_asks_stun_again() {
+        let dir = private_dir("srflx-rescan");
+        let clock = Arc::new(FakeClock::default());
+        let bound = crate::net::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let demux = crate::net::demux::Demux::start(
+            Arc::clone(&bound.socket),
+            bound.local,
+            bound.hosts.clone(),
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        let interfaces = Interfaces::with(&["192.0.2.1"]);
+        let door = FrontDoor {
+            registrations: demux.registrations(),
+            hosts: vec!["192.0.2.1:18556".parse().unwrap()],
+            tcp_hosts: vec![],
+            scan: Some(interfaces.scan("0.0.0.0:18556", None)),
+            stun: Some(Arc::new(StunClient::new(
+                bound.socket,
+                demux.responses(),
+                Arc::<FakeClock>::clone(&clock),
+                crate::net::stun_client::StunClientConfig::default(),
+            ))),
+            turn: None,
+            demux: Some(demux.stats()),
+        };
+        let mut settings = session_settings();
+        settings.limits.max_sessions_per_stream = 8;
+        settings.limits.max_sessions = 8;
+        let s = Supervisor::new(
+            settings,
+            webrtc_environment(&blocking_worker(&dir), door),
+            Arc::<FakeClock>::clone(&clock),
+        );
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        // The offers' commands stop here; the worker's reports are made up.
+        let (tx, _offers) = mpsc::channel(8);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        let (server, asked) = counting_stun_server("203.0.113.7:40000".parse().unwrap());
+        // The srflx candidate of session `id`, once its gathering is done.
+        let srflx = async |id: u64, session: &str| -> String {
+            let mut events = subscription(call_on(&s, 1, &stun_offer(id, session, server)).await);
+            next(&mut events).await;
+            report(
+                &s,
+                session,
+                Report::Answer {
+                    sdp: "v=0\r\na=mid:0\r\n".into(),
+                    talkback: None,
+                },
+            );
+            assert_eq!(next(&mut events).await["type"], "answer");
+            report(&s, session, end_of_candidates());
+            let candidate = next(&mut events).await["candidate"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                next(&mut events).await,
+                json!({ "type": "candidate", "candidate": "" })
+            );
+            candidate
+        };
+        let ordinal = std::sync::atomic::Ordering::SeqCst;
+        assert!(srflx(2, "s1").await.contains("typ srflx raddr 192.0.2.1"));
+        assert_eq!(asked.load(ordinal), 1);
+        // Read again, unchanged: the mapping is the cached one.
+        clock.advance(crate::host_cache::MAX_AGE);
+        assert!(srflx(3, "s2").await.contains("typ srflx raddr 192.0.2.1"));
+        assert_eq!(asked.load(ordinal), 1, "served from the cache");
+        assert_eq!(interfaces.reads(), 1);
+        // Changed: the server is asked again on the new base.
+        interfaces.set(&["192.0.2.2"]);
+        clock.advance(crate::host_cache::MAX_AGE);
+        assert!(srflx(4, "s3").await.contains("typ srflx raddr 192.0.2.2"));
+        assert_eq!(asked.load(ordinal), 2, "asked again after the change");
+        // The worker is stopped within the budget, on the fake clock.
+        let mut shutdown = std::pin::pin!(s.shutdown());
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                () = SystemClock.sleep(Duration::from_millis(5)) => {
+                    clock.advance(Duration::from_millis(100));
+                }
+            }
+        }
+        demux.stop();
     }
 
     fn stun_offer(id: u64, session_id: &str, server: SocketAddr) -> Value {
@@ -5238,6 +5477,7 @@ mod tests {
             registrations: Arc::new(Registrations::default()),
             hosts: vec!["192.0.2.1:18556".parse().unwrap()],
             tcp_hosts: vec!["192.0.2.1:18557".parse().unwrap()],
+            scan: None,
             stun: None,
             turn: None,
             demux: None,
@@ -5384,6 +5624,7 @@ mod tests {
             registrations: demux.registrations(),
             hosts: bound.hosts,
             tcp_hosts: vec![],
+            scan: None,
             stun: None,
             turn: Some(Arc::new(TurnClient::new(
                 bound.socket,

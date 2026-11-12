@@ -88,7 +88,6 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -105,6 +104,7 @@ use tokio::sync::mpsc;
 
 use crate::connect::CONNECT_LEASE;
 use crate::driver::{COMMAND_QUEUE, DriverCommand};
+use crate::host_cache::HostCache;
 use crate::registry::State;
 use crate::session::{MAX_WORKER_CANDIDATES, ulid};
 use crate::worker_text::MAX_MESSAGE_BYTES;
@@ -311,9 +311,11 @@ struct Held {
 /// waiting for one, and the open signals.
 #[derive(Debug)]
 pub(crate) struct Signaling {
-    /// The host addresses a source may gather candidates on: the front
-    /// door's, enumerated before the sandbox.
-    pub(crate) local_addrs: Vec<IpAddr>,
+    /// The front door's host addresses: a source gathers candidates on
+    /// the latest ones
+    /// ([`local_addrs`](crate::host_cache::HostSnapshot::local_addrs)),
+    /// those the last offer read, or else those found before the sandbox.
+    pub(crate) hosts: Arc<HostCache>,
     /// The subscription of each scope: a stream's, or every stream's
     /// (`None`).
     scopes: BTreeMap<Option<String>, Subscriber>,
@@ -343,7 +345,7 @@ impl Default for Signaling {
     /// supervisor injects its own.
     fn default() -> Self {
         Self {
-            local_addrs: Vec::new(),
+            hosts: Arc::default(),
             scopes: BTreeMap::new(),
             waiting: Vec::new(),
             signals: BTreeMap::new(),
@@ -808,7 +810,7 @@ impl State {
             SignalCommand::Opened {
                 request: open.request,
                 signal_id: signal_id.clone(),
-                local_addrs: self.signaling.local_addrs.clone(),
+                local_addrs: self.signaling.hosts.latest().local_addrs.clone(),
             },
         );
         if let Some(count) = self.signaling.line(&open.connection, Line::Opened, now) {
@@ -1381,6 +1383,7 @@ mod tests {
         reason = "test code"
     )]
 
+    use std::net::IpAddr;
     use std::time::UNIX_EPOCH;
 
     use lotse_core::let_assert;
@@ -1388,6 +1391,7 @@ mod tests {
     use tokio::sync::watch;
 
     use super::*;
+    use crate::host_cache::HostSnapshot;
     use crate::registry::{
         ConnectionEntry, ConnectionKey, ConnectionSnapshot, SourceTarget, Talker,
     };
@@ -1462,7 +1466,16 @@ mod tests {
     /// commands, and two local addresses.
     fn signaled_state(capacity: usize) -> (State, Queues) {
         let mut state = State::default();
-        state.signaling.local_addrs = vec![[192, 0, 2, 7].into(), [0_u16; 8].into()];
+        state.signaling.hosts = Arc::new(HostCache::new(
+            HostSnapshot::new(
+                vec!["192.0.2.7:1".parse().unwrap(), "[::]:1".parse().unwrap()],
+                Vec::new(),
+                &[],
+            ),
+            None,
+            &[],
+            &state.signaling.clock,
+        ));
         let mut drivers = BTreeMap::new();
         for (id, stream) in [("c1", "door"), ("c2", "yard")] {
             let (commands, queued) = mpsc::channel(capacity);
