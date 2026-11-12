@@ -633,7 +633,8 @@ impl Supervisor {
                     put.prerecord_ms
                 ),
             )
-            .with_detail("field", "prerecord_ms"));
+            .with_detail("field", "prerecord_ms")
+            .with_detail("limit", "max_prerecord_ms"));
         }
         let validated = put
             .sources
@@ -1774,7 +1775,8 @@ fn check_recording_request(
                 start.prerecord_ms, limits.max_prerecord_ms
             ),
         )
-        .with_detail("field", "prerecord_ms"));
+        .with_detail("field", "prerecord_ms")
+        .with_detail("limit", "max_prerecord_ms"));
     }
     if start.duration_ms > limits.max_recording_ms {
         return Err(ApiError::new(
@@ -1784,7 +1786,8 @@ fn check_recording_request(
                 start.duration_ms, limits.max_recording_ms
             ),
         )
-        .with_detail("field", "duration_ms"));
+        .with_detail("field", "duration_ms")
+        .with_detail("limit", "max_recording_ms"));
     }
     if state.recordings_held() >= usize::try_from(limits.max_recordings).unwrap_or(usize::MAX) {
         return Err(
@@ -2170,6 +2173,7 @@ mod tests {
             "`prerecord_ms` is 1, the maximum is 0 (`limits.max_prerecord_ms`)"
         );
         assert_eq!(err.details["field"], "prerecord_ms");
+        assert_eq!(err.details["limit"], "max_prerecord_ms");
         assert!(s.shared.lock().streams.is_empty());
         let err = error(
             call(
@@ -6096,6 +6100,7 @@ mod tests {
         far["prerecord_ms"] = json!(300_001);
         let err = refused(call(&s, &far.to_string()).await);
         assert_eq!(err.details["field"], "prerecord_ms");
+        assert_eq!(err.details["limit"], "max_prerecord_ms");
         assert_eq!(
             err.message,
             "`prerecord_ms` is 300001, the maximum is 300000 (`limits.max_prerecord_ms`)"
@@ -6104,6 +6109,7 @@ mod tests {
         long["duration_ms"] = json!(3_600_001);
         let err = refused(call(&s, &long.to_string()).await);
         assert_eq!(err.details["field"], "duration_ms");
+        assert_eq!(err.details["limit"], "max_recording_ms");
         // The longest window and the longest recording are allowed, 5 minutes
         // before and an hour after, the most a client's record call asks:
         // what refuses this one is the stream.

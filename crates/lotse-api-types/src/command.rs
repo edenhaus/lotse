@@ -937,7 +937,9 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// `invalid_request` when `value` is longer than `max` characters.
+/// `invalid_request` when `value` is longer than `max` characters, its
+/// `limit` detail `maxLength`, the schema's keyword for the cap: a refusal
+/// at a limit names the limit it hit, which the server logs.
 fn cap_chars(field: &str, value: &str, max: usize) -> Result<(), ApiError> {
     let len = value.chars().count();
     if len > max {
@@ -945,7 +947,8 @@ fn cap_chars(field: &str, value: &str, max: usize) -> Result<(), ApiError> {
             ErrorCode::InvalidRequest,
             format!("`{field}` is {len} characters long, the maximum is {max}"),
         )
-        .with_detail("field", field));
+        .with_detail("field", field)
+        .with_detail("limit", "maxLength"));
     }
     Ok(())
 }
@@ -978,14 +981,17 @@ fn check_signal_error_code(code: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// `invalid_request` when a list has more than `max` entries.
+/// `invalid_request` when a list has more than `max` entries, its `limit`
+/// detail `maxItems`, the schema's keyword for the cap, as
+/// [`cap_chars`]'s.
 fn cap_items(field: &str, len: usize, max: usize) -> Result<(), ApiError> {
     if len > max {
         return Err(ApiError::new(
             ErrorCode::InvalidRequest,
             format!("`{field}` has {len} entries, the maximum is {max}"),
         )
-        .with_detail("field", field));
+        .with_detail("field", field)
+        .with_detail("limit", "maxItems"));
     }
     Ok(())
 }
@@ -1413,6 +1419,21 @@ mod tests {
             assert_eq!(err.error.code, ErrorCode::InvalidRequest);
             assert_eq!(err.error.details["type"], frame["type"]);
             assert!(!err.error.message.contains("xx"), "{}", err.error.message);
+            // A cap names its limit: a list's is `maxItems`, a text's
+            // `maxLength`, as the schema publishes them; a shape is none.
+            let keyword = if !err.error.message.contains(", the maximum is ") {
+                None
+            } else if err.error.message.contains(" entries, ") {
+                Some("maxItems")
+            } else {
+                Some("maxLength")
+            };
+            let limit = err
+                .error
+                .details
+                .get("limit")
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(limit, keyword, "{}", err.error.message);
             let field = err.error.details["field"].as_str().unwrap().to_owned();
             (field, err.error.message)
         })
@@ -1594,6 +1615,7 @@ mod tests {
             assert_eq!(err.id, Some(1));
             assert_eq!(err.error.code, ErrorCode::InvalidStreamId, "{kind}");
             assert_eq!(err.error.details["field"], "stream_id");
+            assert_eq!(err.error.details["limit"], "maxLength");
             assert_eq!(err.error.details["type"], frame["type"]);
             assert_eq!(
                 err.error.message,
