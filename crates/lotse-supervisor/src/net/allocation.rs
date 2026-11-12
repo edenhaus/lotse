@@ -17,6 +17,9 @@
 //! one may have moved the 5-tuple's source address, so the allocation is
 //! confirmed on it by a Refresh sent at once (or by the next Allocate when
 //! there is none yet), and a Refresh answered 437 re-creates it (§8.3).
+//! A Refresh supersedes one still in flight: the older transaction is
+//! retired, so its late answer or timeout cannot undo what the newer one
+//! confirmed.
 //!
 //! Implements RFC 8656 §5 (one allocation per 5-tuple, the same username
 //! for its life), §7.1 and §7.3 (Allocate and its success response), §7.4
@@ -593,8 +596,9 @@ impl Allocation {
     /// A session joins on the host addresses of `generation`. A newer one
     /// than any before may have moved the 5-tuple's source address (RFC
     /// 8656 §5), so the allocation is confirmed on it: by a Refresh sent
-    /// now while it exists (§8), beside one already under way that was
-    /// sent before, else by the Allocate or Refresh sent next. A Refresh
+    /// now while it exists (§8), which retires one already under way that
+    /// was sent before (`supersede_refresh`), else by the Allocate
+    /// or Refresh sent next. A Refresh
     /// answered 437 means the server holds no allocation on the 5-tuple
     /// any more, and it is re-created (§8.3); either way
     /// [`Self::confirmed`] reaches `generation` once the allocation holds
@@ -924,10 +928,14 @@ impl Allocation {
     }
 
     /// Sends a new request for `purpose`, signed when a challenge is
-    /// known, on the newest generation of host addresses.
+    /// known, on the newest generation of host addresses. A Refresh
+    /// retires the one still in flight ([`Self::supersede_refresh`]).
     fn start(&mut self, now: Instant, purpose: Purpose, resigns: u8) {
         if matches!(purpose, Purpose::Allocate | Purpose::Refresh { .. }) {
             self.sent = self.generation;
+        }
+        if matches!(purpose, Purpose::Refresh { .. }) {
+            self.supersede_refresh();
         }
         let id = self.ids.next();
         let builder = match purpose {
@@ -957,6 +965,28 @@ impl Allocation {
                 next: after(now, wait_after(self.transport, &self.config, 1)),
             },
         );
+    }
+
+    /// Retires the Refresh still in flight, if any, before a newer one is
+    /// sent: the newer one, on the newest generation of host addresses,
+    /// decides the allocation's fate (RFC 8656 §8), so the older
+    /// transaction ends here (RFC 8489 §6.2): it is not retransmitted, a
+    /// transmission of it not polled yet is not sent, and its late
+    /// response finds no transaction and its timeout never comes. A late
+    /// 437 or a timeout of the older one would otherwise lose or close the
+    /// allocation the newer one confirmed. At most one Refresh is in
+    /// flight: the scheduled one waits for the one under way.
+    fn supersede_refresh(&mut self) {
+        let superseded = self
+            .transactions
+            .iter()
+            .find(|(_, tx)| matches!(tx.purpose, Purpose::Refresh { .. }))
+            .map(|(id, _)| *id);
+        if let Some(id) = superseded {
+            self.transactions.remove(&id);
+            self.outbox.retain(|transmit| transmit.transaction_id != id);
+            tracing::debug!(server = %self.server, transport = self.transport.name(), "turn refresh superseded by a newer one");
+        }
     }
 
     /// A transaction ended with `outcome`.
@@ -1057,7 +1087,8 @@ impl Allocation {
         outcome: Result<&Message<'_>, TransactionError>,
     ) {
         // Every state change clears the transactions, so a Refresh ends
-        // only while the allocation it refreshes exists.
+        // only while the allocation it refreshes exists, and a newer
+        // Refresh retires an older one, so only the newest ends.
         match outcome {
             Ok(message) => {
                 let lifetime = turn::lifetime(message).unwrap_or(self.config.lifetime);
@@ -1801,15 +1832,13 @@ mod tests {
         rig.machine.confirm(now, 0);
         assert!(rig.machine.outbox.is_empty());
         // A newer one is confirmed at once, and one newer still while that
-        // Refresh is under way gets a Refresh of its own.
+        // Refresh is under way gets a Refresh of its own, which retires
+        // the first before it was even sent.
         rig.machine.confirm(now, 1);
         rig.machine.confirm(now, 2);
-        assert_eq!(rig.machine.outbox.len(), 2);
+        assert_eq!(rig.machine.outbox.len(), 1);
         rig.pump();
-        assert_eq!(
-            rig.log()[2..],
-            [(REFRESH, ok("alice"), None), (REFRESH, ok("alice"), None)]
-        );
+        assert_eq!(rig.log()[2..], [(REFRESH, ok("alice"), None)]);
         assert_eq!(rig.machine.confirmed(), 2);
         assert_eq!(rig.machine.relayed(), Some(relayed));
         assert_eq!(rig.events(), Vec::new());
@@ -1818,9 +1847,56 @@ mod tests {
         rig.machine.confirm(now, 1);
         assert!(rig.machine.outbox.is_empty());
         rig.advance(539 * SECOND);
-        assert_eq!(rig.log().len(), 4);
+        assert_eq!(rig.log().len(), 3);
         rig.advance(SECOND);
-        assert_eq!(rig.log().len(), 5);
+        assert_eq!(rig.log().len(), 4);
+    }
+
+    /// An allocation confirmed on generation 2 by a Refresh that
+    /// superseded generation 1's, which was sent and never answered.
+    fn superseded_refresh(rig: &mut Rig) -> (SocketAddr, Transmit) {
+        let relayed = rig.allocated();
+        let now = rig.now();
+        rig.machine.confirm(now, 1);
+        let older = rig.next();
+        rig.machine.confirm(now, 2);
+        assert!(!rig.machine.is_pending(&older.transaction_id));
+        rig.pump();
+        assert_eq!(rig.log()[2..], [(REFRESH, ok("alice"), None)]);
+        assert_eq!(rig.machine.confirmed(), 2);
+        (relayed, older)
+    }
+
+    #[test]
+    fn rfc8489_6_2_1_a_superseded_refresh_neither_retransmits_nor_times_out() {
+        let mut rig = Rig::new(Transport::Udp);
+        let (relayed, _older) = superseded_refresh(&mut rig);
+        // Past the older one's timeout (39.5 s): nothing is sent, and the
+        // confirmed allocation lives on.
+        for _ in 0..5 {
+            rig.clock.advance(10 * SECOND);
+            rig.machine.handle_timeout(rig.now());
+            assert!(rig.machine.poll_transmit().is_none());
+        }
+        assert_eq!(rig.events(), Vec::new());
+        assert_eq!(rig.machine.relayed(), Some(relayed));
+        assert_eq!(rig.machine.confirmed(), 2);
+    }
+
+    #[test]
+    fn rfc8656_8_3_a_late_error_to_a_superseded_refresh_is_ignored() {
+        let mut rig = Rig::new(Transport::Udp);
+        let (relayed, older) = superseded_refresh(&mut rig);
+        // The older one's answer comes late, from the 5-tuple it left: a
+        // 437, which would lose the allocation were it still awaited.
+        let moved = "198.51.100.8:18556".parse().unwrap();
+        let late = rig.server.handle(moved, false, &older.bytes).unwrap();
+        assert_eq!(rig.log()[3..], [(REFRESH, ok("alice"), Some(437))]);
+        assert!(!rig.machine.handle_input(rig.now(), &late));
+        assert_eq!(rig.events(), Vec::new());
+        assert_eq!(rig.machine.relayed(), Some(relayed));
+        assert_eq!(rig.machine.confirmed(), 2);
+        assert!(rig.machine.outbox.is_empty());
     }
 
     #[test]

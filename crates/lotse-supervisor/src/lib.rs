@@ -382,7 +382,12 @@ fn front_door(
         registrations: demux.registrations(),
         hosts: udp.hosts.clone(),
         tcp_hosts: tcp_hosts(&udp.hosts, tcp_local),
-        scan: Some(HostScan::system(udp.local, udp.dual_stack, tcp_local)),
+        scan: Some(HostScan::system(
+            udp.local,
+            udp.dual_stack,
+            tcp_local,
+            udp.enumeration_failed,
+        )),
         stun: Some(Arc::new(net::stun_client::StunClient::new(
             Arc::clone(&udp.socket),
             demux.responses(),

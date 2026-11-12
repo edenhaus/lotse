@@ -63,8 +63,9 @@ type Probe = dyn Fn(SocketAddr) -> Option<IpAddr> + Send + Sync;
 type Interfaces = dyn Fn() -> io::Result<Vec<InterfaceAddress>> + Send + Sync;
 
 /// How the front door's host addresses are read again: the shared UDP
-/// socket's bound address and family, the ICE-TCP listener's address, and
-/// the probe and enumeration to read them with. Only the supervisor makes
+/// socket's bound address and family, the ICE-TCP listener's address, the
+/// probe and enumeration to read them with, and whether the read at
+/// startup failed to enumerate the interfaces. Only the supervisor makes
 /// one; the binary passes it through.
 #[derive(Clone)]
 pub struct HostScan {
@@ -79,28 +80,38 @@ pub struct HostScan {
     probe: Arc<Probe>,
     /// Lists the interfaces' addresses.
     interfaces: Arc<Interfaces>,
+    /// The read at startup (`net::udp`) failed to enumerate the
+    /// interfaces and warned so: the first re-read that fails too does
+    /// not warn again, and the first that succeeds says the failure ended.
+    startup_failed: bool,
 }
 
 impl HostScan {
     /// A scan of the system's interfaces for the UDP socket bound at
     /// `local` (taking IPv4 too when `dual_stack`) and the ICE-TCP listener
-    /// at `tcp_listener`.
+    /// at `tcp_listener`, whose enumeration at startup failed when
+    /// `startup_failed`.
     pub(crate) fn system(
         local: SocketAddr,
         dual_stack: bool,
         tcp_listener: Option<SocketAddr>,
+        startup_failed: bool,
     ) -> Self {
-        Self::new(
-            local,
-            dual_stack,
-            tcp_listener,
-            Arc::new(hosts::probe),
-            Arc::new(hosts::interfaces),
-        )
+        Self {
+            startup_failed,
+            ..Self::new(
+                local,
+                dual_stack,
+                tcp_listener,
+                Arc::new(hosts::probe),
+                Arc::new(hosts::interfaces),
+            )
+        }
     }
 
-    /// A scan with its own `probe` and `interfaces`: the seam the tests
-    /// change the interfaces through.
+    /// A scan with its own `probe` and `interfaces`, whose enumeration at
+    /// startup succeeded: the seam the tests change the interfaces
+    /// through.
     pub(crate) fn new(
         local: SocketAddr,
         dual_stack: bool,
@@ -114,6 +125,7 @@ impl HostScan {
             tcp_listener,
             probe,
             interfaces,
+            startup_failed: false,
         }
     }
 
@@ -139,12 +151,14 @@ impl HostScan {
 }
 
 impl fmt::Debug for HostScan {
-    /// The addresses; the probe and the enumeration are code.
+    /// The addresses and the startup failure; the probe and the
+    /// enumeration are code.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HostScan")
             .field("local", &self.local)
             .field("dual_stack", &self.dual_stack)
             .field("tcp_listener", &self.tcp_listener)
+            .field("startup_failed", &self.startup_failed)
             .finish_non_exhaustive()
     }
 }
@@ -213,10 +227,10 @@ struct Cached {
     /// When the host addresses were last read; `None` before the first
     /// read, which the default only is.
     read: Option<Instant>,
-    /// The last read failed to enumerate the interfaces: a failure is
-    /// logged as a warning when it starts and as information when it
-    /// ends, in between at debug, so a lasting one does not repeat at
-    /// every offer.
+    /// The last read failed to enumerate the interfaces, the one at
+    /// startup included: a failure is logged as a warning when it starts
+    /// (by `net::hosts` at startup) and as information when it ends, in
+    /// between at debug, so a lasting one does not repeat at every offer.
     failing: bool,
 }
 
@@ -238,6 +252,8 @@ impl HostCache {
     /// A cache holding `snapshot`, read just now, re-read by `scan` with
     /// `advertised` worked out on each change, aged on `clock`; fixed
     /// without a scan or when the scan's socket is bound to one address.
+    /// A scan whose startup read failed to enumerate the interfaces starts
+    /// it failing, so the warning already logged is not repeated.
     pub(crate) fn new(
         snapshot: HostSnapshot,
         scan: Option<HostScan>,
@@ -250,12 +266,15 @@ impl HostCache {
             clock: Arc::clone(clock),
         });
         let read = rescan.as_ref().map(|rescan| rescan.clock.now());
+        let failing = rescan
+            .as_ref()
+            .is_some_and(|rescan| rescan.scan.startup_failed);
         Self {
             rescan,
             cached: Mutex::new(Cached {
                 snapshot: Arc::new(snapshot),
                 read,
-                failing: false,
+                failing,
             }),
         }
     }
@@ -439,6 +458,9 @@ mod tests {
     ) -> HostCache {
         let clock: Arc<dyn Clock> = Arc::<FakeClock>::clone(clock);
         let (read, tcp_hosts) = scan.read();
+        // As the front door: the startup read's failure goes with the scan.
+        let mut scan = scan;
+        scan.startup_failed = read.failure.is_some();
         HostCache::new(
             HostSnapshot::new(read.hosts, tcp_hosts, advertised),
             Some(scan),
@@ -469,10 +491,11 @@ mod tests {
         let scan = Interfaces::with(&[]).scan("[::]:18556", Some("[::]:18557"));
         assert_eq!(
             format!("{scan:?}"),
-            "HostScan { local: [::]:18556, dual_stack: true, tcp_listener: Some([::]:18557), .. }"
+            "HostScan { local: [::]:18556, dual_stack: true, tcp_listener: Some([::]:18557), startup_failed: false, .. }"
         );
         // The system's scan reads the system's interfaces.
-        let system = HostScan::system("0.0.0.0:0".parse().unwrap(), false, None);
+        let system = HostScan::system("0.0.0.0:0".parse().unwrap(), false, None, true);
+        assert!(system.startup_failed);
         let (read, tcp_hosts) = system.read();
         assert!(read.failure.is_none(), "{:?}", read.failure);
         assert!(
@@ -630,6 +653,34 @@ mod tests {
         clock.advance(MAX_AGE);
         let _fallback = hosts.current();
         assert_eq!(captured.lines("WARN").len(), 2);
+    }
+
+    #[test]
+    fn a_failure_at_startup_is_not_warned_again_and_its_end_is_said() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let interfaces = Interfaces::with(&[]);
+        interfaces.fail();
+        let clock = Arc::new(FakeClock::default());
+        let hosts = cache(interfaces.scan("0.0.0.0:7", None), &[], &clock);
+        // Startup warned (`net::hosts`); the first re-read failing too
+        // only says so at debug.
+        clock.advance(MAX_AGE);
+        assert_eq!(hosts.current().hosts, addrs(&["192.0.2.99:7"]));
+        assert_eq!(captured.lines("WARN"), Vec::<String>::new());
+        let lasting = captured.lines("interfaces still not enumerated");
+        assert_eq!(lasting.len(), 1, "{lasting:?}");
+        assert!(lasting[0].contains("DEBUG"), "{lasting:?}");
+        // A cache whose startup read failed says when a re-read succeeds,
+        // its first one included.
+        let hosts = cache(interfaces.scan("0.0.0.0:7", None), &[], &clock);
+        interfaces.set(&["192.0.2.1"]);
+        clock.advance(MAX_AGE);
+        assert_eq!(hosts.current().hosts, addrs(&["192.0.2.1:7"]));
+        let ended = captured.lines("interfaces enumerated again");
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert!(ended[0].contains("INFO"), "{ended:?}");
+        assert_eq!(captured.lines("WARN"), Vec::<String>::new());
     }
 
     #[test]

@@ -138,28 +138,31 @@ pub(crate) fn probe(target: SocketAddr) -> Option<IpAddr> {
 }
 
 /// The host addresses of a socket bound at `local`, accepting IPv4 too
-/// when `dual_stack`, as [`read_host_addresses`] finds them at startup:
-/// the first list is new, so each exclusion is logged at debug, and a
-/// failed enumeration as a warning.
+/// when `dual_stack`, as [`read_host_addresses`] finds them at startup,
+/// and whether the interfaces failed to enumerate: the first list is new,
+/// so each exclusion is logged at debug, and a failed enumeration as a
+/// warning, which the re-reads of `host_cache` do not repeat while the
+/// failure lasts.
 pub(super) fn host_addresses(
     local: SocketAddr,
     dual_stack: bool,
     probe: &dyn Fn(SocketAddr) -> Option<IpAddr>,
     interfaces: &dyn Fn() -> io::Result<Vec<InterfaceAddress>>,
-) -> Vec<SocketAddr> {
+) -> (Vec<SocketAddr>, bool) {
     let HostRead {
         hosts,
         exclusions,
         failure,
     } = read_host_addresses(local, dual_stack, probe, interfaces);
     exclusions.iter().for_each(Exclusion::log);
+    let failed = failure.is_some();
     if let Some(err) = failure {
         tracing::warn!(
             error = %err,
             "interfaces not enumerated; offering the default-route addresses alone"
         );
     }
-    hosts
+    (hosts, failed)
 }
 
 /// The host addresses of a socket bound at `local`, accepting IPv4 too
@@ -426,7 +429,7 @@ mod tests {
     #[test]
     fn rfc8445_5_1_1_1_every_interface_but_the_excluded_default_route_first() {
         let routed = |target| Some(route(target));
-        let hosts = host_addresses("[::]:18556".parse().unwrap(), true, &routed, &|| Ok(host()));
+        let hosts = host_addresses("[::]:18556".parse().unwrap(), true, &routed, &|| Ok(host())).0;
         assert_eq!(
             hosts,
             addrs(&[
@@ -442,7 +445,7 @@ mod tests {
         );
         // The families the socket accepts.
         assert_eq!(
-            host_addresses("[::]:7".parse().unwrap(), false, &routed, &|| Ok(host())),
+            host_addresses("[::]:7".parse().unwrap(), false, &routed, &|| Ok(host())).0,
             addrs(&[
                 "[2001:db8:1:1::abcd]:7",
                 "[fd00:1::2]:7",
@@ -450,7 +453,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            host_addresses("0.0.0.0:7".parse().unwrap(), true, &routed, &|| Ok(host())),
+            host_addresses("0.0.0.0:7".parse().unwrap(), true, &routed, &|| Ok(host())).0,
             addrs(&["10.0.5.3:7", "192.168.1.2:7", "10.0.5.2:7"])
         );
     }
@@ -459,7 +462,7 @@ mod tests {
     fn rfc8445_5_1_1_1_one_ipv6_address_per_interface_and_prefix() {
         // Without a default route the first listed of a prefix stays.
         assert_eq!(
-            host_addresses("[::]:7".parse().unwrap(), false, &|_| None, &|| Ok(host())),
+            host_addresses("[::]:7".parse().unwrap(), false, &|_| None, &|| Ok(host())).0,
             addrs(&[
                 "[2001:db8:1:1::2]:7",
                 "[fd00:1::2]:7",
@@ -469,7 +472,7 @@ mod tests {
         // A default route elsewhere leaves the prefix's first in place.
         let elsewhere = |_| Some("2001:db8:9::1".parse().unwrap());
         assert_eq!(
-            host_addresses("[::]:7".parse().unwrap(), false, &elsewhere, &|| Ok(host())),
+            host_addresses("[::]:7".parse().unwrap(), false, &elsewhere, &|| Ok(host())).0,
             addrs(&[
                 "[2001:db8:1:1::2]:7",
                 "[fd00:1::2]:7",
@@ -492,7 +495,7 @@ mod tests {
     fn a_probed_address_that_is_not_offered_is_not_preferred() {
         let docker = |_| Some("172.17.0.1".parse().unwrap());
         assert_eq!(
-            host_addresses("0.0.0.0:7".parse().unwrap(), false, &docker, &|| Ok(host())),
+            host_addresses("0.0.0.0:7".parse().unwrap(), false, &docker, &|| Ok(host())).0,
             addrs(&["192.168.1.2:7", "10.0.5.2:7", "10.0.5.3:7"])
         );
     }
@@ -547,7 +550,7 @@ mod tests {
     fn host_addresses_are_the_bound_address_or_the_probed_usable_ones_unenumerated() {
         // The interfaces do not change an explicit bind.
         let unasked = || Ok(host());
-        let explicit = host_addresses("127.0.0.1:5".parse().unwrap(), false, &|_| None, &unasked);
+        let explicit = host_addresses("127.0.0.1:5".parse().unwrap(), false, &|_| None, &unasked).0;
         assert_eq!(explicit, addrs(&["127.0.0.1:5"]));
         // A v4-mapped bind is reported as the IPv4 address it is.
         let mapped = host_addresses(
@@ -555,16 +558,19 @@ mod tests {
             true,
             &|_| None,
             &unasked,
-        );
+        )
+        .0;
         assert_eq!(mapped, addrs(&["192.0.2.7:5"]));
         // An explicit bind is used as given, Docker network or not.
         assert_eq!(
-            host_addresses("172.17.0.2:5".parse().unwrap(), false, &|_| None, &unasked),
+            host_addresses("172.17.0.2:5".parse().unwrap(), false, &|_| None, &unasked).0,
             addrs(&["172.17.0.2:5"])
         );
         // An unspecified one asks them.
         assert_eq!(
-            host_addresses("[::]:7".parse().unwrap(), false, &|_| None, &unasked).len(),
+            host_addresses("[::]:7".parse().unwrap(), false, &|_| None, &unasked)
+                .0
+                .len(),
             3
         );
         let failed = || Err(io::Error::other("no interfaces"));
@@ -575,17 +581,20 @@ mod tests {
             })
         };
         assert_eq!(
-            host_addresses("[::]:18556".parse().unwrap(), true, &routed, &failed),
+            host_addresses("[::]:18556".parse().unwrap(), true, &routed, &failed).0,
             addrs(&["192.168.1.2:18556", "[2001:db8::2]:18556"])
         );
         assert_eq!(
-            host_addresses("[::]:18556".parse().unwrap(), false, &routed, &failed),
+            host_addresses("[::]:18556".parse().unwrap(), false, &routed, &failed).0,
             addrs(&["[2001:db8::2]:18556"])
         );
         assert_eq!(
-            host_addresses("0.0.0.0:18556".parse().unwrap(), true, &routed, &failed),
+            host_addresses("0.0.0.0:18556".parse().unwrap(), true, &routed, &failed).0,
             addrs(&["192.168.1.2:18556"])
         );
+        // Startup says whether the enumeration failed, for the re-reads.
+        assert!(host_addresses("[::]:7".parse().unwrap(), true, &routed, &failed).1);
+        assert!(!host_addresses("[::]:7".parse().unwrap(), true, &routed, &unasked).1);
         // The reader hands the failure to its caller, and only a failure.
         let fallback =
             read_host_addresses("0.0.0.0:18556".parse().unwrap(), true, &routed, &failed);
@@ -607,7 +616,7 @@ mod tests {
         assert_eq!(explicit.exclusions, []);
         // No route, or only unusable addresses: nothing.
         assert_eq!(
-            host_addresses("[::]:1".parse().unwrap(), true, &|_| None, &failed),
+            host_addresses("[::]:1".parse().unwrap(), true, &|_| None, &failed).0,
             []
         );
         for unusable in [
@@ -625,7 +634,7 @@ mod tests {
             let ip: IpAddr = unusable.parse().unwrap();
             assert!(!usable(ip), "{unusable}");
             assert_eq!(
-                host_addresses("[::]:1".parse().unwrap(), true, &|_| Some(ip), &failed),
+                host_addresses("[::]:1".parse().unwrap(), true, &|_| Some(ip), &failed).0,
                 []
             );
         }
@@ -696,7 +705,7 @@ mod tests {
             unrouted.exclusions
         );
         // Startup logs each, at debug, with its interface and reason.
-        let hosts = host_addresses("[::]:7".parse().unwrap(), true, &routed, &|| Ok(host()));
+        let hosts = host_addresses("[::]:7".parse().unwrap(), true, &routed, &|| Ok(host())).0;
         assert_eq!(hosts, read.hosts);
         let logged = captured.lines("interface address not offered");
         assert_eq!(logged.len(), read.exclusions.len(), "{logged:?}");

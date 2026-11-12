@@ -51,6 +51,10 @@ pub struct BoundUdp {
     /// The addresses datagrams arrive on, the default-route one of each
     /// family first: the host candidates' addresses.
     pub hosts: Vec<SocketAddr>,
+    /// The interfaces failed to enumerate when [`Self::hosts`] was read,
+    /// which was warned about: `host_cache` does not warn again while the
+    /// failure lasts, and says when it ends.
+    pub enumeration_failed: bool,
 }
 
 /// Binds the shared UDP socket.
@@ -73,7 +77,8 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<BoundUdp> {
     let send_buffer = socket.send_buffer_size().unwrap_or(0);
     // An empty list means sessions answer without a host candidate; the
     // `ready` event shows it too.
-    let hosts = hosts::host_addresses(local, dual_stack, &hosts::probe, &hosts::interfaces);
+    let (hosts, enumeration_failed) =
+        hosts::host_addresses(local, dual_stack, &hosts::probe, &hosts::interfaces);
     tracing::info!(
         %local,
         dual_stack,
@@ -90,6 +95,7 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<BoundUdp> {
         send_buffer,
         dual_stack,
         hosts,
+        enumeration_failed,
     })
 }
 
