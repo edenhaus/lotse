@@ -3,8 +3,8 @@
 //!
 //! It takes the packet by its payload type, not by the codec the answer
 //! named first: the browser sends the first codec of the answer's list,
-//! but may switch to any other the answer lists without renegotiating
-//! (RFC 3264 §7). The talk-back m-line lists only codecs that reach the
+//! but may change to any other the answer lists "on the fly", without a
+//! new offer (RFC 3264 §7). The talk-back m-line lists only codecs that reach the
 //! camera (Opus and both laws may all reach a G.711 backchannel), but a
 //! `sendrecv` one that also carries the downlink lists the stream
 //! audio's too. The

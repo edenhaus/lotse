@@ -2,7 +2,7 @@
 //! path, for an H.264 or an H.265 stream (Main or High tier). The payload
 //! type check refuses what would panic str0m, the engine answers the rest
 //! or returns an error, and a refused offer never reaches it. A session
-//! that answered then takes a re-offer (`webrtc/renegotiate`, RFC 8829
+//! that answered then takes a re-offer (`webrtc/reoffer`, RFC 8829
 //! §5.3), with or without the camera's backchannel and with the claim
 //! granted or busy, which it answers or refuses without panicking.
 //! Run with `cargo +nightly fuzz run sdp_offer` from the repository root.
@@ -181,6 +181,6 @@ fuzz_target!(|data: &[u8]| {
     // Answered or refused, the session goes on and takes the next one:
     // the same SDP again, as a browser repeating its offer sends it.
     for _ in 0..2 {
-        let _answer = session.renegotiate(Instant::now(), &reoffer, backchannel.clone(), claim);
+        let _answer = session.reoffer(Instant::now(), &reoffer, backchannel.clone(), claim);
     }
 });

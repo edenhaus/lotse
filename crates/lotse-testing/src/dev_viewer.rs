@@ -1157,9 +1157,7 @@ mod tests {
         // Talk stays disabled from the stop until the re-offer dropping
         // talk-back is answered: the browser takes one offer at a time.
         let disabled = stop.find("$(\"talk\").disabled = true;").expect(stop);
-        let reoffer = stop
-            .find(r#"await renegotiate("inactive", mine)"#)
-            .expect(stop);
+        let reoffer = stop.find(r#"await reoffer("inactive", mine)"#).expect(stop);
         let stale = reoffer
             + stop[reoffer..]
                 .find("if (mine !== attempt) return;")
@@ -1171,7 +1169,7 @@ mod tests {
         );
     }
 
-    /// Talk-back comes and goes by re-offer (`webrtc/renegotiate`, RFC
+    /// Talk-back comes and goes by re-offer (`webrtc/reoffer`, RFC
     /// 8829 §5.2.2): every Talk re-offers the m-line `sendonly`, Stop
     /// talking re-offers it `inactive`, which lets the backchannel go;
     /// nothing releases it by command. A declined claim (answered
@@ -1181,38 +1179,36 @@ mod tests {
     fn rfc8829_s5_2_2_talk_and_stop_re_offer_talk_back() {
         let page = PAGE;
         assert!(!page.contains("backchannel/release"), "no release command");
-        let renegotiate = page
-            .split("async function renegotiate(direction, mine)")
+        let reoffer = page
+            .split("async function reoffer(direction, mine)")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
-            .expect("renegotiate()");
-        let set = renegotiate
+            .expect("reoffer()");
+        let set = reoffer
             .find("transceiver.direction = direction;")
-            .expect(renegotiate);
-        let offer = renegotiate
-            .find("await peer.createOffer()")
-            .expect(renegotiate);
-        let local = renegotiate
+            .expect(reoffer);
+        let offer = reoffer.find("await peer.createOffer()").expect(reoffer);
+        let local = reoffer
             .find("await peer.setLocalDescription(offer)")
-            .expect(renegotiate);
-        let posted = renegotiate
-            .find(r#"call({ type: "webrtc/renegotiate", session_id: session, sdp: sent(offer.sdp) })"#)
-            .expect(renegotiate);
-        let remote = renegotiate
+            .expect(reoffer);
+        let posted = reoffer
+            .find(r#"call({ type: "webrtc/reoffer", session_id: session, sdp: sent(offer.sdp) })"#)
+            .expect(reoffer);
+        let remote = reoffer
             .find(
                 r#"await peer.setRemoteDescription({ type: "answer", sdp: answered.result.sdp })"#,
             )
-            .expect(renegotiate);
+            .expect(reoffer);
         assert!(
             set < offer && offer < local && local < posted && posted < remote,
-            "{renegotiate}"
+            "{reoffer}"
         );
         // Refused: rolled back, the transceiver as it was.
-        let refused = renegotiate
+        let refused = reoffer
             .split("if (!answered.success) {")
             .nth(1)
             .and_then(|rest| rest.split("\n  }").next())
-            .expect(renegotiate);
+            .expect(reoffer);
         assert!(
             refused.contains(r#"await peer.setLocalDescription({ type: "rollback" });"#)
                 && refused.contains("transceiver.direction = before;")
@@ -1221,8 +1217,8 @@ mod tests {
         );
         // Whether the answer gave the session the backchannel.
         assert!(
-            renegotiate.contains(r#"return transceiver.currentDirection === "sendonly";"#),
-            "{renegotiate}"
+            reoffer.contains(r#"return transceiver.currentDirection === "sendonly";"#),
+            "{reoffer}"
         );
         // The re-offer leaves out what Play's offer left out.
         assert!(page.contains("const sdp = sent(offer.sdp);"));
@@ -1242,7 +1238,7 @@ mod tests {
             .find("navigator.mediaDevices.getUserMedia({ audio: true })")
             .expect(start);
         let claim = start
-            .find(r#"await renegotiate("sendonly", mine)"#)
+            .find(r#"await reoffer("sendonly", mine)"#)
             .expect(start);
         let on = start
             .find("await transceiver.sender.replaceTrack(track)")
@@ -1250,7 +1246,7 @@ mod tests {
         assert!(mic < claim && claim < on, "{start}");
         assert!(!start.contains("currentDirection"), "{start}");
         assert!(
-            start.contains("\n  try {\n    claimed = await renegotiate(\"sendonly\", mine);"),
+            start.contains("\n  try {\n    claimed = await reoffer(\"sendonly\", mine);"),
             "the re-offer is unconditional: {start}"
         );
         let declined = &start[claim..on];
@@ -1271,9 +1267,7 @@ mod tests {
         let off = stop
             .find("await transceiver.sender.replaceTrack(null)")
             .expect(stop);
-        let drop = stop
-            .find(r#"await renegotiate("inactive", mine)"#)
-            .expect(stop);
+        let drop = stop.find(r#"await reoffer("inactive", mine)"#).expect(stop);
         assert!(off < held && held < drop, "{stop}");
         // A declined offer still leaves Talk usable, to ask again.
         let answered = page
@@ -1345,14 +1339,10 @@ mod tests {
         let cleared = play.find("declinedWhy = undefined;").expect(play);
         let offer = play.find("await peer.createOffer()").expect(play);
         assert!(cleared < offer, "{play}");
-        let renegotiate = body("async function renegotiate(direction, mine)");
-        let cleared = renegotiate
-            .find("declinedWhy = undefined;")
-            .expect(renegotiate);
-        let offer = renegotiate
-            .find("await peer.createOffer()")
-            .expect(renegotiate);
-        assert!(cleared < offer, "{renegotiate}");
+        let reoffer = body("async function reoffer(direction, mine)");
+        let cleared = reoffer.find("declinedWhy = undefined;").expect(reoffer);
+        let offer = reoffer.find("await peer.createOffer()").expect(reoffer);
+        assert!(cleared < offer, "{reoffer}");
         // Set nowhere else: the warning, Play and the re-offers.
         assert_eq!(page.matches("declinedWhy = ").count(), 3, "{page}");
     }

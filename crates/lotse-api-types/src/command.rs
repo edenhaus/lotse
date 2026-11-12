@@ -245,7 +245,7 @@ pub struct WebrtcCandidate {
     pub sdp_mline_index: Option<u32>,
 }
 
-/// `webrtc/renegotiate`: a re-offer for an answered session, taken only
+/// `webrtc/reoffer`: a re-offer for an answered session, taken only
 /// from the connection that owns it, answered in the result. Only the
 /// audio m-lines may change: one offered `sendonly`, or the downlink one
 /// offered `sendrecv`, asks for talk-back, and the answer says whether
@@ -261,7 +261,7 @@ pub struct WebrtcCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
-pub struct WebrtcRenegotiate {
+pub struct WebrtcReoffer {
     /// The command id.
     pub id: u64,
     /// The session.
@@ -546,12 +546,12 @@ pub enum Command {
     #[serde(rename = "webrtc/candidate")]
     #[cfg_attr(feature = "schema", schemars(title = "WebrtcCandidateCommand"))]
     WebrtcCandidate(WebrtcCandidate),
-    /// `webrtc/renegotiate`: a re-offer for an answered session, taken
+    /// `webrtc/reoffer`: a re-offer for an answered session, taken
     /// only from the connection that owns it; the result carries the
     /// answer.
-    #[serde(rename = "webrtc/renegotiate")]
-    #[cfg_attr(feature = "schema", schemars(title = "WebrtcRenegotiateCommand"))]
-    WebrtcRenegotiate(WebrtcRenegotiate),
+    #[serde(rename = "webrtc/reoffer")]
+    #[cfg_attr(feature = "schema", schemars(title = "WebrtcReofferCommand"))]
+    WebrtcReoffer(WebrtcReoffer),
     /// `session/get`: one session's state.
     #[serde(rename = "session/get")]
     #[cfg_attr(feature = "schema", schemars(title = "SessionGetCommand"))]
@@ -619,7 +619,7 @@ impl Command {
         "unsubscribe",
         "webrtc/offer",
         "webrtc/candidate",
-        "webrtc/renegotiate",
+        "webrtc/reoffer",
         "session/get",
         "session/list",
         "session/close",
@@ -650,7 +650,7 @@ impl Command {
             Self::Unsubscribe(c) => c.id,
             Self::WebrtcOffer(c) => c.id,
             Self::WebrtcCandidate(c) => c.id,
-            Self::WebrtcRenegotiate(c) => c.id,
+            Self::WebrtcReoffer(c) => c.id,
             Self::SessionGet(c) | Self::SessionClose(c) | Self::SessionAdopt(c) => c.id,
             Self::SessionList(c) => c.id,
             Self::BackchannelRelease(c) => c.id,
@@ -680,7 +680,7 @@ impl Command {
             Self::Unsubscribe(_) => "unsubscribe",
             Self::WebrtcOffer(_) => "webrtc/offer",
             Self::WebrtcCandidate(_) => "webrtc/candidate",
-            Self::WebrtcRenegotiate(_) => "webrtc/renegotiate",
+            Self::WebrtcReoffer(_) => "webrtc/reoffer",
             Self::SessionGet(_) => "session/get",
             Self::SessionList(_) => "session/list",
             Self::SessionClose(_) => "session/close",
@@ -874,9 +874,9 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             let mid = candidate.sdp_mid.as_deref().unwrap_or_default();
             cap_chars("sdp_mid", mid, MAX_TEXT_CHARS)?;
         }
-        Command::WebrtcRenegotiate(renegotiate) => {
-            cap_chars("session_id", &renegotiate.session_id, MAX_ID_CHARS)?;
-            cap_chars("sdp", &renegotiate.sdp, MAX_SDP_CHARS)?;
+        Command::WebrtcReoffer(reoffer) => {
+            cap_chars("session_id", &reoffer.session_id, MAX_ID_CHARS)?;
+            cap_chars("sdp", &reoffer.sdp, MAX_SDP_CHARS)?;
         }
         Command::SessionGet(session)
         | Command::SessionClose(session)
@@ -1076,8 +1076,8 @@ mod tests {
                 "webrtc/candidate",
             ),
             (
-                r#"{"id":13,"type":"webrtc/renegotiate","session_id":"01J8ZK","sdp":"v=0"}"#,
-                "webrtc/renegotiate",
+                r#"{"id":13,"type":"webrtc/reoffer","session_id":"01J8ZK","sdp":"v=0"}"#,
+                "webrtc/reoffer",
             ),
             (
                 r#"{"id":14,"type":"session/get","session_id":"s"}"#,
@@ -1166,30 +1166,30 @@ mod tests {
     }
 
     #[test]
-    fn a_renegotiation_names_its_session_and_carries_the_re_offer() {
+    fn a_reoffer_names_its_session_and_carries_its_sdp() {
         let_assert!(
-            Command::WebrtcRenegotiate(renegotiate) = parse_command(
-                r#"{"id":1,"type":"webrtc/renegotiate","session_id":"s1","sdp":"v=0\r\n"}"#
+            Command::WebrtcReoffer(reoffer) = parse_command(
+                r#"{"id":1,"type":"webrtc/reoffer","session_id":"s1","sdp":"v=0\r\n"}"#
             )
             .unwrap()
         );
         assert_eq!(
             (
-                renegotiate.id,
-                renegotiate.session_id.as_str(),
-                renegotiate.sdp.as_str()
+                reoffer.id,
+                reoffer.session_id.as_str(),
+                reoffer.sdp.as_str()
             ),
             (1, "s1", "v=0\r\n")
         );
         // Every field is required: a re-offer is for one session.
         for frame in [
-            r#"{"id":2,"type":"webrtc/renegotiate","sdp":"v=0"}"#,
-            r#"{"id":3,"type":"webrtc/renegotiate","session_id":"s1"}"#,
-            r#"{"id":4,"type":"webrtc/renegotiate","session_id":"s1","sdp":"v=0","stream_id":"x"}"#,
+            r#"{"id":2,"type":"webrtc/reoffer","sdp":"v=0"}"#,
+            r#"{"id":3,"type":"webrtc/reoffer","session_id":"s1"}"#,
+            r#"{"id":4,"type":"webrtc/reoffer","session_id":"s1","sdp":"v=0","stream_id":"x"}"#,
         ] {
             let err = parse_command(frame).unwrap_err();
             assert_eq!(err.error.code, ErrorCode::InvalidRequest, "{frame}");
-            assert_eq!(err.error.details["type"], "webrtc/renegotiate");
+            assert_eq!(err.error.details["type"], "webrtc/reoffer");
         }
     }
 
@@ -1429,7 +1429,7 @@ mod tests {
         let server = |urls: usize, url: usize, username: usize, credential: usize| json!({ "urls": vec![text(url); urls], "username": text(username), "credential": text(credential) });
         let offer = |sdp: usize, servers: Vec<serde_json::Value>| json!({ "id": 1, "type": "webrtc/offer", "stream_id": "a", "sdp": text(sdp), "ice_servers": servers });
         let candidate = |session: usize, candidate: usize, mid: usize| json!({ "id": 1, "type": "webrtc/candidate", "session_id": text(session), "candidate": text(candidate), "sdp_mid": text(mid) });
-        let renegotiate = |session: usize, sdp: usize| json!({ "id": 1, "type": "webrtc/renegotiate", "session_id": text(session), "sdp": text(sdp) });
+        let reoffer = |session: usize, sdp: usize| json!({ "id": 1, "type": "webrtc/reoffer", "session_id": text(session), "sdp": text(sdp) });
         let at_cap = server(MAX_ICE_URLS, MAX_TEXT_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS);
         let remove = |pin: usize| json!({ "id": 1, "type": "clients/remove", "pin": text(pin) });
         let pinned = |pin: usize| json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "protocol": "https", "url": "https://c/", "tls": { "pin": text(pin) } }] });
@@ -1439,7 +1439,7 @@ mod tests {
             pinned(MAX_PIN_CHARS),
             offer(MAX_SDP_CHARS, vec![at_cap.clone(); MAX_ICE_SERVERS]),
             candidate(MAX_ID_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS),
-            renegotiate(MAX_ID_CHARS, MAX_SDP_CHARS),
+            reoffer(MAX_ID_CHARS, MAX_SDP_CHARS),
         ];
         for frame in &accepted {
             assert!(limited(frame).is_ok(), "{}", frame["type"]);
@@ -1470,8 +1470,8 @@ mod tests {
             (candidate(MAX_ID_CHARS + 1, 1, 1), "session_id"),
             (candidate(1, MAX_TEXT_CHARS + 1, 1), "candidate"),
             (candidate(1, 1, MAX_TEXT_CHARS + 1), "sdp_mid"),
-            (renegotiate(MAX_ID_CHARS + 1, 1), "session_id"),
-            (renegotiate(1, MAX_SDP_CHARS + 1), "sdp"),
+            (reoffer(MAX_ID_CHARS + 1, 1), "session_id"),
+            (reoffer(1, MAX_SDP_CHARS + 1), "sdp"),
         ];
         for (frame, field) in &refused {
             let (named, message) = limited(frame).unwrap_err();

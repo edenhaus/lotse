@@ -383,7 +383,7 @@ pub struct StreamBackchannel {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TalkerReason {
-    /// A session's offer (`webrtc/offer` or `webrtc/renegotiate`) asked
+    /// A session's offer (`webrtc/offer` or `webrtc/reoffer`) asked
     /// for talk-back while nobody held the backchannel; it holds it now.
     Claimed,
     /// The talker's session closed; the backchannel is free.
@@ -391,9 +391,9 @@ pub enum TalkerReason {
     /// `backchannel/release` freed it; the next offer that asks for
     /// talk-back claims it.
     Released,
-    /// The talker's re-offer (`webrtc/renegotiate`) dropped talk-back;
+    /// The talker's re-offer (`webrtc/reoffer`) dropped talk-back;
     /// the backchannel is free.
-    Renegotiated,
+    Reoffered,
     /// The camera refused the talker's backchannel session, the session
     /// did not open in time, or its connection was lost while the talker
     /// held it: the backchannel is free, and the talker's session got a
@@ -413,7 +413,7 @@ impl TalkerReason {
             Self::Claimed => "claimed",
             Self::SessionClosed => "session_closed",
             Self::Released => "released",
-            Self::Renegotiated => "renegotiated",
+            Self::Reoffered => "reoffered",
             Self::Refused => "refused",
             Self::OptedOut => "opted_out",
         }
@@ -425,7 +425,7 @@ impl TalkerReason {
             Self::Claimed,
             Self::SessionClosed,
             Self::Released,
-            Self::Renegotiated,
+            Self::Reoffered,
             Self::Refused,
             Self::OptedOut,
         ]
@@ -745,7 +745,7 @@ mod tests {
             (TalkerReason::Claimed, "claimed"),
             (TalkerReason::SessionClosed, "session_closed"),
             (TalkerReason::Released, "released"),
-            (TalkerReason::Renegotiated, "renegotiated"),
+            (TalkerReason::Reoffered, "reoffered"),
             (TalkerReason::Refused, "refused"),
             (TalkerReason::OptedOut, "opted_out"),
         ] {

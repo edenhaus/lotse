@@ -1170,7 +1170,7 @@ impl State {
                 .is_some_and(|session| session.connection == id),
             TalkerReason::SessionClosed
             | TalkerReason::Released
-            | TalkerReason::Renegotiated
+            | TalkerReason::Reoffered
             | TalkerReason::Refused
             | TalkerReason::OptedOut => entry.talker.session.as_deref() == Some(session_id),
         };
@@ -2107,11 +2107,11 @@ mod tests {
         );
         let _claimed = front.try_recv().unwrap();
         assert_eq!(
-            state.talker_changed("c1", "s2", TalkerReason::Renegotiated, later),
+            state.talker_changed("c1", "s2", TalkerReason::Reoffered, later),
             None
         );
         assert_eq!(
-            state.talker_changed("c1", "s1", TalkerReason::Renegotiated, later),
+            state.talker_changed("c1", "s1", TalkerReason::Reoffered, later),
             Some(Talker {
                 session: None,
                 since: Some(later),
@@ -2120,7 +2120,7 @@ mod tests {
         let event = front.try_recv().unwrap().payload;
         assert_eq!(
             (&event["talker"], &event["reason"]),
-            (&serde_json::Value::Null, &serde_json::json!("renegotiated"))
+            (&serde_json::Value::Null, &serde_json::json!("reoffered"))
         );
         // The camera refuses s1's backchannel session: free again, from
         // s1 only.
