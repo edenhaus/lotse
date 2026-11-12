@@ -31,7 +31,7 @@ repos:
       - id: actionlint
   # The browser test's lint and format (tests/browser/); its settings are in its pyproject.toml.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.4 # the ruff in tests/browser/pyproject.toml; Renovate updates both in one PR
+    rev: v0.17.5 # the ruff in tests/browser/pyproject.toml; Renovate updates both in one PR
     hooks:
       - id: ruff-check
         files: ^tests/browser/
