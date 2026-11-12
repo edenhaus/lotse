@@ -37,7 +37,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -184,6 +184,8 @@ struct Handle {
     status: watch::Receiver<Option<SocketAddr>>,
     /// What sessions send from its relay candidates; TCP only.
     outbound: Option<mpsc::Sender<Outbound>>,
+    /// Set once the server answered any of the allocation's requests.
+    answered: Arc<AtomicBool>,
 }
 
 /// The allocations; see the module documentation.
@@ -237,6 +239,19 @@ impl TurnClient {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&(canonical(server), Transport::Tcp))
             .and_then(|handle| handle.outbound.clone())
+    }
+
+    /// Whether the server of the allocation on `server` over `transport`
+    /// answered any of its requests, a 401 challenge included (RFC 8656
+    /// §7.2, RFC 8489 §9.2): proof that the path to it carries that
+    /// transport. `false` while it has answered none, and when there is no
+    /// such allocation.
+    pub fn answered(&self, server: SocketAddr, transport: Transport) -> bool {
+        self.allocations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(canonical(server), transport))
+            .is_some_and(|handle| handle.answered.load(Ordering::Relaxed))
     }
 
     /// A lease on the allocation for `server` over `transport`, made with
@@ -589,6 +604,8 @@ struct Driver {
     _keep: mpsc::UnboundedSender<Command>,
     /// The relayed address, published.
     status: watch::Sender<Option<SocketAddr>>,
+    /// Set at the server's first answer ([`TurnClient::answered`]).
+    answered: Arc<AtomicBool>,
     /// Sessions waiting for the allocation.
     adds: Vec<(LeaseId, LeaseReply)>,
     /// Sessions waiting for a permission.
@@ -607,6 +624,7 @@ impl Driver {
     fn new(machine: Allocation, server: SocketAddr, clock: Arc<dyn Clock>) -> (Self, Handle) {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (status, watcher) = watch::channel(None);
+        let answered = Arc::new(AtomicBool::new(false));
         let driver = Self {
             machine,
             server,
@@ -614,6 +632,7 @@ impl Driver {
             commands: receiver,
             _keep: commands.clone(),
             status,
+            answered: Arc::clone(&answered),
             adds: Vec::new(),
             permits: Vec::new(),
             binds: Vec::new(),
@@ -626,6 +645,7 @@ impl Driver {
                 commands,
                 status: watcher,
                 outbound: None,
+                answered,
             },
         )
     }
@@ -736,7 +756,8 @@ impl Driver {
     /// A message from the server: on UDP the demux hands over only
     /// responses; on TCP what the server relays from a peer is unwrapped
     /// and routed as the peer's datagram, or discarded (RFC 8656 §11.4,
-    /// §12.6), and the rest is the server's own.
+    /// §12.6), and the rest is the server's own. A response to one of the
+    /// allocation's requests marks the server as having answered.
     fn input(&mut self, link: &mut Link, reply: &RawReply) {
         if let Link::Stream {
             peers,
@@ -756,8 +777,8 @@ impl Driver {
                 Relayed::Server => {}
             }
         }
-        if reply.from == self.server {
-            let _response = self.machine.handle_input(self.clock.now(), &reply.bytes);
+        if reply.from == self.server && self.machine.handle_input(self.clock.now(), &reply.bytes) {
+            self.answered.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1524,6 +1545,30 @@ mod tests {
                 turn.requests().iter().any(|r| r.method == REFRESH) && turn.allocations().is_empty()
             })
             .await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8656_7_2_an_allocation_knows_once_its_server_answered_even_the_challenge() {
+        bounded(async {
+            let setup = Setup::new().await;
+            let turn = setup.turn();
+            let udp = setup.server.udp_addr();
+            assert!(!setup.client.answered(udp, Transport::Udp), "no allocation");
+            // The first Allocate is lost: nothing answered yet.
+            turn.drop_requests(1);
+            let mut lease = pin!(setup.lease(Transport::Udp, "alice"));
+            until_dropped(turn, 1, lease.as_mut()).await;
+            assert!(!setup.client.answered(udp, Transport::Udp));
+            // The retransmission's 401 is an answer.
+            setup.clock.advance(Duration::from_millis(500));
+            let _lease = lease.await.unwrap();
+            assert!(setup.client.answered(udp, Transport::Udp));
+            assert!(
+                !setup.client.answered(udp, Transport::Tcp),
+                "another transport"
+            );
         })
         .await;
     }

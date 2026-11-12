@@ -1026,7 +1026,13 @@ impl Supervisor {
             let _handle = spawn_named("session.relay", async move {
                 let mut leased = |relayed| shared.lock().session_relayed(&id, serial, relayed);
                 tokio::select! {
-                    () = crate::gather::relay_all(&client, turn, &shared.hosts, &mut leased) => {}
+                    () = crate::gather::relay_all(
+                        &client,
+                        shared.clock.as_ref(),
+                        turn,
+                        &shared.hosts,
+                        &mut leased,
+                    ) => {}
                     () = deadline => {
                         tracing::debug!(
                             session.id = id,
@@ -5742,6 +5748,52 @@ mod tests {
             next(&mut events).await,
             json!({ "type": "candidate", "candidate": "" })
         );
+        shutdown_on(&s, &clock).await;
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_silent_udp_turn_server_s_tcp_twin_relays_before_the_deadline_rfc_7065_3_1() {
+        let dir = private_dir("relay-twin");
+        let (turn, server) = turn_server().await;
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, host) = with_turn_on(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let (tx, mut rx) = mpsc::channel(16);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        // A network that drops UDP to the server: its host and port over
+        // UDP never answer, over TCP they are the fake server's.
+        let address = server.tcp_addr();
+        let silent = tokio::net::UdpSocket::bind(address).await.unwrap();
+        let mut offer = offer(2, "front", Some("s1"));
+        offer["ice_servers"] = json!([{
+            "urls": [format!("turn:{address}"), format!("turn:{address}?transport=tcp")],
+            "username": "ha", "credential": "pw"
+        }]);
+        let mut events = subscription(call_on(&s, 1, &offer).await);
+        next(&mut events).await;
+        // The UDP attempt runs; its twin waits.
+        let mut buf = [0_u8; 1500];
+        let (_, from) = silent.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from, host);
+        assert_eq!(server.tcp_clients(), []);
+        // No answer over UDP within the delay: the twin starts alongside,
+        // long before the gather deadline.
+        clock.advance(crate::gather::TWIN_DELAY);
+        let_assert!(
+            DriverCommand::RelayCandidate {
+                relayed,
+                server: via,
+                tcp: true,
+                ..
+            } = next_command(&mut rx).await,
+            "the tcp twin's relay candidate"
+        );
+        assert_eq!(via, address);
+        let allocations = turn.allocations();
+        assert_eq!(allocations.len(), 1);
+        assert!(allocations[0].tcp);
+        assert_eq!(allocations[0].relayed, relayed);
         shutdown_on(&s, &clock).await;
         demux.stop();
     }

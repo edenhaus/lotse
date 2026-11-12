@@ -4,7 +4,8 @@
 //! a lease on each one's shared allocation over UDP or TCP, whose relayed
 //! address the worker's agent takes as a relay candidate. Every STUN
 //! server is asked at once; the TURN servers wait in a queue
-//! ([`RelayQueue`]) behind [`TURN_IN_FLIGHT`] attempts.
+//! ([`RelayQueue`]) behind [`TURN_IN_FLIGHT`] attempts, a UDP server with
+//! its TCP twin one entry ([`relay_entry`]).
 //!
 //! Implements RFC 7064 §3.1 (the `stun:` URI: host and optional port,
 //! default 3478), RFC 7065 §3.1 (the `turn:` URI: host, optional port,
@@ -18,12 +19,16 @@
 //! sends from it, so the worker makes its line.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::pin;
 use std::time::Duration;
 
+use futures_util::future::{Either, select};
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::session::{IceServer, SessionEvent, WarningCode};
+use lotse_core::clock::Clock;
 use lotse_core::secret::Secret;
 
 use crate::net::allocation::Transport;
@@ -62,9 +67,11 @@ pub(crate) const GATHER_DEADLINE: Duration = Duration::from_secs(4);
 /// named twice takes one place.
 pub(crate) const MAX_STUN_SERVERS: usize = 8;
 
-/// TURN attempts of a session in flight at once: an attempt that fails
-/// makes room for the next in line, one that yields a lease does not, so
-/// a session holds at most this many relay candidates.
+/// TURN entries of a session in flight at once: an entry that ends
+/// without a lease makes room for the next in line, one that yields a
+/// lease does not, so a session holds at most this many relay candidates.
+/// An entry is a server with its TCP twin, if any ([`TurnEntry`]): it
+/// takes one place while either of its attempts runs.
 ///
 /// TURN is queued, unlike STUN: an allocation is state and quota on the
 /// server, and a TURN failure is mostly fast (an error response, a TCP
@@ -72,14 +79,29 @@ pub(crate) const MAX_STUN_SERVERS: usize = 8;
 /// within [`GATHER_DEADLINE`].
 pub(crate) const TURN_IN_FLIGHT: usize = 4;
 
-/// TURN attempts per session in all, a TCP fallback included; the
-/// servers beyond it are ignored. Twice [`TURN_IN_FLIGHT`]: when the
+/// TURN entries per session in all, a UDP server and its TCP twin one;
+/// the servers beyond it are ignored. Twice [`TURN_IN_FLIGHT`]: when the
 /// first four fail fast, four more still run, and a list longer than that
 /// (it may name
 /// [`MAX_ICE_SERVERS`](lotse_api_types::limits::MAX_ICE_SERVERS) ×
 /// [`MAX_ICE_URLS`](lotse_api_types::limits::MAX_ICE_URLS) URLs) is no
 /// reason to let one offer open more allocations.
 pub(crate) const MAX_TURN_ATTEMPTS: usize = 8;
+
+/// How long a UDP attempt whose server has a TCP twin goes without any
+/// answer from the server before the twin starts alongside it.
+///
+/// A network that blocks UDP to the server mostly drops it silently, and
+/// the UDP attempt then fails only at its own timeout (RFC 8489 §6.2.1:
+/// 39.5 s), long after [`GATHER_DEADLINE`]; so the twin does not wait for
+/// that failure. No specification sets the delay: it is our choice, after
+/// the idea of RFC 8305's connection attempt delay (an analogy, not what
+/// is implemented). By 1 s the Allocate went out twice (§6.2.1: an RTO of
+/// 500 ms, sends at 0 and 0.5 s), and any answer, the 401 challenge
+/// included (RFC 8656 §7.2, RFC 8489 §9.2), proves the UDP path, so the
+/// twin then waits for that attempt to fail. A second leaves the twin's
+/// connection and its two round trips room within [`GATHER_DEADLINE`].
+pub(crate) const TWIN_DELAY: Duration = Duration::from_secs(1);
 
 /// Warnings an offer's `ice_servers` yield; the rest are logged. The
 /// session's queue must hold them with its `session` event before them
@@ -124,14 +146,15 @@ pub(crate) struct TurnServer {
 }
 
 /// A TURN server to allocate on, with the same server over TCP to try
-/// when this one, over UDP, fails.
+/// when this one, over UDP, is silent or fails ([`relay_entry`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnEntry {
     /// The server.
     pub(crate) server: TurnServer,
-    /// Its TCP twin, eligible only once this attempt failed; only a UDP
-    /// server has one.
-    pub(crate) fallback: Option<TurnServer>,
+    /// Its TCP twin, started alongside it once the server has not
+    /// answered over UDP within [`TWIN_DELAY`], else once this attempt
+    /// failed; only a UDP server has one.
+    pub(crate) twin: Option<TurnServer>,
 }
 
 /// What `ice_servers` asks of a session.
@@ -152,16 +175,18 @@ pub(crate) struct IcePlan {
 /// `turn:` entry without a username and credential is skipped: TURN asks
 /// for the long-term credential (RFC 8656 §5), and browsers refuse such an
 /// entry (W3C WebRTC 1.0 §4.2.1). A `turn:` over TCP whose host and port
-/// the list names over UDP too is that UDP server's fallback, whatever
-/// their order: both relay over UDP to the peer (§7.1), so the UDP
-/// allocation is enough when it works, and what a session sends through a
-/// TCP one passes through the supervisor, which owns the connection; but
-/// a network that blocks UDP to the server still reaches it over TCP. A
-/// UDP server has one fallback, the first such TCP entry; a second is
-/// ignored. A TCP entry without a UDP twin is an ordinary entry. A server
-/// named twice is one (a STUN one by host, ignoring ASCII case, and port).
-/// The servers keep their list order, the first [`MAX_STUN_SERVERS`] STUN and
-/// [`MAX_TURN_ATTEMPTS`] TURN ones (a fallback counted with its twin).
+/// the list names over UDP too is that UDP server's twin, whatever their
+/// order: both relay over UDP to the peer (§7.1), so the UDP allocation is
+/// enough when it works, and what a session sends through a TCP one
+/// passes through the supervisor, which owns the connection; but a
+/// network that blocks UDP to the server still reaches it over TCP. The
+/// twin starts only when the server is silent over UDP or that attempt
+/// failed ([`relay_entry`]). A UDP server has one twin, the first such
+/// TCP entry; a second is ignored. A TCP entry without a UDP twin is an
+/// ordinary entry. A server named twice is one (a STUN one by host,
+/// ignoring ASCII case, and port). The servers keep their list order,
+/// the first [`MAX_STUN_SERVERS`] STUN and [`MAX_TURN_ATTEMPTS`] TURN
+/// entries (a UDP server and its twin one).
 pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
     let mut plan = IcePlan::default();
     let mut turns: Vec<TurnServer> = Vec::new();
@@ -232,8 +257,8 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
 }
 
 /// `turns` in list order as entries, each TCP server whose host and port
-/// a UDP one names too as the fallback of the first such UDP server that
-/// has none yet; at most [`MAX_TURN_ATTEMPTS`] entries.
+/// a UDP one names too as the twin of the first such UDP server that has
+/// none yet; at most [`MAX_TURN_ATTEMPTS`] entries.
 fn turn_entries(turns: Vec<TurnServer>) -> Vec<TurnEntry> {
     let udp: Vec<StunServer> = turns
         .iter()
@@ -245,29 +270,26 @@ fn turn_entries(turns: Vec<TurnServer>) -> Vec<TurnEntry> {
     });
     let mut entries: Vec<TurnEntry> = plain
         .into_iter()
-        .map(|server| TurnEntry {
-            server,
-            fallback: None,
-        })
+        .map(|server| TurnEntry { server, twin: None })
         .collect();
     // A twin's host and port are named over UDP, so every entry naming
     // them is over UDP: a TCP one would be a twin itself.
     for twin in twins {
-        let free = entries.iter_mut().find(|entry| {
-            entry.fallback.is_none() && same_server(&entry.server.server, &twin.server)
-        });
+        let free = entries
+            .iter_mut()
+            .find(|entry| entry.twin.is_none() && same_server(&entry.server.server, &twin.server));
         if let Some(entry) = free {
             tracing::debug!(
                 host = twin.server.host,
                 port = twin.server.port,
-                "turn server over tcp named over udp too; tried when the udp one fails"
+                "turn server over tcp named over udp too; tried when the udp one is silent or fails"
             );
-            entry.fallback = Some(twin);
+            entry.twin = Some(twin);
         } else {
             tracing::debug!(
                 host = twin.server.host,
                 port = twin.server.port,
-                "turn server over tcp whose udp twin has its fallback already ignored"
+                "turn server over tcp whose udp server has a twin already ignored"
             );
         }
     }
@@ -281,20 +303,19 @@ fn turn_entries(turns: Vec<TurnServer>) -> Vec<TurnEntry> {
     entries
 }
 
-/// The order a session's TURN attempts start in: [`TURN_IN_FLIGHT`] at
-/// first, then one more each time one fails, a failed server's TCP
-/// fallback ahead of the servers not started yet; at most
-/// [`MAX_TURN_ATTEMPTS`] in all. An attempt that yields a lease starts
-/// none: its place stays taken by the relay candidate. The policy alone,
-/// without sockets; [`relay_all`] runs it.
+/// The order a session's TURN entries start in: [`TURN_IN_FLIGHT`] at
+/// first, then the next in list order each time one ends without a lease;
+/// at most [`MAX_TURN_ATTEMPTS`] in all. An entry is a server with its TCP
+/// twin, if any: it holds one place in flight and one of the total while
+/// either of its attempts runs, and its twin needs none of its own
+/// ([`relay_entry`]). An entry that yields a lease starts none: its place
+/// stays taken by the relay candidate. The policy alone, without sockets;
+/// [`relay_all`] runs it.
 #[derive(Debug)]
 pub(crate) struct RelayQueue {
-    /// The servers not started yet, in list order.
+    /// The entries not started yet, in list order.
     waiting: VecDeque<TurnEntry>,
-    /// The fallbacks of the servers that failed, in the order they
-    /// failed; each goes before [`Self::waiting`].
-    fallbacks: VecDeque<TurnServer>,
-    /// The attempts started, at most [`MAX_TURN_ATTEMPTS`].
+    /// The entries started, at most [`MAX_TURN_ATTEMPTS`].
     started: usize,
 }
 
@@ -303,12 +324,11 @@ impl RelayQueue {
     pub(crate) fn new(entries: Vec<TurnEntry>) -> Self {
         Self {
             waiting: entries.into(),
-            fallbacks: VecDeque::new(),
             started: 0,
         }
     }
 
-    /// The attempts to start at once, at most [`TURN_IN_FLIGHT`].
+    /// The entries to start at once, at most [`TURN_IN_FLIGHT`].
     pub(crate) fn first(&mut self) -> Vec<TurnEntry> {
         let mut first = Vec::new();
         while first.len() < TURN_IN_FLIGHT
@@ -319,35 +339,25 @@ impl RelayQueue {
         first
     }
 
-    /// An attempt failed, its `fallback` (if any) now eligible: the
-    /// attempt to start in its place, if one is left within the limit.
-    pub(crate) fn failed(&mut self, fallback: Option<TurnServer>) -> Option<TurnEntry> {
-        self.fallbacks.extend(fallback);
+    /// An entry ended without a lease, its twin's attempt included: the
+    /// entry to start in its place, if one is left within the limit.
+    pub(crate) fn failed(&mut self) -> Option<TurnEntry> {
         self.next()
     }
 
-    /// The next attempt in line: a fallback, else the next server; none
-    /// once [`MAX_TURN_ATTEMPTS`] started.
+    /// The next entry in line; none once [`MAX_TURN_ATTEMPTS`] started.
     fn next(&mut self) -> Option<TurnEntry> {
         if self.started >= MAX_TURN_ATTEMPTS {
-            if !self.fallbacks.is_empty() || !self.waiting.is_empty() {
+            if !self.waiting.is_empty() {
                 tracing::debug!(
                     limit = MAX_TURN_ATTEMPTS,
                     "turn attempt limit reached; the servers left are ignored"
                 );
-                self.fallbacks.clear();
                 self.waiting.clear();
             }
             return None;
         }
-        let next = self
-            .fallbacks
-            .pop_front()
-            .map(|server| TurnEntry {
-                server,
-                fallback: None,
-            })
-            .or_else(|| self.waiting.pop_front())?;
+        let next = self.waiting.pop_front()?;
         self.started = self.started.saturating_add(1);
         Some(next)
     }
@@ -480,15 +490,15 @@ pub(crate) struct Relayed {
     pub(crate) local: SocketAddr,
 }
 
-/// Leases the allocation on `server` over its transport (made with its
-/// credential if there is none yet), reached from the host address of the
-/// family it resolves to; `None` when that fails.
-pub(crate) async fn relay(
+/// Leases the allocation on `server` at `target`, as resolved, over its
+/// transport (made with its credential if there is none yet), its traffic
+/// leaving from the host address `local`; `None` when that fails.
+async fn lease(
     client: &TurnClient,
     server: &TurnServer,
-    hosts: &[SocketAddr],
+    target: SocketAddr,
+    local: SocketAddr,
 ) -> Option<Relayed> {
-    let (target, local) = reach(&server.server, hosts).await?;
     match client
         .lease(target, server.transport, &server.credentials)
         .await
@@ -500,36 +510,89 @@ pub(crate) async fn relay(
             local,
         }),
         Err(err) => {
-            tracing::warn!(server = %target, error = %err, "turn allocation failed");
+            tracing::warn!(server = %target, transport = ?server.transport, error = %err, "turn allocation failed");
             None
         }
     }
 }
 
-/// Runs a session's TURN attempts on `entries` in [`RelayQueue`]'s order,
-/// each reached from `hosts`, and hands each lease to `leased` as it
-/// comes; returns once no attempt is running or left to start. Dropping
-/// it drops the attempts running.
+/// `relayed` when it is a lease, else what `other`, the entry's other
+/// attempt, yields.
+async fn or_other(
+    relayed: Option<Relayed>,
+    other: impl Future<Output = Option<Relayed>>,
+) -> Option<Relayed> {
+    if relayed.is_some() {
+        return relayed;
+    }
+    tracing::debug!("turn attempt failed; its twin's attempt decides the entry");
+    other.await
+}
+
+/// One entry's attempts, reached from the host address of the family its
+/// server resolves to: a lease on its server, and for a UDP server with a
+/// TCP twin, on the twin at the same address. The twin starts alongside
+/// the UDP attempt once [`TWIN_DELAY`] passed on `clock` without any
+/// answer from the server over UDP ([`TurnClient::answered`]); when the
+/// server answered, or the UDP attempt failed sooner, it starts once that
+/// attempt failed. The first lease is the entry's: the other attempt is
+/// dropped with this future, and a lease its allocation grants later is
+/// released at once (nobody waits for it). `None` when no attempt yields
+/// one.
+pub(crate) async fn relay_entry(
+    client: &TurnClient,
+    clock: &dyn Clock,
+    entry: TurnEntry,
+    hosts: &[SocketAddr],
+) -> Option<Relayed> {
+    let TurnEntry { server, twin } = entry;
+    let (target, local) = reach(&server.server, hosts).await?;
+    let Some(twin) = twin else {
+        return lease(client, &server, target, local).await;
+    };
+    let mut first = pin!(lease(client, &server, target, local));
+    let second = pin!(lease(client, &twin, target, local));
+    let silent = tokio::select! {
+        relayed = &mut first => return or_other(relayed, second).await,
+        () = clock.sleep(TWIN_DELAY) => !client.answered(target, Transport::Udp),
+    };
+    if !silent {
+        tracing::debug!(server = %target, "turn server answered over udp; its tcp twin waits for that attempt to fail");
+        let relayed = first.await;
+        return or_other(relayed, second).await;
+    }
+    tracing::debug!(server = %target, delay = ?TWIN_DELAY, "no answer from the turn server over udp; its tcp twin started alongside");
+    match select(first, second).await {
+        Either::Left((relayed, other)) | Either::Right((relayed, other)) => {
+            or_other(relayed, other).await
+        }
+    }
+}
+
+/// Runs a session's TURN entries in [`RelayQueue`]'s order, each by
+/// [`relay_entry`] on `clock` and reached from `hosts`, and hands each
+/// lease to `leased` as it comes; returns once no entry is running or
+/// left to start. Dropping it drops the attempts running.
 pub(crate) async fn relay_all(
     client: &TurnClient,
+    clock: &dyn Clock,
     entries: Vec<TurnEntry>,
     hosts: &[SocketAddr],
     leased: &mut (dyn FnMut(Relayed) + Send),
 ) {
     let mut queue = RelayQueue::new(entries);
     let attempt = |entry: TurnEntry| async move {
-        let relayed = relay(client, &entry.server, hosts).await;
-        (relayed, entry)
+        let host = entry.server.server.host.clone();
+        (relay_entry(client, clock, entry, hosts).await, host)
     };
     let mut running: FuturesUnordered<_> = queue.first().into_iter().map(attempt).collect();
-    while let Some((relayed, entry)) = running.next().await {
+    while let Some((relayed, failed)) = running.next().await {
         if let Some(relayed) = relayed {
             leased(relayed);
-        } else if let Some(next) = queue.failed(entry.fallback) {
+        } else if let Some(next) = queue.failed() {
             tracing::debug!(
-                failed = entry.server.server.host,
+                failed,
                 next = next.server.server.host,
-                transport = ?next.server.transport,
                 "turn server failed; the next in line tried"
             );
             running.push(attempt(next));
@@ -547,8 +610,10 @@ mod tests {
 
     use std::net::UdpSocket;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use lotse_core::clock::SystemClock;
+    use lotse_core::clock::{FakeClock, SystemClock};
+    use lotse_testing::fake_turn::{ALLOCATE, FakeTurn, FakeTurnServer};
     use serde_json::json;
 
     use super::*;
@@ -683,7 +748,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Each entry's server and fallback as host, port and transport.
+    /// Each entry's server and twin as host, port and transport.
     fn named(plan: &IcePlan) -> Vec<(String, u16, Transport, Option<Transport>)> {
         plan.turn
             .iter()
@@ -692,9 +757,9 @@ mod tests {
                     entry.server.server.host.clone(),
                     entry.server.server.port,
                     entry.server.transport,
-                    entry.fallback.as_ref().map(|fallback| {
-                        assert!(same_server(&fallback.server, &entry.server.server));
-                        fallback.transport
+                    entry.twin.as_ref().map(|twin| {
+                        assert!(same_server(&twin.server, &entry.server.server));
+                        twin.transport
                     }),
                 )
             })
@@ -719,7 +784,7 @@ mod tests {
         ])
         .unwrap();
         // Named twice is one server; TCP to a server named over UDP too is
-        // the UDP one's fallback, whatever the order; TCP without a UDP
+        // the UDP one's twin, whatever the order; TCP without a UDP
         // twin is a server of its own; no credential, no server; no
         // warning.
         assert_eq!(
@@ -736,7 +801,7 @@ mod tests {
             "pw"
         );
         assert_eq!(plan.warnings, []);
-        // A UDP server has one fallback: a second TCP twin, with another
+        // A UDP server has one twin: a second TCP twin, with another
         // credential, is ignored; another UDP server of the same host and
         // port takes it.
         let plan = super::plan(&[
@@ -750,7 +815,7 @@ mod tests {
         );
         assert_eq!(
             plan.turn[0]
-                .fallback
+                .twin
                 .as_ref()
                 .unwrap()
                 .credentials
@@ -770,8 +835,8 @@ mod tests {
                 ("t1".to_owned(), 3478, Transport::Udp, Some(Transport::Tcp)),
             ]
         );
-        // The limit counts entries, a fallback with its twin, in list
-        // order.
+        // The limit counts entries, a UDP server with its twin one, in
+        // list order.
         let mut many: Vec<String> = (0..10)
             .map(|n| format!("turn:t{n}?transport=tcp"))
             .collect();
@@ -813,7 +878,7 @@ mod tests {
             (0..count)
                 .map(|n| TurnEntry {
                     server: turn(&format!("t{n}"), false),
-                    fallback: twinned.then(|| turn(&format!("t{n}"), true)),
+                    twin: twinned.then(|| turn(&format!("t{n}"), true)),
                 })
                 .collect(),
         )
@@ -841,11 +906,11 @@ mod tests {
         let mut queue = queue(10, false);
         assert_eq!(hosts(queue.first()), ["t0", "t1", "t2", "t3"]);
         for n in 4..MAX_TURN_ATTEMPTS {
-            assert_eq!(which(queue.failed(None)), Some((format!("t{n}"), false)));
+            assert_eq!(which(queue.failed()), Some((format!("t{n}"), false)));
         }
         // The total limit: the rest are never tried.
-        assert_eq!(which(queue.failed(None)), None);
-        assert_eq!(which(queue.failed(None)), None);
+        assert_eq!(which(queue.failed()), None);
+        assert_eq!(which(queue.failed()), None);
         assert!(queue.waiting.is_empty());
     }
 
@@ -854,47 +919,33 @@ mod tests {
         let mut queue = queue(6, false);
         assert_eq!(hosts(queue.first()), ["t0", "t1", "t2", "t3"]);
         // t0 and t1 yield leases and start nothing; t2 and t3 fail.
-        assert_eq!(which(queue.failed(None)), Some(("t4".into(), false)));
-        assert_eq!(which(queue.failed(None)), Some(("t5".into(), false)));
-        assert_eq!(which(queue.failed(None)), None);
-        assert_eq!(which(queue.failed(None)), None);
+        assert_eq!(which(queue.failed()), Some(("t4".into(), false)));
+        assert_eq!(which(queue.failed()), Some(("t5".into(), false)));
+        assert_eq!(which(queue.failed()), None);
+        assert_eq!(which(queue.failed()), None);
         let mut short = self::queue(2, false);
         assert_eq!(hosts(short.first()), ["t0", "t1"]);
-        assert_eq!(which(short.failed(None)), None);
+        assert_eq!(which(short.failed()), None);
         assert_eq!(RelayQueue::new(Vec::new()).first(), []);
     }
 
     #[test]
-    fn a_tcp_twin_runs_next_only_after_its_udp_twin_failed_rfc_7065_3_1() {
-        let mut queue = queue(6, true);
-        assert_eq!(hosts(queue.first()), ["t0", "t1", "t2", "t3"]);
-        // t1 over UDP fails: its TCP twin goes ahead of t4.
-        let t1 = turn("t1", true);
-        assert_eq!(which(queue.failed(Some(t1))), Some(("t1".into(), true)));
-        // Its TCP twin fails too: it has no fallback of its own.
-        assert_eq!(which(queue.failed(None)), Some(("t4".into(), false)));
-        assert_eq!(
-            which(queue.failed(Some(turn("t3", true)))),
-            Some(("t3".into(), true))
-        );
-        // The eighth attempt, the last: the total limit counts the
-        // fallbacks.
-        assert_eq!(which(queue.failed(None)), Some(("t5".into(), false)));
-        assert_eq!(which(queue.failed(Some(turn("t5", true)))), None);
-        assert!(queue.fallbacks.is_empty());
-        // t0 and t2 succeeded: their TCP twins never ran.
-    }
-
-    #[test]
-    fn fallbacks_wait_in_the_order_their_twins_failed() {
-        let mut queue = RelayQueue::new(Vec::new());
-        queue.fallbacks.push_back(turn("t1", true));
-        assert_eq!(
-            which(queue.failed(Some(turn("t0", true)))),
-            Some(("t1".into(), true))
-        );
-        assert_eq!(which(queue.failed(None)), Some(("t0".into(), true)));
-        assert_eq!(which(queue.failed(None)), None);
+    fn a_udp_server_and_its_tcp_twin_take_one_place_and_count_once_rfc_7065_3_1() {
+        let mut queue = queue(10, true);
+        let first = queue.first();
+        assert_eq!(hosts(first.clone()), ["t0", "t1", "t2", "t3"]);
+        // Each entry carries its twin: the queue never starts one alone.
+        assert!(first.iter().all(|entry| entry.twin.is_some()));
+        // Each entry that ends without a lease, its twin's attempt
+        // included, makes room for the next: all eight entries run.
+        for n in 4..MAX_TURN_ATTEMPTS {
+            let next = queue.failed().unwrap();
+            assert_eq!(next.server.server.host, format!("t{n}"));
+            assert_eq!(next.server.transport, Transport::Udp);
+            assert_eq!(next.twin.unwrap().transport, Transport::Tcp);
+        }
+        assert_eq!(which(queue.failed()), None);
+        assert!(queue.waiting.is_empty());
     }
 
     #[test]
@@ -983,6 +1034,344 @@ mod tests {
             None
         );
 
+        demux.stop();
+    }
+
+    /// A TURN client on a loopback socket, its timers on `clock`, with its
+    /// demux and the socket's address.
+    fn turn_client(clock: &Arc<FakeClock>) -> (TurnClient, Demux, SocketAddr) {
+        let bound = crate::net::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let local = bound.local;
+        let demux = Demux::start(
+            Arc::clone(&bound.socket),
+            local,
+            vec![local],
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        let client = TurnClient::new(
+            bound.socket,
+            &demux,
+            clock.clone(),
+            crate::net::allocation::AllocationConfig::default(),
+        );
+        (client, demux, local)
+    }
+
+    /// A fake TURN server knowing user `ha` with password `pw`.
+    fn fake_turn() -> Arc<FakeTurn> {
+        let turn = Arc::new(FakeTurn::new(
+            Arc::new(SystemClock),
+            "lotse.test",
+            Duration::from_secs(600),
+        ));
+        turn.add_user("ha", "pw");
+        turn
+    }
+
+    /// What a loopback UDP TURN server does with the requests it reads.
+    enum Udp {
+        /// Answers none.
+        Silent,
+        /// Answers only the first, as `turn` does.
+        First(Arc<FakeTurn>),
+        /// Answers each, as `turn` does.
+        Each(Arc<FakeTurn>),
+    }
+
+    /// A UDP socket on `port` of loopback doing `udp`; the datagrams it
+    /// read.
+    fn udp_server(port: u16, udp: Udp) -> Arc<AtomicUsize> {
+        let socket = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        let read = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&read);
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 1500];
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                let seen = count.fetch_add(1, Ordering::SeqCst);
+                let turn = match &udp {
+                    Udp::First(turn) if seen == 0 => turn,
+                    Udp::Each(turn) => turn,
+                    Udp::Silent | Udp::First(_) => continue,
+                };
+                if let Some(reply) = turn.handle(from, false, &buf[..n]) {
+                    let _sent = socket.send_to(&reply, from);
+                }
+            }
+        });
+        read
+    }
+
+    /// A TCP listener on loopback that closes each connection at once,
+    /// with a UDP socket on its port doing `udp`: a UDP server and its
+    /// TCP twin. The port, the datagrams read and the connections taken.
+    fn twin_ports(udp: Udp) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                count.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (port, udp_server(port, udp), accepted)
+    }
+
+    /// An entry for the server on `port` of loopback over UDP, with its
+    /// TCP twin, signing as `ha` with `password`.
+    fn twinned(port: u16, password: &str) -> TurnEntry {
+        let server = |tcp: bool| TurnServer {
+            server: StunServer {
+                host: "127.0.0.1".into(),
+                port,
+            },
+            transport: if tcp { Transport::Tcp } else { Transport::Udp },
+            credentials: Credentials {
+                username: "ha".into(),
+                password: Secret::new(password.into()),
+            },
+        };
+        TurnEntry {
+            server: server(false),
+            twin: Some(server(true)),
+        }
+    }
+
+    /// Polls `done` on real time for up to five seconds.
+    async fn eventually(mut done: impl FnMut() -> bool) {
+        let mut tries = 0;
+        while !done() {
+            assert!(tries < 1_000, "condition not reached");
+            tries += 1;
+            SystemClock.sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Runs `relay_all` on `entries` while `test` runs, moving `clock` by
+    /// `step` every 5 ms of real time once `test` is done, until both
+    /// end; the leases it yielded.
+    async fn run_relays(
+        client: &TurnClient,
+        clock: &FakeClock,
+        entries: Vec<TurnEntry>,
+        hosts: &[SocketAddr],
+        test: impl Future<Output = ()>,
+        step: Duration,
+    ) -> Vec<Relayed> {
+        let mut leases = Vec::new();
+        {
+            let mut push = |relayed| leases.push(relayed);
+            let mut relays = pin!(relay_all(client, clock, entries, hosts, &mut push));
+            let mut test = pin!(test);
+            let mut tested = false;
+            let ended = async {
+                loop {
+                    tokio::select! {
+                        () = &mut relays => break,
+                        () = &mut test, if !tested => tested = true,
+                        () = SystemClock.sleep(Duration::from_millis(5)), if tested => {
+                            clock.advance(step);
+                        }
+                    }
+                }
+                assert!(tested, "the queue ended before the test");
+            };
+            tokio::select! {
+                () = ended => {}
+                () = SystemClock.sleep(Duration::from_secs(10)) => panic!("the queue hung"),
+            }
+        }
+        leases
+    }
+
+    #[tokio::test]
+    async fn eight_twinned_turn_servers_failing_fast_are_all_tried_with_their_twins_rfc_7065_3_1() {
+        let clock = Arc::new(FakeClock::from_system());
+        let (client, demux, local) = turn_client(&clock);
+        // Each refuses the credential over UDP and closes the connection
+        // over TCP: both attempts of each entry fail at once, on a clock
+        // that stands still.
+        let turn = fake_turn();
+        let pairs: Vec<_> = (0..10)
+            .map(|_| twin_ports(Udp::Each(Arc::clone(&turn))))
+            .collect();
+        let entries = pairs
+            .iter()
+            .map(|(port, _, _)| twinned(*port, "wrong"))
+            .collect();
+        let leases = run_relays(&client, &clock, entries, &[local], async {}, Duration::ZERO).await;
+        assert!(leases.is_empty());
+        let tried: Vec<(bool, usize)> = pairs
+            .iter()
+            .map(|(_, read, accepted)| {
+                (
+                    read.load(Ordering::SeqCst) > 0,
+                    accepted.load(Ordering::SeqCst),
+                )
+            })
+            .collect();
+        let mut expected = vec![(true, 1); MAX_TURN_ATTEMPTS];
+        expected.extend([(false, 0); 2]);
+        assert_eq!(tried, expected);
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_udp_turn_server_that_answers_only_its_challenge_keeps_its_twin_waiting_rfc_8656_7_2()
+    {
+        let clock = Arc::new(FakeClock::from_system());
+        let (client, demux, local) = turn_client(&clock);
+        let turn = fake_turn();
+        let server = FakeTurnServer::start(Arc::clone(&turn)).await.unwrap();
+        // The 401 comes over UDP, then nothing: the path carries UDP, and
+        // the twin waits for that attempt to fail.
+        let address = server.tcp_addr();
+        let read = udp_server(address.port(), Udp::First(Arc::clone(&turn)));
+        let test = async {
+            eventually(|| client.answered(address, Transport::Udp)).await;
+            clock.advance(TWIN_DELAY);
+            SystemClock.sleep(Duration::from_millis(100)).await;
+            assert_eq!(server.tcp_clients(), [], "the twin waits");
+        };
+        // The UDP attempt times out (RFC 8489 §6.2.1: 39.5 s), and only then
+        // does the twin run.
+        let leases = run_relays(
+            &client,
+            &clock,
+            vec![twinned(address.port(), "pw")],
+            &[local],
+            test,
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(read.load(Ordering::SeqCst) > 1, "retransmitted");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].transport, Transport::Tcp);
+        assert_eq!(leases[0].server, address);
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_udp_turn_server_that_answers_needs_no_twin_rfc_8656_7_2() {
+        let clock = Arc::new(FakeClock::from_system());
+        let (client, demux, local) = turn_client(&clock);
+        let turn = fake_turn();
+        let server = FakeTurnServer::start(Arc::clone(&turn)).await.unwrap();
+        let address = server.udp_addr();
+        let leases = run_relays(
+            &client,
+            &clock,
+            vec![twinned(address.port(), "pw")],
+            &[local],
+            async {},
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(
+            (leases[0].transport, leases[0].server),
+            (Transport::Udp, address)
+        );
+        assert!(turn.requests().iter().all(|request| !request.tcp));
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_silent_udp_turn_server_whose_twin_fails_too_yields_nothing_rfc_8489_6_2_1() {
+        let clock = Arc::new(FakeClock::from_system());
+        let (client, demux, local) = turn_client(&clock);
+        let (port, read, accepted) = twin_ports(Udp::Silent);
+        let test = async {
+            eventually(|| read.load(Ordering::SeqCst) > 0).await;
+            clock.advance(TWIN_DELAY);
+            // The twin fails at once; the silent UDP attempt goes on.
+            eventually(|| accepted.load(Ordering::SeqCst) == 1).await;
+        };
+        let leases = run_relays(
+            &client,
+            &clock,
+            vec![twinned(port, "pw")],
+            &[local],
+            test,
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(leases.is_empty());
+        assert!(read.load(Ordering::SeqCst) > 1, "retransmitted");
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn when_both_twins_yield_a_lease_the_later_one_is_released_rfc_8656_8() {
+        let clock = Arc::new(FakeClock::from_system());
+        let (client, demux, local) = turn_client(&clock);
+        let turn = fake_turn();
+        let server = FakeTurnServer::start(Arc::clone(&turn)).await.unwrap();
+        // UDP to the server is held up at first, then gets through: a
+        // relay on the TCP twin's port, opened later.
+        let address = server.tcp_addr();
+        let relay = UdpSocket::bind(address).unwrap();
+        let open = Arc::new(AtomicBool::new(false));
+        let opened = Arc::clone(&open);
+        let read = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&read);
+        let to = server.udp_addr();
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 1500];
+            let mut client = None;
+            while let Ok((n, from)) = relay.recv_from(&mut buf) {
+                if from == to {
+                    if let Some(client) = client {
+                        let _sent = relay.send_to(&buf[..n], client);
+                    }
+                } else {
+                    client = Some(from);
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if opened.load(Ordering::SeqCst) {
+                        let _sent = relay.send_to(&buf[..n], to);
+                    }
+                }
+            }
+        });
+        let test = async {
+            // The twin starts alongside the silent UDP attempt and yields
+            // the entry's lease.
+            eventually(|| read.load(Ordering::SeqCst) > 0).await;
+            clock.advance(TWIN_DELAY);
+        };
+        let leases = run_relays(
+            &client,
+            &clock,
+            vec![twinned(address.port(), "pw")],
+            &[local],
+            test,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].transport, Transport::Tcp);
+        // The UDP allocation is granted later, to nobody: released, and
+        // with its last lease gone, deleted.
+        open.store(true, Ordering::SeqCst);
+        let allocate = |tcp: bool| {
+            turn.requests().iter().any(|request| {
+                request.method == ALLOCATE && request.error.is_none() && request.tcp == tcp
+            })
+        };
+        for _ in 0..1_000 {
+            if allocate(false) && turn.allocations().len() == 1 {
+                break;
+            }
+            clock.advance(Duration::from_millis(500));
+            SystemClock.sleep(Duration::from_millis(5)).await;
+        }
+        assert!(allocate(false) && allocate(true), "both yielded a lease");
+        let allocations = turn.allocations();
+        assert_eq!(allocations.len(), 1);
+        assert!(allocations[0].tcp);
+        assert_eq!(allocations[0].relayed, leases[0].lease.relayed());
         demux.stop();
     }
 }
