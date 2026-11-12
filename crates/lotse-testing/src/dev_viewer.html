@@ -692,13 +692,13 @@ function answeredTalkback() {
 }
 
 // Re-offers with the talk-back transceiver's direction set to `direction`
-// (webrtc/renegotiate, RFC 8829 §5.2.2) and applies the answer: true when
+// (webrtc/reoffer, RFC 8829 §5.2.2) and applies the answer: true when
 // the browser's side is sendonly then, the session holding the camera's
 // backchannel; false when the answer declined it (inactive). Each starts
 // without the last negotiation's decline reason. A re-offer
 // the daemon refused is rolled back, the session going on as it was, and
 // gives undefined, as does one a newer Play overtook.
-async function renegotiate(direction, mine) {
+async function reoffer(direction, mine) {
   const peer = pc;
   const transceiver = talkTransceiver;
   const session = sessionId;
@@ -709,7 +709,7 @@ async function renegotiate(direction, mine) {
   if (mine !== attempt) return undefined;
   await peer.setLocalDescription(offer);
   if (mine !== attempt) return undefined;
-  const answered = await call({ type: "webrtc/renegotiate", session_id: session, sdp: sent(offer.sdp) });
+  const answered = await call({ type: "webrtc/reoffer", session_id: session, sdp: sent(offer.sdp) });
   if (mine !== attempt) return undefined;
   if (!answered.success) {
     await peer.setLocalDescription({ type: "rollback" });
@@ -754,7 +754,7 @@ async function startTalking() {
   log("claiming the backchannel: re-offering talk-back");
   let claimed, failed;
   try {
-    claimed = await renegotiate("sendonly", mine);
+    claimed = await reoffer("sendonly", mine);
   } catch (err) {
     failed = err;
   }
@@ -778,7 +778,8 @@ async function startTalking() {
   try {
     await transceiver.sender.replaceTrack(track);
   } catch (err) {
-    // A track the m-line cannot take without renegotiating, say: the
+    // A track the m-line cannot take "without renegotiation" (W3C WebRTC
+    // 1.0, replaceTrack), say: the
     // microphone goes, and Talk comes back for this attempt only; a later
     // Play's controls stay as they are.
     for (const t of stream.getTracks()) t.stop();
@@ -822,7 +823,7 @@ async function stopTalking() {
   if (transceiver.currentDirection === "sendonly") {
     let held, failed;
     try {
-      held = await renegotiate("inactive", mine);
+      held = await reoffer("inactive", mine);
     } catch (err) {
       failed = err;
     }

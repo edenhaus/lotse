@@ -32,6 +32,7 @@ use lotse_core::clock::Clock;
 use lotse_core::secret::Secret;
 use lotse_core::task::BoxFuture;
 
+use crate::host_cache::HostSnapshot;
 use crate::net::allocation::Transport;
 use crate::net::credential::Credentials;
 use crate::net::stun_client::StunClient;
@@ -493,13 +494,16 @@ async fn reach(server: &StunServer, hosts: &[SocketAddr]) -> Option<(SocketAddr,
 /// Gathers from one server: resolves it, sends from the host address of
 /// the family it resolves to, and returns the mapped address with its
 /// base; `None` when that fails or the candidate is redundant (no NAT).
+/// `hosts` are of `generation`, whose mapping the client asks for
+/// (RFC 8445 §5.1.1.2: the candidate is relative to its base).
 pub(crate) async fn gather(
     client: &StunClient,
     server: &StunServer,
     hosts: &[SocketAddr],
+    generation: u64,
 ) -> Option<(SocketAddr, SocketAddr)> {
     let (target, base) = reach(server, hosts).await?;
-    let mapped = client.reflexive(target).await.ok()?;
+    let mapped = client.reflexive(target, generation).await.ok()?;
     if mapped == base {
         tracing::debug!(%mapped, "server-reflexive address equals its base; redundant");
         return None;
@@ -523,15 +527,18 @@ pub(crate) struct Relayed {
 
 /// Leases the allocation on `server` at `target`, as resolved, over its
 /// transport (made with its credential if there is none yet), its traffic
-/// leaving from the host address `local`; `None` when that fails.
+/// leaving from the host address `local` of `generation`, which a TCP
+/// allocation must have been connected on (RFC 8656 §5: an allocation is
+/// bound to its 5-tuple); `None` when that fails.
 async fn lease(
     client: &TurnClient,
     server: &TurnServer,
     target: SocketAddr,
     local: SocketAddr,
+    generation: u64,
 ) -> Option<Relayed> {
     match client
-        .lease(target, server.transport, &server.credentials)
+        .lease(target, server.transport, generation, &server.credentials)
         .await
     {
         Ok(lease) => Some(Relayed {
@@ -560,8 +567,9 @@ async fn or_other(
     other.await
 }
 
-/// One entry's attempts, reached from the host address of the family its
-/// server resolves to: a lease on its server, and for a UDP server with a
+/// One entry's attempts, reached from the host address among `hosts`, of
+/// `generation`, of the family its server resolves to: a lease on its
+/// server, and for a UDP server with a
 /// TCP twin, on the twin at the same address. The twin starts alongside
 /// the UDP attempt once [`TWIN_DELAY`] passed on `clock` without any
 /// answer from the server over UDP ([`TurnClient::answered`]); when the
@@ -575,17 +583,18 @@ pub(crate) async fn relay_entry(
     clock: &dyn Clock,
     entry: TurnEntry,
     hosts: &[SocketAddr],
+    generation: u64,
 ) -> Option<Relayed> {
     let TurnEntry { server, twin } = entry;
     let (target, local) = reach(&server.server, hosts).await?;
     let Some(twin) = twin else {
-        return lease(client, &server, target, local).await;
+        return lease(client, &server, target, local, generation).await;
     };
-    let mut first = pin!(lease(client, &server, target, local));
-    let second = pin!(lease(client, &twin, target, local));
+    let mut first = pin!(lease(client, &server, target, local, generation));
+    let second = pin!(lease(client, &twin, target, local, generation));
     let silent = tokio::select! {
         relayed = &mut first => return or_other(relayed, second).await,
-        () = clock.sleep(TWIN_DELAY) => !client.answered(target, Transport::Udp),
+        () = clock.sleep(TWIN_DELAY) => !client.answered(target, Transport::Udp, generation),
     };
     if !silent {
         tracing::debug!(server = %target, "turn server answered over udp; its tcp twin waits for that attempt to fail");
@@ -601,7 +610,8 @@ pub(crate) async fn relay_entry(
 }
 
 /// Runs a session's TURN entries in [`RelayQueue`]'s order, each by
-/// [`relay_entry`] on `clock` and reached from `hosts`, and hands each
+/// [`relay_entry`] on `clock` and reached from the session's `hosts`
+/// (their addresses, of their generation), and hands each
 /// lease to `leased` as it comes, until `deadline` (the session's
 /// [`GATHER_DEADLINE`]) passes. `false` once no entry is running or left
 /// to start, `true` when the deadline passed first and cut the queue
@@ -613,14 +623,15 @@ pub(crate) async fn relay_all(
     client: &TurnClient,
     clock: &dyn Clock,
     entries: Vec<TurnEntry>,
-    hosts: &[SocketAddr],
+    hosts: &HostSnapshot,
     mut deadline: BoxFuture<'static, ()>,
     leased: &mut (dyn FnMut(Relayed) + Send),
 ) -> bool {
     let mut queue = RelayQueue::new(entries);
     let attempt = |entry: TurnEntry| async move {
         let host = entry.server.server.host.clone();
-        (relay_entry(client, clock, entry, hosts).await, host)
+        let relayed = relay_entry(client, clock, entry, &hosts.hosts, hosts.generation).await;
+        (relayed, host)
     };
     let mut running: FuturesUnordered<_> = queue.first().into_iter().map(attempt).collect();
     loop {

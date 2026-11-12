@@ -8,7 +8,7 @@
 //! outcome (RFC 8829 §5.3.1, RFC 3264 §6.1: the talk-back m-line is
 //! answered `recvonly` or `sendrecv` when the session holds the
 //! backchannel, `inactive` or `sendonly` when not). A re-offer
-//! ([`Session::renegotiate`]) may change the audio m-lines only; the
+//! ([`Session::reoffer`]) may change the audio m-lines only; the
 //! video m-line is the one the session opened with (`VideoShape`).
 //!
 //! A session plays video when the offer has a video m-line (`video_mid`),
@@ -50,7 +50,7 @@ use lotse_core::media::{MediaPacket, RtpHeaderFields};
 use lotse_core::orientation::Orientation;
 use lotse_core::output::TalkbackJudge;
 use lotse_core::session::{
-    RenegotiateError, SessionEngine, SessionEvent, SessionLimits, SessionOpenError, SessionOutput,
+    ReofferError, SessionEngine, SessionEvent, SessionLimits, SessionOpenError, SessionOutput,
     SessionRequest, SessionStats, TalkbackClaim, TalkbackTarget, Transport,
 };
 use lotse_core::throttle::Throttle;
@@ -238,9 +238,9 @@ pub(crate) fn video_mid(offer: &str) -> Option<&str> {
 /// without it: one with a video m-line ([`video_mid`]), stopped or not,
 /// would need the video negotiated on a live engine, which the session
 /// does not do ([`VideoShape`]), so it is refused.
-fn check_no_video(offer: &str) -> Result<(), RenegotiateError> {
+fn check_no_video(offer: &str) -> Result<(), ReofferError> {
     match video_mid(offer) {
-        Some(_) => Err(RenegotiateError::VideoChanged("it adds one".to_owned())),
+        Some(_) => Err(ReofferError::VideoChanged("it adds one".to_owned())),
         None => Ok(()),
     }
 }
@@ -350,8 +350,8 @@ impl VideoShape {
     /// (str0m 0.24 marks such an m-line stopped and `inactive`), or, for
     /// a zero-padded port it does not read as zero, keep it live against
     /// the offer's stop (RFC 3264 §6, §8.2).
-    fn check(&self, offer: &str) -> Result<(), RenegotiateError> {
-        let shape = Self::of(offer, self.pt).ok_or(RenegotiateError::NoVideoTrack)?;
+    fn check(&self, offer: &str) -> Result<(), ReofferError> {
+        let shape = Self::of(offer, self.pt).ok_or(ReofferError::NoVideoTrack)?;
         let sdp = Sdp::parse(offer);
         let section = sdp
             .media()
@@ -369,7 +369,7 @@ impl VideoShape {
         } else {
             return Ok(());
         };
-        Err(RenegotiateError::VideoChanged(changed.to_owned()))
+        Err(ReofferError::VideoChanged(changed.to_owned()))
     }
 }
 
@@ -1181,7 +1181,7 @@ impl Session {
     }
 
     /// Answers the re-offer `offer` on the live engine
-    /// ([`SessionEngine::renegotiate`]): the audio m-lines are planned
+    /// ([`SessionEngine::reoffer`]): the audio m-lines are planned
     /// again ([`AudioPlan`]) for the `backchannel` the camera offers now
     /// and the worker's `claim` of it, talk-back on an m-line the engine
     /// answered before in the first codec it kept that the re-offer lists,
@@ -1202,16 +1202,14 @@ impl Session {
     /// candidates are not added: the browser trickled them, and the
     /// engine keeps its pairs (RFC 8829 §5.3.2: a subsequent answer
     /// keeps the transport).
-    fn renegotiate_offer(
+    fn answer_reoffer(
         &mut self,
         offer: &str,
         backchannel: Option<&TalkbackTarget>,
         claim: TalkbackClaim,
-    ) -> Result<String, RenegotiateError> {
+    ) -> Result<String, ReofferError> {
         if self.state == State::Closed {
-            return Err(RenegotiateError::InvalidSdp(
-                "the session is closed".to_owned(),
-            ));
+            return Err(ReofferError::InvalidSdp("the session is closed".to_owned()));
         }
         // What is no SDP at all is refused as such, before the video
         // m-line is looked for in it.
@@ -1224,7 +1222,7 @@ impl Session {
         // ([`prepare`]).
         check_payload_types(offer).map_err(|reason| {
             tracing::debug!(reason, "re-offer refused: payload types conflict");
-            RenegotiateError::InvalidSdp(reason)
+            ReofferError::InvalidSdp(reason)
         })?;
         let plan = AudioPlan::new(
             offer,
@@ -1245,7 +1243,7 @@ impl Session {
             .rtc
             .sdp_api()
             .accept_offer(sdp)
-            .map_err(|err| RenegotiateError::InvalidSdp(err.to_string()))?;
+            .map_err(|err| ReofferError::InvalidSdp(err.to_string()))?;
         let send = self
             .stream_audio
             .clone()
@@ -1292,7 +1290,7 @@ impl Session {
             audio = self.audio_on,
             talkback,
             candidates_ignored,
-            "session renegotiated"
+            "re-offer answered"
         );
         Ok(one_sync_group(&answer.to_sdp_string()))
     }
@@ -1535,14 +1533,14 @@ impl Session {
     }
 }
 
-/// A re-offer the SDP parser refuses, as [`RenegotiateError::InvalidSdp`]
+/// A re-offer the SDP parser refuses, as [`ReofferError::InvalidSdp`]
 /// with the parser's reason.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "`Result::map_err` hands the error over by value; one function for both parses"
 )]
-fn invalid_sdp(err: SdpError) -> RenegotiateError {
-    RenegotiateError::InvalidSdp(err.to_string())
+fn invalid_sdp(err: SdpError) -> ReofferError {
+    ReofferError::InvalidSdp(err.to_string())
 }
 
 /// Adds the host candidates to `rtc` and returns their `candidate` lines:
@@ -1822,7 +1820,7 @@ impl SessionEngine for Session {
     }
 
     /// The audio plan of the re-offer for the backchannel held, as
-    /// `Session::renegotiate_offer` makes it: for the stream audio and
+    /// `Session::answer_reoffer` makes it: for the stream audio and
     /// the codec order the session opened with, and the codecs the engine
     /// kept on the talk-back m-line (`AudioPlan::kept`, read now: only
     /// an answer changes them, and the worker answers no other re-offer
@@ -1848,15 +1846,15 @@ impl SessionEngine for Session {
         })
     }
 
-    fn renegotiate(
+    fn reoffer(
         &mut self,
         now: Instant,
         offer: &str,
         backchannel: Option<TalkbackTarget>,
         claim: TalkbackClaim,
-    ) -> Result<String, RenegotiateError> {
+    ) -> Result<String, ReofferError> {
         self.now = now;
-        self.renegotiate_offer(offer, backchannel.as_ref(), claim)
+        self.answer_reoffer(offer, backchannel.as_ref(), claim)
     }
 }
 
@@ -2408,7 +2406,7 @@ mod tests {
         for offer in [video.clone(), video.replace("m=video 9 ", "m=video 0 ")] {
             assert_eq!(
                 check_no_video(&offer),
-                Err(RenegotiateError::VideoChanged("it adds one".to_owned())),
+                Err(ReofferError::VideoChanged("it adds one".to_owned())),
                 "{offer}"
             );
         }
@@ -2478,12 +2476,12 @@ mod tests {
         ] {
             assert_eq!(
                 shape.check(&changed),
-                Err(RenegotiateError::VideoChanged(what.to_owned())),
+                Err(ReofferError::VideoChanged(what.to_owned())),
                 "{changed}"
             );
         }
         let audio_only = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=recvonly\r\n";
-        assert_eq!(shape.check(audio_only), Err(RenegotiateError::NoVideoTrack));
+        assert_eq!(shape.check(audio_only), Err(ReofferError::NoVideoTrack));
         assert_eq!(VideoShape::of(audio_only, 96), None);
         // A video m-line without a mid has no shape (RFC 8829 §5.2.1).
         assert_eq!(
@@ -2530,7 +2528,7 @@ mod tests {
         ] {
             assert_eq!(
                 shape.check(&offer(changed)),
-                Err(RenegotiateError::VideoChanged("its codecs".to_owned())),
+                Err(ReofferError::VideoChanged("its codecs".to_owned())),
                 "{changed}"
             );
         }
@@ -2560,7 +2558,7 @@ mod tests {
         for changed in ["H264/48000", "H265/90000"] {
             assert_eq!(
                 shape.check(&offer(changed)),
-                Err(RenegotiateError::VideoChanged("its codecs".to_owned())),
+                Err(ReofferError::VideoChanged("its codecs".to_owned())),
                 "{changed}"
             );
         }

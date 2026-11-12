@@ -669,10 +669,10 @@ impl InProcess {
 
     /// A re-offer for session `id`, whose answer [`Self::pump`] applies
     /// to its peer.
-    async fn renegotiate(&mut self, id: &str, sdp: &str) {
+    async fn reoffer(&mut self, id: &str, sdp: &str) {
         self.tx
             .send_msg(
-                &ToWorker::Renegotiate {
+                &ToWorker::Reoffer {
                     session_id: id.into(),
                     sdp: sdp.into(),
                 },
@@ -730,7 +730,7 @@ impl InProcess {
                             SessionEvent::Candidate { candidate, .. } => {
                                 peer.on_candidate(candidate);
                             }
-                            SessionEvent::Renegotiated { sdp, .. } => peer.on_answer(sdp),
+                            SessionEvent::ReofferAnswered { sdp, .. } => peer.on_answer(sdp),
                             _ => {}
                         }
                         self.events.push((session_id, event));
@@ -1316,7 +1316,7 @@ async fn rfc7587_4_1_an_opus_flood_forwarded_to_an_opus_camera_keeps_to_the_wall
     check_flood(&frames, sent, talked, 48_000);
 }
 
-/// A viewer playing the camera re-offers talk-back (`webrtc/renegotiate`
+/// A viewer playing the camera re-offers talk-back (`webrtc/reoffer`
 /// through the worker): the re-offer claims the backchannel, its answer
 /// takes the dedicated m-line in the camera's PCMU, and the browser's
 /// packets reach the camera through the RTSP source as frames in its
@@ -1339,17 +1339,17 @@ async fn onvif_5_3_a_re_offer_adds_talk_back_whose_tone_reaches_the_camera() {
         .viewer
         .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
         .expect("a re-offer");
-    worker.renegotiate("0", &reoffer).await;
-    let renegotiated = |events: &[(String, SessionEvent)]| {
+    worker.reoffer("0", &reoffer).await;
+    let reoffer_answered = |events: &[(String, SessionEvent)]| {
         events.iter().any(|(_, event)| {
-            matches!(event, SessionEvent::Renegotiated { talkback: Some(codec), .. } if codec == "pcmu")
+            matches!(event, SessionEvent::ReofferAnswered { talkback: Some(codec), .. } if codec == "pcmu")
         })
     };
     // ONVIF Streaming Specification §5.3: the answer waits for the
     // backchannel session's `PLAY`, on a connection of its own.
     worker
         .pump(&mut [&mut peer], |w, _| {
-            let answered = renegotiated(&w.events);
+            let answered = reoffer_answered(&w.events);
             assert!(
                 !answered || backchannel_session(&camera).is_some_and(|log| log.played),
                 "answered before the backchannel session played"
@@ -1375,11 +1375,11 @@ async fn onvif_5_3_a_re_offer_adds_talk_back_whose_tone_reaches_the_camera() {
     // Dropped: let go, and what the browser sends after it goes nowhere.
     let reoffer = peer.viewer.reoffer(Reoffer::Drop).expect("a re-offer");
     let answered = worker.events.len();
-    worker.renegotiate("0", &reoffer).await;
+    worker.reoffer("0", &reoffer).await;
     worker
         .pump(&mut [&mut peer], |w, _| {
             w.events[answered..].iter().any(|(_, event)| {
-                matches!(event, SessionEvent::Renegotiated { talkback: None, .. })
+                matches!(event, SessionEvent::ReofferAnswered { talkback: None, .. })
             })
         })
         .await;
@@ -1395,7 +1395,7 @@ async fn onvif_5_3_a_re_offer_adds_talk_back_whose_tone_reaches_the_camera() {
         .iter()
         .map(|change| (change.session_id.as_str(), change.reason.as_str()))
         .collect();
-    assert_eq!(changes, [("0", "claimed"), ("0", "renegotiated")]);
+    assert_eq!(changes, [("0", "claimed"), ("0", "reoffered")]);
     // The release tore the session down with `Require` and closed its
     // connection.
     let log = backchannel_session(&camera).unwrap();
@@ -1534,7 +1534,7 @@ async fn rfc2326_11_3_3_a_refused_backchannel_session_declines_and_the_next_re_o
         .viewer
         .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
         .expect("a re-offer");
-    worker.renegotiate("0", &reoffer).await;
+    worker.reoffer("0", &reoffer).await;
     let declined = |w: &InProcess| {
         w.events.iter().any(|(_, event)| {
             matches!(event, SessionEvent::TalkbackDeclined { reason, status: Some(453), .. } if reason == "refused")
@@ -1542,10 +1542,10 @@ async fn rfc2326_11_3_3_a_refused_backchannel_session_declines_and_the_next_re_o
     };
     worker.pump(&mut [&mut peer], |w, _| declined(w)).await;
     assert!(
-        worker
-            .events
-            .iter()
-            .any(|(_, event)| matches!(event, SessionEvent::Renegotiated { talkback: None, .. }))
+        worker.events.iter().any(|(_, event)| matches!(
+            event,
+            SessionEvent::ReofferAnswered { talkback: None, .. }
+        ))
     );
     assert_eq!(
         peer.viewer.talkback_direction(),
@@ -1566,13 +1566,13 @@ async fn rfc2326_11_3_3_a_refused_backchannel_session_declines_and_the_next_re_o
         .reoffer(Reoffer::Talkback(TalkbackOffer::Dedicated))
         .expect("a re-offer");
     let answered = worker.events.len();
-    worker.renegotiate("0", &reoffer).await;
+    worker.reoffer("0", &reoffer).await;
     worker
         .pump(&mut [&mut peer], |w, _| {
             w.events[answered..].iter().any(|(_, event)| {
                 matches!(
                     event,
-                    SessionEvent::Renegotiated {
+                    SessionEvent::ReofferAnswered {
                         talkback: Some(_),
                         ..
                     }
@@ -1898,6 +1898,7 @@ impl Api {
                 registrations: demux.registrations(),
                 hosts: bound.hosts,
                 tcp_hosts: vec![],
+                scan: None,
                 stun: None,
                 turn: None,
                 demux: Some(demux.stats()),
@@ -2054,12 +2055,12 @@ impl ApiPeer {
         }
     }
 
-    /// A re-offer of `what` through `webrtc/renegotiate`, its answer
+    /// A re-offer of `what` through `webrtc/reoffer`, its answer
     /// applied: the command's result.
-    async fn renegotiate(&mut self, api: &Api, what: Reoffer) -> Value {
+    async fn reoffer(&mut self, api: &Api, what: Reoffer) -> Value {
         let sdp = self.peer.viewer.reoffer(what).expect("a re-offer");
         let result = api
-            .call(&json!({ "id": 20, "type": "webrtc/renegotiate", "session_id": self.id, "sdp": sdp }))
+            .call(&json!({ "id": 20, "type": "webrtc/reoffer", "session_id": self.id, "sdp": sdp }))
             .await;
         self.peer
             .on_answer(result["sdp"].as_str().expect("the answer"));
@@ -2166,7 +2167,7 @@ async fn source_where(api: &mut Api, peers: &mut [&mut ApiPeer], want: &Value) -
 /// `recvonly`, the second is declined `busy`, answered `inactive` with
 /// one `backchannel_declined`; the holder going silent keeps it; closing
 /// the holder's session frees it for the next re-offer
-/// (`webrtc/renegotiate`), and so does `backchannel/release`, unless it
+/// (`webrtc/reoffer`), and so does `backchannel/release`, unless it
 /// names a session that no longer holds it; a re-offer that drops
 /// talk-back lets go. Each change is a `talker_changed`, and
 /// `session/get` and `stream/get` say who holds it; `stream/get`'s source
@@ -2252,7 +2253,7 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     pump_for(&mut api, &mut [&mut a, &mut b], Duration::from_millis(300)).await;
     assert_eq!(api.talker_changes().len(), 1, "{:?}", api.stream_seen);
     let answer = b
-        .renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+        .reoffer(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
         .await;
     assert!(answer["sdp"].as_str().unwrap().starts_with("v=0"));
     assert_eq!(
@@ -2273,7 +2274,7 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         api.talker_changes().len() >= 2
     })
     .await;
-    b.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+    b.reoffer(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
         .await;
     assert_eq!(
         b.peer.viewer.talkback_direction(),
@@ -2336,7 +2337,7 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     // The released session's next re-offer claims again, and its packets
     // flow again.
     let bytes_before = idle["bytes_sent"].as_u64().unwrap();
-    b.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+    b.reoffer(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
         .await;
     pump(&mut api, &mut [&mut a, &mut b], |api, _| {
         api.talker_changes().len() >= 5
@@ -2370,14 +2371,14 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
         bc["packets_received"].as_u64() == Some(u64::from(b_mic.index))
     })
     .await;
-    b.renegotiate(&api, Reoffer::Drop).await;
+    b.reoffer(&api, Reoffer::Drop).await;
     pump(&mut api, &mut [&mut a, &mut b], |api, _| {
         api.talker_changes().len() >= 6
     })
     .await;
     assert_eq!(
         api.talker_changes()[5],
-        ("b".to_owned(), "renegotiated".to_owned(), Value::Null)
+        ("b".to_owned(), "reoffered".to_owned(), Value::Null)
     );
     pump_for(
         &mut api,
@@ -2399,7 +2400,7 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     })
     .await;
     assert_eq!(c.peer.viewer.talkback_direction(), None);
-    c.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+    c.reoffer(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
         .await;
     assert_eq!(
         c.peer.viewer.talkback_direction(),
@@ -2423,7 +2424,7 @@ async fn two_viewers_claim_hold_and_free_the_backchannel_through_the_control_api
     let sdp = c.peer.viewer.offer().to_owned();
     for (connection, session) in [(2, "c"), (1, "ghost")] {
         let command = parse_command(
-            &json!({ "id": 30, "type": "webrtc/renegotiate", "session_id": session, "sdp": sdp })
+            &json!({ "id": 30, "type": "webrtc/reoffer", "session_id": session, "sdp": sdp })
                 .to_string(),
         )
         .unwrap();
@@ -2480,7 +2481,7 @@ async fn rfc3264_8_2_a_re_offer_that_stops_talk_back_with_its_direction_kept_fre
     );
     assert!(sdp.ends_with("\r\n") && sdp.contains("a=sendonly"), "{sdp}");
     let result = api
-        .call(&json!({ "id": 20, "type": "webrtc/renegotiate", "session_id": "a", "sdp": sdp }))
+        .call(&json!({ "id": 20, "type": "webrtc/reoffer", "session_id": "a", "sdp": sdp }))
         .await;
     let answer = result["sdp"].as_str().expect("the answer");
     let (_, answered) = answer.rsplit_once("m=audio ").expect("an audio m-line");
@@ -2493,13 +2494,13 @@ async fn rfc3264_8_2_a_re_offer_that_stops_talk_back_with_its_direction_kept_fre
     .await;
     assert_eq!(
         api.talker_changes()[1],
-        ("a".to_owned(), "renegotiated".to_owned(), Value::Null)
+        ("a".to_owned(), "reoffered".to_owned(), Value::Null)
     );
     assert_eq!(api.stream().await["backchannel"]["talker"], Value::Null);
     assert_eq!(api.session("a").await["backchannel"]["negotiated"], false);
 
     // b asks for talk-back and claims it.
-    b.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+    b.reoffer(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
         .await;
     assert_eq!(
         b.peer.viewer.talkback_direction(),
@@ -2581,7 +2582,7 @@ async fn rfc3551_4_5_14_talk_back_only_in_two_channel_pcmu_neither_claims_nor_ke
         dropped[at..].replacen("a=inactive", "a=sendonly", 1)
     ));
     assert!(sdp[at..].contains("a=sendonly"), "{sdp}");
-    api.call(&json!({ "id": 20, "type": "webrtc/renegotiate", "session_id": "b", "sdp": sdp }))
+    api.call(&json!({ "id": 20, "type": "webrtc/reoffer", "session_id": "b", "sdp": sdp }))
         .await;
     pump(&mut api, &mut [&mut a, &mut b], |api, peers| {
         api.talker_changes().len() >= 2 && peers[1].warnings("backchannel_declined") > 0
@@ -2589,7 +2590,7 @@ async fn rfc3551_4_5_14_talk_back_only_in_two_channel_pcmu_neither_claims_nor_ke
     .await;
     assert_eq!(
         api.talker_changes()[1],
-        ("b".to_owned(), "renegotiated".to_owned(), Value::Null)
+        ("b".to_owned(), "reoffered".to_owned(), Value::Null)
     );
     assert_eq!(api.stream().await["backchannel"]["talker"], Value::Null);
     let declined = b
@@ -2685,7 +2686,7 @@ async fn rfc8829_5_3_1_a_talk_only_session_beside_a_viewer_talks_to_the_camera()
         api.talker_changes().len() >= 2
     })
     .await;
-    u.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+    u.reoffer(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
         .await;
     assert_eq!(
         u.peer.viewer.talkback_direction(),
@@ -2811,7 +2812,7 @@ async fn onvif_5_3_1_opting_in_and_out_leaves_the_video_alone_and_frees_the_talk
             &json!({ "codec": "pcmu", "state": "available" }),
         )
         .await;
-        v.renegotiate(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
+        v.reoffer(&api, Reoffer::Talkback(TalkbackOffer::Dedicated))
             .await;
         assert_eq!(
             v.peer.viewer.talkback_direction(),

@@ -26,7 +26,7 @@ pub enum ErrorCode {
     /// No such stream.
     StreamNotFound,
     /// No such session, or its grace expired; for `webrtc/candidate` and
-    /// `webrtc/renegotiate`, also a session this connection does not own.
+    /// `webrtc/reoffer`, also a session this connection does not own.
     SessionNotFound,
     /// The session id is already open.
     SessionIdInUse,

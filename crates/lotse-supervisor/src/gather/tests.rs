@@ -469,25 +469,25 @@ async fn gathering_yields_srflx_only_behind_a_nat() {
         port: addr.port(),
     };
     assert_eq!(
-        gather(&client, &stun(natted), &[local]).await,
+        gather(&client, &stun(natted), &[local], 0).await,
         Some(("203.0.113.7:40000".parse().unwrap(), local))
     );
     // RFC 8445 §5.1.3: mapped == base is redundant.
-    assert_eq!(gather(&client, &stun(open), &[local]).await, None);
+    assert_eq!(gather(&client, &stun(open), &[local], 0).await, None);
     // No host of the server's family, an unresolvable name, silence.
     let v6 = StunServer {
         host: "[::1]".into(),
         port: 3478,
     };
-    assert_eq!(gather(&client, &v6, &[local]).await, None);
+    assert_eq!(gather(&client, &v6, &[local], 0).await, None);
     let unresolvable = StunServer {
         host: "stun.invalid".into(),
         port: 3478,
     };
-    assert_eq!(gather(&client, &unresolvable, &[local]).await, None);
+    assert_eq!(gather(&client, &unresolvable, &[local], 0).await, None);
     let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
     assert_eq!(
-        gather(&client, &stun(silent.local_addr().unwrap()), &[local]).await,
+        gather(&client, &stun(silent.local_addr().unwrap()), &[local], 0).await,
         None
     );
 
@@ -628,7 +628,11 @@ async fn run_relays(
     {
         let mut push = collect(&mut leases);
         let never = Box::pin(std::future::pending());
-        let mut relays = pin!(relay_all(client, clock, entries, hosts, never, &mut push));
+        let hosts = HostSnapshot {
+            hosts: hosts.to_vec(),
+            ..HostSnapshot::default()
+        };
+        let mut relays = pin!(relay_all(client, clock, entries, &hosts, never, &mut push));
         let mut test = pin!(test);
         let mut tested = false;
         let ended = async {
@@ -668,7 +672,10 @@ async fn a_lease_ready_just_as_the_gather_deadline_passes_is_released_not_handed
     {
         let mut push = collect(&mut leases);
         let deadline = clock.sleep(GATHER_DEADLINE);
-        let hosts = [local];
+        let hosts = HostSnapshot {
+            hosts: vec![local],
+            ..HostSnapshot::default()
+        };
         let mut relays = pin!(relay_all(
             &client,
             clock.as_ref(),
@@ -743,7 +750,7 @@ async fn a_udp_turn_server_that_answers_only_its_challenge_keeps_its_twin_waitin
     let address = server.tcp_addr();
     let read = udp_server(address.port(), Udp::First(Arc::clone(&turn)));
     let test = async {
-        eventually(|| client.answered(address, Transport::Udp)).await;
+        eventually(|| client.answered(address, Transport::Udp, 0)).await;
         clock.advance(TWIN_DELAY);
         SystemClock.sleep(Duration::from_millis(100)).await;
         assert_eq!(server.tcp_clients(), [], "the twin waits");
@@ -782,15 +789,15 @@ async fn a_session_joining_while_its_udp_allocation_is_deleted_unanswered_starts
     let entry = twinned(address.port(), "pw");
     let credentials = entry.server.credentials.clone();
     let earlier = client
-        .lease(address, Transport::Udp, &credentials)
+        .lease(address, Transport::Udp, 0, &credentials)
         .await
         .unwrap();
-    assert!(client.answered(address, Transport::Udp));
+    assert!(client.answered(address, Transport::Udp, 0));
     udp.drop_requests(usize::MAX);
     drop(earlier);
     eventually(|| udp.dropped() == 1).await;
     // The deleting allocation's answers do not count.
-    assert!(!client.answered(address, Transport::Udp));
+    assert!(!client.answered(address, Transport::Udp, 0));
     // The joining session's UDP attempt waits for the deletion; its
     // twin starts after TWIN_DELAY and yields the lease while the
     // clock stands there, well within the gather deadline.

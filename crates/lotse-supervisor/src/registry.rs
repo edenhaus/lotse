@@ -10,7 +10,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -37,10 +36,10 @@ use lotse_ipc::{
 use tokio::sync::{mpsc, watch};
 use tokio_util::task::TaskTracker;
 
-use crate::advertise::Advertisement;
 use crate::connect::ConnectPermits;
 use crate::driver::{Demand, DriverCommand, DriverSpec};
 use crate::gather::Relayed;
+use crate::host_cache::HostCache;
 use crate::memory::MemoryProbe;
 use crate::millis;
 use crate::net::allocation::Transport;
@@ -1184,7 +1183,7 @@ impl State {
                 .is_some_and(|session| session.connection == id),
             TalkerReason::SessionClosed
             | TalkerReason::Released
-            | TalkerReason::Renegotiated
+            | TalkerReason::Reoffered
             | TalkerReason::Refused
             | TalkerReason::OptedOut => entry.talker.session.as_deref() == Some(session_id),
         };
@@ -1608,14 +1607,11 @@ pub(crate) struct Shared {
     pub(crate) shutdown_budget: Duration,
     /// The connect permits every driver's attempts share.
     pub(crate) connects: ConnectPermits,
-    /// The host candidates' addresses every session answers with.
-    pub(crate) hosts: Vec<SocketAddr>,
-    /// The passive ICE-TCP host candidates' addresses; empty with the
-    /// listener off.
-    pub(crate) tcp_hosts: Vec<SocketAddr>,
-    /// What `webrtc.advertise` makes of every session: its candidates and
-    /// the host filter.
-    pub(crate) advertisement: Arc<Advertisement>,
+    /// The host addresses sessions answer with, and what follows from
+    /// them: the ICE-TCP ones and what `webrtc.advertise` makes of a
+    /// session, its candidates and the host filter; each offer takes the
+    /// current ones ([`HostCache::current`]).
+    pub(crate) hosts: Arc<HostCache>,
     /// The STUN client of srflx gathering; `None` without a front door.
     pub(crate) stun: Option<Arc<StunClient>>,
     /// The TURN client of relay gathering; `None` without a front door.
@@ -1708,6 +1704,8 @@ mod tests {
         clippy::missing_docs_in_private_items,
         reason = "test code"
     )]
+
+    use std::net::SocketAddr;
 
     use lotse_core::let_assert;
     use lotse_ipc::{TrackParams, TrackStats};
@@ -2121,11 +2119,11 @@ mod tests {
         );
         let _claimed = front.try_recv().unwrap();
         assert_eq!(
-            state.talker_changed("c1", "s2", TalkerReason::Renegotiated, later),
+            state.talker_changed("c1", "s2", TalkerReason::Reoffered, later),
             None
         );
         assert_eq!(
-            state.talker_changed("c1", "s1", TalkerReason::Renegotiated, later),
+            state.talker_changed("c1", "s1", TalkerReason::Reoffered, later),
             Some(Talker {
                 session: None,
                 since: Some(later),
@@ -2134,7 +2132,7 @@ mod tests {
         let event = front.try_recv().unwrap().payload;
         assert_eq!(
             (&event["talker"], &event["reason"]),
-            (&serde_json::Value::Null, &serde_json::json!("renegotiated"))
+            (&serde_json::Value::Null, &serde_json::json!("reoffered"))
         );
         // The camera refuses s1's backchannel session: free again, from
         // s1 only.

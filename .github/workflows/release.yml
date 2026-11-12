@@ -66,9 +66,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.11.6
+          version: 2026.11.7
           install_args: rust github:EmbarkStudios/cargo-about github:CycloneDX/cyclonedx-rust-cargo
           cache: false
       - run: mise run set-version "$VERSION"
@@ -162,9 +162,9 @@ jobs:
       # The pushed image, each platform, before it is attested: a HIGH or CRITICAL vulnerability
       # with a fix stops the release (scripts/scan-image.sh). Grype reads the registry with the
       # login above; mise installs it without its cache, as everything in this workflow.
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.11.6
+          version: 2026.11.7
           install_args: grype
           cache: false
       - name: Scan the pushed image

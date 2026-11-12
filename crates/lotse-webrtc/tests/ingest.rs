@@ -711,7 +711,8 @@ fn rfc8445_6_1_1_the_offerer_controls_connects_and_carries_the_negotiated_tracks
     pair.run(Duration::from_millis(500));
     assert!(!pair.engine.stats().data_channel_open);
     // One the camera opens itself is not the offer's: it opens nothing
-    // the engine counts (RFC 8832 §6, no renegotiation for a second).
+    // the engine counts (RFC 8832 §6: a second channel is opened in band,
+    // by its DATA_CHANNEL_OPEN message, not by an offer).
     let mut api = pair.camera().rtc.sdp_api();
     let theirs = api.add_channel("camera".into());
     assert!(api.apply().is_none());

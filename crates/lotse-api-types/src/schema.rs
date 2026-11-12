@@ -38,7 +38,7 @@ mod generator {
     use crate::info::{InfoResult, Metrics};
     use crate::pairing::PairingCreateResult;
     use crate::recording::{RecordingCreateResult, RecordingEvent};
-    use crate::session::{Session, SessionEvent, SessionList, WebrtcRenegotiateResult};
+    use crate::session::{Session, SessionEvent, SessionList, WebrtcReofferResult};
     use crate::signaling::SignalingEvent;
     use crate::stream::{
         BackchannelReleaseResult, Stream, StreamEvent, StreamList, StreamPutResult,
@@ -102,8 +102,8 @@ mod generator {
             results.insert(name.into(), reference::<Success<Empty>>(&mut generator));
         }
         results.insert(
-            "webrtc/renegotiate".into(),
-            reference::<Success<WebrtcRenegotiateResult>>(&mut generator),
+            "webrtc/reoffer".into(),
+            reference::<Success<WebrtcReofferResult>>(&mut generator),
         );
         results.insert(
             "session/get".into(),

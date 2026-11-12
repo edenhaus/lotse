@@ -529,13 +529,17 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
     assert_eq!(now.len(), 2);
     assert!(Arc::ptr_eq(&now[0], &v0) && Arc::ptr_eq(&now[1], &a0));
     assert_eq!((v0.epoch(), a0.epoch()), (1, 1));
-    // Subscribers see the loss, the epoch and the restore, then the new
-    // connection's frames, a keyframe first; the codec stays as it was.
+    // Subscribers see the loss and the epoch before the new connection's
+    // frames, a keyframe first, and the restore; the codec stays as it
+    // was. The restore is told once the runner sees the connection ready,
+    // which may be after the source published its first frames
+    // (`SourceRunner::run_once`), so it may come on either side of them.
     let mut control = Vec::new();
-    let first = loop {
+    let mut first = None;
+    while first.is_none() || !control.contains(&TrackEvent::SourceRestored) {
         match next_event(&mut sub).await {
             TrackEvent::Frame(frame) if frame.epoch == 0 => {}
-            TrackEvent::Frame(frame) => break frame,
+            TrackEvent::Frame(frame) => _ = first.get_or_insert(frame),
             TrackEvent::TrackChanged { codec, .. } if control.is_empty() => {
                 // The first attempt's in-band SPS, if subscribed before it.
                 assert!(
@@ -545,7 +549,8 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
             }
             event => control.push(event),
         }
-    };
+    }
+    let first = first.unwrap();
     assert_eq!(
         control,
         [

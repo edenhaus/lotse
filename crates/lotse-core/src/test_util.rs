@@ -20,7 +20,7 @@ use crate::recording::{
     RecordingError, RecordingMuxer, RecordingMuxerFactory, RecordingPolicy, RecordingTrack,
 };
 use crate::session::{
-    RenegotiateError, SessionEngine, SessionEvent, SessionOpenError, SessionOutput, SessionRequest,
+    ReofferError, SessionEngine, SessionEvent, SessionOpenError, SessionOutput, SessionRequest,
     SessionStats, TalkbackClaim, TalkbackTarget, Transport,
 };
 use crate::signaling::{
@@ -1406,7 +1406,7 @@ impl RecordingMuxer for FakeRecordingMuxer {
 /// when its codec is one a viewer can send and that reaches it; its
 /// engine then reports talk-back negotiated in that codec when the
 /// session holds the backchannel ([`TalkbackClaim::Granted`]). A re-offer
-/// is answered [`ECHO_RENEGOTIATED`] the same way, but `refuse` is
+/// is answered [`ECHO_REOFFER_ANSWER`] the same way, but `refuse` is
 /// invalid SDP and `no video` has no video m-line.
 #[derive(Debug)]
 pub struct EchoSessionFactory;
@@ -1415,7 +1415,7 @@ pub struct EchoSessionFactory;
 pub const ECHO_ANSWER: &str = "v=0 echo";
 
 /// The answer [`EchoEngine`] gives a re-offer.
-pub const ECHO_RENEGOTIATED: &str = "v=0 echo renegotiated";
+pub const ECHO_REOFFER_ANSWER: &str = "v=0 echo reoffer answer";
 
 /// The talk-back codec the echo negotiates for `offer` with
 /// `backchannel` under `claim`: the backchannel's own codec, when the
@@ -1736,28 +1736,28 @@ impl SessionEngine for EchoEngine {
         Box::new(move |backchannel| EchoSessionFactory.talkback_request(&offer, None, backchannel))
     }
 
-    /// Answers [`ECHO_RENEGOTIATED`] with ` backchannel=<codec>` when
+    /// Answers [`ECHO_REOFFER_ANSWER`] with ` backchannel=<codec>` when
     /// talk-back is negotiated now, which [`SessionEngine::talkback`]
     /// reports from then on; `refuse` is invalid SDP, `no video` has no
     /// video m-line.
-    fn renegotiate(
+    fn reoffer(
         &mut self,
         now: Instant,
         offer: &str,
         backchannel: Option<TalkbackTarget>,
         claim: TalkbackClaim,
-    ) -> Result<String, RenegotiateError> {
+    ) -> Result<String, ReofferError> {
         self.idle = now.checked_add(Duration::from_secs(3600)).unwrap_or(now);
         if offer == "refuse" {
-            return Err(RenegotiateError::InvalidSdp("refused by the echo".into()));
+            return Err(ReofferError::InvalidSdp("refused by the echo".into()));
         }
         if offer == "no video" {
-            return Err(RenegotiateError::NoVideoTrack);
+            return Err(ReofferError::NoVideoTrack);
         }
         self.talkback = echo_talkback(offer, backchannel.as_ref(), claim);
         Ok(match self.talkback {
-            Some(codec) => format!("{ECHO_RENEGOTIATED} backchannel={}", codec.name()),
-            None => ECHO_RENEGOTIATED.to_owned(),
+            Some(codec) => format!("{ECHO_REOFFER_ANSWER} backchannel={}", codec.name()),
+            None => ECHO_REOFFER_ANSWER.to_owned(),
         })
     }
 }
@@ -3201,35 +3201,35 @@ mod tests {
             takes: vec![UplinkCodec::Pcmu],
         };
         assert_eq!(
-            engine.renegotiate(
+            engine.reoffer(
                 now,
                 "v=0 talk",
                 Some(target.clone()),
                 TalkbackClaim::Granted
             ),
-            Ok(format!("{ECHO_RENEGOTIATED} backchannel=pcmu"))
+            Ok(format!("{ECHO_REOFFER_ANSWER} backchannel=pcmu"))
         );
         assert_eq!(engine.talkback(), Some(UplinkCodec::Pcmu));
         assert_eq!(
-            engine.renegotiate(now, "v=0", Some(target.clone()), TalkbackClaim::Granted),
-            Ok(ECHO_RENEGOTIATED.to_owned())
+            engine.reoffer(now, "v=0", Some(target.clone()), TalkbackClaim::Granted),
+            Ok(ECHO_REOFFER_ANSWER.to_owned())
         );
         assert_eq!(engine.talkback(), None);
         assert_eq!(
-            engine.renegotiate(now, "v=0 talk", Some(target), TalkbackClaim::Busy),
-            Ok(ECHO_RENEGOTIATED.to_owned())
+            engine.reoffer(now, "v=0 talk", Some(target), TalkbackClaim::Busy),
+            Ok(ECHO_REOFFER_ANSWER.to_owned())
         );
         assert_eq!(
-            engine.renegotiate(now, "refuse", None, TalkbackClaim::Granted),
-            Err(RenegotiateError::InvalidSdp("refused by the echo".into()))
+            engine.reoffer(now, "refuse", None, TalkbackClaim::Granted),
+            Err(ReofferError::InvalidSdp("refused by the echo".into()))
         );
         assert_eq!(
-            engine.renegotiate(now, "no video", None, TalkbackClaim::Granted),
-            Err(RenegotiateError::NoVideoTrack)
+            engine.reoffer(now, "no video", None, TalkbackClaim::Granted),
+            Err(ReofferError::NoVideoTrack)
         );
         let later = now + Duration::from_secs(7200);
         engine
-            .renegotiate(later, "v=0", None, TalkbackClaim::Granted)
+            .reoffer(later, "v=0", None, TalkbackClaim::Granted)
             .unwrap();
         assert_eq!(
             engine.poll(),

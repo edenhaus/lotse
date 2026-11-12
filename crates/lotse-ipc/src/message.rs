@@ -74,9 +74,9 @@ pub enum ToWorker {
         /// The `candidate:` line.
         candidate: String,
     },
-    /// A re-offer from the browser (`webrtc/renegotiate`); a
-    /// `Renegotiated` or `RenegotiateRefused` report answers it.
-    Renegotiate {
+    /// A re-offer from the browser (`webrtc/reoffer`); a
+    /// `ReofferAnswered` or `ReofferRefused` report answers it.
+    Reoffer {
         /// The session.
         session_id: String,
         /// The browser's SDP re-offer.
@@ -182,7 +182,7 @@ impl ToWorker {
             Self::ProbeConnectGranted { .. } => "probe_connect_granted",
             Self::OpenSession(_) => "open_session",
             Self::RemoteCandidate { .. } => "remote_candidate",
-            Self::Renegotiate { .. } => "renegotiate",
+            Self::Reoffer { .. } => "reoffer",
             Self::RelayCandidate { .. } => "relay_candidate",
             Self::RelayChannel { .. } => "relay_channel",
             Self::SessionOrientation { .. } => "session_orientation",
@@ -267,17 +267,17 @@ pub enum SessionEvent {
         /// `pcma`); `None` when talk-back is off.
         talkback: Option<String>,
     },
-    /// The answer to a re-offer (`Renegotiate`).
-    Renegotiated {
+    /// The answer to a re-offer (`Reoffer`).
+    ReofferAnswered {
         /// The SDP.
         sdp: String,
         /// The talk-back codec the answer negotiated (`opus`, `pcmu`,
         /// `pcma`); `None` when talk-back is off now.
         talkback: Option<String>,
     },
-    /// A re-offer (`Renegotiate`) was not applied; the session goes on
+    /// A re-offer (`Reoffer`) was not applied; the session goes on
     /// as it was.
-    RenegotiateRefused {
+    ReofferRefused {
         /// The error code (`invalid_sdp`, `no_video_track`).
         code: String,
         /// For humans.
@@ -285,7 +285,7 @@ pub enum SessionEvent {
     },
     /// The offer or re-offer asked for talk-back the session did not get:
     /// its talk-back m-line was answered without it. One per offer, after
-    /// its `Answer` or `Renegotiated`.
+    /// its `Answer` or `ReofferAnswered`.
     TalkbackDeclined {
         /// Why: `unsupported`, `busy` or `refused`.
         reason: String,
@@ -781,12 +781,12 @@ pub enum RecordingReport {
 
 /// A change of the connection's talker: the session it concerns, the new
 /// talker after `claimed`, the one that let go after `session_closed`,
-/// `released`, `renegotiated`, `refused` or `opted_out`, when the channel is free.
+/// `released`, `reoffered`, `refused` or `opted_out`, when the channel is free.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TalkerChange {
     /// The session.
     pub session_id: String,
-    /// `claimed`, `session_closed`, `released`, `renegotiated`,
+    /// `claimed`, `session_closed`, `released`, `reoffered`,
     /// `refused` or `opted_out`.
     pub reason: String,
     /// When, in milliseconds since the Unix epoch.
@@ -1214,14 +1214,14 @@ mod tests {
             },
             ToSupervisor::Session {
                 session_id: "s1".into(),
-                event: SessionEvent::Renegotiated {
+                event: SessionEvent::ReofferAnswered {
                     sdp: "v=0".into(),
                     talkback: None,
                 },
             },
             ToSupervisor::Session {
                 session_id: "s1".into(),
-                event: SessionEvent::RenegotiateRefused {
+                event: SessionEvent::ReofferRefused {
                     code: "invalid_sdp".into(),
                     message: "no".into(),
                 },
@@ -1241,7 +1241,7 @@ mod tests {
             );
         }
         for release in [
-            ToWorker::Renegotiate {
+            ToWorker::Reoffer {
                 session_id: "s1".into(),
                 sdp: "v=0".into(),
             },
@@ -1565,11 +1565,11 @@ mod tests {
                 "remote_candidate",
             ),
             (
-                ToWorker::Renegotiate {
+                ToWorker::Reoffer {
                     session_id: id(),
                     sdp: "v=0".into(),
                 },
-                "renegotiate",
+                "reoffer",
             ),
             (
                 ToWorker::RelayCandidate {

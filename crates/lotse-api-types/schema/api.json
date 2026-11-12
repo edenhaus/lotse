@@ -680,7 +680,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "`webrtc/renegotiate`: a re-offer for an answered session, taken\nonly from the connection that owns it; the result carries the\nanswer.",
+          "description": "`webrtc/reoffer`: a re-offer for an answered session, taken\nonly from the connection that owns it; the result carries the\nanswer.",
           "properties": {
             "id": {
               "description": "The command id.",
@@ -699,7 +699,7 @@
               "type": "string"
             },
             "type": {
-              "const": "webrtc/renegotiate",
+              "const": "webrtc/reoffer",
               "type": "string"
             }
           },
@@ -709,7 +709,7 @@
             "session_id",
             "sdp"
           ],
-          "title": "WebrtcRenegotiateCommand",
+          "title": "WebrtcReofferCommand",
           "type": "object"
         },
         {
@@ -1252,7 +1252,7 @@
         },
         {
           "const": "session_not_found",
-          "description": "No such session, or its grace expired; for `webrtc/candidate` and\n`webrtc/renegotiate`, also a session this connection does not own.",
+          "description": "No such session, or its grace expired; for `webrtc/candidate` and\n`webrtc/reoffer`, also a session this connection does not own.",
           "type": "string"
         },
         {
@@ -2484,7 +2484,7 @@
           "type": "object"
         },
         {
-          "description": "Non-fatal. Each code comes at most once per session, but `backchannel_declined`, which\ncomes once per offer (`webrtc/offer` or `webrtc/renegotiate`) that\nasked for talk-back the session did not get: the talk-back m-line\nwas answered `inactive` (or `sendonly` when it carries the\nstream's audio too, RFC 3264 §6.1), and `reason` says why.",
+          "description": "Non-fatal. Each code comes at most once per session, but `backchannel_declined`, which\ncomes once per offer (`webrtc/offer` or `webrtc/reoffer`) that\nasked for talk-back the session did not get: the talk-back m-line\nwas answered `inactive` (or `sendonly` when it carries the\nstream's audio too, RFC 3264 §6.1), and `reason` says why.",
           "properties": {
             "code": {
               "$ref": "#/$defs/WarningCode",
@@ -3786,7 +3786,7 @@
       ],
       "type": "object"
     },
-    "Success_for_WebrtcRenegotiateResult": {
+    "Success_for_WebrtcReofferResult": {
       "description": "A successful `result`: exactly one per command.",
       "properties": {
         "id": {
@@ -3796,7 +3796,7 @@
           "type": "integer"
         },
         "result": {
-          "$ref": "#/$defs/WebrtcRenegotiateResult",
+          "$ref": "#/$defs/WebrtcReofferResult",
           "description": "The command's result."
         },
         "success": {
@@ -3881,7 +3881,7 @@
       "oneOf": [
         {
           "const": "claimed",
-          "description": "A session's offer (`webrtc/offer` or `webrtc/renegotiate`) asked\nfor talk-back while nobody held the backchannel; it holds it now.",
+          "description": "A session's offer (`webrtc/offer` or `webrtc/reoffer`) asked\nfor talk-back while nobody held the backchannel; it holds it now.",
           "type": "string"
         },
         {
@@ -3895,8 +3895,8 @@
           "type": "string"
         },
         {
-          "const": "renegotiated",
-          "description": "The talker's re-offer (`webrtc/renegotiate`) dropped talk-back;\nthe backchannel is free.",
+          "const": "reoffered",
+          "description": "The talker's re-offer (`webrtc/reoffer`) dropped talk-back;\nthe backchannel is free.",
           "type": "string"
         },
         {
@@ -4139,8 +4139,8 @@
         }
       ]
     },
-    "WebrtcRenegotiateResult": {
-      "description": "`webrtc/renegotiate`'s result.",
+    "WebrtcReofferResult": {
+      "description": "`webrtc/reoffer`'s result.",
       "properties": {
         "sdp": {
           "description": "The SDP answer to the re-offer.",
@@ -4380,8 +4380,8 @@
     "webrtc/offer": {
       "$ref": "#/$defs/Success_for_Empty"
     },
-    "webrtc/renegotiate": {
-      "$ref": "#/$defs/Success_for_WebrtcRenegotiateResult"
+    "webrtc/reoffer": {
+      "$ref": "#/$defs/Success_for_WebrtcReofferResult"
     }
   },
   "shutdown": {
