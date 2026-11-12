@@ -44,6 +44,7 @@ use lotse_api_types::frame::Hello;
 use lotse_core::clock::Clock;
 use lotse_core::id::RecordingId;
 use lotse_core::task::{BoxFuture, spawn_named};
+use lotse_core::throttle::CallSites;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -126,6 +127,26 @@ pub const RECORDING_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// closed at accept, without a response. A TLS connection takes its place
 /// when it authenticates, and holds it while it waits for the serve loop.
 pub const MAX_PENDING_UPGRADES: u16 = 8;
+
+/// A limit whose warning a peer can make again and again, one per
+/// connection or command; each has its own rate limit in [`LimitLines`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Limit {
+    /// [`Config::max_connections`]: an upgrade refused.
+    Connections,
+    /// [`Config::max_subscriptions`]: a command refused.
+    Subscriptions,
+    /// [`MAX_PENDING_UPGRADES`]: a connection closed at accept.
+    PendingUpgrades,
+    /// [`UPGRADE_TIMEOUT`]: a connection closed before its upgrade.
+    UpgradeDeadline,
+}
+
+/// The rate limits of the [`Limit`] warnings, one for both listeners and
+/// every connection: the first of each is logged, then one summary per
+/// [`SUMMARY_INTERVAL`](lotse_core::throttle::SUMMARY_INTERVAL) with the
+/// count, so neither a local nor a TLS client floods the log.
+type LimitLines = CallSites<Limit>;
 
 /// A control connection, numbered from one for the daemon's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -268,6 +289,8 @@ struct AppState<H> {
     shutdown: CancellationToken,
     /// Times the closing handshake ([`CLOSE_TIMEOUT`]).
     clock: Arc<dyn Clock>,
+    /// The rate limits of the limit warnings.
+    limit_lines: Arc<LimitLines>,
     /// The TLS listener's pairing, for `pairing/create`; `None` without a
     /// listener.
     pairing: Option<Arc<pairing::Pairing>>,
@@ -291,6 +314,7 @@ impl<H> Clone for AppState<H> {
             next_id: Arc::clone(&self.next_id),
             shutdown: self.shutdown.clone(),
             clock: Arc::clone(&self.clock),
+            limit_lines: Arc::clone(&self.limit_lines),
             pairing: self.pairing.clone(),
             clients: self.clients.clone(),
             serving: self.serving.clone(),
@@ -372,6 +396,7 @@ impl Server {
         // Each queued connection holds one of `pending`'s permits, so the
         // queue never fills and a handshake task never waits to send.
         let (admitted, mut authenticated) = mpsc::channel(usize::from(MAX_PENDING_UPGRADES));
+        let limit_lines = Arc::new(LimitLines::new(Arc::clone(&clock)));
         let (tls, pairing, clients) = match self.tls {
             Some(bound) => {
                 let pairing = bound.pairing(Arc::clone(&clock));
@@ -392,6 +417,7 @@ impl Server {
                             clock: Arc::clone(&clock),
                             shutdown: shutdown.clone(),
                             upgrades: Arc::clone(&pending),
+                            limit_lines: Arc::clone(&limit_lines),
                             admitted,
                             store: bound.store,
                             pairing: Arc::clone(&pairing),
@@ -410,6 +436,7 @@ impl Server {
             next_id: Arc::new(AtomicU64::new(1)),
             shutdown: shutdown.clone(),
             clock: Arc::clone(&clock),
+            limit_lines,
             pairing,
             clients,
             serving: serving.token(),
@@ -461,6 +488,8 @@ struct Admission {
     pending: Arc<Semaphore>,
     /// Times the upgrade deadline.
     clock: Arc<dyn Clock>,
+    /// The rate limits of the limit warnings.
+    limit_lines: Arc<LimitLines>,
     /// Cancelled on graceful shutdown.
     shutdown: CancellationToken,
     /// Held by every connection's task until it ends, so the server's
@@ -479,6 +508,7 @@ impl Admission {
     /// upgrades.
     fn new<H: Handler>(state: AppState<H>, pending: Arc<Semaphore>) -> Self {
         let clock = Arc::clone(&state.clock);
+        let limit_lines = Arc::clone(&state.limit_lines);
         let shutdown = state.shutdown.clone();
         let serving = state.serving.clone();
         let clients = state.clients.clone();
@@ -503,6 +533,7 @@ impl Admission {
             http,
             pending,
             clock,
+            limit_lines,
             shutdown,
             serving,
             clients,
@@ -517,7 +548,7 @@ impl Admission {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let Some(slot) = upgrade_slot(&self.pending, &peer) else {
+        let Some(slot) = upgrade_slot(&self.pending, &peer, &self.limit_lines) else {
             return;
         };
         let body = recording::BodyWatch::new();
@@ -562,6 +593,7 @@ impl Admission {
                     slot,
                     body,
                     clock: Arc::clone(&self.clock),
+                    limit_lines: Arc::clone(&self.limit_lines),
                     serving: self.serving.clone(),
                     clients: self.clients.clone(),
                     next_id: Arc::clone(&self.next_id),
@@ -572,17 +604,22 @@ impl Admission {
 }
 
 /// A place among the [`MAX_PENDING_UPGRADES`] connections awaiting their
-/// upgrade, from `pending`, for `peer`; `None`, logged, when there is none
-/// and the connection is to be closed without a response.
+/// upgrade, from `pending`, for `peer`; `None`, logged rate-limited on
+/// `limit_lines`, when there is none and the connection is to be closed
+/// without a response.
 pub(crate) fn upgrade_slot(
     pending: &Arc<Semaphore>,
     peer: &PeerInfo,
+    limit_lines: &LimitLines,
 ) -> Option<OwnedSemaphorePermit> {
     let slot = Arc::clone(pending).try_acquire_owned().ok();
-    if slot.is_none() {
+    if slot.is_none()
+        && let Some(refused) = limit_lines.hit(Limit::PendingUpgrades)
+    {
         tracing::warn!(
             %peer,
             max = MAX_PENDING_UPGRADES,
+            refused,
             "control connection refused: too many connections awaiting the upgrade"
         );
     }
@@ -601,6 +638,8 @@ struct Accepted {
     body: recording::BodyWatch,
     /// Times a recording body's waits.
     clock: Arc<dyn Clock>,
+    /// The rate limits of the limit warnings.
+    limit_lines: Arc<LimitLines>,
     /// Held until the connection ends.
     serving: TaskTrackerToken,
     /// The TLS listener's clients, to close a recording body's connection once
@@ -628,6 +667,7 @@ async fn handshake(
         slot,
         body,
         clock,
+        limit_lines,
         serving: _serving,
         clients,
         next_id,
@@ -641,12 +681,15 @@ async fn handshake(
             false
         }
         () = deadline => {
-            let timeout_ms = UPGRADE_TIMEOUT.as_millis();
-            tracing::warn!(
-                %peer,
-                timeout_ms,
-                "control connection closed: no upgrade before the deadline"
-            );
+            if let Some(closed) = limit_lines.hit(Limit::UpgradeDeadline) {
+                let timeout_ms = UPGRADE_TIMEOUT.as_millis();
+                tracing::warn!(
+                    %peer,
+                    timeout_ms,
+                    closed,
+                    "control connection closed: no upgrade before the deadline"
+                );
+            }
             false
         }
         () = shutdown.cancelled() => {
@@ -768,6 +811,7 @@ mod tests {
         if shutting_down {
             shutdown.cancel();
         }
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
         AppState {
             handler: Arc::new(Minimal),
             config: Config {
@@ -781,7 +825,8 @@ mod tests {
             connections: Arc::new(AtomicU32::new(0)),
             next_id: Arc::new(AtomicU64::new(1)),
             shutdown,
-            clock: Arc::new(lotse_core::clock::FakeClock::default()),
+            limit_lines: Arc::new(LimitLines::new(clock.clone())),
+            clock,
             pairing: None,
             clients: None,
             serving: TaskTracker::new().token(),
@@ -850,6 +895,101 @@ mod tests {
             answer(state(1, false)).await,
             (101, serde_json::Value::Null)
         );
+    }
+
+    /// The lines logged to `logs` so far that contain `message`.
+    fn logged(logs: &pairing::test_support::Captured, message: &str) -> Vec<String> {
+        logs.text()
+            .lines()
+            .filter(|line| line.contains(message))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A client can ask past `max_connections` again and again: each
+    /// upgrade is refused, logged as the first, then one summary per
+    /// interval on the clock with the count since the last line.
+    #[tokio::test]
+    async fn upgrades_past_the_connection_limit_are_logged_rate_limited() {
+        let (logs, _guard) = pairing::test_support::capture();
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let state = AppState {
+            clock: Arc::<lotse_core::clock::FakeClock>::clone(&clock),
+            limit_lines: Arc::new(LimitLines::new(clock.clone())),
+            ..state(0, false)
+        };
+        let refused = (503, ErrorCode::LimitReached.as_str().into());
+        assert_eq!(answer(state.clone()).await, refused);
+        assert_eq!(answer(state.clone()).await, refused);
+        let lines = logged(&logs, "control connection refused: limit reached");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("refused=1"), "{lines:?}");
+        clock.advance(lotse_core::throttle::SUMMARY_INTERVAL);
+        assert_eq!(answer(state).await, refused);
+        let lines = logged(&logs, "control connection refused: limit reached");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].ends_with("refused=2"), "{lines:?}");
+    }
+
+    /// Any client of either listener can connect past
+    /// [`MAX_PENDING_UPGRADES`] again and again: each is closed, logged as
+    /// the first, then one summary per interval with the count.
+    #[test]
+    fn connections_past_the_pending_upgrades_are_logged_rate_limited() {
+        let (logs, _guard) = pairing::test_support::capture();
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let limit_lines = LimitLines::new(clock.clone());
+        let full = Arc::new(Semaphore::new(0));
+        let peer = PeerInfo::Unix { uid: 0, pid: None };
+        assert!(upgrade_slot(&full, &peer, &limit_lines).is_none());
+        assert!(upgrade_slot(&full, &peer, &limit_lines).is_none());
+        let message = "too many connections awaiting the upgrade";
+        let lines = logged(&logs, message);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("refused=1"), "{lines:?}");
+        clock.advance(lotse_core::throttle::SUMMARY_INTERVAL);
+        assert!(upgrade_slot(&full, &peer, &limit_lines).is_none());
+        let lines = logged(&logs, message);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].ends_with("refused=2"), "{lines:?}");
+    }
+
+    /// Any client can connect and never send its upgrade, again and again:
+    /// each is closed at the deadline, logged as the first, then one
+    /// summary per interval with the count. The deadline is the interval
+    /// long, so the third connection's is a summary's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connections_past_the_upgrade_deadline_are_logged_rate_limited() {
+        let (logs, _guard) = pairing::test_support::capture();
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let (reader, _producer) = tokio::io::duplex(64);
+        let (_report, written) = tokio::sync::oneshot::channel::<u64>();
+        let recording = RecordingBody {
+            reader: Box::new(reader),
+            written,
+        };
+        let (admission, _pending) = admission(&clock, recording).await;
+        let silent = || {
+            let (client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client
+        };
+        let message = "control connection closed: no upgrade before the deadline";
+        let _first = (silent(), silent());
+        settle().await;
+        clock.advance(UPGRADE_TIMEOUT);
+        settle().await;
+        let lines = logged(&logs, message);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("closed=1"), "{lines:?}");
+        assert_eq!(UPGRADE_TIMEOUT, lotse_core::throttle::SUMMARY_INTERVAL);
+        let _third = silent();
+        settle().await;
+        clock.advance(UPGRADE_TIMEOUT);
+        settle().await;
+        let lines = logged(&logs, message);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].ends_with("closed=2"), "{lines:?}");
     }
 
     /// A handler with one recording, whatever its id, whose body it hands out
@@ -945,6 +1085,7 @@ mod tests {
             next_id: state.next_id,
             shutdown: state.shutdown,
             clock: Arc::<lotse_core::clock::FakeClock>::clone(clock),
+            limit_lines: Arc::new(LimitLines::new(clock.clone())),
             pairing: None,
             clients: None,
             serving: state.serving,

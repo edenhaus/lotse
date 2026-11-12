@@ -585,30 +585,38 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
     }
     assert_eq!(running.handler.subscribers.lock().unwrap().len(), 1);
     assert_eq!(running.handler.sessions.lock().unwrap().len(), 1);
-    let refusals: Vec<String> = logs
-        .text()
-        .lines()
-        .filter(|line| line.contains("subscription limit of the connection reached"))
-        .map(str::to_owned)
-        .collect();
-    assert_eq!(refusals.len(), 5, "{refusals:?}");
-    assert!(
-        refusals[2].contains("id=5") && refusals[2].contains("session/adopt"),
-        "{refusals:?}"
-    );
-    assert!(refusals[3].contains("recording/create"), "{refusals:?}");
-    assert!(refusals[4].contains("signaling/subscribe"), "{refusals:?}");
+    // The client can repeat them at will: the first is logged, the rest
+    // counted until the interval is up, then summed up in one line.
+    let refusals = || -> Vec<String> {
+        logs.text()
+            .lines()
+            .filter(|line| line.contains("subscription limit of the connection reached"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let first = refusals();
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(first[0].contains("id=3") && first[0].contains("stream/subscribe"));
+    assert!(first[0].ends_with("refused=1"), "{first:?}");
+    running
+        .clock
+        .advance(lotse_core::throttle::SUMMARY_INTERVAL);
+    send(&mut ws, json!({ "id": 8, "type": "signaling/subscribe" })).await;
+    assert_eq!(recv(&mut ws).await["error"]["code"], "limit_reached");
+    let summary = refusals();
+    assert_eq!(summary.len(), 2, "{summary:?}");
+    assert!(summary[1].contains("id=8") && summary[1].ends_with("refused=5"));
     // Other commands are not affected.
-    send(&mut ws, json!({ "id": 8, "type": "info" })).await;
+    send(&mut ws, json!({ "id": 9, "type": "info" })).await;
     assert_eq!(recv(&mut ws).await["result"]["version"], "0.0.0-test");
 
     // The session's channel closes: its subscription ended and frees a slot.
     running.handler.sessions.lock().unwrap().clear();
-    send(&mut ws, json!({ "id": 9, "type": "ping" })).await;
+    send(&mut ws, json!({ "id": 10, "type": "ping" })).await;
     assert_eq!(recv(&mut ws).await["type"], "pong");
-    send(&mut ws, json!({ "id": 10, "type": "stream/subscribe" })).await;
-    assert_eq!(recv(&mut ws).await["success"], true);
     send(&mut ws, json!({ "id": 11, "type": "stream/subscribe" })).await;
+    assert_eq!(recv(&mut ws).await["success"], true);
+    send(&mut ws, json!({ "id": 12, "type": "stream/subscribe" })).await;
     assert_eq!(recv(&mut ws).await["error"]["code"], "limit_reached");
     ws.close(None).await.unwrap();
     running.finish().await;
