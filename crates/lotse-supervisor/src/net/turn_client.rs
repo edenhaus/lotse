@@ -252,13 +252,17 @@ impl TurnClient {
     /// again until the server answers its re-creation. One being deleted
     /// (§8.1, LIFETIME 0) is `false` too, its deletion's answer included:
     /// a session joining then waits for a new allocation, which has
-    /// answered nothing yet.
+    /// answered nothing yet. One whose task ended (its TCP connection
+    /// dropped, a Refresh timed out) is no allocation, though its handle
+    /// stays until the next lease prunes it.
     pub fn answered(&self, server: SocketAddr, transport: Transport) -> bool {
         self.allocations
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&(canonical(server), transport))
-            .is_some_and(|handle| handle.answered.load(Ordering::Relaxed))
+            .is_some_and(|handle| {
+                !handle.commands.is_closed() && handle.answered.load(Ordering::Relaxed)
+            })
     }
 
     /// A lease on the allocation for `server` over `transport`, made with
@@ -1735,6 +1739,31 @@ mod tests {
             .await;
             assert_eq!(turn.allocations().len(), 0, "deleted");
             assert!(!setup.client.answered(udp, Transport::Udp));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8656_3_1_an_allocation_whose_connection_dropped_has_no_answer() {
+        bounded(async {
+            let setup = Setup::new().await;
+            let tcp = setup.server.tcp_addr();
+            let lease = setup.lease(Transport::Tcp, "alice").await.unwrap();
+            assert!(setup.client.answered(tcp, Transport::Tcp));
+            // The connection drops: the task ends without a deletion, and
+            // its handle stays until the next lease.
+            setup.server.disconnect_tcp();
+            let mut status = lease.status();
+            status.wait_for(Option::is_none).await.unwrap();
+            eventually(|| {
+                let allocations = setup.client.allocations.lock().unwrap();
+                allocations
+                    .values()
+                    .all(|handle| handle.commands.is_closed())
+            })
+            .await;
+            assert_eq!(setup.client.allocations.lock().unwrap().len(), 1);
+            assert!(!setup.client.answered(tcp, Transport::Tcp));
         })
         .await;
     }
