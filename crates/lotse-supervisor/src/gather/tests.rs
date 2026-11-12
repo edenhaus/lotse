@@ -613,6 +613,15 @@ fn collect(leases: &mut Vec<Relayed>) -> impl FnMut(Relayed) + Send + '_ {
     move |relayed| leases.push(relayed)
 }
 
+/// The host addresses of a session: `local`, of `generation`.
+fn snapshot(local: SocketAddr, generation: u64) -> HostSnapshot {
+    HostSnapshot {
+        hosts: vec![local],
+        generation,
+        ..HostSnapshot::default()
+    }
+}
+
 /// Runs `relay_all` on `entries`, with no deadline, while `test` runs,
 /// moving `clock` by `step` every 5 ms of real time once `test` is
 /// done, until both end; the leases it yielded.
@@ -620,7 +629,7 @@ async fn run_relays(
     client: &TurnClient,
     clock: &FakeClock,
     entries: Vec<TurnEntry>,
-    hosts: &[SocketAddr],
+    hosts: &HostSnapshot,
     test: impl Future<Output = ()>,
     step: Duration,
 ) -> Vec<Relayed> {
@@ -628,11 +637,7 @@ async fn run_relays(
     {
         let mut push = collect(&mut leases);
         let never = Box::pin(std::future::pending());
-        let hosts = HostSnapshot {
-            hosts: hosts.to_vec(),
-            ..HostSnapshot::default()
-        };
-        let mut relays = pin!(relay_all(client, clock, entries, &hosts, never, &mut push));
+        let mut relays = pin!(relay_all(client, clock, entries, hosts, never, &mut push));
         let mut test = pin!(test);
         let mut tested = false;
         let ended = async {
@@ -672,10 +677,7 @@ async fn a_lease_ready_just_as_the_gather_deadline_passes_is_released_not_handed
     {
         let mut push = collect(&mut leases);
         let deadline = clock.sleep(GATHER_DEADLINE);
-        let hosts = HostSnapshot {
-            hosts: vec![local],
-            ..HostSnapshot::default()
-        };
+        let hosts = snapshot(local, 0);
         let mut relays = pin!(relay_all(
             &client,
             clock.as_ref(),
@@ -722,7 +724,15 @@ async fn eight_twinned_turn_servers_failing_fast_are_all_tried_with_their_twins_
         .iter()
         .map(|(port, _, _)| twinned(*port, "wrong"))
         .collect();
-    let leases = run_relays(&client, &clock, entries, &[local], async {}, Duration::ZERO).await;
+    let leases = run_relays(
+        &client,
+        &clock,
+        entries,
+        &snapshot(local, 0),
+        async {},
+        Duration::ZERO,
+    )
+    .await;
     assert!(leases.is_empty());
     let tried: Vec<(bool, usize)> = pairs
         .iter()
@@ -761,7 +771,7 @@ async fn a_udp_turn_server_that_answers_only_its_challenge_keeps_its_twin_waitin
         &client,
         &clock,
         vec![twinned(address.port(), "pw")],
-        &[local],
+        &snapshot(local, 0),
         test,
         Duration::from_millis(500),
     )
@@ -805,7 +815,15 @@ async fn a_session_joining_while_its_udp_allocation_is_deleted_unanswered_starts
         SystemClock.sleep(Duration::from_millis(50)).await;
         clock.advance(TWIN_DELAY);
     };
-    let leases = run_relays(&client, &clock, vec![entry], &[local], test, Duration::ZERO).await;
+    let leases = run_relays(
+        &client,
+        &clock,
+        vec![entry],
+        &snapshot(local, 0),
+        test,
+        Duration::ZERO,
+    )
+    .await;
     assert_eq!(leases.len(), 1);
     assert_eq!(
         (leases[0].transport, leases[0].server),
@@ -814,6 +832,53 @@ async fn a_session_joining_while_its_udp_allocation_is_deleted_unanswered_starts
     assert!(clock.now().duration_since(start) < GATHER_DEADLINE);
     // The deletion never got through: the UDP server still holds it.
     assert_eq!(udp.allocations().len(), 1);
+    demux.stop();
+}
+
+#[tokio::test]
+async fn a_udp_turn_server_silent_after_a_host_address_change_starts_its_twin_rfc_8656_8() {
+    let clock = Arc::new(FakeClock::from_system());
+    let start = clock.now();
+    let (client, demux, local) = turn_client(&clock);
+    let turn = fake_turn();
+    let server = FakeTurnServer::start(Arc::clone(&turn)).await.unwrap();
+    // The UDP server on the TCP twin's port answers an allocation of the
+    // host addresses at startup, then goes silent.
+    let address = server.tcp_addr();
+    let udp = fake_turn();
+    let _read = udp_server(address.port(), Udp::Each(Arc::clone(&udp)));
+    let entry = twinned(address.port(), "pw");
+    let credentials = entry.server.credentials.clone();
+    let _earlier = client
+        .lease(address, Transport::Udp, 0, &credentials)
+        .await
+        .unwrap();
+    assert!(client.answered(address, Transport::Udp, 0));
+    udp.drop_requests(usize::MAX);
+    // A session on changed host addresses: the Refresh that would
+    // confirm the shared allocation on them goes unanswered, so the
+    // answers over the old 5-tuple do not hold its twin back, which
+    // yields the lease while the clock stands at TWIN_DELAY.
+    let test = async {
+        eventually(|| udp.dropped() == 1).await;
+        assert!(!client.answered(address, Transport::Udp, 1));
+        clock.advance(TWIN_DELAY);
+    };
+    let leases = run_relays(
+        &client,
+        &clock,
+        vec![entry],
+        &snapshot(local, 1),
+        test,
+        Duration::ZERO,
+    )
+    .await;
+    assert_eq!(leases.len(), 1);
+    assert_eq!(
+        (leases[0].transport, leases[0].server),
+        (Transport::Tcp, address)
+    );
+    assert!(clock.now().duration_since(start) < GATHER_DEADLINE);
     demux.stop();
 }
 
@@ -828,7 +893,7 @@ async fn a_udp_turn_server_that_answers_needs_no_twin_rfc_8656_7_2() {
         &client,
         &clock,
         vec![twinned(address.port(), "pw")],
-        &[local],
+        &snapshot(local, 0),
         async {},
         Duration::ZERO,
     )
@@ -857,7 +922,7 @@ async fn a_silent_udp_turn_server_whose_twin_fails_too_yields_nothing_rfc_8489_6
         &client,
         &clock,
         vec![twinned(port, "pw")],
-        &[local],
+        &snapshot(local, 0),
         test,
         Duration::from_millis(500),
     )
@@ -909,7 +974,7 @@ async fn when_both_twins_yield_a_lease_the_later_one_is_released_rfc_8656_8() {
         &client,
         &clock,
         vec![twinned(address.port(), "pw")],
-        &[local],
+        &snapshot(local, 0),
         test,
         Duration::ZERO,
     )

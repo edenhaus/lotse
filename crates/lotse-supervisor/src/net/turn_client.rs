@@ -338,7 +338,11 @@ impl TurnClient {
     /// session joining then waits for a new allocation, which has answered
     /// nothing yet. One whose task ended (its TCP connection dropped, a
     /// Refresh timed out) is no allocation, though its handle stays until
-    /// the next lease prunes it.
+    /// the next lease prunes it. A UDP allocation, shared across
+    /// generations, counts as answered for a session of a newer generation
+    /// only once the Refresh that confirms it on that generation's 5-tuple
+    /// was answered (RFC 8656 §5, §8): from that session's join until then
+    /// it is `false`.
     pub fn answered(&self, server: SocketAddr, transport: Transport, generation: u64) -> bool {
         self.allocations
             .lock()
@@ -896,6 +900,20 @@ impl Driver {
         }
     }
 
+    /// A session joins on the host addresses of `generation`: when the
+    /// allocation exists and is not confirmed on that generation yet, the
+    /// answers so far came over a 5-tuple the new addresses may have moved
+    /// (RFC 8656 §5), so [`TurnClient::answered`] is cleared until the
+    /// server answers the Refresh that confirms it (§8), as
+    /// [`Self::track_answer`] then marks. Only a UDP allocation is shared
+    /// across generations; a TCP one is confirmed on its own once it
+    /// exists.
+    fn unanswered_on(&self, generation: u64) {
+        if self.machine.relayed().is_some() && generation > self.machine.confirmed() {
+            self.answered.store(false, Ordering::Relaxed);
+        }
+    }
+
     /// Writes what a session sends from the relay candidate to the server
     /// when it is one whole `ChannelData` message, padded (RFC 8656
     /// §12.5), from the relayed address, on a channel the server relays
@@ -951,6 +969,7 @@ impl Driver {
                 }
                 Some(lease) => {
                     self.adds.push((lease, generation, reply));
+                    self.unanswered_on(generation);
                     self.machine.confirm(now, generation);
                     self.grant_confirmed();
                 }
@@ -1956,6 +1975,32 @@ mod tests {
                 !setup.client.answered(udp, Transport::Tcp, 0),
                 "another transport"
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8656_8_a_udp_allocation_has_no_answer_for_a_new_generation_until_its_confirmation_is_answered()
+     {
+        bounded(async {
+            let setup = Setup::new().await;
+            let turn = setup.turn();
+            let udp = setup.server.udp_addr();
+            let _first = setup.lease(Transport::Udp, "alice").await.unwrap();
+            // Another session of the confirmed generation keeps the answer.
+            let _same = setup.lease(Transport::Udp, "bob").await.unwrap();
+            assert!(setup.client.answered(udp, Transport::Udp, 0));
+            // A session of a newer generation: the confirming Refresh is
+            // lost, and the answers over the old 5-tuple no longer count.
+            turn.drop_requests(1);
+            let mut newer = pin!(setup.lease_on(Transport::Udp, "bob", 1));
+            until_dropped(turn, 1, newer.as_mut()).await;
+            assert!(!setup.client.answered(udp, Transport::Udp, 1));
+            // The retransmission's answer confirms it, and counts.
+            setup.clock.advance(Duration::from_millis(500));
+            let _newer = newer.await.unwrap();
+            assert!(setup.client.answered(udp, Transport::Udp, 1));
+            assert_eq!(turn.allocations()[0].refreshes, 1);
         })
         .await;
     }
