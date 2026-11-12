@@ -54,7 +54,7 @@ use tracing::Instrument as _;
 use crate::advertise::Advertisement;
 use crate::connect::ConnectPermits;
 use crate::driver::{COMMAND_QUEUE, Demand, Driver, DriverCommand, DriverSpec};
-use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnServer};
+use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnEntry};
 use crate::memory::{Memory, MemoryProbe};
 use crate::net::demux::{DemuxStats, Registrations};
 use crate::net::stun_client::StunClient;
@@ -938,7 +938,12 @@ impl Supervisor {
             state.close_offer(&session_id, entry, &error, connection_state);
             return Ok(rx);
         }
-        entry.gathering(stun_servers.len().saturating_add(turn_servers.len()));
+        // Each STUN server is a gather, and the TURN queue one more.
+        entry.gathering(
+            stun_servers
+                .len()
+                .saturating_add(usize::from(!turn_servers.is_empty())),
+        );
         state.sessions.insert(session_id.clone(), entry);
         state.refresh_connection(&connection_id);
         drop(state);
@@ -960,7 +965,7 @@ impl Supervisor {
 
     /// The STUN and TURN servers of `ice` this front door has a client
     /// for.
-    fn gatherable(&self, ice: &mut IcePlan) -> (Vec<StunServer>, Vec<TurnServer>) {
+    fn gatherable(&self, ice: &mut IcePlan) -> (Vec<StunServer>, Vec<TurnEntry>) {
         let stun = std::mem::take(&mut ice.stun);
         let turn = std::mem::take(&mut ice.turn);
         (
@@ -977,16 +982,18 @@ impl Supervisor {
         )
     }
 
-    /// Gathers a server-reflexive candidate from each of `stun` and a
-    /// relay candidate from each of `turn` for session `serial`, and
-    /// releases end-of-candidates after [`GATHER_DEADLINE`] whatever they
-    /// did; a lease that comes later than that is released.
+    /// Gathers a server-reflexive candidate from each of `stun`, all at
+    /// once, and relay candidates from `turn` in their queue's order
+    /// ([`crate::gather::relay_all`]) for session `serial`, and releases
+    /// end-of-candidates after [`GATHER_DEADLINE`] whatever they did; the
+    /// TURN attempts still running then are dropped, and a lease that comes
+    /// later than that is released.
     fn start_gathering(
         &self,
         session_id: &str,
         serial: u64,
         stun: Vec<StunServer>,
-        turn: Vec<TurnServer>,
+        turn: Vec<TurnEntry>,
     ) {
         if self.shared.stun.is_none() && self.shared.turn.is_none() {
             return;
@@ -1008,19 +1015,27 @@ impl Supervisor {
                 });
             }
         }
-        if let Some(client) = &self.shared.turn {
-            for server in turn {
-                let client = Arc::clone(client);
-                let shared = Arc::clone(&self.shared);
-                let id = session_id.to_owned();
-                let _handle = spawn_named("session.relay", async move {
-                    let relayed = tokio::select! {
-                        relayed = crate::gather::relay(&client, &server, &shared.hosts) => relayed,
-                        () = shared.clock.sleep(GATHER_DEADLINE) => None,
-                    };
-                    shared.lock().session_relayed(&id, serial, relayed);
-                });
-            }
+        if let Some(client) = &self.shared.turn
+            && !turn.is_empty()
+        {
+            let client = Arc::clone(client);
+            let shared = Arc::clone(&self.shared);
+            let id = session_id.to_owned();
+            // The deadline counts from now, not from the task's first poll.
+            let deadline = shared.clock.sleep(GATHER_DEADLINE);
+            let _handle = spawn_named("session.relay", async move {
+                let mut leased = |relayed| shared.lock().session_relayed(&id, serial, relayed);
+                tokio::select! {
+                    () = crate::gather::relay_all(&client, turn, &shared.hosts, &mut leased) => {}
+                    () = deadline => {
+                        tracing::debug!(
+                            session.id = id,
+                            "turn attempts still running at the gather deadline dropped"
+                        );
+                    }
+                }
+                shared.lock().session_relays_done(&id, serial);
+            });
         }
         let id = session_id.to_owned();
         self.shared
@@ -5110,7 +5125,8 @@ mod tests {
     }
 
     /// [`with_webrtc`] with a STUN client on a loopback socket and its
-    /// demux; the host address is the socket's.
+    /// demux; the host address is the socket's. It has a TURN client too,
+    /// which an offer without `turn:` servers leaves idle.
     fn with_stun(binary: &str, clock: Arc<dyn Clock>) -> (Supervisor, crate::net::demux::Demux) {
         with_stun_advertising(binary, clock, Vec::new())
     }
@@ -5134,12 +5150,17 @@ mod tests {
             hosts: bound.hosts,
             tcp_hosts: vec![],
             stun: Some(Arc::new(StunClient::new(
-                bound.socket,
+                Arc::clone(&bound.socket),
                 demux.responses(),
                 Arc::clone(&clock),
                 crate::net::stun_client::StunClientConfig::default(),
             ))),
-            turn: None,
+            turn: Some(Arc::new(TurnClient::new(
+                bound.socket,
+                &demux,
+                Arc::clone(&clock),
+                crate::net::allocation::AllocationConfig::default(),
+            ))),
             demux: Some(demux.stats()),
         };
         let mut settings = session_settings();
@@ -5364,6 +5385,7 @@ mod tests {
         assert_eq!(next(&mut events).await["type"], "answer");
         report(&s, "s1", end_of_candidates());
         tokio::task::yield_now().await;
+        // Not released by the TURN client either, which has no server.
         assert!(events.try_recv().is_err(), "held while the gather runs");
         clock.advance(GATHER_DEADLINE);
         assert_eq!(
@@ -5377,7 +5399,14 @@ mod tests {
     /// [`with_webrtc`] with a TURN client on a loopback socket and its
     /// demux, and that socket's host address.
     fn with_turn(binary: &str) -> (Supervisor, crate::net::demux::Demux, SocketAddr) {
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        with_turn_on(binary, Arc::new(SystemClock))
+    }
+
+    /// [`with_turn`] on `clock`.
+    fn with_turn_on(
+        binary: &str,
+        clock: Arc<dyn Clock>,
+    ) -> (Supervisor, crate::net::demux::Demux, SocketAddr) {
         let bound = crate::net::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
         let demux = crate::net::demux::Demux::start(
             Arc::clone(&bound.socket),
@@ -5593,7 +5622,10 @@ mod tests {
     async fn a_refused_turn_credential_ends_the_relay_gather_without_a_candidate() {
         let dir = private_dir("relay-refused");
         let (turn, server) = turn_server().await;
-        let (s, demux, _host) = with_turn(&blocking_worker(&dir));
+        // The clock stands still: end-of-candidates comes as the queue ends,
+        // not at the deadline.
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, _host) = with_turn_on(&blocking_worker(&dir), clock.clone());
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut events =
             subscription(call_on(&s, 1, &turn_offer(2, server.udp_addr(), "wrong")).await);
@@ -5613,7 +5645,104 @@ mod tests {
             json!({ "type": "candidate", "candidate": "" })
         );
         assert_eq!(turn.allocations(), []);
-        s.shutdown().await;
+        shutdown_on(&s, &clock).await;
+        demux.stop();
+    }
+
+    /// A TURN server over TCP on a loopback port nobody listens on: its
+    /// connection is refused at once.
+    fn refused_turn_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = listener.local_addr().unwrap();
+        drop(listener);
+        format!("turn:{closed}?transport=tcp")
+    }
+
+    #[tokio::test]
+    async fn four_failed_turn_servers_make_room_for_a_fifth_before_the_deadline() {
+        let dir = private_dir("relay-queue");
+        let (turn, server) = turn_server().await;
+        // The clock stands still: the deadline never passes.
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, _host) = with_turn_on(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let (tx, mut rx) = mpsc::channel(16);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        let mut urls: Vec<String> = (0..crate::gather::TURN_IN_FLIGHT)
+            .map(|_| refused_turn_url())
+            .collect();
+        urls.push(format!("turn:{}", server.udp_addr()));
+        let mut offer = offer(2, "front", Some("s1"));
+        offer["ice_servers"] = json!([{ "urls": urls, "username": "ha", "credential": "pw" }]);
+        let mut events = subscription(call_on(&s, 1, &offer).await);
+        next(&mut events).await;
+        let_assert!(
+            DriverCommand::RelayCandidate {
+                relayed,
+                server: via,
+                tcp: false,
+                ..
+            } = next_command(&mut rx).await,
+            "the fifth server's relay candidate"
+        );
+        assert_eq!(via, server.udp_addr());
+        assert_eq!(turn.allocations().len(), 1);
+        // Nothing left in flight or queued: end-of-candidates follows the
+        // relay's line at once (RFC 8838 §13).
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
+        );
+        assert_eq!(next(&mut events).await["type"], "answer");
+        report(&s, "s1", end_of_candidates());
+        report(
+            &s,
+            "s1",
+            Report::Relayed {
+                relayed,
+                candidate: None,
+            },
+        );
+        assert_eq!(
+            next(&mut events).await,
+            json!({ "type": "candidate", "candidate": "" })
+        );
+        shutdown_on(&s, &clock).await;
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_silent_turn_server_holds_end_of_candidates_for_the_deadline_only() {
+        let dir = private_dir("relay-deadline");
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, _host) = with_turn_on(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut events =
+            subscription(call_on(&s, 1, &turn_offer(2, silent.local_addr().unwrap(), "pw")).await);
+        next(&mut events).await;
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
+        );
+        assert_eq!(next(&mut events).await["type"], "answer");
+        report(&s, "s1", end_of_candidates());
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err(), "held while the attempt runs");
+        clock.advance(GATHER_DEADLINE);
+        assert_eq!(
+            next(&mut events).await,
+            json!({ "type": "candidate", "candidate": "" })
+        );
+        shutdown_on(&s, &clock).await;
         demux.stop();
     }
 

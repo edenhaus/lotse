@@ -974,16 +974,12 @@ impl State {
         self.deliver_session(session_id, events, "worker");
     }
 
-    /// A TURN gather of session `serial` finished: a lease goes to the
-    /// worker as a relay candidate, whose line the worker reports; without
-    /// one, or once end-of-candidates went out, the gather just ends and a
-    /// lease is released.
-    pub(crate) fn session_relayed(
-        &mut self,
-        session_id: &str,
-        serial: u64,
-        relayed: Option<Relayed>,
-    ) {
+    /// A TURN attempt of session `serial` yielded `relayed`: the lease goes
+    /// to the worker as a relay candidate, whose line the worker reports
+    /// and end-of-candidates waits for; once the gather deadline passed or
+    /// end-of-candidates went out, or when the worker's queue is full, it
+    /// is released.
+    pub(crate) fn session_relayed(&mut self, session_id: &str, serial: u64, relayed: Relayed) {
         let Some(entry) = self
             .sessions
             .get_mut(session_id)
@@ -991,38 +987,56 @@ impl State {
         else {
             return;
         };
-        if let Some(relayed) = relayed.filter(|_| !entry.candidates_done()) {
-            let address = relayed.lease.relayed();
-            let command = DriverCommand::RelayCandidate {
-                session_id: session_id.to_owned(),
-                relayed: address,
-                server: relayed.server,
-                local: relayed.local,
-                tcp: relayed.transport == Transport::Tcp,
-                grant: relayed.lease.grant(),
-            };
-            let queued = self
-                .connections
-                .get(&entry.connection)
-                .is_some_and(|connection| connection.commands.try_send(command).is_ok());
-            if queued {
-                tracing::info!(
-                    session.id = session_id,
-                    relayed = %address,
-                    server = %relayed.server,
-                    transport = ?relayed.transport,
-                    "relay candidate handed to the worker"
-                );
-                entry.relay_handed_over(relayed.lease);
-                return;
-            }
-            tracing::warn!(
+        if entry.gathering_over() {
+            tracing::debug!(
                 session.id = session_id,
-                "driver queue full; relay candidate dropped"
+                server = %relayed.server,
+                "relay lease after the gather deadline released"
             );
+            return;
         }
-        let events = entry.gathered(None);
-        self.deliver_session(session_id, events, "gathering");
+        let address = relayed.lease.relayed();
+        let command = DriverCommand::RelayCandidate {
+            session_id: session_id.to_owned(),
+            relayed: address,
+            server: relayed.server,
+            local: relayed.local,
+            tcp: relayed.transport == Transport::Tcp,
+            grant: relayed.lease.grant(),
+        };
+        let queued = self
+            .connections
+            .get(&entry.connection)
+            .is_some_and(|connection| connection.commands.try_send(command).is_ok());
+        if queued {
+            tracing::info!(
+                session.id = session_id,
+                relayed = %address,
+                server = %relayed.server,
+                transport = ?relayed.transport,
+                "relay candidate handed to the worker"
+            );
+            entry.relay_handed_over(relayed.lease);
+            return;
+        }
+        tracing::warn!(
+            session.id = session_id,
+            "driver queue full; relay candidate dropped"
+        );
+    }
+
+    /// The TURN attempts of session `serial` ended, at the latest at the
+    /// gather deadline: end-of-candidates waits only for the relays handed
+    /// to the worker.
+    pub(crate) fn session_relays_done(&mut self, session_id: &str, serial: u64) {
+        if let Some(entry) = self
+            .sessions
+            .get_mut(session_id)
+            .filter(|s| s.serial == serial)
+        {
+            let events = entry.gathered(None);
+            self.deliver_session(session_id, events, "gathering");
+        }
     }
 
     /// A STUN gather of session `serial` finished.
@@ -2630,12 +2644,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_relay_lease_goes_to_the_worker_unless_too_late_or_its_queue_is_full() {
-        let (mut state, mut rx) = relay_state(4);
+        // The session's one gather: its TURN queue.
+        let (mut state, mut rx) = relay_state(1);
         // Another session, or an earlier one under the same id: released.
-        state.session_relayed("ghost", 1, Some(relayed(1)));
-        state.session_relayed("s1", 2, Some(relayed(1)));
+        state.session_relayed("ghost", 1, relayed(1));
+        state.session_relayed("s1", 2, relayed(1));
         assert!(rx.try_recv().is_err());
-        state.session_relayed("s1", 1, Some(relayed(1)));
+        state.session_relayed("s1", 1, relayed(1));
         let_assert!(
             Ok(DriverCommand::RelayCandidate {
                 session_id,
@@ -2657,7 +2672,7 @@ mod tests {
                 true
             )
         );
-        // A full queue: the gather ends without it; so does a failed one.
+        // A full queue: the lease is dropped.
         state
             .connections
             .get("c1")
@@ -2668,8 +2683,11 @@ mod tests {
                 candidate: String::new(),
             })
             .unwrap();
-        state.session_relayed("s1", 1, Some(relayed(2)));
-        state.session_relayed("s1", 1, None);
+        state.session_relayed("s1", 1, relayed(2));
+        // The queue ends; another session's end changes nothing.
+        state.session_relays_done("ghost", 1);
+        state.session_relays_done("s1", 2);
+        state.session_relays_done("s1", 1);
         let session = state.sessions.get_mut("s1").unwrap();
         session
             .apply(lotse_ipc::SessionEvent::Answer {
@@ -2685,13 +2703,13 @@ mod tests {
             .unwrap();
         assert!(
             !session.candidates_done(),
-            "the first relay and one more gather"
+            "the relay handed to the worker is a gather"
         );
         session.gather_deadline();
         assert!(session.candidates_done());
         // After end-of-candidates a lease is too late.
         let _queued = rx.try_recv();
-        state.session_relayed("s1", 1, Some(relayed(3)));
+        state.session_relayed("s1", 1, relayed(3));
         assert!(rx.try_recv().is_err());
         // A channel on the relay the worker has: bound on its lease, which
         // here holds no allocation, so it is refused and logged.
@@ -2706,6 +2724,49 @@ mod tests {
         );
         tokio::task::yield_now().await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn end_of_candidates_waits_for_the_turn_queue_of_its_own_session_rfc_8838_13() {
+        let (mut state, _rx) = relay_state(1);
+        let end = lotse_ipc::SessionEvent::Candidate {
+            candidate: String::new(),
+            mid: None,
+        };
+        let session = state.sessions.get_mut("s1").unwrap();
+        assert_eq!(session.apply(end).unwrap(), []);
+        // The end of another session's queue, or of an earlier one under
+        // the same id, ends nothing.
+        state.session_relays_done("ghost", 1);
+        state.session_relays_done("s1", 2);
+        assert!(!state.sessions["s1"].candidates_done());
+        state.session_relays_done("s1", 1);
+        assert!(state.sessions["s1"].candidates_done());
+    }
+
+    #[test]
+    fn a_lease_after_the_gather_deadline_is_released_rfc_8838_13() {
+        let (mut state, mut rx) = relay_state(1);
+        let session = state.sessions.get_mut("s1").unwrap();
+        // The deadline passed before the worker's end-of-candidates: the
+        // session no longer waits for a relay, so a late lease is
+        // released, not handed to the worker.
+        assert_eq!(session.gather_deadline(), []);
+        assert!(!session.candidates_done());
+        state.session_relayed("s1", 1, relayed(1));
+        assert!(rx.try_recv().is_err());
+        let session = state.sessions.get_mut("s1").unwrap();
+        assert_eq!(
+            session
+                .apply(lotse_ipc::SessionEvent::Candidate {
+                    candidate: String::new(),
+                    mid: None,
+                })
+                .unwrap()
+                .len(),
+            1,
+            "end-of-candidates waits for nothing"
+        );
     }
 
     #[test]

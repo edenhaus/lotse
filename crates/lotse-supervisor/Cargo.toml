@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+futures-util = { workspace = true } # the session's TURN attempts in flight, a `FuturesUnordered` its queue refills
 getrandom = { workspace = true }
 hmac = { workspace = true }
 md-5 = { workspace = true } # the TURN long-term key of the MD5 password algorithm (RFC 8489 §9.2.2)

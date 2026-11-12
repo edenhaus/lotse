@@ -2,7 +2,9 @@
 //! `ice_servers`, a Binding from the shared socket to each, and the
 //! `srflx` candidate the mapped address becomes; and the `turn:` servers,
 //! a lease on each one's shared allocation over UDP or TCP, whose relayed
-//! address the worker's agent takes as a relay candidate.
+//! address the worker's agent takes as a relay candidate. Every STUN
+//! server is asked at once; the TURN servers wait in a queue
+//! ([`RelayQueue`]) behind [`TURN_IN_FLIGHT`] attempts.
 //!
 //! Implements RFC 7064 §3.1 (the `stun:` URI: host and optional port,
 //! default 3478), RFC 7065 §3.1 (the `turn:` URI: host, optional port,
@@ -15,9 +17,11 @@
 //! only the browser is told. A relay candidate is the agent's own: it
 //! sends from it, so the worker makes its line.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::session::{IceServer, SessionEvent, WarningCode};
 use lotse_core::secret::Secret;
@@ -28,13 +32,54 @@ use crate::net::stun_client::StunClient;
 use crate::net::turn_client::{Lease, TurnClient};
 
 /// How long end-of-candidates waits for the gathers after the offer.
-pub(crate) const GATHER_DEADLINE: Duration = Duration::from_secs(2);
+///
+/// No specification sets it: RFC 8838 §13 has end-of-candidates follow
+/// the last candidate and names no time, so 4 s is our choice. It bounds
+/// only how long end-of-candidates waits for slow or silent servers; it
+/// goes out earlier as soon as no gather is in flight or queued. 4 s
+/// covers four tries of a Binding to a silent STUN server (RFC 8489
+/// §6.2.1: an RTO of 500 ms, doubling, sends at 0, 0.5, 1.5 and 3.5 s) and
+/// a TURN allocation's two round trips (the 401 challenge, then the
+/// request with the long-term credential: RFC 8656 §7.2, RFC 8489 §9.2)
+/// with room for retransmissions and for the next server in line after a
+/// fast failure. Waiting longer only delays a failing session's `failed`.
+pub(crate) const GATHER_DEADLINE: Duration = Duration::from_secs(4);
 
-/// STUN servers asked per session; more add no candidate a viewer needs.
-pub(crate) const MAX_STUN_SERVERS: usize = 4;
+/// STUN servers asked per session, all at once; the rest are ignored.
+///
+/// A STUN server is asked in parallel with the others rather than queued:
+/// its failure is usually silence (UDP, no answer), so a queue that moves
+/// on only when an attempt fails would leave a silent server holding its
+/// place until the deadline and never ask the ones behind it. Eight is a
+/// chosen bound, not a specification's: twice the four STUN servers the
+/// client sends by default, with room for servers of its user's own. It
+/// is cheap: a Binding costs one packet and its retransmissions and no
+/// state on the server, the [`StunClient`] caches each server's answer
+/// for 5 min, and identical mappings are told once (RFC 8445 §5.1.3). And
+/// it bounds what one offer makes the daemon send, whose list may name
+/// [`MAX_ICE_SERVERS`](lotse_api_types::limits::MAX_ICE_SERVERS) ×
+/// [`MAX_ICE_URLS`](lotse_api_types::limits::MAX_ICE_URLS) URLs. A server
+/// named twice takes one place.
+pub(crate) const MAX_STUN_SERVERS: usize = 8;
 
-/// TURN servers asked per session; each is one shared allocation.
-pub(crate) const MAX_TURN_SERVERS: usize = 4;
+/// TURN attempts of a session in flight at once: an attempt that fails
+/// makes room for the next in line, one that yields a lease does not, so
+/// a session holds at most this many relay candidates.
+///
+/// TURN is queued, unlike STUN: an allocation is state and quota on the
+/// server, and a TURN failure is mostly fast (an error response, a TCP
+/// connection refused or reset), so the next server in line still runs
+/// within [`GATHER_DEADLINE`].
+pub(crate) const TURN_IN_FLIGHT: usize = 4;
+
+/// TURN attempts per session in all, a TCP fallback included; the
+/// servers beyond it are ignored. Twice [`TURN_IN_FLIGHT`]: when the
+/// first four fail fast, four more still run, and a list longer than that
+/// (it may name
+/// [`MAX_ICE_SERVERS`](lotse_api_types::limits::MAX_ICE_SERVERS) ×
+/// [`MAX_ICE_URLS`](lotse_api_types::limits::MAX_ICE_URLS) URLs) is no
+/// reason to let one offer open more allocations.
+pub(crate) const MAX_TURN_ATTEMPTS: usize = 8;
 
 /// Warnings an offer's `ice_servers` yield; the rest are logged. The
 /// session's queue must hold them with its `session` event before them
@@ -78,6 +123,17 @@ pub(crate) struct TurnServer {
     pub(crate) credentials: Credentials,
 }
 
+/// A TURN server to allocate on, with the same server over TCP to try
+/// when this one, over UDP, fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnEntry {
+    /// The server.
+    pub(crate) server: TurnServer,
+    /// Its TCP twin, eligible only once this attempt failed; only a UDP
+    /// server has one.
+    pub(crate) fallback: Option<TurnServer>,
+}
+
 /// What `ice_servers` asks of a session.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct IcePlan {
@@ -85,8 +141,9 @@ pub(crate) struct IcePlan {
     pub(crate) warnings: Vec<SessionEvent>,
     /// The STUN servers to gather from, at most [`MAX_STUN_SERVERS`].
     pub(crate) stun: Vec<StunServer>,
-    /// The TURN servers to allocate on, at most [`MAX_TURN_SERVERS`].
-    pub(crate) turn: Vec<TurnServer>,
+    /// The TURN servers to allocate on, in list order, at most
+    /// [`MAX_TURN_ATTEMPTS`].
+    pub(crate) turn: Vec<TurnEntry>,
 }
 
 /// Checks `ice_servers`: only `stun:`, `turn:` and `turns:` URIs (RFC 7064,
@@ -94,13 +151,20 @@ pub(crate) struct IcePlan {
 /// `turn_unsupported` warning, the first [`MAX_WARNINGS`] of them. A
 /// `turn:` entry without a username and credential is skipped: TURN asks
 /// for the long-term credential (RFC 8656 §5), and browsers refuse such an
-/// entry (W3C WebRTC 1.0 §4.2.1). A `turn:` over TCP is skipped when the
-/// list names its host and port over UDP too: both relay over UDP to the
-/// peer (§7.1), so the UDP allocation is enough, and what a session sends
-/// through a TCP one passes through the supervisor, which owns the
-/// connection.
+/// entry (W3C WebRTC 1.0 §4.2.1). A `turn:` over TCP whose host and port
+/// the list names over UDP too is that UDP server's fallback, whatever
+/// their order: both relay over UDP to the peer (§7.1), so the UDP
+/// allocation is enough when it works, and what a session sends through a
+/// TCP one passes through the supervisor, which owns the connection; but
+/// a network that blocks UDP to the server still reaches it over TCP. A
+/// UDP server has one fallback, the first such TCP entry; a second is
+/// ignored. A TCP entry without a UDP twin is an ordinary entry. A server
+/// named twice is one (a STUN one by host, ignoring ASCII case, and port).
+/// The servers keep their list order, the first [`MAX_STUN_SERVERS`] STUN and
+/// [`MAX_TURN_ATTEMPTS`] TURN ones (a fallback counted with its twin).
 pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
     let mut plan = IcePlan::default();
+    let mut turns: Vec<TurnServer> = Vec::new();
     for (entry, url) in servers
         .iter()
         .flat_map(|server| server.urls.iter().map(move |url| (server, url)))
@@ -112,7 +176,9 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                     ApiError::new(ErrorCode::InvalidRequest, "not a stun: URI (RFC 7064)")
                         .with_detail("url", url.as_str())
                 })?;
-                if plan.stun.len() < MAX_STUN_SERVERS {
+                if plan.stun.iter().any(|other| same_server(other, &server)) {
+                    tracing::debug!(url, "stun server named twice");
+                } else if plan.stun.len() < MAX_STUN_SERVERS {
                     plan.stun.push(server);
                 } else {
                     tracing::debug!(url, "stun server beyond the per-session limit ignored");
@@ -135,10 +201,10 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                         password: Secret::new(password.clone()),
                     },
                 };
-                if plan.turn.contains(&turn) {
+                if turns.contains(&turn) {
                     tracing::debug!(url, "turn server named twice");
                 } else {
-                    plan.turn.push(turn);
+                    turns.push(turn);
                 }
             }
             "turns" if plan.warnings.len() < MAX_WARNINGS => {
@@ -161,32 +227,130 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
             }
         }
     }
-    let udp: Vec<StunServer> = plan
-        .turn
+    plan.turn = turn_entries(turns);
+    Ok(plan)
+}
+
+/// `turns` in list order as entries, each TCP server whose host and port
+/// a UDP one names too as the fallback of the first such UDP server that
+/// has none yet; at most [`MAX_TURN_ATTEMPTS`] entries.
+fn turn_entries(turns: Vec<TurnServer>) -> Vec<TurnEntry> {
+    let udp: Vec<StunServer> = turns
         .iter()
         .filter(|turn| turn.transport == Transport::Udp)
         .map(|turn| turn.server.clone())
         .collect();
-    plan.turn.retain(|turn| {
-        let redundant = turn.transport == Transport::Tcp
-            && udp.iter().any(|other| same_server(other, &turn.server));
-        if redundant {
+    let (twins, plain): (Vec<TurnServer>, Vec<TurnServer>) = turns.into_iter().partition(|turn| {
+        turn.transport == Transport::Tcp && udp.iter().any(|other| same_server(other, &turn.server))
+    });
+    let mut entries: Vec<TurnEntry> = plain
+        .into_iter()
+        .map(|server| TurnEntry {
+            server,
+            fallback: None,
+        })
+        .collect();
+    // A twin's host and port are named over UDP, so every entry naming
+    // them is over UDP: a TCP one would be a twin itself.
+    for twin in twins {
+        let free = entries.iter_mut().find(|entry| {
+            entry.fallback.is_none() && same_server(&entry.server.server, &twin.server)
+        });
+        if let Some(entry) = free {
             tracing::debug!(
-                host = turn.server.host,
-                port = turn.server.port,
-                "turn server over tcp named over udp too; the udp allocation relays"
+                host = twin.server.host,
+                port = twin.server.port,
+                "turn server over tcp named over udp too; tried when the udp one fails"
+            );
+            entry.fallback = Some(twin);
+        } else {
+            tracing::debug!(
+                host = twin.server.host,
+                port = twin.server.port,
+                "turn server over tcp whose udp twin has its fallback already ignored"
             );
         }
-        !redundant
-    });
-    let kept = plan.turn.len().min(MAX_TURN_SERVERS);
-    for ignored in plan.turn.drain(kept..) {
+    }
+    let kept = entries.len().min(MAX_TURN_ATTEMPTS);
+    for ignored in entries.drain(kept..) {
         tracing::debug!(
-            host = ignored.server.host,
+            host = ignored.server.server.host,
             "turn server beyond the per-session limit ignored"
         );
     }
-    Ok(plan)
+    entries
+}
+
+/// The order a session's TURN attempts start in: [`TURN_IN_FLIGHT`] at
+/// first, then one more each time one fails, a failed server's TCP
+/// fallback ahead of the servers not started yet; at most
+/// [`MAX_TURN_ATTEMPTS`] in all. An attempt that yields a lease starts
+/// none: its place stays taken by the relay candidate. The policy alone,
+/// without sockets; [`relay_all`] runs it.
+#[derive(Debug)]
+pub(crate) struct RelayQueue {
+    /// The servers not started yet, in list order.
+    waiting: VecDeque<TurnEntry>,
+    /// The fallbacks of the servers that failed, in the order they
+    /// failed; each goes before [`Self::waiting`].
+    fallbacks: VecDeque<TurnServer>,
+    /// The attempts started, at most [`MAX_TURN_ATTEMPTS`].
+    started: usize,
+}
+
+impl RelayQueue {
+    /// A queue of `entries`, none started.
+    pub(crate) fn new(entries: Vec<TurnEntry>) -> Self {
+        Self {
+            waiting: entries.into(),
+            fallbacks: VecDeque::new(),
+            started: 0,
+        }
+    }
+
+    /// The attempts to start at once, at most [`TURN_IN_FLIGHT`].
+    pub(crate) fn first(&mut self) -> Vec<TurnEntry> {
+        let mut first = Vec::new();
+        while first.len() < TURN_IN_FLIGHT
+            && let Some(entry) = self.next()
+        {
+            first.push(entry);
+        }
+        first
+    }
+
+    /// An attempt failed, its `fallback` (if any) now eligible: the
+    /// attempt to start in its place, if one is left within the limit.
+    pub(crate) fn failed(&mut self, fallback: Option<TurnServer>) -> Option<TurnEntry> {
+        self.fallbacks.extend(fallback);
+        self.next()
+    }
+
+    /// The next attempt in line: a fallback, else the next server; none
+    /// once [`MAX_TURN_ATTEMPTS`] started.
+    fn next(&mut self) -> Option<TurnEntry> {
+        if self.started >= MAX_TURN_ATTEMPTS {
+            if !self.fallbacks.is_empty() || !self.waiting.is_empty() {
+                tracing::debug!(
+                    limit = MAX_TURN_ATTEMPTS,
+                    "turn attempt limit reached; the servers left are ignored"
+                );
+                self.fallbacks.clear();
+                self.waiting.clear();
+            }
+            return None;
+        }
+        let next = self
+            .fallbacks
+            .pop_front()
+            .map(|server| TurnEntry {
+                server,
+                fallback: None,
+            })
+            .or_else(|| self.waiting.pop_front())?;
+        self.started = self.started.saturating_add(1);
+        Some(next)
+    }
 }
 
 /// Whether two URIs name one server: the host ignoring ASCII case (RFC
@@ -342,6 +506,37 @@ pub(crate) async fn relay(
     }
 }
 
+/// Runs a session's TURN attempts on `entries` in [`RelayQueue`]'s order,
+/// each reached from `hosts`, and hands each lease to `leased` as it
+/// comes; returns once no attempt is running or left to start. Dropping
+/// it drops the attempts running.
+pub(crate) async fn relay_all(
+    client: &TurnClient,
+    entries: Vec<TurnEntry>,
+    hosts: &[SocketAddr],
+    leased: &mut (dyn FnMut(Relayed) + Send),
+) {
+    let mut queue = RelayQueue::new(entries);
+    let attempt = |entry: TurnEntry| async move {
+        let relayed = relay(client, &entry.server, hosts).await;
+        (relayed, entry)
+    };
+    let mut running: FuturesUnordered<_> = queue.first().into_iter().map(attempt).collect();
+    while let Some((relayed, entry)) = running.next().await {
+        if let Some(relayed) = relayed {
+            leased(relayed);
+        } else if let Some(next) = queue.failed(entry.fallback) {
+            tracing::debug!(
+                failed = entry.server.server.host,
+                next = next.server.server.host,
+                transport = ?next.server.transport,
+                "turn server failed; the next in line tried"
+            );
+            running.push(attempt(next));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -424,11 +619,26 @@ mod tests {
                 status: None,
             }
         );
-        let many: Vec<String> = (0..6).map(|n| format!("stun:s{n}")).collect();
+        // Up to the limit, in list order; a server named twice (the host
+        // ignoring ASCII case, RFC 3986 §6.2.2.1) takes one place.
+        let mut many: Vec<String> = vec!["stun:s0".into(), "stun:S0:3478".into()];
+        many.extend((1..=MAX_STUN_SERVERS).map(|n| format!("stun:s{n}")));
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let kept: Vec<String> = super::plan(&servers(&many))
+            .unwrap()
+            .stun
+            .into_iter()
+            .map(|server| server.host)
+            .collect();
+        let expected: Vec<String> = (0..MAX_STUN_SERVERS).map(|n| format!("s{n}")).collect();
+        assert_eq!(kept, expected);
         assert_eq!(
-            super::plan(&servers(&many)).unwrap().stun.len(),
-            MAX_STUN_SERVERS
+            super::plan(&servers(&["stun:s", "stun:s:1"]))
+                .unwrap()
+                .stun
+                .len(),
+            2,
+            "another port is another server"
         );
         for bad in ["http://x/", "stun:", "stun:a/b", "nocolon"] {
             let err = super::plan(&servers(&[bad])).unwrap_err();
@@ -466,22 +676,35 @@ mod tests {
         }
     }
 
+    fn turn_entry(urls: &[&str], credential: Option<&str>) -> IceServer {
+        serde_json::from_value(json!({
+            "urls": urls, "username": credential.map(|_| "ha"), "credential": credential
+        }))
+        .unwrap()
+    }
+
+    /// Each entry's server and fallback as host, port and transport.
+    fn named(plan: &IcePlan) -> Vec<(String, u16, Transport, Option<Transport>)> {
+        plan.turn
+            .iter()
+            .map(|entry| {
+                (
+                    entry.server.server.host.clone(),
+                    entry.server.server.port,
+                    entry.server.transport,
+                    entry.fallback.as_ref().map(|fallback| {
+                        assert!(same_server(&fallback.server, &entry.server.server));
+                        fallback.transport
+                    }),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn plans_keep_turn_servers_with_credentials_over_udp_and_tcp_rfc_7065() {
-        let entry = |urls: &[&str], credential: Option<&str>| -> IceServer {
-            serde_json::from_value(json!({
-                "urls": urls, "username": credential.map(|_| "ha"), "credential": credential
-            }))
-            .unwrap()
-        };
-        let named = |plan: &IcePlan| -> Vec<(String, u16, Transport)> {
-            plan.turn
-                .iter()
-                .map(|t| (t.server.host.clone(), t.server.port, t.transport))
-                .collect()
-        };
         let plan = plan(&[
-            entry(
+            turn_entry(
                 &[
                     "turn:t2?transport=tcp",
                     "turn:t1",
@@ -492,42 +715,186 @@ mod tests {
                 ],
                 Some("pw"),
             ),
-            entry(&["turn:t3"], None),
+            turn_entry(&["turn:t3"], None),
         ])
         .unwrap();
         // Named twice is one server; TCP to a server named over UDP too is
-        // left to the UDP one, whatever the order; no credential, no
-        // server; no warning.
+        // the UDP one's fallback, whatever the order; TCP without a UDP
+        // twin is a server of its own; no credential, no server; no
+        // warning.
         assert_eq!(
             named(&plan),
             [
-                ("t2".to_owned(), 3478, Transport::Tcp),
-                ("t1".to_owned(), 3478, Transport::Udp),
-                ("t1".to_owned(), 443, Transport::Tcp),
+                ("t2".to_owned(), 3478, Transport::Tcp, None),
+                ("t1".to_owned(), 3478, Transport::Udp, Some(Transport::Tcp)),
+                ("t1".to_owned(), 443, Transport::Tcp, None),
             ]
         );
-        assert_eq!(plan.turn[0].credentials.username, "ha");
-        assert_eq!(plan.turn[0].credentials.password.expose_secret(), "pw");
+        assert_eq!(plan.turn[0].server.credentials.username, "ha");
+        assert_eq!(
+            plan.turn[0].server.credentials.password.expose_secret(),
+            "pw"
+        );
         assert_eq!(plan.warnings, []);
-        // The limit counts what is left.
-        let mut many: Vec<String> = (0..6).map(|n| format!("turn:t{n}?transport=tcp")).collect();
+        // A UDP server has one fallback: a second TCP twin, with another
+        // credential, is ignored; another UDP server of the same host and
+        // port takes it.
+        let plan = super::plan(&[
+            turn_entry(&["turn:t1", "turn:t1?transport=tcp"], Some("pw")),
+            turn_entry(&["turn:t1?transport=tcp"], Some("other")),
+        ])
+        .unwrap();
+        assert_eq!(
+            named(&plan),
+            [("t1".to_owned(), 3478, Transport::Udp, Some(Transport::Tcp))]
+        );
+        assert_eq!(
+            plan.turn[0]
+                .fallback
+                .as_ref()
+                .unwrap()
+                .credentials
+                .password
+                .expose_secret(),
+            "pw"
+        );
+        let plan = super::plan(&[
+            turn_entry(&["turn:t1", "turn:t1?transport=tcp"], Some("pw")),
+            turn_entry(&["turn:t1?transport=tcp", "turn:t1"], Some("other")),
+        ])
+        .unwrap();
+        assert_eq!(
+            named(&plan),
+            [
+                ("t1".to_owned(), 3478, Transport::Udp, Some(Transport::Tcp)),
+                ("t1".to_owned(), 3478, Transport::Udp, Some(Transport::Tcp)),
+            ]
+        );
+        // The limit counts entries, a fallback with its twin, in list
+        // order.
+        let mut many: Vec<String> = (0..10)
+            .map(|n| format!("turn:t{n}?transport=tcp"))
+            .collect();
         many.extend((0..3).map(|n| format!("turn:t{n}")));
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        let plan = super::plan(&[entry(&many, Some("pw"))]).unwrap();
-        assert_eq!(
-            named(&plan),
-            [
-                ("t3".to_owned(), 3478, Transport::Tcp),
-                ("t4".to_owned(), 3478, Transport::Tcp),
-                ("t5".to_owned(), 3478, Transport::Tcp),
-                ("t0".to_owned(), 3478, Transport::Udp),
-            ]
-        );
-        let err = super::plan(&[entry(&["turn:t?transport=sctp"], Some("pw"))]).unwrap_err();
+        let plan = super::plan(&[turn_entry(&many, Some("pw"))]).unwrap();
+        let mut expected: Vec<(String, u16, Transport, Option<Transport>)> = (3..10)
+            .map(|n| (format!("t{n}"), 3478, Transport::Tcp, None))
+            .collect();
+        expected.push(("t0".to_owned(), 3478, Transport::Udp, Some(Transport::Tcp)));
+        assert_eq!(expected.len(), MAX_TURN_ATTEMPTS);
+        assert_eq!(named(&plan), expected);
+        let err = super::plan(&[turn_entry(&["turn:t?transport=sctp"], Some("pw"))]).unwrap_err();
         assert_eq!(
             (err.code, &err.details["url"]),
             (ErrorCode::InvalidRequest, &json!("turn:t?transport=sctp"))
         );
+    }
+
+    /// A TURN server named `host`, over TCP when `tcp`.
+    fn turn(host: &str, tcp: bool) -> TurnServer {
+        TurnServer {
+            server: StunServer {
+                host: host.into(),
+                port: STUN_PORT,
+            },
+            transport: if tcp { Transport::Tcp } else { Transport::Udp },
+            credentials: Credentials {
+                username: "ha".into(),
+                password: Secret::new("pw".into()),
+            },
+        }
+    }
+
+    /// Entries `t0`, `t1`, … over UDP, each with its TCP twin when
+    /// `twinned`.
+    fn queue(count: usize, twinned: bool) -> RelayQueue {
+        RelayQueue::new(
+            (0..count)
+                .map(|n| TurnEntry {
+                    server: turn(&format!("t{n}"), false),
+                    fallback: twinned.then(|| turn(&format!("t{n}"), true)),
+                })
+                .collect(),
+        )
+    }
+
+    /// An entry's host and whether it is over TCP.
+    fn which(entry: Option<TurnEntry>) -> Option<(String, bool)> {
+        entry.map(|entry| {
+            (
+                entry.server.server.host,
+                entry.server.transport == Transport::Tcp,
+            )
+        })
+    }
+
+    fn hosts(entries: Vec<TurnEntry>) -> Vec<String> {
+        entries
+            .into_iter()
+            .map(|entry| entry.server.server.host)
+            .collect()
+    }
+
+    #[test]
+    fn four_turn_attempts_run_at_once_and_each_failure_starts_the_next_in_list_order() {
+        let mut queue = queue(10, false);
+        assert_eq!(hosts(queue.first()), ["t0", "t1", "t2", "t3"]);
+        for n in 4..MAX_TURN_ATTEMPTS {
+            assert_eq!(which(queue.failed(None)), Some((format!("t{n}"), false)));
+        }
+        // The total limit: the rest are never tried.
+        assert_eq!(which(queue.failed(None)), None);
+        assert_eq!(which(queue.failed(None)), None);
+        assert!(queue.waiting.is_empty());
+    }
+
+    #[test]
+    fn a_turn_attempt_that_succeeds_starts_none_and_a_short_queue_runs_dry() {
+        let mut queue = queue(6, false);
+        assert_eq!(hosts(queue.first()), ["t0", "t1", "t2", "t3"]);
+        // t0 and t1 yield leases and start nothing; t2 and t3 fail.
+        assert_eq!(which(queue.failed(None)), Some(("t4".into(), false)));
+        assert_eq!(which(queue.failed(None)), Some(("t5".into(), false)));
+        assert_eq!(which(queue.failed(None)), None);
+        assert_eq!(which(queue.failed(None)), None);
+        let mut short = self::queue(2, false);
+        assert_eq!(hosts(short.first()), ["t0", "t1"]);
+        assert_eq!(which(short.failed(None)), None);
+        assert_eq!(RelayQueue::new(Vec::new()).first(), []);
+    }
+
+    #[test]
+    fn a_tcp_twin_runs_next_only_after_its_udp_twin_failed_rfc_7065_3_1() {
+        let mut queue = queue(6, true);
+        assert_eq!(hosts(queue.first()), ["t0", "t1", "t2", "t3"]);
+        // t1 over UDP fails: its TCP twin goes ahead of t4.
+        let t1 = turn("t1", true);
+        assert_eq!(which(queue.failed(Some(t1))), Some(("t1".into(), true)));
+        // Its TCP twin fails too: it has no fallback of its own.
+        assert_eq!(which(queue.failed(None)), Some(("t4".into(), false)));
+        assert_eq!(
+            which(queue.failed(Some(turn("t3", true)))),
+            Some(("t3".into(), true))
+        );
+        // The eighth attempt, the last: the total limit counts the
+        // fallbacks.
+        assert_eq!(which(queue.failed(None)), Some(("t5".into(), false)));
+        assert_eq!(which(queue.failed(Some(turn("t5", true)))), None);
+        assert!(queue.fallbacks.is_empty());
+        // t0 and t2 succeeded: their TCP twins never ran.
+    }
+
+    #[test]
+    fn fallbacks_wait_in_the_order_their_twins_failed() {
+        let mut queue = RelayQueue::new(Vec::new());
+        queue.fallbacks.push_back(turn("t1", true));
+        assert_eq!(
+            which(queue.failed(Some(turn("t0", true)))),
+            Some(("t1".into(), true))
+        );
+        assert_eq!(which(queue.failed(None)), Some(("t0".into(), true)));
+        assert_eq!(which(queue.failed(None)), None);
     }
 
     #[test]
