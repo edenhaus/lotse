@@ -5,7 +5,8 @@
 //! reports checked and passed on, the counters, the pre-record window each
 //! connection keeps), the UDP receive and demux, ICE-TCP accept and srflx
 //! gathering with the STUN client, the advertised addresses' candidates
-//! (`webrtc.advertise`) and the host candidates they hide, the TURN client (the codec, the
+//! (`webrtc.advertise`) and the host candidates they hide, the host
+//! addresses re-read at an offer, the TURN client (the codec, the
 //! long-term credential and
 //! the shared allocations over UDP and TCP, whose servers' relayed
 //! datagrams the demux or the TCP allocation's task unwraps as the peers',
@@ -44,6 +45,7 @@ mod connect;
 mod driver;
 mod gather;
 mod handler;
+mod host_cache;
 pub mod memory;
 pub mod net;
 mod recording;
@@ -56,6 +58,7 @@ mod worker_text;
 
 pub use advertise::{AdvertiseError, AdvertisedAddress, MAX_ADVERTISED};
 pub use handler::{Environment, FrontDoor, Identity, Supervisor};
+pub use host_cache::HostScan;
 pub use lotse_api::Owners;
 pub use lotse_api::Server as ApiServer;
 pub use lotse_api::TlsConfig as ControlTls;
@@ -367,8 +370,8 @@ async fn api_stopped(
 }
 
 /// What sessions need from the front door: the demux's registrations, the
-/// host addresses for UDP and ICE-TCP, and a STUN and a TURN client on the
-/// shared socket.
+/// host addresses for UDP and ICE-TCP and how to read them again, and a
+/// STUN and a TURN client on the shared socket.
 fn front_door(
     udp: &BoundUdp,
     tcp_local: Option<SocketAddr>,
@@ -379,6 +382,7 @@ fn front_door(
         registrations: demux.registrations(),
         hosts: udp.hosts.clone(),
         tcp_hosts: tcp_hosts(&udp.hosts, tcp_local),
+        scan: Some(HostScan::system(udp.local, udp.dual_stack, tcp_local)),
         stun: Some(Arc::new(net::stun_client::StunClient::new(
             Arc::clone(&udp.socket),
             demux.responses(),
@@ -398,7 +402,7 @@ fn front_door(
 /// The passive ICE-TCP candidates' addresses: the listener's own address
 /// when it names one, else each host address at the listener's port;
 /// none with the listener off.
-fn tcp_hosts(hosts: &[SocketAddr], listener: Option<SocketAddr>) -> Vec<SocketAddr> {
+pub(crate) fn tcp_hosts(hosts: &[SocketAddr], listener: Option<SocketAddr>) -> Vec<SocketAddr> {
     match listener {
         None => Vec::new(),
         Some(local) if !local.ip().is_unspecified() => {

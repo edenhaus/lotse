@@ -93,6 +93,7 @@ fn supervisor() -> Supervisor {
             registrations: Arc::new(Registrations::default()),
             hosts: vec![HOST.parse().unwrap()],
             tcp_hosts: vec![],
+            scan: None,
             stun: None,
             turn: None,
             demux: None,

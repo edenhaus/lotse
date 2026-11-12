@@ -164,6 +164,7 @@ fn daemon(linger: Duration, advertise: Vec<AdvertisedAddress>) -> Daemon {
             registrations: demux.registrations(),
             hosts: bound.hosts,
             tcp_hosts: vec![tcp],
+            scan: None,
             stun: Some(Arc::new(StunClient::new(
                 Arc::clone(&bound.socket),
                 demux.responses(),

@@ -182,9 +182,11 @@ impl Protocol {
     }
 }
 
-/// What the advertised addresses make of every session, worked out once
-/// from the front door's host addresses: the candidates told to the
-/// browser, and which of the worker's host candidates it is still told.
+/// What the advertised addresses make of every session, worked out from
+/// the front door's host addresses at startup and again whenever they
+/// change ([`crate::host_cache`]): the candidates told to the browser, and
+/// which of the worker's host candidates it is still told. A session
+/// keeps the one of its offer.
 /// The default advertises nothing and hides nothing.
 #[derive(Debug, Default)]
 pub(crate) struct Advertisement {
@@ -202,7 +204,8 @@ pub(crate) struct Advertisement {
 impl Advertisement {
     /// The candidates of `advertised` on the UDP host addresses `hosts`
     /// and the passive ICE-TCP ones `tcp_hosts` (none with the listener
-    /// off). Logs each decision once, at startup.
+    /// off). Logs each decision each time it is worked out: at startup and
+    /// when the host addresses change.
     pub(crate) fn new(
         advertised: &[AdvertisedAddress],
         hosts: &[SocketAddr],
