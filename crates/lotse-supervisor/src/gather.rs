@@ -536,9 +536,9 @@ async fn or_other(
 /// answer from the server over UDP ([`TurnClient::answered`]); when the
 /// server answered, or the UDP attempt failed sooner, it starts once that
 /// attempt failed. The first lease is the entry's: the other attempt is
-/// dropped with this future, and a lease its allocation grants later is
-/// released at once (nobody waits for it). `None` when no attempt yields
-/// one.
+/// dropped with this future, and a lease its allocation grants it, read
+/// or not, is released at once (nobody holds it). `None` when no attempt
+/// yields one.
 pub(crate) async fn relay_entry(
     client: &TurnClient,
     clock: &dyn Clock,

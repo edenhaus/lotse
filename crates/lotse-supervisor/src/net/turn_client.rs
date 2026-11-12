@@ -7,7 +7,9 @@
 //! A session asks with [`TurnClient::lease`] and gets a [`Lease`]: the
 //! relayed address, permissions and channel bindings, and a watch on the
 //! address (gone when the server ended the allocation). Dropping the lease
-//! releases what it held; the last one deletes the allocation. A later
+//! releases what it held; the last one deletes the allocation. The task
+//! hands over the lease itself, so one granted to a session that stopped
+//! waiting is released as it is dropped unread, wherever it was. A later
 //! session's credential for the same server is remembered as the newest,
 //! for a re-creation after a rejected Refresh.
 //!
@@ -98,8 +100,10 @@ pub enum TurnError {
     Entropy(getrandom::Error),
 }
 
-/// Where a joining session's lease goes, with the relayed address.
-type LeaseReply = oneshot::Sender<Result<(LeaseId, SocketAddr), TurnError>>;
+/// Where a joining session's lease goes. It travels as the [`Lease`]
+/// itself, so one nobody reads is dropped with the channel and released,
+/// whether the session stopped waiting before the grant or after it.
+type LeaseReply = oneshot::Sender<Result<Lease, TurnError>>;
 
 /// Where a channel's number goes once bound.
 type ChannelReply = oneshot::Sender<Result<Channel, TurnError>>;
@@ -180,11 +184,10 @@ enum Command {
 struct Handle {
     /// Commands; closed once the task ended.
     commands: mpsc::UnboundedSender<Command>,
-    /// The relayed address while the allocation exists.
-    status: watch::Receiver<Option<SocketAddr>>,
     /// What sessions send from its relay candidates; TCP only.
     outbound: Option<mpsc::Sender<Outbound>>,
-    /// Set once the server answered any of the allocation's requests.
+    /// Set once the server answered any of the allocation's requests;
+    /// cleared when the allocation is lost.
     answered: Arc<AtomicBool>,
 }
 
@@ -245,7 +248,8 @@ impl TurnClient {
     /// answered any of its requests, a 401 challenge included (RFC 8656
     /// §7.2, RFC 8489 §9.2): proof that the path to it carries that
     /// transport. `false` while it has answered none, and when there is no
-    /// such allocation.
+    /// such allocation. A lost allocation starts over (§8.3): `false`
+    /// again until the server answers its re-creation.
     pub fn answered(&self, server: SocketAddr, transport: Transport) -> bool {
         self.allocations
             .lock()
@@ -288,12 +292,7 @@ impl TurnClient {
             reply,
         }));
         match answer.await {
-            Ok(Ok((id, relayed))) => Ok(Lease {
-                id,
-                relayed,
-                commands: handle.commands,
-                status: handle.status,
-            }),
+            Ok(Ok(lease)) => Ok(lease),
             // Being deleted, or ended before it read the command.
             Ok(Err(TurnError::Closing)) | Err(_) => {
                 handle.commands.closed().await;
@@ -600,11 +599,13 @@ struct Driver {
     clock: Arc<dyn Clock>,
     /// Commands from the client and the leases.
     commands: mpsc::UnboundedReceiver<Command>,
-    /// Keeps `commands` open, so it only ends with the task.
-    _keep: mpsc::UnboundedSender<Command>,
+    /// Keeps `commands` open, so it only ends with the task; each lease
+    /// granted gets a clone.
+    sender: mpsc::UnboundedSender<Command>,
     /// The relayed address, published.
     status: watch::Sender<Option<SocketAddr>>,
-    /// Set at the server's first answer ([`TurnClient::answered`]).
+    /// Set at the server's first answer, cleared when the allocation is
+    /// lost ([`TurnClient::answered`]).
     answered: Arc<AtomicBool>,
     /// Sessions waiting for the allocation.
     adds: Vec<(LeaseId, LeaseReply)>,
@@ -623,14 +624,14 @@ impl Driver {
     /// The task for `machine` and the handle to it.
     fn new(machine: Allocation, server: SocketAddr, clock: Arc<dyn Clock>) -> (Self, Handle) {
         let (commands, receiver) = mpsc::unbounded_channel();
-        let (status, watcher) = watch::channel(None);
+        let (status, _) = watch::channel(None);
         let answered = Arc::new(AtomicBool::new(false));
         let driver = Self {
             machine,
             server,
             clock,
             commands: receiver,
-            _keep: commands.clone(),
+            sender: commands.clone(),
             status,
             answered: Arc::clone(&answered),
             adds: Vec::new(),
@@ -643,7 +644,6 @@ impl Driver {
             driver,
             Handle {
                 commands,
-                status: watcher,
                 outbound: None,
                 answered,
             },
@@ -869,11 +869,18 @@ impl Driver {
         }
     }
 
-    /// Hands a session its lease; one that stopped waiting leaves again.
-    fn grant(&mut self, lease: LeaseId, relayed: SocketAddr, reply: LeaseReply) {
-        if reply.send(Ok((lease, relayed))).is_err() {
-            tracing::debug!(server = %self.server, "turn lease no longer wanted");
-            self.machine.remove_session(self.clock.now(), lease);
+    /// Hands a session its lease. When the session stopped waiting, the
+    /// lease comes back here, or is dropped with the channel when it stops
+    /// before reading it: either way [`Lease`]'s drop queues its release.
+    fn grant(&self, lease: LeaseId, relayed: SocketAddr, reply: LeaseReply) {
+        let lease = Lease {
+            id: lease,
+            relayed,
+            commands: self.sender.clone(),
+            status: self.status.subscribe(),
+        };
+        if reply.send(Ok(lease)).is_err() {
+            tracing::debug!(server = %self.server, "turn lease no longer wanted; released");
         }
     }
 
@@ -888,6 +895,9 @@ impl Driver {
                     }
                 }
                 Event::Lost { .. } => {
+                    // The re-creation's own answers count (§8.3), before
+                    // anyone hears of the loss.
+                    self.answered.store(false, Ordering::Relaxed);
                     self.status.send_replace(None);
                     self.fail_requests(&TurnError::Lost);
                 }
@@ -1550,6 +1560,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lease_granted_but_never_read_is_released() {
+        bounded(async {
+            let setup = Setup::new().await;
+            let turn = setup.turn();
+            let alice = creds("alice");
+            // A UDP attempt and its TCP twin, both granted before either
+            // answer is read.
+            let mut answers = Vec::new();
+            for (server, transport) in [
+                (setup.server.udp_addr(), Transport::Udp),
+                (setup.server.tcp_addr(), Transport::Tcp),
+            ] {
+                let handle = setup
+                    .client
+                    .handle(canonical(server), transport, &alice)
+                    .unwrap();
+                let (reply, answer) = oneshot::channel();
+                handle
+                    .commands
+                    .send(Command::Add {
+                        credentials: alice.clone(),
+                        reply,
+                    })
+                    .unwrap();
+                answers.push(answer);
+            }
+            eventually(|| answers.iter().all(|answer| !answer.is_empty())).await;
+            assert_eq!(turn.allocations().len(), 2);
+            let [udp, tcp] = <[_; 2]>::try_from(answers).unwrap();
+            let kept = udp.await.unwrap().unwrap();
+            // The loser's grant goes unread: its allocation is deleted.
+            drop(tcp);
+            eventually(|| turn.allocations().len() == 1).await;
+            let allocations = turn.allocations();
+            assert!(!allocations[0].tcp);
+            assert_eq!(allocations[0].relayed, kept.relayed());
+            assert!(turn.requests().iter().any(|r| r.tcp && r.method == REFRESH));
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn rfc8656_7_2_an_allocation_knows_once_its_server_answered_even_the_challenge() {
         bounded(async {
             let setup = Setup::new().await;
@@ -1653,6 +1705,29 @@ mod tests {
             assert_eq!(allocations.len(), 1);
             assert_eq!(allocations[0].username, "bob");
             assert_eq!(allocations[0].relayed, relayed);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8656_8_3_a_lost_allocation_has_no_answer_until_its_re_creation_is_answered() {
+        bounded(async {
+            let setup = Setup::new().await;
+            let turn = setup.turn();
+            let udp = setup.server.udp_addr();
+            let alice = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let _bob = setup.lease(Transport::Udp, "bob").await.unwrap();
+            assert!(setup.client.answered(udp, Transport::Udp));
+            let mut status = alice.status();
+            // The refused Refresh loses it; the re-creation waits for the
+            // old allocation to expire.
+            turn.expire_user("alice");
+            setup.clock.advance(Duration::from_secs(540));
+            status.wait_for(Option::is_none).await.unwrap();
+            assert!(!setup.client.answered(udp, Transport::Udp));
+            setup.clock.advance(Duration::from_secs(60));
+            status.wait_for(Option::is_some).await.unwrap();
+            assert!(setup.client.answered(udp, Transport::Udp));
         })
         .await;
     }
@@ -1797,8 +1872,8 @@ mod tests {
             let (peers, _out, frames) = stream_parts();
             driver.run_stream(reader, writer, peers, frames).await;
             assert_eq!(
-                answer.await.unwrap(),
-                Err(TurnError::Allocation(AllocationError::Connection))
+                answer.await.unwrap().unwrap_err(),
+                TurnError::Allocation(AllocationError::Connection)
             );
             assert!(handle.commands.is_closed());
         })
@@ -1809,6 +1884,7 @@ mod tests {
     async fn rfc8656_12_5_a_stream_is_split_into_messages_and_closed_when_out_of_step() {
         bounded(async {
             let (driver, handle, server) = driver();
+            let status = driver.status.subscribe();
             let turn = FakeTurn::new(
                 Arc::new(FakeClock::default()),
                 REALM,
@@ -1849,13 +1925,13 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let (_, relayed) = answer.await.unwrap().unwrap();
-            assert_eq!(turn.allocations()[0].relayed, relayed);
+            let lease = answer.await.unwrap().unwrap();
+            assert_eq!(turn.allocations()[0].relayed, lease.relayed());
             // Neither STUN nor ChannelData: the stream is out of step.
             server_side.write_all(&[0x80, 0, 0, 0]).await.unwrap();
             task.await.unwrap();
             assert!(handle.commands.is_closed());
-            assert_eq!(*handle.status.borrow(), None);
+            assert_eq!(*status.borrow(), None);
         })
         .await;
     }
@@ -1890,6 +1966,7 @@ mod tests {
     async fn a_relayed_frame_that_fails_to_write_ends_the_allocation() {
         bounded(async {
             let (driver, handle, server) = driver();
+            let status = driver.status.subscribe();
             let turn = FakeTurn::new(
                 Arc::new(FakeClock::default()),
                 REALM,
@@ -1913,10 +1990,11 @@ mod tests {
                     reply,
                 })
                 .unwrap();
-            let (lease, relayed) = serve(&turn, server, &mut requests, &mut answers, added)
+            let granted = serve(&turn, server, &mut requests, &mut answers, added)
                 .await
                 .unwrap()
                 .unwrap();
+            let (relayed, lease) = (granted.relayed(), granted.id);
             // Granted before the binding, so read before the frame: the
             // commands are read in order, the frames on a queue of their own.
             let owner = RelayOwner::next();
@@ -1947,7 +2025,7 @@ mod tests {
             .unwrap();
             task.await.unwrap();
             assert!(handle.commands.is_closed());
-            assert_eq!(*handle.status.borrow(), None);
+            assert_eq!(*status.borrow(), None);
         })
         .await;
     }
