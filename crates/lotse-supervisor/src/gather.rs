@@ -187,7 +187,8 @@ pub(crate) struct IcePlan {
 /// ordinary entry. A server named twice is one (a STUN one by host,
 /// ignoring ASCII case, and port). The servers keep their list order,
 /// the first [`MAX_STUN_SERVERS`] STUN and [`MAX_TURN_ATTEMPTS`] TURN
-/// entries (a UDP server and its twin one).
+/// entries (a UDP server and its twin one); a list that names more is
+/// told in one warning per kind ([`warn_beyond_limit`]).
 pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
     let mut plan = IcePlan::default();
     let mut turns: Vec<TurnServer> = Vec::new();
@@ -204,10 +205,8 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                 })?;
                 if plan.stun.iter().any(|other| same_server(other, &server)) {
                     tracing::debug!(url, "stun server named twice");
-                } else if plan.stun.len() < MAX_STUN_SERVERS {
-                    plan.stun.push(server);
                 } else {
-                    tracing::debug!(url, "stun server beyond the per-session limit ignored");
+                    plan.stun.push(server);
                 }
             }
             "turn" => {
@@ -253,13 +252,42 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
             }
         }
     }
+    warn_beyond_limit("stun", MAX_STUN_SERVERS, plan.stun.len());
+    let kept = plan.stun.len().min(MAX_STUN_SERVERS);
+    for ignored in plan.stun.drain(kept..) {
+        tracing::debug!(
+            host = ignored.host,
+            port = ignored.port,
+            "stun server beyond the per-session limit ignored"
+        );
+    }
     plan.turn = turn_entries(turns);
     Ok(plan)
 }
 
+/// Logs one warning when an offer listed more `kind` servers than a
+/// session asks, `listed` counting the usable ones after those named
+/// twice: a reached limit is a warning, as it drops what the client
+/// asked for. Each server dropped is logged at `debug` beside it. One
+/// line per offer and kind, so the client's offers bound how often it is
+/// logged and it needs no rate limit of its own.
+fn warn_beyond_limit(kind: &'static str, limit: usize, listed: usize) {
+    let ignored = listed.saturating_sub(limit);
+    if ignored > 0 {
+        tracing::warn!(
+            kind,
+            limit,
+            listed,
+            ignored,
+            "ice servers beyond the per-session limit ignored"
+        );
+    }
+}
+
 /// `turns` in list order as entries, each TCP server whose host and port
 /// a UDP one names too as the twin of the first such UDP server that has
-/// none yet; at most [`MAX_TURN_ATTEMPTS`] entries.
+/// none yet; at most [`MAX_TURN_ATTEMPTS`] entries, with one warning when
+/// the list had more ([`warn_beyond_limit`]).
 fn turn_entries(turns: Vec<TurnServer>) -> Vec<TurnEntry> {
     let udp: Vec<StunServer> = turns
         .iter()
@@ -294,10 +322,12 @@ fn turn_entries(turns: Vec<TurnServer>) -> Vec<TurnEntry> {
             );
         }
     }
+    warn_beyond_limit("turn", MAX_TURN_ATTEMPTS, entries.len());
     let kept = entries.len().min(MAX_TURN_ATTEMPTS);
     for ignored in entries.drain(kept..) {
         tracing::debug!(
             host = ignored.server.server.host,
+            port = ignored.server.server.port,
             "turn server beyond the per-session limit ignored"
         );
     }
@@ -869,6 +899,67 @@ mod tests {
             (err.code, &err.details["url"]),
             (ErrorCode::InvalidRequest, &json!("turn:t?transport=sctp"))
         );
+    }
+
+    /// The STUN URLs `stun:s<n>` and an entry of the TURN URLs `turn:t<n>`
+    /// for `n` below the counts, `t0` with its TCP twin, each list with
+    /// its last server named twice.
+    fn listed(stun: usize, turn: usize) -> Vec<IceServer> {
+        let mut stun: Vec<String> = (0..stun).map(|n| format!("stun:s{n}")).collect();
+        stun.push(stun.last().unwrap().to_uppercase());
+        let mut turn: Vec<String> = (0..turn).map(|n| format!("turn:t{n}")).collect();
+        turn.push(turn.last().unwrap().clone());
+        turn.push("turn:t0?transport=tcp".into());
+        let stun: Vec<&str> = stun.iter().map(String::as_str).collect();
+        let turn: Vec<&str> = turn.iter().map(String::as_str).collect();
+        let mut listed = servers(&stun);
+        listed.push(turn_entry(&turn, Some("pw")));
+        listed
+    }
+
+    #[test]
+    fn an_offer_over_a_server_limit_warns_once_per_kind_and_one_at_it_not_at_all() {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let warning = "ice servers beyond the per-session limit ignored";
+        // At the limits, a server named twice taking one place: no warning.
+        let plan = plan(&listed(MAX_STUN_SERVERS, MAX_TURN_ATTEMPTS)).unwrap();
+        assert_eq!(
+            (plan.stun.len(), plan.turn.len()),
+            (MAX_STUN_SERVERS, MAX_TURN_ATTEMPTS)
+        );
+        assert_eq!(captured.lines(warning), Vec::<String>::new());
+        // Over them: one warning per kind with the limit and the servers
+        // listed and ignored, each ignored server at debug.
+        let plan = super::plan(&listed(MAX_STUN_SERVERS + 3, MAX_TURN_ATTEMPTS + 2)).unwrap();
+        assert_eq!(
+            (plan.stun.len(), plan.turn.len()),
+            (MAX_STUN_SERVERS, MAX_TURN_ATTEMPTS)
+        );
+        let lines = captured.lines(warning);
+        assert!(lines.iter().all(|line| line.contains(" WARN ")));
+        let fields: Vec<&str> = lines
+            .iter()
+            .map(|line| line.split_once("limit ignored ").unwrap().1)
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                format!(
+                    "kind=\"stun\" limit={MAX_STUN_SERVERS} listed={} ignored=3",
+                    MAX_STUN_SERVERS + 3
+                ),
+                format!(
+                    "kind=\"turn\" limit={MAX_TURN_ATTEMPTS} listed={} ignored=2",
+                    MAX_TURN_ATTEMPTS + 2
+                ),
+            ]
+        );
+        let stun = captured.lines("stun server beyond the per-session limit ignored");
+        let turn = captured.lines("turn server beyond the per-session limit ignored");
+        assert_eq!((stun.len(), turn.len()), (3, 2));
+        assert!(stun[0].contains(&format!("host=\"s{MAX_STUN_SERVERS}\" port=3478")));
+        assert!(turn[0].contains(&format!("host=\"t{MAX_TURN_ATTEMPTS}\" port=3478")));
     }
 
     /// A TURN server named `host`, over TCP when `tcp`.
