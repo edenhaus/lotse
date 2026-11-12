@@ -1328,6 +1328,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_joining_while_its_udp_allocation_is_deleted_unanswered_starts_its_twin_rfc_8656_8_1()
+     {
+        let clock = Arc::new(FakeClock::from_system());
+        let start = clock.now();
+        let (client, demux, local) = turn_client(&clock);
+        let turn = fake_turn();
+        let server = FakeTurnServer::start(Arc::clone(&turn)).await.unwrap();
+        // The UDP server on the TCP twin's port answers an allocation, then
+        // goes silent: its deletion stays unanswered.
+        let address = server.tcp_addr();
+        let udp = fake_turn();
+        let _read = udp_server(address.port(), Udp::Each(Arc::clone(&udp)));
+        let entry = twinned(address.port(), "pw");
+        let credentials = entry.server.credentials.clone();
+        let earlier = client
+            .lease(address, Transport::Udp, &credentials)
+            .await
+            .unwrap();
+        assert!(client.answered(address, Transport::Udp));
+        udp.drop_requests(usize::MAX);
+        drop(earlier);
+        eventually(|| udp.dropped() == 1).await;
+        // The deleting allocation's answers do not count.
+        assert!(!client.answered(address, Transport::Udp));
+        // The joining session's UDP attempt waits for the deletion; its
+        // twin starts after TWIN_DELAY and yields the lease while the
+        // clock stands there, well within the gather deadline.
+        let test = async {
+            SystemClock.sleep(Duration::from_millis(50)).await;
+            clock.advance(TWIN_DELAY);
+        };
+        let leases = run_relays(&client, &clock, vec![entry], &[local], test, Duration::ZERO).await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(
+            (leases[0].transport, leases[0].server),
+            (Transport::Tcp, address)
+        );
+        assert!(clock.now().duration_since(start) < GATHER_DEADLINE);
+        // The deletion never got through: the UDP server still holds it.
+        assert_eq!(udp.allocations().len(), 1);
+        demux.stop();
+    }
+
+    #[tokio::test]
     async fn a_udp_turn_server_that_answers_needs_no_twin_rfc_8656_7_2() {
         let clock = Arc::new(FakeClock::from_system());
         let (client, demux, local) = turn_client(&clock);

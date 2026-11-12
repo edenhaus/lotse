@@ -558,6 +558,13 @@ impl Allocation {
         self.state == State::Closed
     }
 
+    /// Whether the allocation is being deleted (RFC 8656 §8.1, LIFETIME 0)
+    /// or is over: no session joins it any more, and what its server
+    /// answers says nothing of the allocation a joining session waits for.
+    pub fn is_ending(&self) -> bool {
+        matches!(self.state, State::Deleting | State::Closed)
+    }
+
     /// Whether `lease` is one of the allocation's sessions.
     pub fn has_session(&self, lease: LeaseId) -> bool {
         self.sessions.contains(&lease)
@@ -580,7 +587,7 @@ impl Allocation {
     /// newest when it differs from the allocation's; not sent. `None` once the allocation is being deleted
     /// or is over: the session waits for it to close and starts a new one.
     pub fn add_session(&mut self, credentials: &Credentials) -> Option<LeaseId> {
-        if matches!(self.state, State::Deleting | State::Closed) {
+        if self.is_ending() {
             return None;
         }
         let lease = LeaseId(self.next_lease);

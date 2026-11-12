@@ -187,7 +187,7 @@ struct Handle {
     /// What sessions send from its relay candidates; TCP only.
     outbound: Option<mpsc::Sender<Outbound>>,
     /// Set once the server answered any of the allocation's requests;
-    /// cleared when the allocation is lost.
+    /// cleared when the allocation is lost and once it is being deleted.
     answered: Arc<AtomicBool>,
 }
 
@@ -249,7 +249,10 @@ impl TurnClient {
     /// §7.2, RFC 8489 §9.2): proof that the path to it carries that
     /// transport. `false` while it has answered none, and when there is no
     /// such allocation. A lost allocation starts over (§8.3): `false`
-    /// again until the server answers its re-creation.
+    /// again until the server answers its re-creation. One being deleted
+    /// (§8.1, LIFETIME 0) is `false` too, its deletion's answer included:
+    /// a session joining then waits for a new allocation, which has
+    /// answered nothing yet.
     pub fn answered(&self, server: SocketAddr, transport: Transport) -> bool {
         self.allocations
             .lock()
@@ -605,7 +608,7 @@ struct Driver {
     /// The relayed address, published.
     status: watch::Sender<Option<SocketAddr>>,
     /// Set at the server's first answer, cleared when the allocation is
-    /// lost ([`TurnClient::answered`]).
+    /// lost and once it is being deleted ([`TurnClient::answered`]).
     answered: Arc<AtomicBool>,
     /// Sessions waiting for the allocation.
     adds: Vec<(LeaseId, LeaseReply)>,
@@ -757,7 +760,8 @@ impl Driver {
     /// responses; on TCP what the server relays from a peer is unwrapped
     /// and routed as the peer's datagram, or discarded (RFC 8656 §11.4,
     /// §12.6), and the rest is the server's own. A response to one of the
-    /// allocation's requests marks the server as having answered.
+    /// allocation's requests marks the server as having answered
+    /// ([`Self::track_answer`]).
     fn input(&mut self, link: &mut Link, reply: &RawReply) {
         if let Link::Stream {
             peers,
@@ -777,7 +781,22 @@ impl Driver {
                 Relayed::Server => {}
             }
         }
-        if reply.from == self.server && self.machine.handle_input(self.clock.now(), &reply.bytes) {
+        if reply.from == self.server {
+            let answer = self.machine.handle_input(self.clock.now(), &reply.bytes);
+            self.track_answer(answer);
+        }
+    }
+
+    /// Keeps [`TurnClient::answered`] in step with the machine after
+    /// `answer`, whether the server just answered one of its requests:
+    /// set at an answer, cleared once the allocation is being deleted or
+    /// over (RFC 8656 §8.1), so neither the old allocation's answers nor
+    /// its deletion's hold back the TCP twin of a session that waits for
+    /// the next one.
+    fn track_answer(&self, answer: bool) {
+        if self.machine.is_ending() {
+            self.answered.store(false, Ordering::Relaxed);
+        } else if answer {
             self.answered.store(true, Ordering::Relaxed);
         }
     }
@@ -839,6 +858,8 @@ impl Driver {
             Command::Remove { lease } => {
                 self.owners.remove(&lease);
                 self.machine.remove_session(now, lease);
+                // The last session leaving starts the deletion.
+                self.track_answer(false);
             }
             Command::Grant { lease, owner } => {
                 if self.machine.has_session(lease) {
@@ -1683,6 +1704,37 @@ mod tests {
                 .unwrap();
             assert_ne!(again.relayed(), relayed);
             assert_eq!(turn.allocations().len(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8656_8_1_an_allocation_being_deleted_has_no_answer_even_once_its_deletion_is_answered()
+     {
+        bounded(async {
+            let setup = Setup::new().await;
+            let turn = setup.turn();
+            let udp = setup.server.udp_addr();
+            let lease = setup.lease(Transport::Udp, "alice").await.unwrap();
+            assert!(setup.client.answered(udp, Transport::Udp));
+            // The deleting Refresh is lost: the allocation is being
+            // deleted, and its answers no longer count.
+            turn.drop_requests(1);
+            drop(lease);
+            eventually(|| turn.dropped() == 1).await;
+            assert!(!setup.client.answered(udp, Transport::Udp));
+            // The retransmission's answer ends the deletion and the task,
+            // whose handle stays until the next lease; it does not count.
+            setup.clock.advance(Duration::from_millis(500));
+            eventually(|| {
+                let allocations = setup.client.allocations.lock().unwrap();
+                allocations
+                    .values()
+                    .all(|handle| handle.commands.is_closed())
+            })
+            .await;
+            assert_eq!(turn.allocations().len(), 0, "deleted");
+            assert!(!setup.client.answered(udp, Transport::Udp));
         })
         .await;
     }
