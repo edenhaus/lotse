@@ -778,7 +778,8 @@ async function startTalking() {
   try {
     await transceiver.sender.replaceTrack(track);
   } catch (err) {
-    // A track the m-line cannot take without renegotiating, say: the
+    // A track the m-line cannot take "without renegotiation" (W3C WebRTC
+    // 1.0, replaceTrack), say: the
     // microphone goes, and Talk comes back for this attempt only; a later
     // Play's controls stay as they are.
     for (const t of stream.getTracks()) t.stop();
