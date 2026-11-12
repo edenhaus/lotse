@@ -284,6 +284,7 @@ pub async fn serve(
         standby: None,
         sessions: None,
         lost_hand_offs: Throttle::default(),
+        full_recordings: Throttle::default(),
         probes,
         backchannels: BackchannelTasks::default(),
         recordings: Recordings::new(recording_tx),
@@ -375,6 +376,10 @@ struct Serving<'a> {
     /// The log line for hand-offs whose connection the kernel discarded,
     /// rate-limited: a flood of them must not flood the log.
     lost_hand_offs: Throttle,
+    /// The log line of a recording refused at `max_recordings`, which the
+    /// client can ask for again and again: the first, then a summary per
+    /// [`SUMMARY_INTERVAL`](lotse_core::throttle::SUMMARY_INTERVAL).
+    full_recordings: Throttle,
     /// Where the sources' probes of the device's backchannel wait for
     /// the supervisor's connect permits: one gate for the worker, shared
     /// by the running source and the standby.
@@ -657,10 +662,7 @@ impl Serving<'_> {
             (None, _, _) => ("internal_error", "this worker runs no recordings"),
             (_, None, _) => ("internal_error", "the recording came without its pipe"),
             (_, _, None) => ("source_not_live", "the worker runs no source"),
-            _ if self.recordings.len() >= self.settings.recording.max_recordings => (
-                "internal_error",
-                "the worker runs as many recordings as it may",
-            ),
+            _ if self.recordings.len() >= self.settings.recording.max_recordings => RECORDINGS_FULL,
             (Some(factory), Some(fd), Some(running)) => {
                 match tokio::net::unix::pipe::Sender::from_owned_fd(fd) {
                     Ok(pipe) => {
@@ -682,7 +684,14 @@ impl Serving<'_> {
                 }
             }
         };
-        refuse_recording(&mut self.tx, spec.recording_id, refusal).await
+        // Only the limit is the client's to repeat; the other refusals are
+        // the worker's setup or the supervisor's bug.
+        let logged = if refusal == RECORDINGS_FULL {
+            self.full_recordings.hit(self.clock.now())
+        } else {
+            Some(1)
+        };
+        refuse_recording(&mut self.tx, spec.recording_id, refusal, logged).await
     }
 
     /// `StopRecording`: ends `recording_id` cleanly; one this worker does not run is
@@ -1135,14 +1144,24 @@ fn set_prerecord(tracks: &DerivedTracks, window: Option<Duration>) {
     }
 }
 
+/// The refusal of a recording past `max_recordings`: its reason and why.
+const RECORDINGS_FULL: (&str, &str) = (
+    "internal_error",
+    "the worker runs as many recordings as it may",
+);
+
 /// Refuses the recording `recording_id` with `(reason, why)`: its `Closed` at once,
-/// nothing written; its pipe, if one came, is closed already.
+/// nothing written; its pipe, if one came, is closed already. `logged` is
+/// the count of refusals its log line covers, `None` when no line is due.
 async fn refuse_recording(
     tx: &mut Sender,
     recording_id: String,
     (reason, why): (&str, &str),
+    logged: Option<u64>,
 ) -> Result<(), Error> {
-    tracing::warn!(recording.id = %recording_id, reason, why, "recording refused");
+    if let Some(refused) = logged {
+        tracing::warn!(recording.id = %recording_id, reason, why, refused, "recording refused");
+    }
     let closed = ToSupervisor::Recording {
         recording_id,
         event: RecordingReport::Closed {
@@ -5233,6 +5252,7 @@ mod tests {
             standby: None,
             sessions: None,
             lost_hand_offs: Throttle::default(),
+            full_recordings: Throttle::default(),
             probes: ProbeGate::default(),
             backchannels: BackchannelTasks::default(),
             recordings: Recordings::new(mpsc::channel(1).0),
@@ -5952,7 +5972,9 @@ mod tests {
     /// pipe and one past `max_recordings`, each with its pipe closed; a second
     /// start under a running recording's id is dropped with its pipe and no
     /// report, which would be the running recording's. The running recording
-    /// reports through the worker and ends `stopped` on `StopRecording`.
+    /// reports through the worker and ends `stopped` on `StopRecording`. The
+    /// client can ask past the limit again and again: that refusal is logged
+    /// as the first, then one summary per interval with the count.
     #[tokio::test]
     async fn recordings_are_refused_without_a_source_a_pipe_or_room_and_a_running_one_reports() {
         let (logs, _guard) = Logs::capture();
@@ -5997,6 +6019,7 @@ mod tests {
                 audio: None,
             })
         );
+        refuse_k6_and_k7(&mut h, &logs).await;
         h.tx.send_msg(
             &ToWorker::StopRecording {
                 recording_id: "k4".into(),
@@ -6041,6 +6064,42 @@ mod tests {
                 "stop for a recording this worker does not run; ignored"
             ),
             1
+        );
+    }
+
+    /// Starts recordings `k6`, then `k7` a summary interval later, past
+    /// `max_recordings` beside a running `k4`: both are refused, and the
+    /// limit's warning, first logged for `k5`, comes once more for `k7`,
+    /// with the count.
+    async fn refuse_k6_and_k7(h: &mut Harness, logs: &Logs) {
+        // Past the limit again, within the interval of k5's line and after it.
+        for (recording_id, wait) in [
+            ("k6", Duration::ZERO),
+            ("k7", lotse_core::throttle::SUMMARY_INTERVAL),
+        ] {
+            h.clock.advance(wait);
+            let (refused_reader, writer) = recording_pipe();
+            h.tx.send_msg(&start_recording(recording_id), &[writer.as_fd()])
+                .await
+                .unwrap();
+            drop(writer);
+            messages_until(h, |seen| seen.contains(&refused(recording_id))).await;
+            assert_eq!(recording_bytes(refused_reader).await, b"");
+        }
+        let full: Vec<String> = logs
+            .lines(Level::WARN, "recording refused")
+            .into_iter()
+            .map(|line| line.fields)
+            .filter(|fields| fields.contains("as many recordings"))
+            .collect();
+        assert_eq!(full.len(), 2, "{full:?}");
+        assert!(
+            full[0].contains("recording.id=k5 ") && full[0].ends_with("refused=1"),
+            "{full:?}"
+        );
+        assert!(
+            full[1].contains("recording.id=k7 ") && full[1].ends_with("refused=2"),
+            "{full:?}"
         );
     }
 

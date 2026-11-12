@@ -51,6 +51,7 @@ use lotse_core::session::{
 use lotse_core::skew::AV_SYNC_LOST;
 use lotse_core::source::{BACKCHANNEL_OPEN_LIMIT, BackchannelRefused};
 use lotse_core::task::{BoxFuture, spawn_named};
+use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackEvent, TrackId, TrackSubscription, Unit};
 use lotse_ipc::{SessionEvent as IpcEvent, SessionSpec, datagram};
 use tokio::net::UnixDatagram;
@@ -179,6 +180,10 @@ pub(crate) struct SessionManager {
     sessions: HashMap<String, SessionHandle>,
     /// The most sessions open at once; another is refused.
     max_sessions: usize,
+    /// The log line of a session refused at `max_sessions`, which the
+    /// client can ask for again and again: the first, then a summary per
+    /// [`SUMMARY_INTERVAL`](lotse_core::throttle::SUMMARY_INTERVAL).
+    full_lines: Throttle,
     /// The datagram channel reader.
     reader: JoinHandle<()>,
     /// Where session events go.
@@ -230,6 +235,7 @@ impl SessionManager {
             datagrams,
             sessions: HashMap::new(),
             max_sessions,
+            full_lines: Throttle::default(),
             reader,
             events,
             clock,
@@ -263,9 +269,14 @@ impl SessionManager {
         report
     }
 
-    /// Reports a session that never started.
+    /// Reports a session that never started, logged.
     async fn refuse(&self, session_id: String, code: &'static str, message: String) {
         tracing::warn!(session = %session_id, code, message, "session refused");
+        self.report_refused(session_id, code, message).await;
+    }
+
+    /// Reports a session that never started, which its caller logged.
+    async fn report_refused(&self, session_id: String, code: &'static str, message: String) {
         let event = IpcEvent::Closed {
             code: code.to_owned(),
             message,
@@ -294,13 +305,14 @@ impl SessionManager {
             return;
         }
         if self.sessions.len() >= self.max_sessions {
-            self.refuse(
+            let max = self.max_sessions;
+            if let Some(refused) = self.full_lines.hit(self.clock.now()) {
+                tracing::warn!(session = %spec.session_id, code = "internal_error", max, refused, "session refused");
+            }
+            self.report_refused(
                 spec.session_id,
                 "internal_error",
-                format!(
-                    "the worker holds its limit of {} sessions",
-                    self.max_sessions
-                ),
+                format!("the worker holds its limit of {max} sessions"),
             )
             .await;
             return;
@@ -1626,6 +1638,9 @@ async fn run_session(
     let local = ctx.udp.local_addr().ok();
     let mut links = Links::new(Arc::clone(&ctx.clock));
     let mut pending = None;
+    // The viewer's lag warning, which a viewer too slow for the stream
+    // makes again and again: the first, then a summary per interval.
+    let mut gap_lines = Throttle::default();
     loop {
         // Drain after every input (the engine's contract).
         let Some(at) = drain(&ctx, &mut opened, local, &links).await else {
@@ -1648,7 +1663,7 @@ async fn run_session(
             // session output.
             (track, family, event) = next_video(&mut opened.video) => {
                 let now = ctx.clock.now();
-                apply_track_event(opened.engine.as_mut(), now, family, event, |packet| {
+                apply_track_event(opened.engine.as_mut(), now, family, event, &mut gap_lines, |packet| {
                     ctx.mapper.map(track, packet.rtp.ts, packet.arrival)
                 });
             }
@@ -3835,6 +3850,42 @@ mod tests {
                     }
                 ),
             ]
+        );
+    }
+
+    /// The client can ask for sessions past the worker's limit again and
+    /// again: each is refused, logged as the first, then one summary per
+    /// interval on the clock with the count since the last line.
+    #[tokio::test]
+    async fn sessions_past_the_limit_are_refused_and_logged_rate_limited() {
+        let (logs, _guard) = Logs::capture();
+        let mut m = managed();
+        m.manager.max_sessions = 1;
+        m.open("a").await;
+        let refused = || -> Vec<String> {
+            logs.lines(Level::WARN, "session refused")
+                .into_iter()
+                .map(|line| line.fields)
+                .collect()
+        };
+        let full = closed("internal_error", "the worker holds its limit of 1 sessions");
+        for id in ["b", "c"] {
+            m.open(id).await;
+            assert_eq!(m.next().await, (id.to_owned(), full.clone()));
+        }
+        assert_eq!(
+            refused(),
+            [" session=b code=\"internal_error\" max=1 refused=1"],
+            "the second within the interval is counted"
+        );
+        // Nothing yields between the clock's move and the open, so the
+        // waiting session cannot see its connect deadline pass first.
+        m.clock.advance(lotse_core::throttle::SUMMARY_INTERVAL);
+        m.open("d").await;
+        assert_eq!(m.next().await, ("d".to_owned(), full));
+        assert_eq!(
+            refused()[1],
+            " session=d code=\"internal_error\" max=1 refused=2"
         );
     }
 

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::codec::{Codec, CodecFamily};
 use crate::media::MediaPacket;
 use crate::orientation::Orientation;
+use crate::throttle::Throttle;
 use crate::track::{GopSnapshot, TrackEvent};
 use crate::uplink::{UplinkCodec, UplinkPacket};
 
@@ -427,12 +428,16 @@ pub trait SessionEngine: fmt::Debug + Send {
 /// What a session does with one event of its video subscription, or with
 /// its end (`None`): the reactions the output contract requires of every
 /// event. `family` is the video family the session opened with;
-/// `wallclock` maps a packet to its capture time.
+/// `gap_lines` is the session's rate limit of the lag warning; `wallclock`
+/// maps a packet to its capture time.
 ///
 /// - a packet is written;
 /// - a `Gap` (the session lagged) and an `EpochStart` (a reconnect or a
 ///   timestamp discontinuity) skip to the next keyframe, so the viewer
-///   never gets a P-frame whose reference it lacks;
+///   never gets a P-frame whose reference it lacks; a viewer too slow for
+///   the stream lags again and again, so a gap is logged as the first,
+///   then one summary per
+///   [`SUMMARY_INTERVAL`](crate::throttle::SUMMARY_INTERVAL) with the count;
 /// - a `TrackChanged` closes with `stream_changed` when the family
 ///   changed, or when the engine finds the new codec outside the payload
 ///   type it negotiated ([`SessionEngine::check_video_change`]); else the
@@ -446,6 +451,7 @@ pub fn apply_track_event(
     now: Instant,
     family: CodecFamily,
     event: Option<TrackEvent>,
+    gap_lines: &mut Throttle,
     wallclock: impl FnOnce(&MediaPacket) -> Instant,
 ) {
     match event {
@@ -454,7 +460,13 @@ pub fn apply_track_event(
             engine.write_video(now, &packet, at);
         }
         Some(TrackEvent::Gap { skipped }) => {
-            tracing::warn!(skipped, "session lagged; skipping to the next keyframe");
+            if let Some(gaps) = gap_lines.hit(now) {
+                tracing::warn!(
+                    skipped,
+                    gaps,
+                    "session lagged; skipping to the next keyframe"
+                );
+            }
             engine.skip_to_keyframe("gap");
         }
         Some(TrackEvent::EpochStart { epoch }) => {
@@ -546,7 +558,11 @@ pub fn apply_audio_event(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::missing_docs_in_private_items, reason = "test code")]
+    #![allow(
+        clippy::arithmetic_side_effects,
+        clippy::missing_docs_in_private_items,
+        reason = "test code"
+    )]
 
     use super::*;
 
@@ -622,7 +638,14 @@ mod tests {
             sps: None,
             pps: None,
         };
-        apply_track_event(&mut engine, now, h264, Some(changed(main)), at(now));
+        apply_track_event(
+            &mut engine,
+            now,
+            h264,
+            Some(changed(main)),
+            &mut Throttle::default(),
+            at(now),
+        );
         assert!(
             matches!(
                 engine.poll(),
@@ -664,11 +687,13 @@ mod tests {
             mapped = Some(p.rtp.ts);
             now
         });
+        let mut lines = Throttle::default();
         apply_track_event(
             &mut engine,
             now,
             h264,
             Some(TrackEvent::Packet(packet)),
+            &mut lines,
             wallclock,
         );
         assert_eq!(mapped, Some(3_000), "the wallclock is asked for the packet");
@@ -677,7 +702,7 @@ mod tests {
             TrackEvent::Gap { skipped: 4 },
             TrackEvent::EpochStart { epoch: 1 },
         ] {
-            apply_track_event(&mut engine, now, h264, Some(event), at(now));
+            apply_track_event(&mut engine, now, h264, Some(event), &mut lines, at(now));
         }
         assert_eq!(
             engine.stats().skips,
@@ -706,7 +731,7 @@ mod tests {
             TrackEvent::SourceRestored,
             TrackEvent::Frame(Arc::new(frame)),
         ] {
-            apply_track_event(&mut engine, now, h264, Some(event), at(now));
+            apply_track_event(&mut engine, now, h264, Some(event), &mut lines, at(now));
         }
         assert!(
             matches!(engine.poll(), SessionOutput::Timeout(_)),
@@ -718,7 +743,8 @@ mod tests {
             sps: None,
             pps: None,
         };
-        apply_track_event(&mut engine, now, h264, Some(changed(h265)), at(now));
+        let other = Some(changed(h265));
+        apply_track_event(&mut engine, now, h264, other, &mut lines, at(now));
         assert!(matches!(
             engine.poll(),
             SessionOutput::Event(SessionEvent::Closed {
@@ -728,7 +754,7 @@ mod tests {
         ));
         // The track's end closes with stream_deleted.
         let mut engine = EchoEngine::new(now);
-        apply_track_event(&mut engine, now, h264, None, at(now));
+        apply_track_event(&mut engine, now, h264, None, &mut lines, at(now));
         assert!(matches!(
             engine.poll(),
             SessionOutput::Event(SessionEvent::Closed {
@@ -736,6 +762,46 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A viewer too slow for the stream lags again and again: each gap
+    /// skips to the next keyframe, and is logged as the first, then one
+    /// summary per interval with the count since the last line.
+    #[test]
+    fn gaps_are_logged_rate_limited_on_the_clock() {
+        use crate::clock::{Clock as _, SystemClock};
+        use crate::test_logs::Logs;
+        use crate::test_util::EchoEngine;
+        use crate::throttle::SUMMARY_INTERVAL;
+        use tracing::Level;
+
+        let (logs, _guard) = Logs::capture();
+        let now = SystemClock.now();
+        let mut engine = EchoEngine::new(now);
+        let mut lines = Throttle::default();
+        let lagged = "session lagged; skipping to the next keyframe";
+        for (when, skipped) in [
+            (now, 4),
+            (now + Duration::from_secs(1), 5),
+            (now + SUMMARY_INTERVAL, 6),
+        ] {
+            let gap = Some(TrackEvent::Gap { skipped });
+            apply_track_event(
+                &mut engine,
+                when,
+                CodecFamily::H264,
+                gap,
+                &mut lines,
+                at(when),
+            );
+        }
+        assert_eq!(engine.stats().skips, 3, "every gap waits for a keyframe");
+        let fields: Vec<String> = logs
+            .lines(Level::WARN, lagged)
+            .into_iter()
+            .map(|line| line.fields)
+            .collect();
+        assert_eq!(fields, [" skipped=4 gaps=1", " skipped=6 gaps=2"]);
     }
 
     #[test]

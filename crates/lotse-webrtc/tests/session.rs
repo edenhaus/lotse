@@ -4895,6 +4895,7 @@ fn itu_t_h265_7_4_4_a_new_sps_outside_the_negotiated_profile_or_tier_closes_stre
             codec: h265(2),
             clock_rate: 90_000,
         }),
+        &mut lotse_core::throttle::Throttle::default(),
         |_| now,
     );
     let closed = std::iter::from_fn(|| match session.poll() {
