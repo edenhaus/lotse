@@ -18,6 +18,14 @@
 //! supervisor's sandbox allows: its seccomp filter takes any socket family
 //! and Landlock restricts only TCP. An explicitly bound address is the one
 //! host address whatever the interfaces say, so it is never re-read.
+//!
+//! Why each interface address is left out is logged at debug only when
+//! the list is new: at startup (`net::udp`) and when a re-read finds a
+//! different one, after the line saying it changed. A re-read that finds
+//! the same list drops them: it changed nothing a session sees, the
+//! decisions behind the list were logged with it, and repeating them at
+//! every offer, up to once per [`MAX_AGE`], only buries the lines that
+//! say something.
 
 use std::fmt;
 use std::io;
@@ -28,7 +36,7 @@ use std::time::{Duration, Instant};
 use lotse_core::clock::Clock;
 
 use crate::advertise::{AdvertisedAddress, Advertisement};
-use crate::net::hosts::{self, InterfaceAddress};
+use crate::net::hosts::{self, Exclusion, HostRead, InterfaceAddress};
 
 /// How old the host addresses may be when an offer takes them: 2 s. A
 /// burst of offers (a dashboard opening a dozen cameras at once) reads
@@ -107,17 +115,18 @@ impl HostScan {
         self.local.ip().is_unspecified()
     }
 
-    /// The host addresses and the ICE-TCP ones now, and why the interfaces
-    /// were not enumerated if they were not.
-    fn read(&self) -> (Vec<SocketAddr>, Vec<SocketAddr>, Option<io::Error>) {
-        let (hosts, failure) = hosts::read_host_addresses(
+    /// The host addresses now, with the ones left out and why the
+    /// interfaces were not enumerated if they were not, and the ICE-TCP
+    /// addresses that follow from them. Logs nothing.
+    fn read(&self) -> (HostRead, Vec<SocketAddr>) {
+        let read = hosts::read_host_addresses(
             self.local,
             self.dual_stack,
             self.probe.as_ref(),
             self.interfaces.as_ref(),
         );
-        let tcp_hosts = crate::tcp_hosts(&hosts, self.tcp_listener);
-        (hosts, tcp_hosts, failure)
+        let tcp_hosts = crate::tcp_hosts(&read.hosts, self.tcp_listener);
+        (read, tcp_hosts)
     }
 }
 
@@ -252,8 +261,10 @@ impl HostCache {
 
     /// The snapshot for a new session: the last one, re-read first when it
     /// is [`MAX_AGE`] old or older. A changed list is logged once, with
-    /// the addresses before and after, and replaces the snapshot; the
-    /// sessions holding the old one keep it.
+    /// the addresses before and after and then why each interface address
+    /// is left out, and replaces the snapshot; the sessions holding the
+    /// old one keep it. An unchanged list logs no exclusion
+    /// ([module docs](self)).
     pub(crate) fn current(&self) -> Arc<HostSnapshot> {
         let Some(rescan) = &self.rescan else {
             return self.latest();
@@ -267,7 +278,14 @@ impl HostCache {
             return Arc::clone(&cached.snapshot);
         }
         cached.read = Some(now);
-        let (hosts, tcp_hosts, failure) = rescan.scan.read();
+        let (
+            HostRead {
+                hosts,
+                exclusions,
+                failure,
+            },
+            tcp_hosts,
+        ) = rescan.scan.read();
         let failed = failure.is_some();
         match (failure, cached.failing) {
             (Some(err), false) => tracing::warn!(
@@ -293,6 +311,7 @@ impl HostCache {
             tcp_hosts = ?tcp_hosts,
             "host addresses changed; new sessions offer these, running ones keep theirs"
         );
+        exclusions.iter().for_each(Exclusion::log);
         let snapshot = Arc::new(HostSnapshot::new(hosts, tcp_hosts, &rescan.advertised));
         cached.snapshot = Arc::clone(&snapshot);
         snapshot
@@ -404,9 +423,9 @@ mod tests {
         clock: &Arc<FakeClock>,
     ) -> HostCache {
         let clock: Arc<dyn Clock> = Arc::<FakeClock>::clone(clock);
-        let (hosts, tcp_hosts, _) = scan.read();
+        let (read, tcp_hosts) = scan.read();
         HostCache::new(
-            HostSnapshot::new(hosts, tcp_hosts, advertised),
+            HostSnapshot::new(read.hosts, tcp_hosts, advertised),
             Some(scan),
             advertised,
             &clock,
@@ -439,9 +458,13 @@ mod tests {
         );
         // The system's scan reads the system's interfaces.
         let system = HostScan::system("0.0.0.0:0".parse().unwrap(), false, None);
-        let (hosts, tcp_hosts, failure) = system.read();
-        assert!(failure.is_none(), "{failure:?}");
-        assert!(hosts.iter().all(|host| host.is_ipv4() && host.port() == 0));
+        let (read, tcp_hosts) = system.read();
+        assert!(read.failure.is_none(), "{:?}", read.failure);
+        assert!(
+            read.hosts
+                .iter()
+                .all(|host| host.is_ipv4() && host.port() == 0)
+        );
         assert!(tcp_hosts.is_empty(), "listener off");
     }
 
@@ -508,6 +531,49 @@ mod tests {
         clock.advance(MAX_AGE);
         let _latest = hosts.latest();
         assert_eq!(interfaces.reads(), 3);
+    }
+
+    #[test]
+    fn only_a_changed_list_logs_why_addresses_are_left_out() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let interfaces = Interfaces::with(&["192.0.2.1", "fe80::1"]);
+        let clock = Arc::new(FakeClock::default());
+        let hosts = cache(interfaces.scan("[::]:7", None), &[], &clock);
+        let excluded = || captured.lines("interface address not offered");
+        // The same list again: nothing new, so nothing about exclusions.
+        for _ in 0..3 {
+            clock.advance(MAX_AGE);
+            assert_eq!(hosts.current().hosts, addrs(&["192.0.2.1:7"]));
+        }
+        assert_eq!(interfaces.reads(), 4);
+        assert_eq!(excluded(), Vec::<String>::new());
+        // A changed list logs them once, after the change.
+        interfaces.set(&["192.0.2.1", "fe80::1", "2001:db8:1::2"]);
+        clock.advance(MAX_AGE);
+        assert_eq!(
+            hosts.current().hosts,
+            addrs(&["192.0.2.1:7", "[2001:db8:1::2]:7"])
+        );
+        let logged = excluded();
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(
+            logged[0].contains("DEBUG")
+                && logged[0].contains("ip=fe80::1")
+                && logged[0].contains("reason=\"link-local\""),
+            "{logged:?}"
+        );
+        let all = captured.lines("");
+        let changed = all
+            .iter()
+            .position(|line| line.contains("host addresses changed"))
+            .unwrap();
+        assert!(all[changed + 1].contains("interface address not offered"));
+        // Unchanged again: still once.
+        clock.advance(MAX_AGE);
+        let _same = hosts.current();
+        assert_eq!(interfaces.reads(), 6);
+        assert_eq!(excluded().len(), 1);
     }
 
     #[test]
