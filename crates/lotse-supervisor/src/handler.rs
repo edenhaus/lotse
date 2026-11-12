@@ -987,7 +987,7 @@ impl Supervisor {
     /// ([`crate::gather::relay_all`]) for session `serial`, and releases
     /// end-of-candidates after [`GATHER_DEADLINE`] whatever they did; the
     /// TURN attempts still running then are dropped, and a lease that comes
-    /// later than that is released.
+    /// later than that, or is ready just as it passes, is released.
     fn start_gathering(
         &self,
         session_id: &str,
@@ -1025,21 +1025,18 @@ impl Supervisor {
             let deadline = shared.clock.sleep(GATHER_DEADLINE);
             let _handle = spawn_named("session.relay", async move {
                 let mut leased = |relayed| shared.lock().session_relayed(&id, serial, relayed);
-                tokio::select! {
-                    () = crate::gather::relay_all(
-                        &client,
-                        shared.clock.as_ref(),
-                        turn,
-                        &shared.hosts,
-                        &mut leased,
-                    ) => {}
-                    () = deadline => {
-                        tracing::debug!(
-                            session.id = id,
-                            "turn attempts still running at the gather deadline dropped"
-                        );
-                    }
-                }
+                let cut = crate::gather::relay_all(
+                    &client,
+                    shared.clock.as_ref(),
+                    turn,
+                    &shared.hosts,
+                    deadline,
+                    &mut leased,
+                )
+                .await;
+                // Cut short: the attempts still running at the deadline
+                // were dropped, and a lease ready just then released.
+                tracing::debug!(session.id = id, cut_by_deadline = cut, "turn attempts over");
                 shared.lock().session_relays_done(&id, serial);
             });
         }

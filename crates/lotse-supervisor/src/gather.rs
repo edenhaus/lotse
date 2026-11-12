@@ -30,6 +30,7 @@ use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::session::{IceServer, SessionEvent, WarningCode};
 use lotse_core::clock::Clock;
 use lotse_core::secret::Secret;
+use lotse_core::task::BoxFuture;
 
 use crate::net::allocation::Transport;
 use crate::net::credential::Credentials;
@@ -571,22 +572,36 @@ pub(crate) async fn relay_entry(
 
 /// Runs a session's TURN entries in [`RelayQueue`]'s order, each by
 /// [`relay_entry`] on `clock` and reached from `hosts`, and hands each
-/// lease to `leased` as it comes; returns once no entry is running or
-/// left to start. Dropping it drops the attempts running.
+/// lease to `leased` as it comes, until `deadline` (the session's
+/// [`GATHER_DEADLINE`]) passes. `false` once no entry is running or left
+/// to start, `true` when the deadline passed first and cut the queue
+/// short: the attempts still running then are dropped. The deadline is
+/// looked at first: once it passed, a lease that is ready at the same
+/// time is dropped with its attempt, and so released (nobody holds it),
+/// never handed to `leased`. Dropping it drops the attempts running.
 pub(crate) async fn relay_all(
     client: &TurnClient,
     clock: &dyn Clock,
     entries: Vec<TurnEntry>,
     hosts: &[SocketAddr],
+    mut deadline: BoxFuture<'static, ()>,
     leased: &mut (dyn FnMut(Relayed) + Send),
-) {
+) -> bool {
     let mut queue = RelayQueue::new(entries);
     let attempt = |entry: TurnEntry| async move {
         let host = entry.server.server.host.clone();
         (relay_entry(client, clock, entry, hosts).await, host)
     };
     let mut running: FuturesUnordered<_> = queue.first().into_iter().map(attempt).collect();
-    while let Some((relayed, failed)) = running.next().await {
+    loop {
+        let next = tokio::select! {
+            biased;
+            () = &mut deadline => return true,
+            next = running.next() => next,
+        };
+        let Some((relayed, failed)) = next else {
+            return false;
+        };
         if let Some(relayed) = relayed {
             leased(relayed);
         } else if let Some(next) = queue.failed() {
@@ -1149,9 +1164,9 @@ mod tests {
         }
     }
 
-    /// Runs `relay_all` on `entries` while `test` runs, moving `clock` by
-    /// `step` every 5 ms of real time once `test` is done, until both
-    /// end; the leases it yielded.
+    /// Runs `relay_all` on `entries`, with no deadline, while `test` runs,
+    /// moving `clock` by `step` every 5 ms of real time once `test` is
+    /// done, until both end; the leases it yielded.
     async fn run_relays(
         client: &TurnClient,
         clock: &FakeClock,
@@ -1163,13 +1178,17 @@ mod tests {
         let mut leases = Vec::new();
         {
             let mut push = |relayed| leases.push(relayed);
-            let mut relays = pin!(relay_all(client, clock, entries, hosts, &mut push));
+            let never = Box::pin(std::future::pending());
+            let mut relays = pin!(relay_all(client, clock, entries, hosts, never, &mut push));
             let mut test = pin!(test);
             let mut tested = false;
             let ended = async {
                 loop {
                     tokio::select! {
-                        () = &mut relays => break,
+                        cut = &mut relays => {
+                            assert!(!cut, "no deadline cut the queue short");
+                            break;
+                        }
                         () = &mut test, if !tested => tested = true,
                         () = SystemClock.sleep(Duration::from_millis(5)), if tested => {
                             clock.advance(step);
@@ -1184,6 +1203,54 @@ mod tests {
             }
         }
         leases
+    }
+
+    #[tokio::test]
+    async fn a_lease_ready_just_as_the_gather_deadline_passes_is_released_not_handed_over_rfc_8656_8()
+     {
+        let clock = Arc::new(FakeClock::from_system());
+        let (client, demux, local) = turn_client(&clock);
+        let turn = fake_turn();
+        let server = FakeTurnServer::start(Arc::clone(&turn)).await.unwrap();
+        let entry = TurnEntry {
+            twin: None,
+            ..twinned(server.udp_addr().port(), "pw")
+        };
+        let mut leases = Vec::new();
+        {
+            let mut push = |relayed| leases.push(relayed);
+            let deadline = clock.sleep(GATHER_DEADLINE);
+            let hosts = [local];
+            let mut relays = pin!(relay_all(
+                &client,
+                clock.as_ref(),
+                vec![entry],
+                &hosts,
+                deadline,
+                &mut push
+            ));
+            // Polled until the server granted the allocation, and no more:
+            // its lease reaches the client and waits there, unread.
+            let mut polls = 0;
+            while turn.allocations().is_empty() {
+                assert!(polls < 1_000, "no allocation granted");
+                polls += 1;
+                let poll =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(relays.as_mut().poll(cx)))
+                        .await;
+                assert!(poll.is_pending());
+                SystemClock.sleep(Duration::from_millis(5)).await;
+            }
+            SystemClock.sleep(Duration::from_millis(100)).await;
+            // The deadline passes with the lease ready: the deadline wins,
+            // every time.
+            clock.advance(GATHER_DEADLINE);
+            assert!(relays.await, "the deadline cut the queue short");
+        }
+        assert!(leases.is_empty(), "a lease handed over after the deadline");
+        // Nobody holds the lease: released, and with it the allocation.
+        eventually(|| turn.allocations().is_empty()).await;
+        demux.stop();
     }
 
     #[tokio::test]
