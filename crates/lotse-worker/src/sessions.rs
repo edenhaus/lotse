@@ -3873,10 +3873,10 @@ mod tests {
             m.open(id).await;
             assert_eq!(m.next().await, (id.to_owned(), full.clone()));
         }
+        // The second, within the interval, is counted, not logged.
         assert_eq!(
             refused(),
-            [" session=b code=\"internal_error\" max=1 refused=1"],
-            "the second within the interval is counted"
+            [" session=b code=\"internal_error\" max=1 refused=1"]
         );
         // Nothing yields between the clock's move and the open, so the
         // waiting session cannot see its connect deadline pass first.

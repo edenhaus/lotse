@@ -6092,14 +6092,13 @@ mod tests {
             .map(|line| line.fields)
             .filter(|fields| fields.contains("as many recordings"))
             .collect();
-        assert_eq!(full.len(), 2, "{full:?}");
-        assert!(
-            full[0].contains("recording.id=k5 ") && full[0].ends_with("refused=1"),
-            "{full:?}"
-        );
-        assert!(
-            full[1].contains("recording.id=k7 ") && full[1].ends_with("refused=2"),
-            "{full:?}"
+        let why = r#"reason="internal_error" why="the worker runs as many recordings as it may""#;
+        assert_eq!(
+            full,
+            [
+                format!(" recording.id=k5 {why} refused=1"),
+                format!(" recording.id=k7 {why} refused=2"),
+            ]
         );
     }
 

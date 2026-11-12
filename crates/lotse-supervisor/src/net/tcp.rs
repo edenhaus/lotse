@@ -810,7 +810,8 @@ mod tests {
         let _over_ip = (from("127.0.0.1").await, from("127.0.0.1").await);
         settle(&running.stats, |s| IceTcpStats::get(&s.refused), 2).await;
         let per_ip = refused("max_per_ip");
-        assert_eq!(per_ip.len(), 1, "the second within the interval is counted");
+        // The second, within the interval, is counted, not logged.
+        assert_eq!(per_ip.len(), 1, "{per_ip:?}");
         assert!(per_ip[0].ends_with("refused=1"), "{per_ip:?}");
         // The total is its own line.
         let other = from("127.0.0.2").await;
