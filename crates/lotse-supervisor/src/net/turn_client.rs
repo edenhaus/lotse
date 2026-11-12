@@ -226,10 +226,18 @@ struct Route {
 
 impl Route {
     /// Moves the entry to `relayed` on `server`, or removes it for `None`.
+    /// An entry at the old address is removed only while it is still this
+    /// allocation's: the server may have given the address to a new
+    /// allocation (RFC 8656 §7.2) before this one's task learned it lost
+    /// it, and the new one's entry stays.
     fn set(&mut self, server: SocketAddr, relayed: Option<SocketAddr>) {
         let at = relayed.map(|relayed| (server, canonical(relayed)));
         let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(old) = self.at.take() {
+        if let Some(old) = self.at.take()
+            && routes
+                .get(&old)
+                .is_some_and(|queue| queue.same_channel(&self.queue))
+        {
             routes.remove(&old);
         }
         if let Some(at) = at {
@@ -1573,6 +1581,33 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[test]
+    fn rfc8656_7_2_a_lost_allocation_leaves_the_route_a_new_one_took_over() {
+        let routes = Routes::default();
+        let server: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+        let relayed: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let (old_queue, _old_frames) = mpsc::channel(1);
+        let (new_queue, _new_frames) = mpsc::channel(1);
+        let route = |queue| Route {
+            routes: Arc::clone(&routes),
+            queue,
+            at: None,
+        };
+        let (mut old, mut new) = (route(old_queue), route(new_queue.clone()));
+        old.set(server, Some(relayed));
+        // The server gave the address to a new allocation before the old
+        // one's task learned it lost it.
+        new.set(server, Some(relayed));
+        old.set(server, None);
+        let entries = routes.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[&(server, relayed)].same_channel(&new_queue));
+        drop(entries);
+        // The new one's own removal still removes it.
+        new.set(server, None);
+        assert!(routes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
