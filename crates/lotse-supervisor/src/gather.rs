@@ -1164,6 +1164,13 @@ mod tests {
         }
     }
 
+    /// What `relay_all` hands over, pushed onto `leases`. One closure for
+    /// every test, so a test that expects nothing handed over leaves no
+    /// closure of its own that never runs (llvm-cov counts one as missed).
+    fn collect(leases: &mut Vec<Relayed>) -> impl FnMut(Relayed) + Send + '_ {
+        move |relayed| leases.push(relayed)
+    }
+
     /// Runs `relay_all` on `entries`, with no deadline, while `test` runs,
     /// moving `clock` by `step` every 5 ms of real time once `test` is
     /// done, until both end; the leases it yielded.
@@ -1177,7 +1184,7 @@ mod tests {
     ) -> Vec<Relayed> {
         let mut leases = Vec::new();
         {
-            let mut push = |relayed| leases.push(relayed);
+            let mut push = collect(&mut leases);
             let never = Box::pin(std::future::pending());
             let mut relays = pin!(relay_all(client, clock, entries, hosts, never, &mut push));
             let mut test = pin!(test);
@@ -1218,7 +1225,7 @@ mod tests {
         };
         let mut leases = Vec::new();
         {
-            let mut push = |relayed| leases.push(relayed);
+            let mut push = collect(&mut leases);
             let deadline = clock.sleep(GATHER_DEADLINE);
             let hosts = [local];
             let mut relays = pin!(relay_all(
