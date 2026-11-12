@@ -2,6 +2,13 @@
 //! each `stun:` server from the shared socket, so the mapped address is
 //! the port the daemon uses, with retransmission and a per-server cache.
 //!
+//! The cache holds a server's mapping for the generation of host
+//! addresses it was learned on (`host_cache`): a server-reflexive
+//! candidate is relative to its base (RFC 8445 §5.1.1.2), and once the
+//! host addresses changed, the kernel may send from another one, which a
+//! NAT maps elsewhere, so the first gathering of a new generation asks
+//! the server again.
+//!
 //! Implements RFC 8489 §6.2.1 (retransmission: RTO doubling, `Rc`
 //! attempts) and §7.2 (a request needs no attributes); responses arrive
 //! through the demux by transaction id.
@@ -74,8 +81,9 @@ pub struct StunClient {
     clock: Arc<dyn Clock>,
     /// The tunables.
     config: StunClientConfig,
-    /// Answers by server, with when they were learned.
-    cache: Mutex<HashMap<SocketAddr, (Instant, SocketAddr)>>,
+    /// Answers by server, with the generation of host addresses and the
+    /// time they were learned at; one per server, the latest asked.
+    cache: Mutex<HashMap<SocketAddr, (u64, Instant, SocketAddr)>>,
 }
 
 impl StunClient {
@@ -95,16 +103,24 @@ impl StunClient {
         }
     }
 
-    /// The daemon's address as `server` sees it, cached.
-    pub async fn reflexive(&self, server: SocketAddr) -> Result<SocketAddr, StunClientError> {
+    /// The daemon's address as `server` sees it from the host addresses
+    /// of `generation`, cached for that generation only
+    /// ([module docs](self)).
+    pub async fn reflexive(
+        &self,
+        server: SocketAddr,
+        generation: u64,
+    ) -> Result<SocketAddr, StunClientError> {
         let now = self.clock.now();
         let cached = self
             .cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&server)
-            .filter(|(at, _)| now.saturating_duration_since(*at) < self.config.cache)
-            .map(|(_, mapped)| *mapped);
+            .filter(|(learned_on, at, _)| {
+                *learned_on == generation && now.saturating_duration_since(*at) < self.config.cache
+            })
+            .map(|(_, _, mapped)| *mapped);
         if let Some(mapped) = cached {
             return Ok(mapped);
         }
@@ -112,7 +128,7 @@ impl StunClient {
         self.cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(server, (self.clock.now(), mapped));
+            .insert(server, (generation, self.clock.now(), mapped));
         Ok(mapped)
     }
 
@@ -276,10 +292,10 @@ mod tests {
     #[tokio::test]
     async fn the_mapped_address_is_gathered_and_cached() {
         let (client, demux, server, thread) = client(1, false);
-        let mapped = client.reflexive(server).await.unwrap();
+        let mapped = client.reflexive(server, 0).await.unwrap();
         assert_eq!(mapped.port(), demux_port(&demux, &client));
         // The server answers once; the second call is served from the cache.
-        assert_eq!(client.reflexive(server).await.unwrap(), mapped);
+        assert_eq!(client.reflexive(server, 0).await.unwrap(), mapped);
         thread.join().unwrap();
         demux.stop();
     }
@@ -304,13 +320,43 @@ mod tests {
                 cache: Duration::from_secs(60),
             },
         );
-        let mapped = client.reflexive(server).await.unwrap();
+        let mapped = client.reflexive(server, 0).await.unwrap();
         clock.advance(Duration::from_secs(59));
-        assert_eq!(client.reflexive(server).await.unwrap(), mapped);
+        assert_eq!(client.reflexive(server, 0).await.unwrap(), mapped);
         clock.advance(Duration::from_secs(1));
-        assert_eq!(client.reflexive(server).await.unwrap(), mapped);
+        assert_eq!(client.reflexive(server, 0).await.unwrap(), mapped);
         stop.store(true, std::sync::atomic::Ordering::Release);
         assert_eq!(thread.join().unwrap(), 2, "gathered at 0 s and at 60 s");
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn rfc8445_5_1_1_2_a_mapping_is_not_reused_once_the_host_addresses_changed() {
+        let bound = super::super::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let local = bound.local;
+        let clock = Arc::new(FakeClock::default());
+        let demux =
+            Demux::start(Arc::clone(&bound.socket), local, vec![local], clock.clone()).unwrap();
+        let (server, stop, thread) = counting_server();
+        let client = StunClient::new(
+            bound.socket,
+            demux.responses(),
+            clock.clone(),
+            StunClientConfig {
+                rto: Duration::from_millis(50),
+                retries: 2,
+                cache: Duration::from_secs(60),
+            },
+        );
+        // Learned and cached on the first host addresses.
+        let mapped = client.reflexive(server, 0).await.unwrap();
+        assert_eq!(client.reflexive(server, 0).await.unwrap(), mapped);
+        // The next generation asks again, well within the cache time, and
+        // its answer is then the cached one.
+        assert_eq!(client.reflexive(server, 1).await.unwrap(), mapped);
+        assert_eq!(client.reflexive(server, 1).await.unwrap(), mapped);
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(thread.join().unwrap(), 2, "once per generation");
         demux.stop();
     }
 
@@ -337,7 +383,7 @@ mod tests {
             StunClientConfig::default(),
         );
         let mapped = tokio::select! {
-            mapped = client.reflexive(server) => mapped.unwrap(),
+            mapped = client.reflexive(server, 0) => mapped.unwrap(),
             () = SystemClock.sleep(Duration::from_secs(5)) => panic!("no mapped address"),
         };
         assert!(
@@ -359,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn a_silent_server_times_out_after_the_retransmissions() {
         let (client, demux, server, thread) = client(0, false);
-        let err = client.reflexive(server).await.unwrap_err();
+        let err = client.reflexive(server, 0).await.unwrap_err();
         assert!(matches!(err, StunClientError::Timeout), "{err}");
         assert_eq!(err.to_string(), "no answer from the stun server");
         drop(thread);
@@ -377,7 +423,7 @@ mod tests {
         );
         // An IPv4 socket has no way to an IPv6 server.
         let err = client
-            .reflexive("[::1]:3478".parse().unwrap())
+            .reflexive("[::1]:3478".parse().unwrap(), 0)
             .await
             .unwrap_err();
         assert!(matches!(err, StunClientError::Send(_)), "{err}");
@@ -398,7 +444,7 @@ mod tests {
             Arc::new(FakeClock::default()),
             StunClientConfig::default(),
         );
-        let mut gathering = Box::pin(client.reflexive(server.local_addr().unwrap()));
+        let mut gathering = Box::pin(client.reflexive(server.local_addr().unwrap(), 0));
         // One poll sends the request and waits for the answer.
         let early = tokio::select! {
             biased;
@@ -418,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn an_error_response_is_reported() {
         let (client, demux, server, thread) = client(1, true);
-        let err = client.reflexive(server).await.unwrap_err();
+        let err = client.reflexive(server, 0).await.unwrap_err();
         assert!(
             matches!(err, StunClientError::ErrorResponse { code: 400, ref reason } if reason == "Bad"),
             "{err}"

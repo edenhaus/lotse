@@ -13,6 +13,14 @@
 //! restart); when its pair dies, the client opens a new session, which
 //! gets the current ones.
 //!
+//! Each snapshot carries a generation, one more at each change of the
+//! list, so what was learned from the host addresses of before is not
+//! handed to a session on the new ones: the STUN client asks a server
+//! again rather than reuse a mapping (a server-reflexive candidate is
+//! relative to its base, RFC 8445 §5.1.1.2), and a new session's lease
+//! on a TCP allocation comes from one connected on the new addresses (an
+//! allocation is bound to its 5-tuple, RFC 8656 §5).
+//!
 //! The re-read is `getifaddrs(3)` (a netlink dump on Linux) and two
 //! probe sockets that send nothing (the `net::hosts` module), which the
 //! supervisor's sandbox allows: its seccomp filter takes any socket family
@@ -156,11 +164,14 @@ pub(crate) struct HostSnapshot {
     /// The addresses of [`Self::hosts`], each once: where a signaled
     /// source gathers its candidates.
     pub(crate) local_addrs: Vec<IpAddr>,
+    /// Which list of host addresses this is: 0 for the one found at
+    /// startup, one more at each change ([module docs](self)).
+    pub(crate) generation: u64,
 }
 
 impl HostSnapshot {
     /// The snapshot of `hosts` and `tcp_hosts`, with `advertised` worked
-    /// out on them.
+    /// out on them, of generation 0.
     pub(crate) fn new(
         hosts: Vec<SocketAddr>,
         tcp_hosts: Vec<SocketAddr>,
@@ -177,6 +188,7 @@ impl HostSnapshot {
             hosts,
             tcp_hosts,
             local_addrs,
+            generation: 0,
         }
     }
 }
@@ -262,8 +274,9 @@ impl HostCache {
     /// The snapshot for a new session: the last one, re-read first when it
     /// is [`MAX_AGE`] old or older. A changed list is logged once, with
     /// the addresses before and after and then why each interface address
-    /// is left out, and replaces the snapshot; the sessions holding the
-    /// old one keep it. An unchanged list logs no exclusion
+    /// is left out, and replaces the snapshot with one of the next
+    /// generation; the sessions holding the old one keep it. An unchanged
+    /// list logs no exclusion and keeps the generation
     /// ([module docs](self)).
     pub(crate) fn current(&self) -> Arc<HostSnapshot> {
         let Some(rescan) = &self.rescan else {
@@ -312,7 +325,9 @@ impl HostCache {
             "host addresses changed; new sessions offer these, running ones keep theirs"
         );
         exclusions.iter().for_each(Exclusion::log);
-        let snapshot = Arc::new(HostSnapshot::new(hosts, tcp_hosts, &rescan.advertised));
+        let mut snapshot = HostSnapshot::new(hosts, tcp_hosts, &rescan.advertised);
+        snapshot.generation = cached.snapshot.generation.wrapping_add(1);
+        let snapshot = Arc::new(snapshot);
         cached.snapshot = Arc::clone(&snapshot);
         snapshot
     }
@@ -484,6 +499,7 @@ mod tests {
         assert_eq!(interfaces.reads(), 1, "the first read");
         let first = hosts.current();
         assert_eq!(first.hosts, addrs(&["192.0.2.1:18556"]));
+        assert_eq!(first.generation, 0);
         // No IPv6 host address to be the advertised one's base.
         assert_eq!(first.advertisement.lines(), Vec::<String>::new());
         // A change within the max age is not seen yet.
@@ -511,6 +527,7 @@ mod tests {
             ]
         );
         assert_eq!(second.advertisement.lines().len(), 2, "UDP and TCP");
+        assert_eq!(second.generation, 1, "a change is a new generation");
         assert!(Arc::ptr_eq(&hosts.latest(), &second));
         // A session that took the first keeps it.
         assert_eq!(first.hosts, addrs(&["192.0.2.1:18556"]));
@@ -526,6 +543,7 @@ mod tests {
         clock.advance(MAX_AGE);
         assert!(Arc::ptr_eq(&hosts.current(), &second));
         assert_eq!(interfaces.reads(), 3);
+        assert_eq!(hosts.latest().generation, 1, "the same generation");
         assert_eq!(captured.lines("host addresses changed").len(), 1);
         // `latest` never reads.
         clock.advance(MAX_AGE);

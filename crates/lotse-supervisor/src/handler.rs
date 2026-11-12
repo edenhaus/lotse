@@ -1007,12 +1007,13 @@ impl Supervisor {
                 let hosts = Arc::clone(hosts);
                 let id = session_id.to_owned();
                 let _handle = spawn_named("session.gather", async move {
-                    let candidate = crate::gather::gather(&client, &server, &hosts.hosts)
-                        .await
-                        .map(|(mapped, base)| {
-                            let related = hosts.advertisement.related(mapped, base);
-                            crate::gather::srflx_candidate(index, mapped, related)
-                        });
+                    let candidate =
+                        crate::gather::gather(&client, &server, &hosts.hosts, hosts.generation)
+                            .await
+                            .map(|(mapped, base)| {
+                                let related = hosts.advertisement.related(mapped, base);
+                                crate::gather::srflx_candidate(index, mapped, related)
+                            });
                     shared.lock().session_gathered(&id, serial, candidate);
                 });
             }
@@ -1025,7 +1026,7 @@ impl Supervisor {
                 let id = session_id.to_owned();
                 let _handle = spawn_named("session.relay", async move {
                     let relayed = tokio::select! {
-                        relayed = crate::gather::relay(&client, &server, &hosts.hosts) => relayed,
+                        relayed = crate::gather::relay(&client, &server, &hosts.hosts, hosts.generation) => relayed,
                         () = shared.clock.sleep(GATHER_DEADLINE) => None,
                     };
                     shared.lock().session_relayed(&id, serial, relayed);
@@ -5292,6 +5293,123 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A STUN server answering every Binding with `mapped`, and how many
+    /// it answered.
+    fn counting_stun_server(
+        mapped: SocketAddr,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&answered);
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 1500];
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                let request = crate::net::stun::parse(&buf[..n]).unwrap();
+                let reply = crate::net::stun::Builder::new(
+                    crate::net::stun::Class::Success,
+                    crate::net::stun::METHOD_BINDING,
+                    request.transaction_id,
+                )
+                .xor_mapped_address(mapped)
+                .build();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _sent = socket.send_to(&reply, from);
+            }
+        });
+        (addr, answered)
+    }
+
+    #[tokio::test]
+    async fn rfc8445_5_1_1_2_the_first_offer_after_a_host_address_change_asks_stun_again() {
+        let dir = private_dir("srflx-rescan");
+        let clock = Arc::new(FakeClock::default());
+        let bound = crate::net::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let demux = crate::net::demux::Demux::start(
+            Arc::clone(&bound.socket),
+            bound.local,
+            bound.hosts.clone(),
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        let interfaces = Interfaces::with(&["192.0.2.1"]);
+        let door = FrontDoor {
+            registrations: demux.registrations(),
+            hosts: vec!["192.0.2.1:18556".parse().unwrap()],
+            tcp_hosts: vec![],
+            scan: Some(interfaces.scan("0.0.0.0:18556", None)),
+            stun: Some(Arc::new(StunClient::new(
+                bound.socket,
+                demux.responses(),
+                Arc::<FakeClock>::clone(&clock),
+                crate::net::stun_client::StunClientConfig::default(),
+            ))),
+            turn: None,
+            demux: Some(demux.stats()),
+        };
+        let mut settings = session_settings();
+        settings.limits.max_sessions_per_stream = 8;
+        settings.limits.max_sessions = 8;
+        let s = Supervisor::new(
+            settings,
+            webrtc_environment(&blocking_worker(&dir), door),
+            Arc::<FakeClock>::clone(&clock),
+        );
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        // The offers' commands stop here; the worker's reports are made up.
+        let (tx, _offers) = mpsc::channel(8);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        let (server, asked) = counting_stun_server("203.0.113.7:40000".parse().unwrap());
+        // The srflx candidate of session `id`, once its gathering is done.
+        let srflx = async |id: u64, session: &str| -> String {
+            let mut events = subscription(call_on(&s, 1, &stun_offer(id, session, server)).await);
+            next(&mut events).await;
+            report(
+                &s,
+                session,
+                Report::Answer {
+                    sdp: "v=0\r\na=mid:0\r\n".into(),
+                    talkback: None,
+                },
+            );
+            assert_eq!(next(&mut events).await["type"], "answer");
+            report(&s, session, end_of_candidates());
+            let candidate = next(&mut events).await["candidate"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                next(&mut events).await,
+                json!({ "type": "candidate", "candidate": "" })
+            );
+            candidate
+        };
+        let ordinal = std::sync::atomic::Ordering::SeqCst;
+        assert!(srflx(2, "s1").await.contains("typ srflx raddr 192.0.2.1"));
+        assert_eq!(asked.load(ordinal), 1);
+        // Read again, unchanged: the mapping is the cached one.
+        clock.advance(crate::host_cache::MAX_AGE);
+        assert!(srflx(3, "s2").await.contains("typ srflx raddr 192.0.2.1"));
+        assert_eq!(asked.load(ordinal), 1, "served from the cache");
+        assert_eq!(interfaces.reads(), 1);
+        // Changed: the server is asked again on the new base.
+        interfaces.set(&["192.0.2.2"]);
+        clock.advance(crate::host_cache::MAX_AGE);
+        assert!(srflx(4, "s3").await.contains("typ srflx raddr 192.0.2.2"));
+        assert_eq!(asked.load(ordinal), 2, "asked again after the change");
+        // The worker is stopped within the budget, on the fake clock.
+        let mut shutdown = std::pin::pin!(s.shutdown());
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                () = SystemClock.sleep(Duration::from_millis(5)) => {
+                    clock.advance(Duration::from_millis(100));
+                }
+            }
+        }
+        demux.stop();
     }
 
     fn stun_offer(id: u64, session_id: &str, server: SocketAddr) -> Value {

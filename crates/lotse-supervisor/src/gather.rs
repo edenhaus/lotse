@@ -288,13 +288,16 @@ async fn reach(server: &StunServer, hosts: &[SocketAddr]) -> Option<(SocketAddr,
 /// Gathers from one server: resolves it, sends from the host address of
 /// the family it resolves to, and returns the mapped address with its
 /// base; `None` when that fails or the candidate is redundant (no NAT).
+/// `hosts` are of `generation`, whose mapping the client asks for
+/// (RFC 8445 §5.1.1.2: the candidate is relative to its base).
 pub(crate) async fn gather(
     client: &StunClient,
     server: &StunServer,
     hosts: &[SocketAddr],
+    generation: u64,
 ) -> Option<(SocketAddr, SocketAddr)> {
     let (target, base) = reach(server, hosts).await?;
-    let mapped = client.reflexive(target).await.ok()?;
+    let mapped = client.reflexive(target, generation).await.ok()?;
     if mapped == base {
         tracing::debug!(%mapped, "server-reflexive address equals its base; redundant");
         return None;
@@ -318,15 +321,18 @@ pub(crate) struct Relayed {
 
 /// Leases the allocation on `server` over its transport (made with its
 /// credential if there is none yet), reached from the host address of the
-/// family it resolves to; `None` when that fails.
+/// family it resolves to; `None` when that fails. `hosts` are of
+/// `generation`, which a TCP allocation must have been connected on
+/// (RFC 8656 §5: an allocation is bound to its 5-tuple).
 pub(crate) async fn relay(
     client: &TurnClient,
     server: &TurnServer,
     hosts: &[SocketAddr],
+    generation: u64,
 ) -> Option<Relayed> {
     let (target, local) = reach(&server.server, hosts).await?;
     match client
-        .lease(target, server.transport, &server.credentials)
+        .lease(target, server.transport, generation, &server.credentials)
         .await
     {
         Ok(lease) => Some(Relayed {
@@ -594,25 +600,25 @@ mod tests {
             port: addr.port(),
         };
         assert_eq!(
-            gather(&client, &stun(natted), &[local]).await,
+            gather(&client, &stun(natted), &[local], 0).await,
             Some(("203.0.113.7:40000".parse().unwrap(), local))
         );
         // RFC 8445 §5.1.3: mapped == base is redundant.
-        assert_eq!(gather(&client, &stun(open), &[local]).await, None);
+        assert_eq!(gather(&client, &stun(open), &[local], 0).await, None);
         // No host of the server's family, an unresolvable name, silence.
         let v6 = StunServer {
             host: "[::1]".into(),
             port: 3478,
         };
-        assert_eq!(gather(&client, &v6, &[local]).await, None);
+        assert_eq!(gather(&client, &v6, &[local], 0).await, None);
         let unresolvable = StunServer {
             host: "stun.invalid".into(),
             port: 3478,
         };
-        assert_eq!(gather(&client, &unresolvable, &[local]).await, None);
+        assert_eq!(gather(&client, &unresolvable, &[local], 0).await, None);
         let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
         assert_eq!(
-            gather(&client, &stun(silent.local_addr().unwrap()), &[local]).await,
+            gather(&client, &stun(silent.local_addr().unwrap()), &[local], 0).await,
             None
         );
 
