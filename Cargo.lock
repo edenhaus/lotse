@@ -1728,7 +1728,7 @@ dependencies = [
  "lotse-testing",
  "lotse-tls",
  "retina",
- "sdp-types",
+ "sdp-types 0.3.2",
  "serde",
  "serde_json",
  "socket2",
@@ -2536,7 +2536,7 @@ dependencies = [
  "memchr",
  "pretty-hex",
  "rand 0.8.8",
- "sdp-types",
+ "sdp-types 0.2.0",
  "smallvec",
  "tracing",
  "url",
@@ -2739,6 +2739,18 @@ name = "sdp-types"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46d46be065d0565cf5c6703b6ba9f92b0de85b20a4c83f87e110bc0a1040b1bc"
+dependencies = [
+ "bstr",
+ "fallible-iterator",
+ "hex",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sdp-types"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef408d5c8c27b151ef7cc88b34636ea95fcfbff66bbc04c2621960a2ea735d3"
 dependencies = [
  "bstr",
  "fallible-iterator",
