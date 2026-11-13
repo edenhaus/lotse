@@ -42,7 +42,6 @@ use crate::gather::Relayed;
 use crate::host_cache::HostCache;
 use crate::memory::MemoryProbe;
 use crate::millis;
-use crate::net::allocation::Transport;
 use crate::net::demux::{DatagramSink, Registrations};
 use crate::net::stun_client::StunClient;
 use crate::net::turn_client::TurnClient;
@@ -997,7 +996,7 @@ impl State {
                 relayed: address,
                 server: relayed.server,
                 local: relayed.local,
-                tcp: relayed.transport == Transport::Tcp,
+                tcp: relayed.transport.is_stream(),
                 grant: relayed.lease.grant(),
             };
             let queued = self
@@ -2340,7 +2339,7 @@ mod tests {
                 port,
             ))),
             server: "192.0.2.3:3478".parse().unwrap(),
-            transport: Transport::Tcp,
+            transport: crate::net::allocation::Transport::Tcp,
             local: "192.0.2.1:18556".parse().unwrap(),
         }
     }
