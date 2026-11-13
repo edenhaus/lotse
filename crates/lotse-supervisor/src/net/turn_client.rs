@@ -2035,6 +2035,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reader_ends_when_its_task_goes_while_a_message_waits_for_room() {
+        bounded(async {
+            let server: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+            // The task's queue is full, so the next message waits for room.
+            let (queue, inbound) = mpsc::channel(1);
+            queue
+                .try_send(RawReply {
+                    from: server,
+                    bytes: Vec::new(),
+                })
+                .unwrap();
+            let (reader, mut from_server) = tokio::io::duplex(64);
+            let message = Builder::new(Class::Indication, METHOD_BINDING, [1; 12]).build();
+            from_server.write_all(&message).await.unwrap();
+            let mut reading = pin!(read_stream(Box::new(reader), server, queue));
+            tokio::select! {
+                () = &mut reading => panic!("ended while its task lives"),
+                () = SystemClock.sleep(Duration::from_millis(20)) => {}
+            }
+            // The task goes; the waiting message fails, and the reading
+            // ends though the stream is still open.
+            drop(inbound);
+            reading.await;
+            drop(from_server);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn rfc8489_6_2_3_tls_allocations_are_one_per_server_name() {
         bounded(async {
             let tls = CameraTls::self_signed(&["127.0.0.1", "localhost"]).unwrap();

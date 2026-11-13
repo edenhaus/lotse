@@ -186,13 +186,15 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
         .map(|turn| turn.server.clone())
         .collect();
     plan.turn.retain(|turn| {
-        let redundant = turn.via.transport().is_stream()
-            && udp.iter().any(|other| same_server(other, &turn.server));
+        let transport = turn.via.transport();
+        let redundant =
+            transport.is_stream() && udp.iter().any(|other| same_server(other, &turn.server));
         if redundant {
+            let transport = transport.name();
             tracing::debug!(
                 host = turn.server.host,
                 port = turn.server.port,
-                transport = turn.via.transport().name(),
+                transport,
                 "turn server over a stream named over udp too; the udp allocation relays"
             );
         }
