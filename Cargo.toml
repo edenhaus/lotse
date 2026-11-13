@@ -197,7 +197,7 @@ allocation-counter = { version = "0.8", default-features = false }
 # binary. Its `wrap_help` default only formats `--help`.
 divan = { version = "0.1", default-features = false }
 # The WebSocket client of `lotse ctl` over the Unix socket; the same engine axum uses.
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 # The Opus encoder of the AAC-LC → Opus transcoder, later the talk-back decoder: safe bindings to
 # libopus, bundled and built statically by cmake.
