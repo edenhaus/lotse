@@ -4,7 +4,9 @@
 The intended dependency graph lives in the TOML file so it can be written ahead
 of the code. Every direct dependency edge between workspace crates must be
 listed there, a restricted external crate may only be a direct dependency of
-its owners, and a dev-only crate may never be a normal or build dependency. Prints one line per violation and exits 1.
+its owners, and a dev-only crate may never be a normal or build dependency. A
+harness crate's own edges are exempt, and no crate may depend on it. Prints one
+line per violation and exits 1.
 
 Runs on any Python 3; the config parser covers exactly the TOML subset the file
 uses: `[section]` headers and `key = ["a", "b"]` lines, with `#` comments.
@@ -54,12 +56,18 @@ def main():
     config = parse(CONFIG.read_text())
     dependents = config.get("dependents", {})
     dev_only = set(config.get("dev-only", {}).get("crates", []))
+    harness = set(config.get("harness", {}).get("crates", []))
     external = config.get("external", {})
     members = metadata()
     errors = []
     for name, pkg in sorted(members.items()):
         for dep in pkg["dependencies"]:
             target, kind = dep["name"], dep["kind"] or "normal"
+            if target in harness:
+                errors.append(f"{name} -> {target} ({kind}): {target} is a harness, nothing may depend on it")
+                continue
+            if name in harness:
+                continue
             if target in members:
                 if name not in dependents.get(target, []):
                     errors.append(

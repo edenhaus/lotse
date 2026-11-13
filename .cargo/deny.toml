@@ -32,12 +32,10 @@ allow = [
   "CDLA-Permissive-2.0", # webpki-roots data
 ]
 exceptions = [
-  # libFuzzer's own license (LLVM's before Apache-2.0 WITH LLVM-exception); only the fuzz workspace
-  # (fuzz/Cargo.lock) links it, never a release build, so cargo-about never meets it.
+  # libFuzzer's own license (LLVM's before Apache-2.0 WITH LLVM-exception); only the fuzz targets
+  # (lotse-fuzz) link it, never a release build, so cargo-about never meets it.
   { crate = "libfuzzer-sys", allow = ["NCSA"] },
 ]
-# One policy for two workspaces (the root and fuzz/): each run meets only its own exceptions.
-unused-license-exception = "allow"
 
 [licenses.private]
 ignore = true # our own publish = false crates

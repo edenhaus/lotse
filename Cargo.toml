@@ -1,7 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
-exclude = ["fuzz"] # cargo-fuzz crate is its own workspace (nightly, libfuzzer-sys)
+members = ["crates/*", "fuzz"]
+# A bare `cargo build`/`cargo test` leaves the fuzz targets out; `--workspace` (clippy, hack)
+# checks them too. They are built for fuzzing only by `cargo fuzz build` (scripts/fuzz.sh, CI).
+default-members = ["crates/*"]
 
 [workspace.package]
 version = "0.0.0-dev"
@@ -216,6 +218,9 @@ rubato = { version = "5", default-features = false }
 # nanoaudio-core (no dependencies) and `wide` (bytemuck, in the tree already, and on x86
 # safe_arch) come with it.
 nanoaudio-g722 = { version = "0.1.1", default-features = false }
+# libFuzzer and its `fuzz_target!` harness, for the fuzz targets (fuzz/) only, never a release
+# build; `link_libfuzzer` builds libFuzzer's C++ and links its `main`.
+libfuzzer-sys = { version = "0.4", default-features = false, features = ["link_libfuzzer"] }
 
 # Workspace crates; the allowed edges are in .cargo/layering.toml.
 lotse-api = { path = "crates/lotse-api" }

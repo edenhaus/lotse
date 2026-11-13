@@ -99,7 +99,7 @@ jobs:
             if git diff --quiet "$base" HEAD -- "$@"; then echo false; else echo true; fi
           }
           {
-            echo "deps=$(changed Cargo.lock fuzz/Cargo.lock .cargo/deny.toml)"
+            echo "deps=$(changed Cargo.lock .cargo/deny.toml)"
             echo "schema=$(changed crates/lotse-api-types/schema/api.json)"
             # What a fuzz target can be built from, and what scripts/fuzz-select.sh runs them all
             # for.
@@ -124,9 +124,6 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: check
-          workspaces: |
-            . -> target
-            fuzz -> fuzz/target
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/uv
@@ -554,7 +551,13 @@ jobs:
       corpus: ${{ steps.corpus.outputs.sha }}
     env:
       NIGHTLY: nightly-2026-11-11 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
-      BIN_DIR: fuzz/target/x86_64-unknown-linux-gnu/release
+      BIN_DIR: target/x86_64-unknown-linux-gnu/release
+      # cargo-fuzz builds the release profile; the daemon's (fat LTO, one codegen unit, symbols
+      # stripped) would slow the build down and take the names out of the sanitizer's stack traces.
+      # The same as `mise run fuzz` (mise.toml).
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_STRIP: none
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -565,12 +568,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: fuzz-build
-          workspaces: fuzz -> target # relative to the workspace: fuzz/target
           cache-bin: true # cargo-fuzz
       - run: cargo "+$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
-      # cargo-fuzz has no `--locked`: this fails on a stale fuzz/Cargo.lock, and the build below
-      # then resolves nothing new.
-      - run: cargo "+$NIGHTLY" fetch --manifest-path fuzz/Cargo.toml --locked
+      # cargo-fuzz has no `--locked`: this fails on a stale Cargo.lock, and the build below then
+      # resolves nothing new.
+      - run: cargo "+$NIGHTLY" fetch --locked
       - run: cargo "+$NIGHTLY" fuzz build
       # The selected targets in groups of up to 4, one Fuzz job each (scripts/fuzz-parallel.sh).
       - name: Select the targets

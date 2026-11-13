@@ -24,7 +24,7 @@ repos:
     hooks:
       - id: codespell
         args: ["--ignore-words-list=medias,unparseable,numer,stap,ue,fo,trun,wronly"] # SDP media sections; accepted spelling; str0m's `MediaTime::numer`; RFC 6184 STAP-A; Exp-Golomb `ue(v)`; RFC 4648 test vector; ISO/IEC 14496-12 `trun` box; open(2) `O_WRONLY`
-        exclude: ^(Cargo\.lock|fuzz/Cargo\.lock|tests/browser/uv\.lock)$
+        exclude: ^(Cargo\.lock|tests/browser/uv\.lock)$
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.12
     hooks:
@@ -64,7 +64,8 @@ repos:
         types: [rust]
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        # The fuzz targets are not under the workspace lints yet (fuzz/Cargo.toml); fuzz-check builds them.
+        entry: cargo clippy --workspace --exclude lotse-fuzz --all-targets --all-features --locked -- -D warnings
         language: system
         files: (\.rs|Cargo\.toml|Cargo\.lock|clippy\.toml)$
         pass_filenames: false
@@ -90,13 +91,11 @@ repos:
         pass_filenames: false
       - id: fuzz-check
         name: cargo check (fuzz targets build)
-        # The fuzz crate is its own workspace, outside clippy and hack: a change to a crate's API
-        # breaks a target silently until the nightly fuzz run. Type-checking needs no nightly and no
-        # sanitizer. `--locked`: fuzz/Cargo.lock is committed, so a crate change that moves the fuzz
-        # graph fails here until the lockfile is refreshed (the same command without `--locked`).
-        entry: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
+        # The fuzz crate is outside clippy (fuzz/Cargo.toml): a change to a crate's API would break a
+        # target silently until the nightly fuzz run. Type-checking needs no nightly and no sanitizer.
+        entry: cargo check -p lotse-fuzz --all-targets --locked
         language: system
-        files: ^(crates|fuzz)/|^Cargo\.toml$
+        files: ^(crates|fuzz)/|^Cargo\.(toml|lock)$
         pass_filenames: false
       - id: api-schema
         name: api schema (schema/api.json matches the DTOs)
@@ -130,13 +129,6 @@ repos:
         name: cargo deny
         # advisories need the network and change without our code changing: CI's Security audit job
         entry: cargo deny --all-features check bans licenses sources
-        language: system
-        files: (Cargo\.toml|Cargo\.lock|\.cargo/deny\.toml)$
-        pass_filenames: false
-      - id: cargo-deny-fuzz
-        name: cargo deny (fuzz workspace)
-        # Its own lockfile, so its own graph (libFuzzer and its build script); the same policy.
-        entry: cargo deny --manifest-path fuzz/Cargo.toml --all-features check bans licenses sources
         language: system
         files: (Cargo\.toml|Cargo\.lock|\.cargo/deny\.toml)$
         pass_filenames: false
