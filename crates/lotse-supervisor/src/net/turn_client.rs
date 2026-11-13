@@ -58,7 +58,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -206,9 +206,8 @@ enum Command {
 struct Handle {
     /// Commands; closed once the task ended.
     commands: mpsc::UnboundedSender<Command>,
-    /// Set once the server answered any of the allocation's requests;
-    /// cleared when the allocation is lost and once it is being deleted.
-    answered: Arc<AtomicBool>,
+    /// What the server answered: [`Driver::answered`].
+    answered: Arc<AtomicU64>,
 }
 
 /// The queues of the TCP allocations for what sessions send from their
@@ -338,18 +337,22 @@ impl TurnClient {
     /// session joining then waits for a new allocation, which has answered
     /// nothing yet. One whose task ended (its TCP connection dropped, a
     /// Refresh timed out) is no allocation, though its handle stays until
-    /// the next lease prunes it. A UDP allocation, shared across
+    /// the next lease prunes it. An answer counts only for the generation
+    /// its request was sent on and the older ones (RFC 8489 §6.2: a
+    /// retransmission keeps its transaction's), as the 5-tuple of a newer
+    /// one may differ (RFC 8656 §5): a UDP allocation, shared across
     /// generations, counts as answered for a session of a newer generation
-    /// only once the Refresh that confirms it on that generation's 5-tuple
-    /// was answered (RFC 8656 §5, §8): from that session's join until then
-    /// it is `false`.
+    /// once the server answered a request sent after it joined, the Refresh
+    /// that confirms the allocation on its 5-tuple (§8) or a later one, and
+    /// late answers to requests sent before do not. For TCP the key fixes
+    /// the generation, and the same rule holds.
     pub fn answered(&self, server: SocketAddr, transport: Transport, generation: u64) -> bool {
         self.allocations
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&key(canonical(server), transport, generation))
             .is_some_and(|handle| {
-                !handle.commands.is_closed() && handle.answered.load(Ordering::Relaxed)
+                !handle.commands.is_closed() && handle.answered.load(Ordering::Relaxed) > generation
             })
     }
 
@@ -709,9 +712,12 @@ struct Driver {
     sender: mpsc::UnboundedSender<Command>,
     /// The relayed address, published.
     status: watch::Sender<Option<SocketAddr>>,
-    /// Set at the server's first answer, cleared when the allocation is
-    /// lost and once it is being deleted ([`TurnClient::answered`]).
-    answered: Arc<AtomicBool>,
+    /// One more than the newest generation of host addresses a request
+    /// the server answered was sent on ([`Allocation::handle_input`]),
+    /// saturating; 0 while it answered none, and reset to 0 when the
+    /// allocation is lost and once it is being deleted
+    /// ([`TurnClient::answered`]: answered for a generation below it).
+    answered: Arc<AtomicU64>,
     /// A TCP allocation's entry in the client's index; `None` on UDP.
     route: Option<Route>,
     /// Sessions waiting for the allocation, or for it to be confirmed on
@@ -733,7 +739,7 @@ impl Driver {
     fn new(machine: Allocation, server: SocketAddr, clock: Arc<dyn Clock>) -> (Self, Handle) {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (status, _) = watch::channel(None);
-        let answered = Arc::new(AtomicBool::new(false));
+        let answered = Arc::new(AtomicU64::new(0));
         let driver = Self {
             machine,
             server,
@@ -887,30 +893,18 @@ impl Driver {
     }
 
     /// Keeps [`TurnClient::answered`] in step with the machine after
-    /// `answer`, whether the server just answered one of its requests:
-    /// set at an answer, cleared once the allocation is being deleted or
-    /// over (RFC 8656 §8.1), so neither the old allocation's answers nor
-    /// its deletion's hold back the TCP twin of a session that waits for
-    /// the next one.
-    fn track_answer(&self, answer: bool) {
+    /// `answer`, the generation of host addresses of the request the
+    /// server just answered, if it answered one: raised to that
+    /// generation, never lowered by an older one's late answer (RFC 8656
+    /// §5), and reset once the allocation is being deleted or over (§8.1),
+    /// so neither the old allocation's answers nor its deletion's hold
+    /// back the TCP twin of a session that waits for the next one.
+    fn track_answer(&self, answer: Option<u64>) {
         if self.machine.is_ending() {
-            self.answered.store(false, Ordering::Relaxed);
-        } else if answer {
-            self.answered.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// A session joins on the host addresses of `generation`: when the
-    /// allocation exists and is not confirmed on that generation yet, the
-    /// answers so far came over a 5-tuple the new addresses may have moved
-    /// (RFC 8656 §5), so [`TurnClient::answered`] is cleared until the
-    /// server answers the Refresh that confirms it (§8), as
-    /// [`Self::track_answer`] then marks. Only a UDP allocation is shared
-    /// across generations; a TCP one is confirmed on its own once it
-    /// exists.
-    fn unanswered_on(&self, generation: u64) {
-        if self.machine.relayed().is_some() && generation > self.machine.confirmed() {
-            self.answered.store(false, Ordering::Relaxed);
+            self.answered.store(0, Ordering::Relaxed);
+        } else if let Some(generation) = answer {
+            self.answered
+                .fetch_max(generation.saturating_add(1), Ordering::Relaxed);
         }
     }
 
@@ -969,7 +963,6 @@ impl Driver {
                 }
                 Some(lease) => {
                     self.adds.push((lease, generation, reply));
-                    self.unanswered_on(generation);
                     self.machine.confirm(now, generation);
                     self.grant_confirmed();
                 }
@@ -978,7 +971,7 @@ impl Driver {
                 self.owners.remove(&lease);
                 self.machine.remove_session(now, lease);
                 // The last session leaving starts the deletion.
-                self.track_answer(false);
+                self.track_answer(None);
             }
             Command::Grant { lease, owner } => {
                 if self.machine.has_session(lease) {
@@ -1060,7 +1053,7 @@ impl Driver {
                 Event::Lost { .. } => {
                     // The re-creation's own answers count (§8.3), before
                     // anyone hears of the loss.
-                    self.answered.store(false, Ordering::Relaxed);
+                    self.answered.store(0, Ordering::Relaxed);
                     self.relay_at(None);
                     self.fail_requests(&TurnError::Lost);
                 }
@@ -1996,8 +1989,71 @@ mod tests {
             let mut newer = pin!(setup.lease_on(Transport::Udp, "bob", 1));
             until_dropped(turn, 1, newer.as_mut()).await;
             assert!(!setup.client.answered(udp, Transport::Udp, 1));
+            // They still count for the generation they were sent on.
+            assert!(setup.client.answered(udp, Transport::Udp, 0));
             // The retransmission's answer confirms it, and counts.
             setup.clock.advance(Duration::from_millis(500));
+            let _newer = newer.await.unwrap();
+            assert!(setup.client.answered(udp, Transport::Udp, 1));
+            assert_eq!(turn.allocations()[0].refreshes, 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8656_5_a_challenge_answered_before_a_new_generation_joined_does_not_count_for_it() {
+        bounded(async {
+            let setup = Setup::new().await;
+            let turn = setup.turn();
+            let udp = setup.server.udp_addr();
+            // The unsigned Allocate is challenged and the signed one lost,
+            // while a session on changed host addresses joins.
+            turn.drop_requests_after(1, 1);
+            let mut both = pin!(async {
+                tokio::join!(
+                    setup.lease(Transport::Udp, "alice"),
+                    setup.lease_on(Transport::Udp, "bob", 1)
+                )
+            });
+            until_dropped(turn, 1, both.as_mut()).await;
+            assert!(setup.client.answered(udp, Transport::Udp, 0));
+            assert!(!setup.client.answered(udp, Transport::Udp, 1));
+            // The retransmission's answer, then the confirmation on
+            // generation 1 the allocation needs, count for it.
+            setup.clock.advance(Duration::from_millis(500));
+            let (first, newer) = both.await;
+            let (first, newer) = (first.unwrap(), newer.unwrap());
+            assert_eq!(first.relayed(), newer.relayed());
+            assert!(setup.client.answered(udp, Transport::Udp, 1));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8656_5_a_late_answer_sent_before_a_new_generation_joined_does_not_count_for_it() {
+        bounded(async {
+            let setup = Setup::new().await;
+            let turn = setup.turn();
+            let udp = setup.server.udp_addr();
+            let first = setup.lease(Transport::Udp, "alice").await.unwrap();
+            // A permission on generation 0 is lost, then the Refresh that
+            // confirms the allocation for a session on generation 1, a
+            // quarter RTO later.
+            turn.drop_requests(2);
+            let mut permit = pin!(first.permit(peer(1).ip()));
+            until_dropped(turn, 1, permit.as_mut()).await;
+            setup.clock.advance(Duration::from_millis(250));
+            let mut newer = pin!(setup.lease_on(Transport::Udp, "bob", 1));
+            until_dropped(turn, 2, newer.as_mut()).await;
+            assert!(!setup.client.answered(udp, Transport::Udp, 1));
+            // The permission's retransmission is answered first: it
+            // proves generation 0's path only.
+            setup.clock.advance(Duration::from_millis(250));
+            assert_eq!(permit.await, Ok(()));
+            assert!(setup.client.answered(udp, Transport::Udp, 0));
+            assert!(!setup.client.answered(udp, Transport::Udp, 1));
+            // The Refresh's retransmission is answered: it counts.
+            setup.clock.advance(Duration::from_millis(250));
             let _newer = newer.await.unwrap();
             assert!(setup.client.answered(udp, Transport::Udp, 1));
             assert_eq!(turn.allocations()[0].refreshes, 1);

@@ -869,21 +869,24 @@ impl Allocation {
         self.reconcile(now);
     }
 
-    /// A message from the server. `false` when it is not a response to
+    /// A message from the server. `None` when it is not a response to
     /// an outstanding request, which the caller handles otherwise (or
-    /// drops). A response to a signed request whose integrity does not
+    /// drops); else the generation of host addresses the request was
+    /// sent on ([`Self::confirm`]), which its retransmissions keep (RFC
+    /// 8489 §6.2): the answer proves the path to the server for that
+    /// generation, never for a newer one, whose 5-tuple may differ (RFC
+    /// 8656 §5). A response to a signed request whose integrity does not
     /// verify is consumed and ignored, so the retransmissions go on (RFC
     /// 8489 §9.2.5).
-    pub fn handle_input(&mut self, now: Instant, bytes: &[u8]) -> bool {
+    pub fn handle_input(&mut self, now: Instant, bytes: &[u8]) -> Option<u64> {
         let Ok(message) = stun::parse(bytes) else {
-            return false;
+            return None;
         };
         if !matches!(message.class, Class::Success | Class::Error) {
-            return false;
+            return None;
         }
-        let Some(tx) = self.transactions.remove(&message.transaction_id) else {
-            return false;
-        };
+        let tx = self.transactions.remove(&message.transaction_id)?;
+        let generation = tx.generation;
         let code = message.error_code().map(|(code, _)| code);
         let challenged = message.class == Class::Error
             && matches!(code, Some(ERROR_UNAUTHENTICATED | ERROR_STALE_NONCE));
@@ -896,7 +899,7 @@ impl Allocation {
         {
             tracing::debug!(server = %self.server, "turn response without valid integrity ignored");
             self.transactions.insert(message.transaction_id, tx);
-            return true;
+            return Some(generation);
         }
         if challenged {
             self.challenged(now, &tx, &message);
@@ -908,7 +911,7 @@ impl Allocation {
             }
             self.finish(now, tx.purpose, Ok(&message));
         }
-        true
+        Some(generation)
     }
 
     /// A 401 or 438 answered `tx`: sign its purpose for the new challenge
@@ -1423,7 +1426,7 @@ mod tests {
             let transmit = self.next();
             let tcp = self.transport == Transport::Tcp;
             if let Some(answer) = self.server.handle(self.client, tcp, &transmit.bytes) {
-                assert!(self.machine.handle_input(self.now(), &answer));
+                assert!(self.machine.handle_input(self.now(), &answer).is_some());
             }
         }
 
@@ -1708,7 +1711,7 @@ mod tests {
             Builder::new(Class::Success, turn::METHOD_REFRESH, request.transaction_id)
                 .attribute(turn::ATTR_LIFETIME, &2_u32.to_be_bytes()),
         );
-        assert!(rig.machine.handle_input(rig.now(), &answer));
+        assert!(rig.machine.handle_input(rig.now(), &answer).is_some());
         assert_eq!(rig.machine.poll_timeout(), Some(rig.now() + 10 * SECOND));
         assert!(rig.machine.warned_short_lifetime);
     }
@@ -1811,7 +1814,7 @@ mod tests {
             Builder::new(Class::Error, METHOD_REFRESH_TEST, refresh.transaction_id)
                 .attribute(ATTR_ERROR_CODE, &error_code(441)),
         );
-        assert!(rig.machine.handle_input(rig.now(), &answer));
+        assert!(rig.machine.handle_input(rig.now(), &answer).is_some());
         assert_eq!(rig.events(), [Event::Lost { relayed: first }]);
     }
 
@@ -1899,7 +1902,7 @@ mod tests {
         let moved = "198.51.100.8:18556".parse().unwrap();
         let late = rig.server.handle(moved, false, &older.bytes).unwrap();
         assert_eq!(rig.log()[3..], [(REFRESH, ok("alice"), Some(437))]);
-        assert!(!rig.machine.handle_input(rig.now(), &late));
+        assert!(rig.machine.handle_input(rig.now(), &late).is_none());
         assert_eq!(rig.events(), Vec::new());
         assert_eq!(rig.machine.relayed(), Some(relayed));
         assert_eq!(rig.machine.confirmed(), 2);
@@ -1924,6 +1927,27 @@ mod tests {
                 (REFRESH, ok("alice"), None),
             ]
         );
+        assert_eq!(rig.machine.confirmed(), 1);
+    }
+
+    #[test]
+    fn rfc8489_6_2_and_rfc8656_5_an_answer_names_the_generation_its_transaction_was_sent_on() {
+        let mut rig = Rig::new(Transport::Udp);
+        // The unsigned Allocate goes out on generation 0 and is lost; the
+        // host addresses change before its retransmission, which keeps
+        // the generation of its transaction.
+        let _lost = rig.next();
+        let now = rig.now();
+        rig.machine.confirm(now, 1);
+        rig.clock.advance(Duration::from_millis(500));
+        rig.machine.handle_timeout(rig.now());
+        let again = rig.next();
+        let challenge = rig.server.handle(rig.client, false, &again.bytes).unwrap();
+        assert_eq!(rig.machine.handle_input(rig.now(), &challenge), Some(0));
+        // The signed Allocate is a new transaction, on generation 1.
+        let signed = rig.next();
+        let answer = rig.server.handle(rig.client, false, &signed.bytes).unwrap();
+        assert_eq!(rig.machine.handle_input(rig.now(), &answer), Some(1));
         assert_eq!(rig.machine.confirmed(), 1);
     }
 
@@ -2021,7 +2045,7 @@ mod tests {
             Builder::new(Class::Error, turn::METHOD_ALLOCATE, allocate.transaction_id)
                 .attribute(ATTR_ERROR_CODE, &error_code(437)),
         );
-        assert!(rig.machine.handle_input(rig.now(), &answer));
+        assert!(rig.machine.handle_input(rig.now(), &answer).is_some());
         assert_eq!(
             rig.events(),
             [Event::Closed {
@@ -2059,7 +2083,7 @@ mod tests {
             Builder::new(Class::Error, turn::METHOD_ALLOCATE, allocate.transaction_id)
                 .attribute(ATTR_ERROR_CODE, &error_code(486)),
         );
-        assert!(rig.machine.handle_input(rig.now(), &answer));
+        assert!(rig.machine.handle_input(rig.now(), &answer).is_some());
         assert_eq!(
             rig.events(),
             [Event::Closed {
@@ -2076,7 +2100,7 @@ mod tests {
             "alice",
             Builder::new(Class::Error, turn::METHOD_ALLOCATE, allocate.transaction_id),
         );
-        assert!(rig.machine.handle_input(rig.now(), &answer));
+        assert!(rig.machine.handle_input(rig.now(), &answer).is_some());
         assert_eq!(
             rig.events(),
             [Event::Closed {
@@ -2097,7 +2121,7 @@ mod tests {
                 allocate.transaction_id,
             ),
         );
-        assert!(rig.machine.handle_input(rig.now(), &answer));
+        assert!(rig.machine.handle_input(rig.now(), &answer).is_some());
         assert_eq!(
             rig.events(),
             [Event::Closed {
@@ -2119,7 +2143,7 @@ mod tests {
             )
             .xor_address(turn::ATTR_XOR_RELAYED_ADDRESS, peer(9)),
         );
-        assert!(rig.machine.handle_input(rig.now(), &answer));
+        assert!(rig.machine.handle_input(rig.now(), &answer).is_some());
         assert_eq!(rig.events(), [Event::Allocated { relayed: peer(9) }]);
         assert_eq!(rig.machine.poll_timeout(), Some(rig.now() + 540 * SECOND));
     }
@@ -2135,7 +2159,7 @@ mod tests {
         )
         .xor_address(turn::ATTR_XOR_RELAYED_ADDRESS, peer(9))
         .build();
-        assert!(rig.machine.handle_input(rig.now(), &forged));
+        assert!(rig.machine.handle_input(rig.now(), &forged).is_some());
         let wrong_key = signed(
             "bob",
             Builder::new(
@@ -2145,7 +2169,7 @@ mod tests {
             )
             .xor_address(turn::ATTR_XOR_RELAYED_ADDRESS, peer(9)),
         );
-        assert!(rig.machine.handle_input(rig.now(), &wrong_key));
+        assert!(rig.machine.handle_input(rig.now(), &wrong_key).is_some());
         assert!(rig.machine.is_pending(&allocate.transaction_id));
         assert_eq!(rig.events(), []);
         // The retransmission reaches the server.
@@ -2160,23 +2184,23 @@ mod tests {
         let mut rig = Rig::new(Transport::Udp);
         let allocate = rig.next();
         let now = rig.now();
-        assert!(!rig.machine.handle_input(now, b"not stun"));
+        assert!(rig.machine.handle_input(now, b"not stun").is_none());
         let indication = Builder::new(
             Class::Indication,
             turn::METHOD_DATA,
             allocate.transaction_id,
         )
         .build();
-        assert!(!rig.machine.handle_input(now, &indication));
+        assert!(rig.machine.handle_input(now, &indication).is_none());
         let request = Builder::new(
             Class::Request,
             turn::METHOD_ALLOCATE,
             allocate.transaction_id,
         )
         .build();
-        assert!(!rig.machine.handle_input(now, &request));
+        assert!(rig.machine.handle_input(now, &request).is_none());
         let unknown = Builder::new(Class::Success, turn::METHOD_ALLOCATE, [0; 12]).build();
-        assert!(!rig.machine.handle_input(now, &unknown));
+        assert!(rig.machine.handle_input(now, &unknown).is_none());
         assert!(rig.machine.is_pending(&allocate.transaction_id));
     }
 
@@ -2187,7 +2211,7 @@ mod tests {
         let challenge = Builder::new(Class::Error, turn::METHOD_ALLOCATE, allocate.transaction_id)
             .attribute(ATTR_ERROR_CODE, &error_code(401))
             .build();
-        assert!(rig.machine.handle_input(rig.now(), &challenge));
+        assert!(rig.machine.handle_input(rig.now(), &challenge).is_some());
         assert_eq!(
             rig.events(),
             [Event::Closed {
@@ -2210,7 +2234,7 @@ mod tests {
         .xor_address(turn::ATTR_XOR_RELAYED_ADDRESS, peer(9))
         .attribute(turn::ATTR_LIFETIME, &600_u32.to_be_bytes())
         .build();
-        assert!(rig.machine.handle_input(rig.now(), &answer));
+        assert!(rig.machine.handle_input(rig.now(), &answer).is_some());
         assert_eq!(rig.events(), [Event::Allocated { relayed: peer(9) }]);
         rig.clock.advance(540 * SECOND);
         rig.machine.handle_timeout(rig.now());
