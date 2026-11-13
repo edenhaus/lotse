@@ -680,15 +680,7 @@ async fn handshake(
             false
         }
         () = deadline => {
-            if let Some(closed) = limit_lines.hit(Limit::UpgradeDeadline) {
-                let timeout_ms = UPGRADE_TIMEOUT.as_millis();
-                tracing::warn!(
-                    %peer,
-                    timeout_ms,
-                    closed,
-                    "control connection closed: no upgrade before the deadline"
-                );
-            }
+            warn_upgrade_deadline(&limit_lines, &peer);
             false
         }
         () = shutdown.cancelled() => {
@@ -718,6 +710,21 @@ async fn handshake(
     }
     // The body's sender, which `send_body`'s receiver needs, lives until here.
     drop(body);
+}
+
+/// Logs `peer`'s connection closed at [`UPGRADE_TIMEOUT`], rate-limited
+/// on `limit_lines`. A function of its own, not generic, so the unit
+/// tests' copy runs both the line that is due and the one that is not.
+fn warn_upgrade_deadline(limit_lines: &LimitLines, peer: &PeerInfo) {
+    if let Some(closed) = limit_lines.hit(Limit::UpgradeDeadline) {
+        let timeout_ms = UPGRADE_TIMEOUT.as_millis();
+        tracing::warn!(
+            %peer,
+            timeout_ms,
+            closed,
+            "control connection closed: no upgrade before the deadline"
+        );
+    }
 }
 
 #[cfg(test)]
