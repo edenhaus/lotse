@@ -13,6 +13,7 @@ tag-template: "$RESOLVED_VERSION"
 change-template: "- $TITLE (#$NUMBER) $AUTHORS"
 change-title-escapes: '\<*_&' # Markdown in a title stays text; Release Drafter keeps @ and # from mentioning
 sort-direction: ascending
+include-pre-releases: true
 
 categories:
   - title: "Breaking changes"
