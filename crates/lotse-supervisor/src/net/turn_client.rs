@@ -1160,7 +1160,11 @@ pub async fn uplink(client: Arc<TurnClient>, datagrams: UnixDatagram, owner: Rel
 /// Splits the stream from the server into messages (STUN by its length,
 /// RFC 8489 §6.2.2; `ChannelData` padded, RFC 8656 §12.5) and queues them
 /// for the task; ends with the stream, on a message neither is (§12), or
-/// with the task.
+/// with the task, even while a read waits: the stream closes once this
+/// half goes too. A plain TCP write half shuts the connection down when
+/// dropped, so the server ends it; a TLS stream's does not, and a server
+/// that keeps the connection open would otherwise keep it, and this task,
+/// alive.
 async fn read_stream(mut reader: Reader, server: SocketAddr, queue: mpsc::Sender<RawReply>) {
     let mut buffer = Vec::new();
     let mut chunk = vec![0; 4096];
@@ -1187,7 +1191,11 @@ async fn read_stream(mut reader: Reader, server: SocketAddr, queue: mpsc::Sender
                 }
             }
         }
-        match reader.read(&mut chunk).await {
+        let read = tokio::select! {
+            read = reader.read(&mut chunk) => read,
+            () = queue.closed() => return,
+        };
+        match read {
             Ok(0) | Err(_) => return,
             Ok(read) => buffer.extend_from_slice(chunk.get(..read).unwrap_or_default()),
         }
@@ -2002,6 +2010,26 @@ mod tests {
             assert_eq!((&buf[..len], from), (&b"hello"[..], relayed));
             worker.send(&[]).unwrap();
             task.await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8656_7_releasing_the_last_tls_lease_closes_the_connection() {
+        bounded(async {
+            let tls = CameraTls::self_signed(&["127.0.0.1"]).unwrap();
+            let setup = Setup::tls(0, &tls).await;
+            let lease = setup
+                .lease(pinned("127.0.0.1", &tls), "alice")
+                .await
+                .unwrap();
+            assert_eq!(setup.server.tcp_clients().len(), 1);
+            // The last lease deletes the allocation; the server keeps the
+            // connection open, so the client must close it: nothing of it,
+            // the task reading it included, outlives the allocation.
+            drop(lease);
+            eventually(|| setup.turn().allocations().is_empty()).await;
+            eventually(|| setup.server.tcp_clients().is_empty()).await;
         })
         .await;
     }
