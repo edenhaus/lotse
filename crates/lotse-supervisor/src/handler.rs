@@ -3190,9 +3190,11 @@ mod tests {
             "nothing opened on an error"
         );
 
-        // RFC 7065 turns: is not supported yet: a warning after `session`.
+        // RFC 7065 turns: over UDP (DTLS, RFC 7350) is not supported: a
+        // warning after `session`; over TCP it is TLS, which is.
         let mut with_ice = offer(2, "front", Some("s1"));
-        with_ice["ice_servers"] = json!([{ "urls": ["stun:stun.example:3478", "TURN:t", "turns:t:5349"],
+        with_ice["ice_servers"] = json!([{ "urls": ["stun:stun.example:3478", "TURN:t", "turns:t:5349",
+                                                    "turns:t:5349?transport=udp"],
                                             "username": "u", "credential": "c" }]);
         let mut s1 = subscription(call_on(&s, 1, &with_ice).await);
         assert_eq!(
@@ -3208,7 +3210,7 @@ mod tests {
             warning["message"]
                 .as_str()
                 .unwrap()
-                .contains("turns:t:5349")
+                .contains("turns:t:5349?transport=udp")
         );
         let err = error(call_on(&s, 1, &offer(3, "front", Some("s1"))).await);
         assert_eq!(err.code, ErrorCode::SessionIdInUse);
@@ -4643,11 +4645,12 @@ mod tests {
             ),
             true,
         );
-        // As many turns: URLs as an offer may carry, each worth a warning.
+        // As many turns: URLs over DTLS as an offer may carry, each worth a
+        // warning.
         let servers: Vec<Value> = (0..lotse_api_types::limits::MAX_ICE_SERVERS)
             .map(|server| {
                 let urls: Vec<String> = (0..lotse_api_types::limits::MAX_ICE_URLS)
-                    .map(|url| format!("turns:t{server}-{url}.example"))
+                    .map(|url| format!("turns:t{server}-{url}.example?transport=udp"))
                     .collect();
                 json!({ "urls": urls })
             })

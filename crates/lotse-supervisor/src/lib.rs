@@ -8,9 +8,10 @@
 //! (`webrtc.advertise`) and the host candidates they hide, the host
 //! addresses re-read at an offer, the TURN client (the codec, the
 //! long-term credential and
-//! the shared allocations over UDP and TCP, whose servers' relayed
-//! datagrams the demux or the TCP allocation's task unwraps as the peers',
-//! and the TCP allocations' writing of what workers frame); later snapshot
+//! the shared allocations over UDP, TCP and TLS over TCP (`turns:`, the
+//! handshake through `lotse-tls`), whose servers' relayed datagrams the
+//! demux or the TCP allocation's task unwraps as the peers', and the TCP
+//! allocations' writing of what workers frame); later snapshot
 //! orchestration.
 //!
 //! The network front door. Parses no camera bytes: only JSON, STUN, TURN
@@ -24,7 +25,8 @@
 //! Standards: RFC 8489 (with Errata 6268 and 6290), RFC 8656, RFC 7983, RFC 4648 §4,
 //! RFC 4571, RFC 6544, RFC 8445 §5.1 and §7.2.5.2.1, RFC 8839 §5.1 and §5.4, RFC 8866 §5
 //! and §9, RFC 5888 §4, RFC 3542 §6.1,
-//! RFC 4291 §2.5.1 and §2.5.5.2, RFC 6724 §5, RFC 7064, RFC 7065, the ULID spec,
+//! RFC 4291 §2.5.1 and §2.5.5.2, RFC 6724 §5, RFC 7064, RFC 7065, RFC 7350 (only to
+//! refuse `turns:` over DTLS), the ULID spec,
 //! `getaddrinfo(3)`, `getifaddrs(3)`.
 
 use std::future::Future;

@@ -4109,7 +4109,7 @@
         },
         {
           "const": "turn_unsupported",
-          "description": "A `turns:` entry of `ice_servers` was ignored.",
+          "description": "A `turns:` entry of `ice_servers` over DTLS (`?transport=udp`, RFC\n7350) was ignored; TURN over TLS (`turns:` over TCP) is supported.",
           "type": "string"
         },
         {

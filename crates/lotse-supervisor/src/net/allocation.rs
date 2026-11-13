@@ -99,6 +99,9 @@ pub enum Transport {
     Udp,
     /// A TCP connection of its own.
     Tcp,
+    /// TLS over a TCP connection of its own (RFC 8656 §3.1, RFC 8489
+    /// §6.2.3); to the state machine a TCP connection.
+    Tls,
 }
 
 impl Transport {
@@ -107,6 +110,17 @@ impl Transport {
         match self {
             Self::Udp => "udp",
             Self::Tcp => "tcp",
+            Self::Tls => "tls",
+        }
+    }
+
+    /// Whether the transport is a byte stream (TCP, or TLS over TCP): a
+    /// reliable one, framed as RFC 8489 §6.2.2 and RFC 8656 §12.5 say, and
+    /// owned by the supervisor's allocation task.
+    pub const fn is_stream(self) -> bool {
+        match self {
+            Self::Udp => false,
+            Self::Tcp | Self::Tls => true,
         }
     }
 }
@@ -415,10 +429,10 @@ fn after(now: Instant, by: Duration) -> Instant {
 
 /// How long to wait after the `sends`th transmission of a request over
 /// `transport`: `RTO` doubling on UDP, `Rm` times the first `RTO` after
-/// the last (RFC 8489 §6.2.1); `Ti` on TCP (§6.2.2).
+/// the last (RFC 8489 §6.2.1); `Ti` on TCP and TLS over TCP (§6.2.2).
 fn wait_after(transport: Transport, config: &AllocationConfig, sends: u32) -> Duration {
     match transport {
-        Transport::Tcp => config.reliable_timeout,
+        Transport::Tcp | Transport::Tls => config.reliable_timeout,
         Transport::Udp if sends >= config.attempts => config.rto.saturating_mul(config.last_wait),
         Transport::Udp => config.rto.saturating_mul(
             1_u32
@@ -1424,7 +1438,7 @@ mod tests {
         /// One transmission through the fake server and its answer back.
         fn step(&mut self) {
             let transmit = self.next();
-            let tcp = self.transport == Transport::Tcp;
+            let tcp = self.transport.is_stream();
             if let Some(answer) = self.server.handle(self.client, tcp, &transmit.bytes) {
                 assert!(self.machine.handle_input(self.now(), &answer).is_some());
             }
@@ -1591,25 +1605,28 @@ mod tests {
     }
 
     #[test]
-    fn rfc8489_6_2_2_tcp_waits_ti_and_never_retransmits() {
-        let mut rig = Rig::new(Transport::Tcp);
-        let start = rig.now();
-        rig.server.drop_requests(usize::MAX);
-        rig.pump();
-        assert_eq!(
-            rig.machine.poll_timeout(),
-            Some(start + Duration::from_millis(39_500))
-        );
-        rig.advance(Duration::from_millis(39_499));
-        assert_eq!(rig.events(), []);
-        rig.advance(Duration::from_millis(1));
-        assert_eq!(rig.sent.len(), 1);
-        assert_eq!(
-            rig.events(),
-            [Event::Closed {
-                error: Some(AllocationError::Allocate(TransactionError::Timeout))
-            }]
-        );
+    fn rfc8489_6_2_2_tcp_and_tls_wait_ti_and_never_retransmit() {
+        for transport in [Transport::Tcp, Transport::Tls] {
+            let mut rig = Rig::new(transport);
+            let start = rig.now();
+            rig.server.drop_requests(usize::MAX);
+            rig.pump();
+            assert_eq!(
+                rig.machine.poll_timeout(),
+                Some(start + Duration::from_millis(39_500)),
+                "{transport:?}"
+            );
+            rig.advance(Duration::from_millis(39_499));
+            assert_eq!(rig.events(), []);
+            rig.advance(Duration::from_millis(1));
+            assert_eq!(rig.sent.len(), 1, "{transport:?}");
+            assert_eq!(
+                rig.events(),
+                [Event::Closed {
+                    error: Some(AllocationError::Allocate(TransactionError::Timeout))
+                }]
+            );
+        }
     }
 
     #[test]
@@ -2702,5 +2719,13 @@ mod tests {
     fn transports_are_named_for_logs() {
         assert_eq!(Transport::Udp.name(), "udp");
         assert_eq!(Transport::Tcp.name(), "tcp");
+        assert_eq!(Transport::Tls.name(), "tls");
+    }
+
+    #[test]
+    fn rfc8656_3_1_tcp_and_tls_over_tcp_are_streams_udp_is_not() {
+        assert!(!Transport::Udp.is_stream());
+        assert!(Transport::Tcp.is_stream());
+        assert!(Transport::Tls.is_stream());
     }
 }

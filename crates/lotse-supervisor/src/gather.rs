@@ -1,15 +1,18 @@
 //! Gathering for one session: the `stun:` servers of the offer's
 //! `ice_servers`, a Binding from the shared socket to each, and the
-//! `srflx` candidate the mapped address becomes; and the `turn:` servers,
-//! a lease on each one's shared allocation over UDP or TCP, whose relayed
-//! address the worker's agent takes as a relay candidate. Every STUN
-//! server is asked at once; the TURN servers wait in a queue
-//! ([`RelayQueue`]) behind [`TURN_IN_FLIGHT`] attempts, a UDP server with
-//! its TCP twin one entry ([`relay_entry`]).
+//! `srflx` candidate the mapped address becomes; and the `turn:` and
+//! `turns:` servers, a lease on each one's shared allocation over UDP, TCP
+//! or TLS over TCP, whose relayed address the worker's agent takes as a
+//! relay candidate. Every STUN server is asked at once; the TURN servers
+//! wait in a queue ([`RelayQueue`]) behind [`TURN_IN_FLIGHT`] attempts, a
+//! UDP server with its TCP or TLS twin one entry ([`relay_entry`]).
 //!
 //! Implements RFC 7064 §3.1 (the `stun:` URI: host and optional port,
-//! default 3478), RFC 7065 §3.1 (the `turn:` URI: host, optional port,
-//! default 3478, and optional transport), RFC 8445 §5.1.1.2 (a
+//! default 3478), RFC 7065 §3.1 (the `turn:` and `turns:` URIs: host,
+//! optional port, default 3478 and 5349, and optional transport; a
+//! `turns:` URI over UDP asks for DTLS, RFC 7350, which is not supported),
+//! RFC 8489 §6.2.3 (a `turns:` server proves the URI's host name to the
+//! embedded roots), RFC 8445 §5.1.1.2 (a
 //! server-reflexive candidate and its base), §5.1.2.1 (its priority),
 //! §5.1.1.3 (its foundation) and §5.1.3 (a candidate equal to its base is
 //! redundant and dropped), and RFC 8839 §5.1 (the `candidate` attribute).
@@ -31,12 +34,13 @@ use lotse_api_types::session::{IceServer, SessionEvent, WarningCode};
 use lotse_core::clock::Clock;
 use lotse_core::secret::Secret;
 use lotse_core::task::BoxFuture;
+use lotse_tls::{TlsTarget, Trust};
 
 use crate::host_cache::HostSnapshot;
 use crate::net::allocation::Transport;
 use crate::net::credential::Credentials;
 use crate::net::stun_client::StunClient;
-use crate::net::turn_client::{Lease, TurnClient};
+use crate::net::turn_client::{Lease, TurnClient, Via};
 
 /// How long end-of-candidates waits for the gathers after the offer.
 ///
@@ -72,7 +76,7 @@ pub(crate) const MAX_STUN_SERVERS: usize = 8;
 /// TURN entries of a session in flight at once: an entry that ends
 /// without a lease makes room for the next in line, one that yields a
 /// lease does not, so a session holds at most this many relay candidates.
-/// An entry is a server with its TCP twin, if any ([`TurnEntry`]): it
+/// An entry is a server with its TCP or TLS twin, if any ([`TurnEntry`]): it
 /// takes one place while either of its attempts runs.
 ///
 /// TURN is queued, unlike STUN: an allocation is state and quota on the
@@ -81,7 +85,7 @@ pub(crate) const MAX_STUN_SERVERS: usize = 8;
 /// within [`GATHER_DEADLINE`].
 pub(crate) const TURN_IN_FLIGHT: usize = 4;
 
-/// TURN entries per session in all, a UDP server and its TCP twin one;
+/// TURN entries per session in all, a UDP server and its twin one;
 /// the servers beyond it are ignored. Twice [`TURN_IN_FLIGHT`]: when the
 /// first four fail fast, four more still run, and a list longer than that
 /// (it may name
@@ -90,7 +94,7 @@ pub(crate) const TURN_IN_FLIGHT: usize = 4;
 /// reason to let one offer open more allocations.
 pub(crate) const MAX_TURN_ATTEMPTS: usize = 8;
 
-/// How long a UDP attempt whose server has a TCP twin goes without any
+/// How long a UDP attempt whose server has a TCP or TLS twin goes without any
 /// answer from the server before the twin starts alongside it.
 ///
 /// A network that blocks UDP to the server mostly drops it silently, and
@@ -115,6 +119,9 @@ pub(crate) const MAX_WARNINGS: usize = 4;
 /// 7065 §3.1, RFC 8489 §18.6).
 const STUN_PORT: u16 = 3478;
 
+/// The default port of a `turns:` URI (RFC 7065 §3.1, RFC 8489 §18.6).
+const TURNS_PORT: u16 = 5349;
+
 /// The type preference of a server-reflexive candidate (RFC 8445
 /// §5.1.2.2 recommends 100).
 pub(crate) const SRFLX_TYPE_PREFERENCE: u32 = 100;
@@ -135,14 +142,15 @@ pub(crate) struct StunServer {
     pub(crate) port: u16,
 }
 
-/// A `turn:` server as its URI names it, with its entry's long-term
-/// credential.
+/// A `turn:` or `turns:` server as its URI names it, with its entry's
+/// long-term credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnServer {
     /// The host and port.
     pub(crate) server: StunServer,
-    /// The transport to it (RFC 7065 §3.1).
-    pub(crate) transport: Transport,
+    /// How it is reached (RFC 7065 §3.1); over TLS, the host as the name
+    /// its certificate must carry, checked against the embedded roots.
+    pub(crate) via: Via,
     /// The entry's username and credential.
     pub(crate) credentials: Credentials,
 }
@@ -153,7 +161,7 @@ pub(crate) struct TurnServer {
 pub(crate) struct TurnEntry {
     /// The server.
     pub(crate) server: TurnServer,
-    /// Its TCP twin, started alongside it once the server has not
+    /// Its TCP or TLS twin, started alongside it once the server has not
     /// answered over UDP within [`TWIN_DELAY`], else once this attempt
     /// failed; only a UDP server has one.
     pub(crate) twin: Option<TurnServer>,
@@ -172,24 +180,26 @@ pub(crate) struct IcePlan {
 }
 
 /// Checks `ice_servers`: only `stun:`, `turn:` and `turns:` URIs (RFC 7064,
-/// RFC 7065). `turns:` is not supported until M6 and yields a
-/// `turn_unsupported` warning, the first [`MAX_WARNINGS`] of them. A
-/// `turn:` entry without a username and credential is skipped: TURN asks
-/// for the long-term credential (RFC 8656 §5), and browsers refuse such an
-/// entry (W3C WebRTC 1.0 §4.2.1). A `turn:` over TCP whose host and port
-/// the list names over UDP too is that UDP server's twin, whatever their
-/// order: both relay over UDP to the peer (§7.1), so the UDP allocation is
-/// enough when it works, and what a session sends through a TCP one
-/// passes through the supervisor, which owns the connection; but a
-/// network that blocks UDP to the server still reaches it over TCP. The
-/// twin starts only when the server is silent over UDP or that attempt
-/// failed ([`relay_entry`]). A UDP server has one twin, the first such
-/// TCP entry; a second is ignored. A TCP entry without a UDP twin is an
-/// ordinary entry. A server named twice is one (a STUN one by host,
-/// ignoring ASCII case, and port). The servers keep their list order,
-/// the first [`MAX_STUN_SERVERS`] STUN and [`MAX_TURN_ATTEMPTS`] TURN
-/// entries (a UDP server and its twin one); a list that names more is
-/// told in one warning per kind ([`warn_beyond_limit`]).
+/// RFC 7065). A `turns:` URI is TLS over TCP, its host a TLS server name
+/// (RFC 8489 §6.2.3); one with `?transport=udp` asks for DTLS (RFC 7350),
+/// which is not supported, and yields a `turn_unsupported` warning, the
+/// first [`MAX_WARNINGS`] of them. A `turn:` or `turns:` entry without a
+/// username and credential is skipped: TURN asks for the long-term
+/// credential (RFC 8656 §5), and browsers refuse such an entry (W3C WebRTC
+/// 1.0 §4.2.1). A server over TCP or TLS whose host and port the list
+/// names over UDP too is that UDP server's twin, whatever their order: all
+/// relay over UDP to the peer (§7.1), so the UDP allocation is enough when
+/// it works, and what a session sends through a stream passes through the
+/// supervisor, which owns the connection; but a network that blocks UDP to
+/// the server still reaches it over TCP. The twin starts only when the
+/// server is silent over UDP or that attempt failed ([`relay_entry`]). A
+/// UDP server has one twin, the first such TCP or TLS entry; a second is
+/// ignored. A TCP or TLS entry without a UDP twin is an ordinary entry. A
+/// server named twice is one (a STUN one by host, ignoring ASCII case, and
+/// port). The servers keep their list order, the first
+/// [`MAX_STUN_SERVERS`] STUN and [`MAX_TURN_ATTEMPTS`] TURN entries (a UDP
+/// server and its twin one); a list that names more is told in one warning
+/// per kind ([`warn_beyond_limit`]).
 pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
     let mut plan = IcePlan::default();
     let mut turns: Vec<TurnServer> = Vec::new();
@@ -210,18 +220,37 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                     plan.stun.push(server);
                 }
             }
-            "turn" => {
-                let (server, tcp) = parse_turn(rest).ok_or_else(|| {
-                    ApiError::new(ErrorCode::InvalidRequest, "not a turn: URI (RFC 7065)")
-                        .with_detail("url", url.as_str())
+            scheme @ ("turn" | "turns") => {
+                let tls = scheme == "turns";
+                let default_port = if tls { TURNS_PORT } else { STUN_PORT };
+                let (server, query) = parse_turn(rest, default_port).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("not a {scheme}: URI (RFC 7065)"),
+                    )
+                    .with_detail("url", url.as_str())
                 })?;
+                let via = match (tls, query) {
+                    (false, TransportQuery::Tcp) => Via::Tcp,
+                    (false, TransportQuery::Udp | TransportQuery::None) => Via::Udp,
+                    (true, TransportQuery::Udp) => {
+                        warn_unsupported(&mut plan, url);
+                        continue;
+                    }
+                    (true, TransportQuery::Tcp | TransportQuery::None) => {
+                        Via::Tls(TlsTarget::new(&server.host, Trust::Roots).map_err(|err| {
+                            ApiError::new(ErrorCode::InvalidRequest, err)
+                                .with_detail("url", url.as_str())
+                        })?)
+                    }
+                };
                 let (Some(username), Some(password)) = (&entry.username, &entry.credential) else {
                     tracing::info!(url, "turn server without username and credential ignored");
                     continue;
                 };
                 let turn = TurnServer {
                     server,
-                    transport: if tcp { Transport::Tcp } else { Transport::Udp },
+                    via,
                     credentials: Credentials {
                         username: username.clone(),
                         password: Secret::new(password.clone()),
@@ -232,17 +261,6 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                 } else {
                     turns.push(turn);
                 }
-            }
-            "turns" if plan.warnings.len() < MAX_WARNINGS => {
-                plan.warnings.push(SessionEvent::Warning {
-                    code: WarningCode::TurnUnsupported,
-                    message: format!("{url} ignored: TURN over TLS is not supported yet"),
-                    reason: None,
-                    status: None,
-                });
-            }
-            "turns" => {
-                tracing::debug!(url, "turns: server beyond the warning limit ignored");
             }
             _ => {
                 return Err(ApiError::new(
@@ -292,34 +310,37 @@ fn warn_beyond_limit(kind: &'static str, limit: usize, listed: usize) {
 fn turn_entries(turns: Vec<TurnServer>) -> Vec<TurnEntry> {
     let udp: Vec<StunServer> = turns
         .iter()
-        .filter(|turn| turn.transport == Transport::Udp)
+        .filter(|turn| turn.via == Via::Udp)
         .map(|turn| turn.server.clone())
         .collect();
     let (twins, plain): (Vec<TurnServer>, Vec<TurnServer>) = turns.into_iter().partition(|turn| {
-        turn.transport == Transport::Tcp && udp.iter().any(|other| same_server(other, &turn.server))
+        turn.via.transport().is_stream() && udp.iter().any(|other| same_server(other, &turn.server))
     });
     let mut entries: Vec<TurnEntry> = plain
         .into_iter()
         .map(|server| TurnEntry { server, twin: None })
         .collect();
     // A twin's host and port are named over UDP, so every entry naming
-    // them is over UDP: a TCP one would be a twin itself.
+    // them is over UDP: a TCP or TLS one would be a twin itself.
     for twin in twins {
         let free = entries
             .iter_mut()
             .find(|entry| entry.twin.is_none() && same_server(&entry.server.server, &twin.server));
+        let transport = twin.via.transport().name();
         if let Some(entry) = free {
             tracing::debug!(
                 host = twin.server.host,
                 port = twin.server.port,
-                "turn server over tcp named over udp too; tried when the udp one is silent or fails"
+                transport,
+                "turn server over a stream named over udp too; tried when the udp one is silent or fails"
             );
             entry.twin = Some(twin);
         } else {
             tracing::debug!(
                 host = twin.server.host,
                 port = twin.server.port,
-                "turn server over tcp whose udp server has a twin already ignored"
+                transport,
+                "turn server over a stream whose udp server has a twin already ignored"
             );
         }
     }
@@ -395,30 +416,67 @@ impl RelayQueue {
     }
 }
 
+/// Warns of a `turns:` URI over UDP, DTLS (RFC 7350), which is not
+/// supported: a `turn_unsupported` warning while fewer than
+/// [`MAX_WARNINGS`] were given, else a log line.
+fn warn_unsupported(plan: &mut IcePlan, url: &str) {
+    if plan.warnings.len() < MAX_WARNINGS {
+        plan.warnings.push(SessionEvent::Warning {
+            code: WarningCode::TurnUnsupported,
+            message: format!("{url} ignored: TURN over DTLS is not supported"),
+            reason: None,
+            status: None,
+        });
+    } else {
+        tracing::debug!(
+            url,
+            "turns: server over dtls beyond the warning limit ignored"
+        );
+    }
+}
+
 /// Whether two URIs name one server: the host ignoring ASCII case (RFC
 /// 3986 §6.2.2.1) and the port.
 fn same_server(one: &StunServer, other: &StunServer) -> bool {
     one.port == other.port && one.host.eq_ignore_ascii_case(&other.host)
 }
 
-/// The server after `turn:` and whether it asks for TCP (RFC 7065 §3.1:
-/// `host [ ":" port ] [ "?transport=" transport ]`, transport `udp` or
-/// `tcp`, UDP when absent). Another transport, or another query, fails.
-fn parse_turn(rest: &str) -> Option<(StunServer, bool)> {
-    let (address, tcp) = match rest.split_once('?') {
-        None => (rest, false),
+/// The `?transport=` query of a `turn:` or `turns:` URI (RFC 7065 §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportQuery {
+    /// None: UDP for `turn:`, TCP for `turns:`.
+    None,
+    /// `udp`: DTLS for `turns:` (RFC 7350).
+    Udp,
+    /// `tcp`.
+    Tcp,
+}
+
+/// The server after `turn:` or `turns:` and the transport it asks for
+/// (RFC 7065 §3.1: `host [ ":" port ] [ "?transport=" transport ]`,
+/// transport `udp` or `tcp`), `default_port` when it names none. Another
+/// transport, or another query, fails.
+fn parse_turn(rest: &str, default_port: u16) -> Option<(StunServer, TransportQuery)> {
+    let (address, transport) = match rest.split_once('?') {
+        None => (rest, TransportQuery::None),
         Some((address, query)) => match query.to_ascii_lowercase().as_str() {
-            "transport=udp" => (address, false),
-            "transport=tcp" => (address, true),
+            "transport=udp" => (address, TransportQuery::Udp),
+            "transport=tcp" => (address, TransportQuery::Tcp),
             _ => return None,
         },
     };
-    parse_stun(address).map(|server| (server, tcp))
+    parse_host(address, default_port).map(|server| (server, transport))
 }
 
 /// The host and port after `stun:` (RFC 7064 §3.1: `host [ ":" port ]`).
 /// User info, a path or a query fail the host or port syntax.
 fn parse_stun(rest: &str) -> Option<StunServer> {
+    parse_host(rest, STUN_PORT)
+}
+
+/// `host [ ":" port ]` of a `stun:`, `turn:` or `turns:` URI (RFC 7064
+/// §3.1, RFC 7065 §3.1), `default_port` when it names none.
+fn parse_host(rest: &str, default_port: u16) -> Option<StunServer> {
     let (host, port) = match rest.rsplit_once(':') {
         // An IPv6 literal without a port ends in its bracket.
         Some((host, port)) if !port.contains(']') => (host, Some(port)),
@@ -437,7 +495,7 @@ fn parse_stun(rest: &str) -> Option<StunServer> {
     };
     let port = match port {
         Some(port) => port.parse().ok().filter(|port| *port != 0)?,
-        None => STUN_PORT,
+        None => default_port,
     };
     valid_host.then(|| StunServer {
         host: host.to_owned(),
@@ -519,7 +577,8 @@ pub(crate) struct Relayed {
     pub(crate) lease: Lease,
     /// The server, as resolved.
     pub(crate) server: SocketAddr,
-    /// The transport to it.
+    /// The transport to it; on a stream (TCP or TLS) what the session
+    /// sends goes through the supervisor.
     pub(crate) transport: Transport,
     /// The host address the allocation's traffic leaves from.
     pub(crate) local: SocketAddr,
@@ -527,9 +586,9 @@ pub(crate) struct Relayed {
 
 /// Leases the allocation on `server` at `target`, as resolved, over its
 /// transport (made with its credential if there is none yet), its traffic
-/// leaving from the host address `local` of `generation`, which a TCP
-/// allocation must have been connected on (RFC 8656 §5: an allocation is
-/// bound to its 5-tuple); `None` when that fails.
+/// leaving from the host address `local` of `generation`, which a TCP or
+/// TLS allocation must have been connected on (RFC 8656 §5: an allocation
+/// is bound to its 5-tuple); `None` when that fails.
 async fn lease(
     client: &TurnClient,
     server: &TurnServer,
@@ -538,17 +597,17 @@ async fn lease(
     generation: u64,
 ) -> Option<Relayed> {
     match client
-        .lease(target, server.transport, generation, &server.credentials)
+        .lease(target, &server.via, generation, &server.credentials)
         .await
     {
         Ok(lease) => Some(Relayed {
             lease,
             server: target,
-            transport: server.transport,
+            transport: server.via.transport(),
             local,
         }),
         Err(err) => {
-            tracing::warn!(server = %target, transport = ?server.transport, error = %err, "turn allocation failed");
+            tracing::warn!(server = %target, transport = ?server.via.transport(), error = %err, "turn allocation failed");
             None
         }
     }
@@ -570,7 +629,7 @@ async fn or_other(
 /// One entry's attempts, reached from the host address among `hosts`, of
 /// `generation`, of the family its server resolves to: a lease on its
 /// server, and for a UDP server with a
-/// TCP twin, on the twin at the same address. The twin starts alongside
+/// TCP or TLS twin, on the twin at the same address. The twin starts alongside
 /// the UDP attempt once [`TWIN_DELAY`] passed on `clock` without any
 /// answer from the server over UDP ([`TurnClient::answered`]); when the
 /// server answered, or the UDP attempt failed sooner, it starts once that
@@ -594,14 +653,14 @@ pub(crate) async fn relay_entry(
     let second = pin!(lease(client, &twin, target, local, generation));
     let silent = tokio::select! {
         relayed = &mut first => return or_other(relayed, second).await,
-        () = clock.sleep(TWIN_DELAY) => !client.answered(target, Transport::Udp, generation),
+        () = clock.sleep(TWIN_DELAY) => !client.answered(target, &Via::Udp, generation),
     };
     if !silent {
-        tracing::debug!(server = %target, "turn server answered over udp; its tcp twin waits for that attempt to fail");
+        tracing::debug!(server = %target, "turn server answered over udp; its twin over a stream waits for that attempt to fail");
         let relayed = first.await;
         return or_other(relayed, second).await;
     }
-    tracing::debug!(server = %target, delay = ?TWIN_DELAY, "no answer from the turn server over udp; its tcp twin started alongside");
+    tracing::debug!(server = %target, delay = ?TWIN_DELAY, "no answer from the turn server over udp; its twin over a stream started alongside");
     match select(first, second).await {
         Either::Left((relayed, other)) | Either::Right((relayed, other)) => {
             or_other(relayed, other).await

@@ -48,8 +48,15 @@ fn stun_uris_parse_per_rfc_7064_3_1() {
 }
 
 #[test]
-fn plans_keep_stun_servers_warn_on_turns_and_refuse_the_rest() {
-    let plan = plan(&servers(&["stun:a", "STUN:b:1", "turn:t", "turns:t:5349"])).unwrap();
+fn plans_keep_stun_servers_warn_on_turns_over_dtls_and_refuse_the_rest() {
+    let plan = plan(&servers(&[
+        "stun:a",
+        "STUN:b:1",
+        "turn:t",
+        "turns:t:5349",
+        "turns:t:5349?transport=udp",
+    ]))
+    .unwrap();
     assert_eq!(
         plan.stun,
         [
@@ -64,7 +71,9 @@ fn plans_keep_stun_servers_warn_on_turns_and_refuse_the_rest() {
         ]
     );
     assert_eq!(plan.warnings.len(), 1);
-    let many: Vec<String> = (0..6).map(|n| format!("turns:t{n}")).collect();
+    let many: Vec<String> = (0..6)
+        .map(|n| format!("turns:t{n}?transport=UDP"))
+        .collect();
     let many: Vec<&str> = many.iter().map(String::as_str).collect();
     let warnings = super::plan(&servers(&many)).unwrap().warnings;
     assert_eq!(warnings.len(), MAX_WARNINGS);
@@ -73,7 +82,7 @@ fn plans_keep_stun_servers_warn_on_turns_and_refuse_the_rest() {
         SessionEvent::Warning {
             code: WarningCode::TurnUnsupported,
             message: format!(
-                "turns:t{} ignored: TURN over TLS is not supported yet",
+                "turns:t{}?transport=UDP ignored: TURN over DTLS is not supported",
                 MAX_WARNINGS - 1
             ),
             reason: None,
@@ -113,18 +122,23 @@ fn plans_keep_stun_servers_warn_on_turns_and_refuse_the_rest() {
 
 #[test]
 fn turn_uris_parse_per_rfc_7065_3_1() {
-    let parse = |rest: &str| parse_turn(rest).map(|(s, tcp)| (s.host, s.port, tcp));
+    let parse = |rest: &str| parse_turn(rest, STUN_PORT).map(|(s, q)| (s.host, s.port, q));
     assert_eq!(
         parse("turn.example"),
-        Some(("turn.example".into(), 3478, false))
+        Some(("turn.example".into(), 3478, TransportQuery::None))
     );
     assert_eq!(
         parse("turn.example:80?transport=udp"),
-        Some(("turn.example".into(), 80, false))
+        Some(("turn.example".into(), 80, TransportQuery::Udp))
     );
     assert_eq!(
         parse("[2001:db8::1]:443?transport=TCP"),
-        Some(("[2001:db8::1]".into(), 443, true))
+        Some(("[2001:db8::1]".into(), 443, TransportQuery::Tcp))
+    );
+    // `turns:` defaults to 5349.
+    assert_eq!(
+        parse_turn("turn.example", TURNS_PORT).map(|(s, _)| s.port),
+        Some(5349)
     );
     for bad in [
         "",
@@ -152,10 +166,10 @@ fn named(plan: &IcePlan) -> Vec<(String, u16, Transport, Option<Transport>)> {
             (
                 entry.server.server.host.clone(),
                 entry.server.server.port,
-                entry.server.transport,
+                entry.server.via.transport(),
                 entry.twin.as_ref().map(|twin| {
                     assert!(same_server(&twin.server, &entry.server.server));
-                    twin.transport
+                    twin.via.transport()
                 }),
             )
         })
@@ -252,6 +266,64 @@ fn plans_keep_turn_servers_with_credentials_over_udp_and_tcp_rfc_7065() {
     );
 }
 
+#[test]
+fn plans_keep_turns_servers_over_tls_to_the_embedded_roots_rfc_8489_6_2_3() {
+    let plan = plan(&[
+        turn_entry(
+            &[
+                "turns:t1",
+                "TURNS:t1:5349?transport=tcp",
+                "turns:t2:443?transport=TCP",
+                "turns:[2001:db8::1]",
+                // Named over UDP at its port too: the UDP server's twin,
+                // whatever the order.
+                "turns:t3:443",
+                "turn:t3:443",
+            ],
+            Some("pw"),
+        ),
+        turn_entry(&["turns:t4"], None),
+    ])
+    .unwrap();
+    let tls = |host: &str| Via::Tls(TlsTarget::new(host, Trust::Roots).unwrap());
+    let reached: Vec<(String, u16, Via, Option<Via>)> = plan
+        .turn
+        .iter()
+        .map(|entry| {
+            (
+                entry.server.server.host.clone(),
+                entry.server.server.port,
+                entry.server.via.clone(),
+                entry.twin.as_ref().map(|twin| twin.via.clone()),
+            )
+        })
+        .collect();
+    // Named twice is one server, the default port 5349; no credential,
+    // no server; no warning.
+    assert_eq!(
+        reached,
+        [
+            ("t1".to_owned(), 5349, tls("t1"), None),
+            ("t2".to_owned(), 443, tls("t2"), None),
+            ("[2001:db8::1]".to_owned(), 5349, tls("[2001:db8::1]"), None),
+            ("t3".to_owned(), 443, Via::Udp, Some(tls("t3"))),
+        ]
+    );
+    assert_eq!(plan.turn[0].server.credentials.username, "ha");
+    assert_eq!(plan.warnings, []);
+    // A host that is no TLS server name, and another transport, fail.
+    for bad in ["turns:a..b", "turns:-t", "turns:t?transport=sctp"] {
+        let err = super::plan(&[turn_entry(&[bad], Some("pw"))]).unwrap_err();
+        assert_eq!(
+            (err.code, &err.details["url"]),
+            (ErrorCode::InvalidRequest, &json!(bad)),
+            "{bad}"
+        );
+    }
+    let err = super::plan(&[turn_entry(&["turns:t:0"], Some("pw"))]).unwrap_err();
+    assert_eq!(err.message, "not a turns: URI (RFC 7065)");
+}
+
 /// The STUN URLs `stun:s<n>` and an entry of the TURN URLs `turn:t<n>`
 /// for `n` below the counts, `t0` with its TCP twin, each list with
 /// its last server named twice.
@@ -320,7 +392,7 @@ fn turn(host: &str, tcp: bool) -> TurnServer {
             host: host.into(),
             port: STUN_PORT,
         },
-        transport: if tcp { Transport::Tcp } else { Transport::Udp },
+        via: if tcp { Via::Tcp } else { Via::Udp },
         credentials: Credentials {
             username: "ha".into(),
             password: Secret::new("pw".into()),
@@ -343,12 +415,7 @@ fn queue(count: usize, twinned: bool) -> RelayQueue {
 
 /// An entry's host and whether it is over TCP.
 fn which(entry: Option<TurnEntry>) -> Option<(String, bool)> {
-    entry.map(|entry| {
-        (
-            entry.server.server.host,
-            entry.server.transport == Transport::Tcp,
-        )
-    })
+    entry.map(|entry| (entry.server.server.host, entry.server.via == Via::Tcp))
 }
 
 fn hosts(entries: Vec<TurnEntry>) -> Vec<String> {
@@ -398,8 +465,8 @@ fn a_udp_server_and_its_tcp_twin_take_one_place_and_count_once_rfc_7065_3_1() {
     for n in 4..MAX_TURN_ATTEMPTS {
         let next = queue.failed().unwrap();
         assert_eq!(next.server.server.host, format!("t{n}"));
-        assert_eq!(next.server.transport, Transport::Udp);
-        assert_eq!(next.twin.unwrap().transport, Transport::Tcp);
+        assert_eq!(next.server.via, Via::Udp);
+        assert_eq!(next.twin.unwrap().via, Via::Tcp);
     }
     assert_eq!(which(queue.failed()), None);
     assert!(queue.waiting.is_empty());
@@ -584,7 +651,7 @@ fn twinned(port: u16, password: &str) -> TurnEntry {
             host: "127.0.0.1".into(),
             port,
         },
-        transport: if tcp { Transport::Tcp } else { Transport::Udp },
+        via: if tcp { Via::Tcp } else { Via::Udp },
         credentials: Credentials {
             username: "ha".into(),
             password: Secret::new(password.into()),
@@ -760,7 +827,7 @@ async fn a_udp_turn_server_that_answers_only_its_challenge_keeps_its_twin_waitin
     let address = server.tcp_addr();
     let read = udp_server(address.port(), Udp::First(Arc::clone(&turn)));
     let test = async {
-        eventually(|| client.answered(address, Transport::Udp, 0)).await;
+        eventually(|| client.answered(address, &Via::Udp, 0)).await;
         clock.advance(TWIN_DELAY);
         SystemClock.sleep(Duration::from_millis(100)).await;
         assert_eq!(server.tcp_clients(), [], "the twin waits");
@@ -799,15 +866,15 @@ async fn a_session_joining_while_its_udp_allocation_is_deleted_unanswered_starts
     let entry = twinned(address.port(), "pw");
     let credentials = entry.server.credentials.clone();
     let earlier = client
-        .lease(address, Transport::Udp, 0, &credentials)
+        .lease(address, &Via::Udp, 0, &credentials)
         .await
         .unwrap();
-    assert!(client.answered(address, Transport::Udp, 0));
+    assert!(client.answered(address, &Via::Udp, 0));
     udp.drop_requests(usize::MAX);
     drop(earlier);
     eventually(|| udp.dropped() == 1).await;
     // The deleting allocation's answers do not count.
-    assert!(!client.answered(address, Transport::Udp, 0));
+    assert!(!client.answered(address, &Via::Udp, 0));
     // The joining session's UDP attempt waits for the deletion; its
     // twin starts after TWIN_DELAY and yields the lease while the
     // clock stands there, well within the gather deadline.
@@ -850,10 +917,10 @@ async fn a_udp_turn_server_silent_after_a_host_address_change_starts_its_twin_rf
     let entry = twinned(address.port(), "pw");
     let credentials = entry.server.credentials.clone();
     let _earlier = client
-        .lease(address, Transport::Udp, 0, &credentials)
+        .lease(address, &Via::Udp, 0, &credentials)
         .await
         .unwrap();
-    assert!(client.answered(address, Transport::Udp, 0));
+    assert!(client.answered(address, &Via::Udp, 0));
     udp.drop_requests(usize::MAX);
     // A session on changed host addresses: the Refresh that would
     // confirm the shared allocation on them goes unanswered, so the
@@ -861,7 +928,7 @@ async fn a_udp_turn_server_silent_after_a_host_address_change_starts_its_twin_rf
     // yields the lease while the clock stands at TWIN_DELAY.
     let test = async {
         eventually(|| udp.dropped() == 1).await;
-        assert!(!client.answered(address, Transport::Udp, 1));
+        assert!(!client.answered(address, &Via::Udp, 1));
         clock.advance(TWIN_DELAY);
     };
     let leases = run_relays(

@@ -245,7 +245,7 @@ pub(crate) enum DriverCommand {
         server: SocketAddr,
         /// The host address the allocation's traffic leaves from.
         local: SocketAddr,
-        /// The allocation reaches its server over TCP.
+        /// The allocation reaches its server over TCP, plain or TLS.
         tcp: bool,
         /// Grants the lease's channels to the worker that gets the
         /// candidate, so on TCP only it writes on them.
