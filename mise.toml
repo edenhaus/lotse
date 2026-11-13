@@ -209,7 +209,7 @@ arg "[secs]" help="seconds to run" default="60"
 # nothing new. scripts/fuzz.sh holds libFuzzer's time and memory limits, for CI too.
 # The release profile without the daemon's fat LTO, single codegen unit and stripped symbols, as
 # CI's Fuzz build sets it: a faster build, and the sanitizer's stack traces keep their names.
-env = { NIGHTLY = "nightly-2026-11-11", CARGO_PROFILE_RELEASE_LTO = "false", CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16", CARGO_PROFILE_RELEASE_STRIP = "none" }
+env = { NIGHTLY = "nightly-2026-11-13", CARGO_PROFILE_RELEASE_LTO = "false", CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16", CARGO_PROFILE_RELEASE_STRIP = "none" }
 run = [
   'rustup toolchain install "$NIGHTLY" --profile minimal',
   'cargo "+$NIGHTLY" fetch --locked',
