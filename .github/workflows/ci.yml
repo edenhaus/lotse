@@ -550,7 +550,7 @@ jobs:
       groups: ${{ steps.select.outputs.groups }}
       corpus: ${{ steps.corpus.outputs.sha }}
     env:
-      NIGHTLY: nightly-2026-11-11 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
+      NIGHTLY: nightly-2026-11-13 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
       BIN_DIR: target/x86_64-unknown-linux-gnu/release
       # cargo-fuzz builds the release profile; the daemon's (fat LTO, one codegen unit, symbols
       # stripped) would slow the build down and take the names out of the sanitizer's stack traces.
