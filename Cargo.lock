@@ -1762,7 +1762,7 @@ dependencies = [
  "allocation-counter",
  "divan",
  "futures-util",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hmac",
  "lotse-api",
  "lotse-api-types",
