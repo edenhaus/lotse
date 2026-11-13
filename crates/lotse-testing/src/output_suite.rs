@@ -32,6 +32,7 @@ use lotse_core::session::{
     SessionStats, Transport, apply_track_event,
 };
 use lotse_core::source::TrackSet;
+use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackLimits, TrackSubscription, Unit};
 use str0m::rtp::RtpPacket;
 
@@ -250,6 +251,8 @@ pub struct SessionUnderTest {
     track: Arc<Track>,
     /// Its live packets and events.
     subscription: TrackSubscription,
+    /// The rate limit of its lag warning, as the worker keeps one.
+    gap_lines: Throttle,
     /// The viewer.
     viewer: Viewer,
     /// The simulated time.
@@ -308,6 +311,7 @@ impl SessionUnderTest {
             family: track.codec().family(),
             track: Arc::clone(track),
             subscription: track.subscribe(Unit::Packets),
+            gap_lines: Throttle::default(),
             viewer,
             now,
             events: Vec::new(),
@@ -367,6 +371,7 @@ impl SessionUnderTest {
                 self.now,
                 self.family,
                 event,
+                &mut self.gap_lines,
                 |packet| packet.arrival,
             );
             self.drain();

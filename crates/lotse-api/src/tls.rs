@@ -68,7 +68,7 @@ use crate::listener::{BindError, PeerInfo, accept_retrying};
 use crate::owners::Owners;
 use crate::pairing::{self, CODE_LIFETIME, PairContext, Pairing, Unpaired};
 use crate::recording::{BodyWatch, Watched};
-use crate::{UPGRADE_TIMEOUT, upgrade_slot};
+use crate::{LimitLines, UPGRADE_TIMEOUT, upgrade_slot};
 
 /// From accept to the end of the TLS handshake: 3 s. A TLS 1.3 handshake
 /// is one round trip and the client's flight.
@@ -507,6 +507,8 @@ pub(crate) struct Handshakes {
     /// The places of the connections awaiting the upgrade, shared with
     /// the Unix socket.
     pub(crate) upgrades: Arc<Semaphore>,
+    /// The rate limits of the limit warnings, shared with the Unix socket.
+    pub(crate) limit_lines: Arc<LimitLines>,
     /// Where an authenticated connection goes.
     pub(crate) admitted: mpsc::Sender<Authenticated>,
     /// Who may connect.
@@ -592,7 +594,7 @@ async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshak
                 "control client authenticated"
             );
             let peer = PeerInfo::Tls { pin, addr };
-            let Some(slot) = upgrade_slot(&h.upgrades, &peer) else {
+            let Some(slot) = upgrade_slot(&h.upgrades, &peer, &h.limit_lines) else {
                 return;
             };
             let deadline = h.clock.sleep(UPGRADE_TIMEOUT);

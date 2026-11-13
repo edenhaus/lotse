@@ -54,7 +54,7 @@ use crate::listener::PeerInfo;
 use crate::outbox::{Class, Outbox, Outgoing, Overflow};
 use crate::pairing::Pairing;
 use crate::{
-    AppState, CLOSE_TIMEOUT, ConnectionId, Event, Handler, MAX_MESSAGE_BYTES,
+    AppState, CLOSE_TIMEOUT, ConnectionId, Event, Handler, Limit, MAX_MESSAGE_BYTES,
     OUTBOUND_BUDGET_BYTES, Outcome,
 };
 
@@ -101,11 +101,14 @@ pub(crate) async fn upgrade<H: Handler>(
     let open = state.connections.fetch_add(1, Ordering::AcqRel);
     if open >= state.config.max_connections {
         state.connections.fetch_sub(1, Ordering::AcqRel);
-        tracing::warn!(
-            open,
-            max = state.config.max_connections,
-            "control connection refused: limit reached"
-        );
+        if let Some(refused) = state.limit_lines.hit(Limit::Connections) {
+            tracing::warn!(
+                open,
+                max = state.config.max_connections,
+                refused,
+                "control connection refused: limit reached"
+            );
+        }
         return refuse(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::LimitReached,
