@@ -885,13 +885,13 @@ impl Allocation {
 
     /// A message from the server. `None` when it is not a response to
     /// an outstanding request, which the caller handles otherwise (or
-    /// drops); else the generation of host addresses the request was
+    /// drops), or is one whose integrity does not verify; else the generation of host addresses the request was
     /// sent on ([`Self::confirm`]), which its retransmissions keep (RFC
     /// 8489 §6.2): the answer proves the path to the server for that
     /// generation, never for a newer one, whose 5-tuple may differ (RFC
     /// 8656 §5). A response to a signed request whose integrity does not
     /// verify is consumed and ignored, so the retransmissions go on (RFC
-    /// 8489 §9.2.5).
+    /// 8489 §9.2.5); it proves no path, so it is no answer.
     pub fn handle_input(&mut self, now: Instant, bytes: &[u8]) -> Option<u64> {
         let Ok(message) = stun::parse(bytes) else {
             return None;
@@ -913,7 +913,7 @@ impl Allocation {
         {
             tracing::debug!(server = %self.server, "turn response without valid integrity ignored");
             self.transactions.insert(message.transaction_id, tx);
-            return Some(generation);
+            return None;
         }
         if challenged {
             self.challenged(now, &tx, &message);
@@ -2176,7 +2176,7 @@ mod tests {
         )
         .xor_address(turn::ATTR_XOR_RELAYED_ADDRESS, peer(9))
         .build();
-        assert!(rig.machine.handle_input(rig.now(), &forged).is_some());
+        assert_eq!(rig.machine.handle_input(rig.now(), &forged), None);
         let wrong_key = signed(
             "bob",
             Builder::new(
@@ -2186,7 +2186,7 @@ mod tests {
             )
             .xor_address(turn::ATTR_XOR_RELAYED_ADDRESS, peer(9)),
         );
-        assert!(rig.machine.handle_input(rig.now(), &wrong_key).is_some());
+        assert_eq!(rig.machine.handle_input(rig.now(), &wrong_key), None);
         assert!(rig.machine.is_pending(&allocate.transaction_id));
         assert_eq!(rig.events(), []);
         // The retransmission reaches the server.
