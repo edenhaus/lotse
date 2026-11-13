@@ -129,7 +129,7 @@ mpeg2ts-reader = { version = "0.18", default-features = false }
 # bump re-audits those internals, and what it counts unchecked or allocates from a count.
 mp4-atom = { version = "=0.17.1", default-features = false }
 # RTSP message parsing and serialization for the fake camera of the tests.
-rtsp-types = { version = "0.1", default-features = false }
+rtsp-types = { version = "0.2", default-features = false }
 # SDP media descriptions in `lotse-rtsp`: the payload type and `a=ptime` of a camera's backchannel
 # media; the version retina parses with, already in the tree.
 sdp-types = { version = "0.2", default-features = false }
