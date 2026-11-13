@@ -25,6 +25,11 @@
       "description": "str0m, its DTLS stack dimpl and the RustCrypto crates lotse-webrtc's crypto provider implements str0m's traits with: a release of one needs the matching releases of the others",
       "matchPackageNames": ["str0m", "dimpl", "aes", "aes-gcm", "ctr", "hmac", "sha1", "sha2"],
       "groupName": "str0m and RustCrypto"
+    },
+    {
+      "description": "The fuzzing nightly has a release every day; one bump a week, on Monday, is enough to follow it",
+      "matchDepNames": ["rust-nightly"],
+      "schedule": ["* * * * 1"]
     }
   ],
   "customManagers": [
