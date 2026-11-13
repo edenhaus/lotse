@@ -19,7 +19,10 @@
 //! gets its answer before the close. On close the sessions are
 //! orphaned and the slot released first; the writer then gets
 //! [`CLOSE_TIMEOUT`] to deliver the queue and the close frame, after which
-//! the socket is dropped (RFC 6455 §7.1.1).
+//! the socket is dropped (RFC 6455 §7.1.1). A command refused at a limit
+//! is logged as a warning, throttled per connection and limit
+//! ([`lotse_core::throttle`]), so a client repeating it cannot flood the
+//! log and every limit stays visible.
 
 use std::collections::HashMap;
 use std::io;
@@ -40,6 +43,7 @@ use lotse_api_types::frame::{Empty, EventFrame, Failure, Pong, Shutdown, Success
 use lotse_api_types::pairing::PairingCreateResult;
 use lotse_core::fingerprint::Fingerprint;
 use lotse_core::task::{BoxFuture, spawn_blocking_named};
+use lotse_core::throttle::Throttle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -316,6 +320,19 @@ struct Connection<H> {
     /// any: no further command is read until it ends. Left to finish when
     /// the connection closes first, so a change it began is still logged.
     pending: Option<JoinHandle<()>>,
+    /// The warning of each limit a command was refused at, by
+    /// [`RefusalKey`]: fixed in the code, so the map stays small.
+    refusals: HashMap<RefusalKey, Throttle>,
+}
+
+/// What a refusal at a limit is throttled by on one connection: its code
+/// and its `limit` and `field` details, each named in the code, never a
+/// value of the request.
+type RefusalKey = (ErrorCode, Option<String>, Option<String>);
+
+/// Detail `key` of `error`, when it is text.
+fn text_detail<'e>(error: &'e ApiError, key: &str) -> Option<&'e str> {
+    error.details.get(key).and_then(serde_json::Value::as_str)
 }
 
 /// Serves one connection until the peer leaves, the queue overflows or the
@@ -360,6 +377,7 @@ async fn serve<H: Handler>(
         peer,
         removed,
         pending: None,
+        refusals: HashMap::new(),
     };
     connection.send(Class::Signaling, &connection.state.handler.hello());
 
@@ -514,6 +532,50 @@ impl<H: Handler> Connection<H> {
         queue(&self.outbox, class, frame);
     }
 
+    /// Answers command `id`, of type `command`, with `error`, warning first
+    /// when it is a refusal at a limit ([`Self::warn_at_limit`]).
+    fn refuse(&mut self, id: Option<u64>, command: Option<&str>, error: ApiError) {
+        self.warn_at_limit(id, command, &error);
+        self.send(Class::Signaling, &Failure::new(id, error));
+    }
+
+    /// Warns that command `id` was refused at a limit, when `error` is
+    /// `limit_reached` or names the `limit` it hit (an input over its cap,
+    /// a recording longer than allowed). `command` is its type, else the
+    /// `type` detail a refusal of [`lotse_api_types::parse_command`]
+    /// carries, a command's name. The first refusal of each
+    /// [`RefusalKey`] is logged, then at most one line per
+    /// [`lotse_core::throttle::SUMMARY_INTERVAL`] with the count since the
+    /// last one. Only names are logged, never a value of the request,
+    /// which may hold a secret.
+    fn warn_at_limit(&mut self, id: Option<u64>, command: Option<&str>, error: &ApiError) {
+        let limit = text_detail(error, "limit");
+        if error.code != ErrorCode::LimitReached && limit.is_none() {
+            return;
+        }
+        let field = text_detail(error, "field");
+        let command = command.or_else(|| text_detail(error, "type"));
+        let key = (
+            error.code,
+            limit.map(str::to_owned),
+            field.map(str::to_owned),
+        );
+        let now = self.state.clock.now();
+        let Some(refused) = self.refusals.entry(key).or_default().hit(now) else {
+            return;
+        };
+        tracing::warn!(
+            connection = self.id.0,
+            id,
+            command,
+            code = error.code.as_str(),
+            limit,
+            field,
+            refused,
+            "command refused: a limit was reached"
+        );
+    }
+
     /// Whether another subscription fits under `max_subscriptions`, after
     /// forgetting the ones that ended (a session's `closed`, a handler that
     /// dropped the channel), so a long-lived connection does not
@@ -569,7 +631,7 @@ impl<H: Handler> Connection<H> {
             Ok(command) => command,
             Err(err) => {
                 tracing::debug!(id = ?err.id, code = err.error.code.as_str(), "command rejected");
-                self.send(Class::Signaling, &Failure::new(err.id, err.error));
+                self.refuse(err.id, None, err.error);
                 return;
             }
         };
@@ -589,7 +651,8 @@ impl<H: Handler> Connection<H> {
             return;
         }
         self.last_id = Some(id);
-        tracing::debug!(id, command = command.name(), "command");
+        let name = command.name();
+        tracing::debug!(id, command = name, "command");
         match command {
             Command::Ping(_) => self.send(Class::Signaling, &Pong::new(id)),
             command @ (Command::PairingCreate(_)
@@ -623,28 +686,19 @@ impl<H: Handler> Connection<H> {
                 }
             }
             other if opens_subscription(&other) && !self.subscription_slot_free() => {
-                tracing::warn!(
-                    id,
-                    command = other.name(),
-                    max = self.state.config.max_subscriptions,
-                    "command refused: subscription limit of the connection reached"
-                );
-                self.send(
-                    Class::Signaling,
-                    &Failure::new(
-                        Some(id),
-                        ApiError::new(
-                            ErrorCode::LimitReached,
-                            "too many open subscriptions on this connection",
-                        ),
-                    ),
+                self.refuse(
+                    Some(id),
+                    Some(name),
+                    ApiError::new(
+                        ErrorCode::LimitReached,
+                        "too many open subscriptions on this connection",
+                    )
+                    .with_detail("limit", "max_subscriptions"),
                 );
             }
             other => match self.handled(id, other).await {
                 Outcome::Result(result) => self.send(Class::Signaling, &Success::new(id, result)),
-                Outcome::Error(error) => {
-                    self.send(Class::Signaling, &Failure::new(Some(id), error));
-                }
+                Outcome::Error(error) => self.refuse(Some(id), Some(name), error),
                 Outcome::Subscribed(events) => {
                     self.send(Class::Signaling, &Success::new(id, Empty::default()));
                     self.subscribe(id, events);
