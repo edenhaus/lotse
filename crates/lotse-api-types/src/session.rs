@@ -141,7 +141,8 @@ pub enum SessionEvent {
 pub enum WarningCode {
     /// Audio omitted from the session; the rest of it continues.
     AudioCodecUnsupported,
-    /// A `turns:` entry of `ice_servers` was ignored.
+    /// A `turns:` entry of `ice_servers` over DTLS (`?transport=udp`, RFC
+    /// 7350) was ignored; TURN over TLS (`turns:` over TCP) is supported.
     TurnUnsupported,
     /// Audio withdrawn because sync could not be held.
     AvSyncLost,

@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+futures-util = { workspace = true } # the session's TURN attempts in flight, a `FuturesUnordered` its queue refills
 getrandom = { workspace = true }
 hmac = { workspace = true }
 md-5 = { workspace = true } # the TURN long-term key of the MD5 password algorithm (RFC 8489 §9.2.2)
@@ -30,6 +31,7 @@ lotse-api = { workspace = true }
 lotse-api-types = { workspace = true }
 lotse-core = { workspace = true }
 lotse-ipc = { workspace = true }
+lotse-tls = { workspace = true } # the TLS handshake of a TURN allocation over TLS (`turns:`), against the embedded roots
 
 [dev-dependencies]
 allocation-counter = { workspace = true } # the demux's allocation count (tests/allocations.rs)

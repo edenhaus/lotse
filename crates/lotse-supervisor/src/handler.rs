@@ -53,7 +53,7 @@ use tracing::Instrument as _;
 
 use crate::connect::ConnectPermits;
 use crate::driver::{COMMAND_QUEUE, Demand, Driver, DriverCommand, DriverSpec};
-use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnServer};
+use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnEntry};
 use crate::host_cache::{HostCache, HostScan, HostSnapshot};
 use crate::memory::{Memory, MemoryProbe};
 use crate::net::demux::{DemuxStats, Registrations};
@@ -633,7 +633,8 @@ impl Supervisor {
                     put.prerecord_ms
                 ),
             )
-            .with_detail("field", "prerecord_ms"));
+            .with_detail("field", "prerecord_ms")
+            .with_detail("limit", "max_prerecord_ms"));
         }
         let validated = put
             .sources
@@ -945,7 +946,12 @@ impl Supervisor {
             state.close_offer(&session_id, entry, &error, connection_state);
             return Ok(rx);
         }
-        entry.gathering(stun_servers.len().saturating_add(turn_servers.len()));
+        // Each STUN server is a gather, and the TURN queue one more.
+        entry.gathering(
+            stun_servers
+                .len()
+                .saturating_add(usize::from(!turn_servers.is_empty())),
+        );
         state.sessions.insert(session_id.clone(), entry);
         state.refresh_connection(&connection_id);
         drop(state);
@@ -966,7 +972,7 @@ impl Supervisor {
 
     /// The STUN and TURN servers of `ice` this front door has a client
     /// for.
-    fn gatherable(&self, ice: &mut IcePlan) -> (Vec<StunServer>, Vec<TurnServer>) {
+    fn gatherable(&self, ice: &mut IcePlan) -> (Vec<StunServer>, Vec<TurnEntry>) {
         let stun = std::mem::take(&mut ice.stun);
         let turn = std::mem::take(&mut ice.turn);
         (
@@ -983,17 +989,19 @@ impl Supervisor {
         )
     }
 
-    /// Gathers a server-reflexive candidate from each of `stun` and a
-    /// relay candidate from each of `turn` for session `serial`, on a base
+    /// Gathers a server-reflexive candidate from each of `stun`, all at
+    /// once, and relay candidates from `turn` in their queue's order
+    /// ([`crate::gather::relay_all`]) for session `serial`, on a base
     /// among the session's `hosts`, and releases end-of-candidates after
-    /// [`GATHER_DEADLINE`] whatever they did; a lease that comes later
-    /// than that is released.
+    /// [`GATHER_DEADLINE`] whatever they did; the TURN attempts still
+    /// running then are dropped, and a lease that comes later than that,
+    /// or is ready just as it passes, is released.
     fn start_gathering(
         &self,
         session_id: &str,
         serial: u64,
         stun: Vec<StunServer>,
-        turn: Vec<TurnServer>,
+        turn: Vec<TurnEntry>,
         hosts: &Arc<HostSnapshot>,
     ) {
         if self.shared.stun.is_none() && self.shared.turn.is_none() {
@@ -1018,20 +1026,31 @@ impl Supervisor {
                 });
             }
         }
-        if let Some(client) = &self.shared.turn {
-            for server in turn {
-                let client = Arc::clone(client);
-                let shared = Arc::clone(&self.shared);
-                let hosts = Arc::clone(hosts);
-                let id = session_id.to_owned();
-                let _handle = spawn_named("session.relay", async move {
-                    let relayed = tokio::select! {
-                        relayed = crate::gather::relay(&client, &server, &hosts.hosts, hosts.generation) => relayed,
-                        () = shared.clock.sleep(GATHER_DEADLINE) => None,
-                    };
-                    shared.lock().session_relayed(&id, serial, relayed);
-                });
-            }
+        if let Some(client) = &self.shared.turn
+            && !turn.is_empty()
+        {
+            let client = Arc::clone(client);
+            let shared = Arc::clone(&self.shared);
+            let hosts = Arc::clone(hosts);
+            let id = session_id.to_owned();
+            // The deadline counts from now, not from the task's first poll.
+            let deadline = shared.clock.sleep(GATHER_DEADLINE);
+            let _handle = spawn_named("session.relay", async move {
+                let mut leased = |relayed| shared.lock().session_relayed(&id, serial, relayed);
+                let cut = crate::gather::relay_all(
+                    &client,
+                    shared.clock.as_ref(),
+                    turn,
+                    &hosts,
+                    deadline,
+                    &mut leased,
+                )
+                .await;
+                // Cut short: the attempts still running at the deadline
+                // were dropped, and a lease ready just then released.
+                tracing::debug!(session.id = id, cut_by_deadline = cut, "turn attempts over");
+                shared.lock().session_relays_done(&id, serial);
+            });
         }
         let id = session_id.to_owned();
         self.shared
@@ -1774,7 +1793,8 @@ fn check_recording_request(
                 start.prerecord_ms, limits.max_prerecord_ms
             ),
         )
-        .with_detail("field", "prerecord_ms"));
+        .with_detail("field", "prerecord_ms")
+        .with_detail("limit", "max_prerecord_ms"));
     }
     if start.duration_ms > limits.max_recording_ms {
         return Err(ApiError::new(
@@ -1784,7 +1804,8 @@ fn check_recording_request(
                 start.duration_ms, limits.max_recording_ms
             ),
         )
-        .with_detail("field", "duration_ms"));
+        .with_detail("field", "duration_ms")
+        .with_detail("limit", "max_recording_ms"));
     }
     if state.recordings_held() >= usize::try_from(limits.max_recordings).unwrap_or(usize::MAX) {
         return Err(
@@ -2170,6 +2191,7 @@ mod tests {
             "`prerecord_ms` is 1, the maximum is 0 (`limits.max_prerecord_ms`)"
         );
         assert_eq!(err.details["field"], "prerecord_ms");
+        assert_eq!(err.details["limit"], "max_prerecord_ms");
         assert!(s.shared.lock().streams.is_empty());
         let err = error(
             call(
@@ -3172,9 +3194,11 @@ mod tests {
             "nothing opened on an error"
         );
 
-        // RFC 7065 turns: is not supported yet: a warning after `session`.
+        // RFC 7065 turns: over UDP (DTLS, RFC 7350) is not supported: a
+        // warning after `session`; over TCP it is TLS, which is.
         let mut with_ice = offer(2, "front", Some("s1"));
-        with_ice["ice_servers"] = json!([{ "urls": ["stun:stun.example:3478", "TURN:t", "turns:t:5349"],
+        with_ice["ice_servers"] = json!([{ "urls": ["stun:stun.example:3478", "TURN:t", "turns:t:5349",
+                                                    "turns:t:5349?transport=udp"],
                                             "username": "u", "credential": "c" }]);
         let mut s1 = subscription(call_on(&s, 1, &with_ice).await);
         assert_eq!(
@@ -3190,7 +3214,7 @@ mod tests {
             warning["message"]
                 .as_str()
                 .unwrap()
-                .contains("turns:t:5349")
+                .contains("turns:t:5349?transport=udp")
         );
         let err = error(call_on(&s, 1, &offer(3, "front", Some("s1"))).await);
         assert_eq!(err.code, ErrorCode::SessionIdInUse);
@@ -4625,11 +4649,12 @@ mod tests {
             ),
             true,
         );
-        // As many turns: URLs as an offer may carry, each worth a warning.
+        // As many turns: URLs over DTLS as an offer may carry, each worth a
+        // warning.
         let servers: Vec<Value> = (0..lotse_api_types::limits::MAX_ICE_SERVERS)
             .map(|server| {
                 let urls: Vec<String> = (0..lotse_api_types::limits::MAX_ICE_URLS)
-                    .map(|url| format!("turns:t{server}-{url}.example"))
+                    .map(|url| format!("turns:t{server}-{url}.example?transport=udp"))
                     .collect();
                 json!({ "urls": urls })
             })
@@ -5225,7 +5250,8 @@ mod tests {
     }
 
     /// [`with_webrtc`] with a STUN client on a loopback socket and its
-    /// demux; the host address is the socket's.
+    /// demux; the host address is the socket's. It has a TURN client too,
+    /// which an offer without `turn:` servers leaves idle.
     fn with_stun(binary: &str, clock: Arc<dyn Clock>) -> (Supervisor, crate::net::demux::Demux) {
         with_stun_advertising(binary, clock, Vec::new())
     }
@@ -5250,12 +5276,17 @@ mod tests {
             tcp_hosts: vec![],
             scan: None,
             stun: Some(Arc::new(StunClient::new(
-                bound.socket,
+                Arc::clone(&bound.socket),
                 demux.responses(),
                 Arc::clone(&clock),
                 crate::net::stun_client::StunClientConfig::default(),
             ))),
-            turn: None,
+            turn: Some(Arc::new(TurnClient::new(
+                bound.socket,
+                &demux,
+                Arc::clone(&clock),
+                crate::net::allocation::AllocationConfig::default(),
+            ))),
             demux: Some(demux.stats()),
         };
         let mut settings = session_settings();
@@ -5598,6 +5629,7 @@ mod tests {
         assert_eq!(next(&mut events).await["type"], "answer");
         report(&s, "s1", end_of_candidates());
         tokio::task::yield_now().await;
+        // Not released by the TURN client either, which has no server.
         assert!(events.try_recv().is_err(), "held while the gather runs");
         clock.advance(GATHER_DEADLINE);
         assert_eq!(
@@ -5611,7 +5643,14 @@ mod tests {
     /// [`with_webrtc`] with a TURN client on a loopback socket and its
     /// demux, and that socket's host address.
     fn with_turn(binary: &str) -> (Supervisor, crate::net::demux::Demux, SocketAddr) {
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        with_turn_on(binary, Arc::new(SystemClock))
+    }
+
+    /// [`with_turn`] on `clock`.
+    fn with_turn_on(
+        binary: &str,
+        clock: Arc<dyn Clock>,
+    ) -> (Supervisor, crate::net::demux::Demux, SocketAddr) {
         let bound = crate::net::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
         let demux = crate::net::demux::Demux::start(
             Arc::clone(&bound.socket),
@@ -5828,7 +5867,10 @@ mod tests {
     async fn a_refused_turn_credential_ends_the_relay_gather_without_a_candidate() {
         let dir = private_dir("relay-refused");
         let (turn, server) = turn_server().await;
-        let (s, demux, _host) = with_turn(&blocking_worker(&dir));
+        // The clock stands still: end-of-candidates comes as the queue ends,
+        // not at the deadline.
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, _host) = with_turn_on(&blocking_worker(&dir), clock.clone());
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut events =
             subscription(call_on(&s, 1, &turn_offer(2, server.udp_addr(), "wrong")).await);
@@ -5848,7 +5890,150 @@ mod tests {
             json!({ "type": "candidate", "candidate": "" })
         );
         assert_eq!(turn.allocations(), []);
-        s.shutdown().await;
+        shutdown_on(&s, &clock).await;
+        demux.stop();
+    }
+
+    /// A TURN server over TCP on a loopback port nobody listens on: its
+    /// connection is refused at once.
+    fn refused_turn_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = listener.local_addr().unwrap();
+        drop(listener);
+        format!("turn:{closed}?transport=tcp")
+    }
+
+    #[tokio::test]
+    async fn four_failed_turn_servers_make_room_for_a_fifth_before_the_deadline() {
+        let dir = private_dir("relay-queue");
+        let (turn, server) = turn_server().await;
+        // The clock stands still: the deadline never passes.
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, _host) = with_turn_on(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let (tx, mut rx) = mpsc::channel(16);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        let mut urls: Vec<String> = (0..crate::gather::TURN_IN_FLIGHT)
+            .map(|_| refused_turn_url())
+            .collect();
+        urls.push(format!("turn:{}", server.udp_addr()));
+        let mut offer = offer(2, "front", Some("s1"));
+        offer["ice_servers"] = json!([{ "urls": urls, "username": "ha", "credential": "pw" }]);
+        let mut events = subscription(call_on(&s, 1, &offer).await);
+        next(&mut events).await;
+        let_assert!(
+            DriverCommand::RelayCandidate {
+                relayed,
+                server: via,
+                tcp: false,
+                ..
+            } = next_command(&mut rx).await,
+            "the fifth server's relay candidate"
+        );
+        assert_eq!(via, server.udp_addr());
+        assert_eq!(turn.allocations().len(), 1);
+        // Nothing left in flight or queued: end-of-candidates follows the
+        // relay's line at once (RFC 8838 §13).
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
+        );
+        assert_eq!(next(&mut events).await["type"], "answer");
+        report(&s, "s1", end_of_candidates());
+        report(
+            &s,
+            "s1",
+            Report::Relayed {
+                relayed,
+                candidate: None,
+            },
+        );
+        assert_eq!(
+            next(&mut events).await,
+            json!({ "type": "candidate", "candidate": "" })
+        );
+        shutdown_on(&s, &clock).await;
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_silent_turn_server_holds_end_of_candidates_for_the_deadline_only() {
+        let dir = private_dir("relay-deadline");
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, _host) = with_turn_on(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut events =
+            subscription(call_on(&s, 1, &turn_offer(2, silent.local_addr().unwrap(), "pw")).await);
+        next(&mut events).await;
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
+        );
+        assert_eq!(next(&mut events).await["type"], "answer");
+        report(&s, "s1", end_of_candidates());
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err(), "held while the attempt runs");
+        clock.advance(GATHER_DEADLINE);
+        assert_eq!(
+            next(&mut events).await,
+            json!({ "type": "candidate", "candidate": "" })
+        );
+        shutdown_on(&s, &clock).await;
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_silent_udp_turn_server_s_tcp_twin_relays_before_the_deadline_rfc_7065_3_1() {
+        let dir = private_dir("relay-twin");
+        let (turn, server) = turn_server().await;
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, host) = with_turn_on(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let (tx, mut rx) = mpsc::channel(16);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        // A network that drops UDP to the server: its host and port over
+        // UDP never answer, over TCP they are the fake server's.
+        let address = server.tcp_addr();
+        let silent = tokio::net::UdpSocket::bind(address).await.unwrap();
+        let mut offer = offer(2, "front", Some("s1"));
+        offer["ice_servers"] = json!([{
+            "urls": [format!("turn:{address}"), format!("turn:{address}?transport=tcp")],
+            "username": "ha", "credential": "pw"
+        }]);
+        let mut events = subscription(call_on(&s, 1, &offer).await);
+        next(&mut events).await;
+        // The UDP attempt runs; its twin waits.
+        let mut buf = [0_u8; 1500];
+        let (_, from) = silent.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from, host);
+        assert_eq!(server.tcp_clients(), []);
+        // No answer over UDP within the delay: the twin starts alongside,
+        // long before the gather deadline.
+        clock.advance(crate::gather::TWIN_DELAY);
+        let_assert!(
+            DriverCommand::RelayCandidate {
+                relayed,
+                server: via,
+                tcp: true,
+                ..
+            } = next_command(&mut rx).await,
+            "the tcp twin's relay candidate"
+        );
+        assert_eq!(via, address);
+        let allocations = turn.allocations();
+        assert_eq!(allocations.len(), 1);
+        assert!(allocations[0].tcp);
+        assert_eq!(allocations[0].relayed, relayed);
+        shutdown_on(&s, &clock).await;
         demux.stop();
     }
 
@@ -6096,6 +6281,7 @@ mod tests {
         far["prerecord_ms"] = json!(300_001);
         let err = refused(call(&s, &far.to_string()).await);
         assert_eq!(err.details["field"], "prerecord_ms");
+        assert_eq!(err.details["limit"], "max_prerecord_ms");
         assert_eq!(
             err.message,
             "`prerecord_ms` is 300001, the maximum is 300000 (`limits.max_prerecord_ms`)"
@@ -6104,6 +6290,7 @@ mod tests {
         long["duration_ms"] = json!(3_600_001);
         let err = refused(call(&s, &long.to_string()).await);
         assert_eq!(err.details["field"], "duration_ms");
+        assert_eq!(err.details["limit"], "max_recording_ms");
         // The longest window and the longest recording are allowed, 5 minutes
         // before and an hour after, the most a client's record call asks:
         // what refuses this one is the stream.

@@ -1544,12 +1544,14 @@ dependencies = [
 name = "lotse-supervisor"
 version = "0.0.0-dev"
 dependencies = [
+ "futures-util",
  "getrandom 0.3.4",
  "hmac",
  "lotse-api",
  "lotse-api-types",
  "lotse-core",
  "lotse-ipc",
+ "lotse-tls",
  "md-5",
  "nix",
  "quinn-udp",

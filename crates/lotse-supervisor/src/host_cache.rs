@@ -34,6 +34,12 @@
 //! decisions behind the list were logged with it, and repeating them at
 //! every offer, up to once per [`MAX_AGE`], only buries the lines that
 //! say something.
+//!
+//! Each host address is a UDP host candidate, and with ICE-TCP on a
+//! passive TCP one, that a session's worker reports; past
+//! [`MAX_WORKER_CANDIDATES`] the session is refused. A list over that
+//! budget is warned about when it is new, at startup and at each change,
+//! not at every offer ([`warn_over_budget`]); the list is not cut.
 
 use std::fmt;
 use std::io;
@@ -45,6 +51,7 @@ use lotse_core::clock::Clock;
 
 use crate::advertise::{AdvertisedAddress, Advertisement};
 use crate::net::hosts::{self, Exclusion, HostRead, InterfaceAddress};
+use crate::session::MAX_WORKER_CANDIDATES;
 
 /// How old the host addresses may be when an offer takes them: 2 s. A
 /// burst of offers (a dashboard opening a dozen cameras at once) reads
@@ -207,6 +214,36 @@ impl HostSnapshot {
     }
 }
 
+/// Warns when `snapshot`'s host candidates, one per address of its
+/// [`HostSnapshot::hosts`] and of its [`HostSnapshot::tcp_hosts`], are
+/// more than a session's worker may report ([`MAX_WORKER_CANDIDATES`]):
+/// every session on them is refused. Called when a list is new, so a
+/// lasting one is warned about once, not at every offer.
+///
+/// The fix it names is one that works: the TCP host addresses are the UDP
+/// ones, so binding `--webrtc-udp-listen` to one address always does;
+/// turning ICE-TCP off only while the UDP candidates alone fit.
+fn warn_over_budget(snapshot: &HostSnapshot) {
+    let over = |count: usize| u32::try_from(count).unwrap_or(u32::MAX) > MAX_WORKER_CANDIDATES;
+    let hosts = snapshot.hosts.len();
+    let candidates = hosts.saturating_add(snapshot.tcp_hosts.len());
+    if over(candidates) {
+        let fix = if over(hosts) {
+            "bind `--webrtc-udp-listen` to one address"
+        } else {
+            "bind `--webrtc-udp-listen` to one address or turn ICE-TCP off (`--webrtc-tcp-listen off`)"
+        };
+        tracing::warn!(
+            candidates,
+            hosts,
+            tcp_hosts = snapshot.tcp_hosts.len(),
+            budget = MAX_WORKER_CANDIDATES,
+            %fix,
+            "more host candidates than a session may report, server-reflexive and relay ones aside; every session will be refused"
+        );
+    }
+}
+
 /// What re-reads the host addresses: the scan, the advertised addresses
 /// to work out again on a change, and the clock that ages them.
 #[derive(Debug)]
@@ -253,7 +290,9 @@ impl HostCache {
     /// `advertised` worked out on each change, aged on `clock`; fixed
     /// without a scan or when the scan's socket is bound to one address.
     /// A scan whose startup read failed to enumerate the interfaces starts
-    /// it failing, so the warning already logged is not repeated.
+    /// it failing, so the warning already logged is not repeated. Warns
+    /// when `snapshot` is over a session's candidate budget
+    /// ([`warn_over_budget`]): this is the list found at startup.
     pub(crate) fn new(
         snapshot: HostSnapshot,
         scan: Option<HostScan>,
@@ -269,6 +308,7 @@ impl HostCache {
         let failing = rescan
             .as_ref()
             .is_some_and(|rescan| rescan.scan.startup_failed);
+        warn_over_budget(&snapshot);
         Self {
             rescan,
             cached: Mutex::new(Cached {
@@ -294,9 +334,10 @@ impl HostCache {
     /// is [`MAX_AGE`] old or older. A changed list is logged once, with
     /// the addresses before and after and then why each interface address
     /// is left out, and replaces the snapshot with one of the next
-    /// generation; the sessions holding the old one keep it. An unchanged
-    /// list logs no exclusion and keeps the generation
-    /// ([module docs](self)).
+    /// generation, warned about when it is over a session's candidate
+    /// budget ([`warn_over_budget`]); the sessions holding the old one
+    /// keep it. An unchanged list logs no exclusion and keeps the
+    /// generation ([module docs](self)).
     pub(crate) fn current(&self) -> Arc<HostSnapshot> {
         let Some(rescan) = &self.rescan else {
             return self.latest();
@@ -346,6 +387,7 @@ impl HostCache {
         exclusions.iter().for_each(Exclusion::log);
         let mut snapshot = HostSnapshot::new(hosts, tcp_hosts, &rescan.advertised);
         snapshot.generation = cached.snapshot.generation.wrapping_add(1);
+        warn_over_budget(&snapshot);
         let snapshot = Arc::new(snapshot);
         cached.snapshot = Arc::clone(&snapshot);
         snapshot
@@ -705,5 +747,103 @@ mod tests {
         let fixed = HostCache::default();
         assert_eq!(fixed.current().hosts, Vec::<SocketAddr>::new());
         assert!(Arc::ptr_eq(&fixed.current(), &fixed.latest()));
+    }
+
+    /// `count` addresses of TEST-NET-1 (RFC 5737), `192.0.2.1` on.
+    fn test_net(count: u8) -> Vec<String> {
+        (1..=count).map(|n| format!("192.0.2.{n}")).collect()
+    }
+
+    /// The warnings about the host candidates' budget `captured` holds.
+    fn over_budget(captured: &Captured) -> Vec<String> {
+        captured.lines("more host candidates than a session may report")
+    }
+
+    #[test]
+    fn host_candidates_over_a_session_s_budget_are_warned_about_at_startup() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::default());
+        let at = |list: &[String], port: u16| -> Vec<SocketAddr> {
+            list.iter()
+                .map(|ip| SocketAddr::new(ip.parse().unwrap(), port))
+                .collect()
+        };
+        // 32 UDP and 32 TCP host candidates fit the budget of 64 exactly.
+        let fits = HostCache::new(
+            HostSnapshot::new(at(&test_net(32), 7), at(&test_net(32), 8), &[]),
+            None,
+            &[],
+            &clock,
+        );
+        assert_eq!(fits.current().hosts.len(), 32);
+        assert_eq!(over_budget(&captured), Vec::<String>::new());
+        // One more is over it: warned, and the list is kept whole.
+        let over = HostCache::new(
+            HostSnapshot::new(at(&test_net(33), 7), at(&test_net(32), 8), &[]),
+            None,
+            &[],
+            &clock,
+        );
+        assert_eq!(over.current().hosts.len(), 33);
+        let warned = over_budget(&captured);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        for part in [
+            "WARN",
+            "candidates=65",
+            "hosts=33",
+            "tcp_hosts=32",
+            "budget=64",
+            "--webrtc-udp-listen",
+            "--webrtc-tcp-listen off",
+        ] {
+            assert!(warned[0].contains(part), "{part}: {warned:?}");
+        }
+        // 65 UDP ones are over it without ICE-TCP: turning it off is no
+        // fix, so the warning does not name it.
+        let _udp_over = HostCache::new(
+            HostSnapshot::new(at(&test_net(65), 7), at(&test_net(65), 8), &[]),
+            None,
+            &[],
+            &clock,
+        );
+        let warned = over_budget(&captured);
+        assert_eq!(warned.len(), 2, "{warned:?}");
+        assert!(warned[1].contains("hosts=65"), "{warned:?}");
+        assert!(warned[1].contains("--webrtc-udp-listen"), "{warned:?}");
+        assert!(!warned[1].contains("--webrtc-tcp-listen"), "{warned:?}");
+    }
+
+    #[test]
+    fn a_reread_over_a_session_s_candidate_budget_is_warned_about_once_per_change() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let interfaces = Interfaces::with(&["192.0.2.1"]);
+        let clock = Arc::new(FakeClock::default());
+        let hosts = cache(interfaces.scan("[::]:7", Some("[::]:8")), &[], &clock);
+        assert_eq!(over_budget(&captured), Vec::<String>::new());
+        let set = |count: u8| {
+            let list = test_net(count);
+            interfaces.set(&list.iter().map(String::as_str).collect::<Vec<_>>());
+            clock.advance(MAX_AGE);
+            hosts.current()
+        };
+        // 33 addresses are 66 candidates with ICE-TCP: warned at the
+        // change, not again while the list stays.
+        assert_eq!(set(33).tcp_hosts.len(), 33);
+        assert_eq!(set(33).hosts.len(), 33);
+        let warned = over_budget(&captured);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("candidates=66"), "{warned:?}");
+        // After the line saying the list changed.
+        let all = captured.lines("");
+        let position = |needle: &str| all.iter().position(|line| line.contains(needle));
+        assert!(
+            position("host addresses changed") < position("more host candidates"),
+            "{all:?}"
+        );
+        // Back to 64, within the budget: nothing more.
+        assert_eq!(set(32).hosts.len(), 32);
+        assert_eq!(over_budget(&captured).len(), 1);
     }
 }

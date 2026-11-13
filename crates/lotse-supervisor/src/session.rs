@@ -223,8 +223,11 @@ pub(crate) struct SessionEntry {
     talkback: Option<&'static str>,
     /// Browser candidates received so far.
     pub(crate) remote_candidates: u32,
-    /// STUN gathers still running; end-of-candidates waits for them.
-    gathers: usize,
+    /// Gathers still running: a STUN server each, the TURN queue while it
+    /// runs, and each relay handed to the worker until its report;
+    /// end-of-candidates waits for them. `None` once the gather deadline
+    /// passed: nothing is waited for, and a lease that comes is released.
+    gathers: Option<usize>,
     /// The worker sent its end-of-candidates.
     worker_done: bool,
     /// End-of-candidates went out; later candidates are dropped.
@@ -332,7 +335,7 @@ impl SessionEntry {
             answered: false,
             talkback: None,
             remote_candidates: 0,
-            gathers: 0,
+            gathers: Some(0),
             worker_done: false,
             candidates_done: false,
             worker_candidates: 0,
@@ -481,7 +484,8 @@ impl SessionEntry {
     }
 
     /// Whether end-of-candidates went out, after which no candidate may
-    /// follow (RFC 8838 §13).
+    /// follow (RFC 8838 §13), for tests.
+    #[cfg(test)]
     pub(crate) const fn candidates_done(&self) -> bool {
         self.candidates_done
     }
@@ -540,9 +544,11 @@ impl SessionEntry {
         waiting
     }
 
-    /// A relay candidate went to the worker on `lease`: its gathering
-    /// ends with the worker's report ([`WorkerSessionEvent::Relayed`]).
+    /// A relay candidate went to the worker on `lease`: a gather of its
+    /// own, which ends with the worker's report
+    /// ([`WorkerSessionEvent::Relayed`]).
     pub(crate) fn relay_handed_over(&mut self, lease: Lease) {
+        self.gathers = self.gathers.map(|gathers| gathers.saturating_add(1));
         self.relays.push(SessionRelay {
             lease: Arc::new(lease),
             pending: true,
@@ -650,10 +656,10 @@ impl SessionEntry {
         sdp
     }
 
-    /// `count` STUN and TURN gathers started; end-of-candidates waits for
-    /// them.
+    /// `count` gathers started, a STUN server each and the TURN queue one;
+    /// end-of-candidates waits for them.
     pub(crate) const fn gathering(&mut self, count: usize) {
-        self.gathers = count;
+        self.gathers = Some(count);
     }
 
     /// A gather finished with `candidate`, or without one: the events to
@@ -662,7 +668,7 @@ impl SessionEntry {
     /// server-reflexive one at an address already told
     /// ([`Self::first_srflx`]).
     pub(crate) fn gathered(&mut self, candidate: Option<String>) -> Vec<SessionEvent> {
-        self.gathers = self.gathers.saturating_sub(1);
+        self.gathers = self.gathers.map(|gathers| gathers.saturating_sub(1));
         let mut out = Vec::new();
         let candidate = candidate.filter(|line| !self.candidates_done && self.first_srflx(line));
         if let Some(candidate) = candidate {
@@ -687,16 +693,25 @@ impl SessionEntry {
         }
     }
 
+    /// Whether a lease that comes now is too late: the gather deadline
+    /// passed or end-of-candidates went out.
+    pub(crate) const fn gathering_over(&self) -> bool {
+        self.gathers.is_none() || self.candidates_done
+    }
+
     /// The gather deadline passed: end-of-candidates waits no longer.
     pub(crate) fn gather_deadline(&mut self) -> Vec<SessionEvent> {
-        self.gathers = 0;
+        self.gathers = None;
         self.finish_candidates().into_iter().collect()
     }
 
     /// End-of-candidates, once the worker sent its own and no gather runs
     /// (RFC 8838 §13: after it, no candidate follows).
     fn finish_candidates(&mut self) -> Option<SessionEvent> {
-        if !self.worker_done || self.gathers > 0 || self.candidates_done {
+        if !self.worker_done
+            || self.gathers.is_some_and(|gathers| gathers > 0)
+            || self.candidates_done
+        {
             return None;
         }
         self.candidates_done = true;
@@ -2065,11 +2080,14 @@ mod tests {
         let _logs = captured.install();
         let (tx, _rx) = mpsc::channel(8);
         let mut session = entry(tx);
-        session.gathering(2);
+        // The TURN queue is one gather; each relay it hands over is one
+        // more, which outlives the queue.
+        session.gathering(1);
         let relayed: SocketAddr = "203.0.113.1:49153".parse().unwrap();
         let other: SocketAddr = "203.0.113.1:49154".parse().unwrap();
         session.relay_handed_over(Lease::detached(relayed));
         session.relay_handed_over(Lease::detached(other));
+        assert_eq!(session.gathered(None), vec![]);
         session.applied(WorkerSessionEvent::Answer {
             sdp: "v=0\r\na=mid:0\r\n".into(),
             talkback: None,

@@ -26,6 +26,7 @@ use lotse_api_types::command::Command;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Hello, HelloTag};
 use lotse_core::clock::FakeClock;
+use lotse_core::throttle::SUMMARY_INTERVAL;
 use serde_json::{Value, json};
 use tokio::net::UnixStream;
 use tokio::sync::{Notify, mpsc};
@@ -133,6 +134,11 @@ impl Handler for FakeHandler {
                     events: rx,
                 }
             }
+            // A refusal at a limit, as the supervisor's busy connection.
+            Command::BackchannelRelease(_) => Outcome::Error(
+                ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
+                    .with_detail("limit", "connection_queue"),
+            ),
             Command::Info(_) => Outcome::Result(json!({ "version": "0.0.0-test" })),
             Command::StreamList(_) => Outcome::Result(json!({ "streams": {} })),
             // A result over the whole outbound budget.
@@ -144,7 +150,6 @@ impl Handler for FakeHandler {
             | Command::SessionList(_)
             | Command::SessionClose(_)
             | Command::SessionAdopt(_)
-            | Command::BackchannelRelease(_)
             | Command::SignalingSubscribe(_)
             | Command::SignalingAnswer(_)
             | Command::SignalingCandidate(_)
@@ -585,39 +590,116 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
     }
     assert_eq!(running.handler.subscribers.lock().unwrap().len(), 1);
     assert_eq!(running.handler.sessions.lock().unwrap().len(), 1);
-    // The client can repeat them at will: the first is logged, the rest
-    // counted until the interval is up, then summed up in one line.
-    let refusals = || -> Vec<String> {
-        logs.text()
-            .lines()
-            .filter(|line| line.contains("subscription limit of the connection reached"))
-            .map(str::to_owned)
-            .collect()
-    };
-    let first = refusals();
-    assert_eq!(first.len(), 1, "{first:?}");
-    assert!(first[0].contains("id=3") && first[0].contains("stream/subscribe"));
-    assert!(first[0].ends_with("refused=1"), "{first:?}");
-    running
-        .clock
-        .advance(lotse_core::throttle::SUMMARY_INTERVAL);
-    send(&mut ws, json!({ "id": 8, "type": "signaling/subscribe" })).await;
-    assert_eq!(recv(&mut ws).await["error"]["code"], "limit_reached");
-    let summary = refusals();
-    assert_eq!(summary.len(), 2, "{summary:?}");
-    assert!(summary[1].contains("id=8") && summary[1].ends_with("refused=5"));
+    // The first refusal is a warning, the four after it within the
+    // interval are counted for the next.
+    let refusals = warned_limits(&logs);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    for part in [
+        "id=3",
+        "command=\"stream/subscribe\"",
+        "code=\"limit_reached\"",
+        "limit=\"max_subscriptions\"",
+        "refused=1",
+    ] {
+        assert!(refusals[0].contains(part), "{part}: {refusals:?}");
+    }
     // Other commands are not affected.
-    send(&mut ws, json!({ "id": 9, "type": "info" })).await;
+    send(&mut ws, json!({ "id": 8, "type": "info" })).await;
     assert_eq!(recv(&mut ws).await["result"]["version"], "0.0.0-test");
 
     // The session's channel closes: its subscription ended and frees a slot.
     running.handler.sessions.lock().unwrap().clear();
-    send(&mut ws, json!({ "id": 10, "type": "ping" })).await;
+    send(&mut ws, json!({ "id": 9, "type": "ping" })).await;
     assert_eq!(recv(&mut ws).await["type"], "pong");
-    send(&mut ws, json!({ "id": 11, "type": "stream/subscribe" })).await;
+    send(&mut ws, json!({ "id": 10, "type": "stream/subscribe" })).await;
     assert_eq!(recv(&mut ws).await["success"], true);
-    send(&mut ws, json!({ "id": 12, "type": "stream/subscribe" })).await;
+    running.clock.advance(SUMMARY_INTERVAL);
+    send(&mut ws, json!({ "id": 11, "type": "stream/subscribe" })).await;
     assert_eq!(recv(&mut ws).await["error"]["code"], "limit_reached");
+    let refusals = warned_limits(&logs);
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    assert!(refusals[1].contains("id=11"), "{refusals:?}");
+    assert!(refusals[1].contains("refused=5"), "{refusals:?}");
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// The warnings of refusals at a limit `logs` holds, in order.
+fn warned_limits(logs: &Captured) -> Vec<String> {
+    logs.text()
+        .lines()
+        .filter(|line| line.contains("command refused: a limit was reached"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_refusal_at_a_limit_is_warned_once_per_interval_and_limit_and_no_other_refusal_is() {
+    let (logs, _guard) = capture(tracing::Level::WARN);
+    let running = start("limit-warn", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    let busy = json!({ "type": "backchannel/release", "stream_id": "a" });
+    let server =
+        json!({ "urls": ["turn:192.0.2.1"], "username": "u", "credential": "secret-credential" });
+    let over_cap = json!({ "type": "webrtc/offer", "stream_id": "a", "sdp": "v=0",
+                           "ice_servers": vec![server; 17] });
+    let missing = json!({ "type": "stream/get", "stream_id": "missing" });
+    for (id, frame, code) in [
+        (1, &busy, "limit_reached"),
+        (2, &busy, "limit_reached"),
+        (3, &over_cap, "invalid_request"),
+        (4, &missing, "stream_not_found"),
+    ] {
+        let mut frame = frame.clone();
+        frame["id"] = json!(id);
+        send(&mut ws, frame).await;
+        let refused = recv(&mut ws).await;
+        assert_eq!(refused["error"]["code"], code, "{refused}");
+    }
+    running.clock.advance(SUMMARY_INTERVAL);
+    let mut again = busy.clone();
+    again["id"] = json!(5);
+    send(&mut ws, again).await;
+    assert_eq!(recv(&mut ws).await["error"]["code"], "limit_reached");
+
+    // Each limit is warned on its own: the busy connection's first, the
+    // second within the interval counted for the next; the list over its
+    // cap with the field; the missing stream not at all.
+    let warned = warned_limits(&logs);
+    assert_eq!(warned.len(), 3, "{warned:?}");
+    for (line, parts) in [
+        (
+            &warned[0],
+            &[
+                "connection=",
+                "id=1",
+                "command=\"backchannel/release\"",
+                "code=\"limit_reached\"",
+                "limit=\"connection_queue\"",
+                "refused=1",
+            ][..],
+        ),
+        (
+            &warned[1],
+            &[
+                "id=3",
+                "command=\"webrtc/offer\"",
+                "code=\"invalid_request\"",
+                "limit=\"maxItems\"",
+                "field=\"ice_servers\"",
+                "refused=1",
+            ][..],
+        ),
+        (&warned[2], &["id=5", "refused=2"][..]),
+    ] {
+        for part in parts {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+    }
+    let text = logs.text();
+    assert!(!text.contains("secret-credential"), "{text}");
+    assert!(!text.contains("stream_not_found"), "{text}");
     ws.close(None).await.unwrap();
     running.finish().await;
 }

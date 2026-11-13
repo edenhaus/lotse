@@ -8,7 +8,9 @@
 //! viewer from the warm GOP cache without a new camera connection, and the
 //! linger keeps the connection for a viewer that comes back. A viewer the
 //! daemon reaches only through a TURN relay plays through the fake TURN
-//! server's loopback relay, allocated over UDP and over TCP. With an address
+//! server's loopback relay, allocated over UDP and over TCP; a `turns:`
+//! server whose certificate is not trusted is never sent the credential.
+//! With an address
 //! advertised (`webrtc.advertise`), a viewer told no host candidate plays
 //! through a loopback port forward playing the NAT in front of the daemon,
 //! over UDP and over passive ICE-TCP.
@@ -49,7 +51,7 @@ use lotse_supervisor::worker::WorkerConfig;
 use lotse_supervisor::{
     AdvertisedAddress, Environment, FrontDoor, Identity, Limits, Settings, Supervisor,
 };
-use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel, Stats};
+use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel, CameraTls, Stats};
 use lotse_testing::fake_turn::{FakeTurn, FakeTurnServer};
 use lotse_testing::viewer::{Outgoing, TalkbackOffer, Viewer};
 use lotse_testing::{CameraConfig, FakeCamera};
@@ -1458,6 +1460,83 @@ async fn relayed_viewer(tcp: bool) {
             () = &mut waited => panic!("the allocation outlived its last session"),
         }
     }
+    stop(daemon, cam).await;
+}
+
+/// A `turns:` server whose certificate no embedded root vouches for (RFC
+/// 8489 §6.2.3): the handshake fails before any request, so the server
+/// never sees the credential, and the viewer plays over its host pair
+/// with no relay candidate, end-of-candidates still sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc8489_6_2_3_an_untrusted_turns_server_gets_no_credential_and_no_relay_candidate() {
+    let cam = FakeCamera::start(CameraConfig::default(), clock())
+        .await
+        .expect("camera");
+    let turn = Arc::new(FakeTurn::new(
+        clock(),
+        "lotse.test",
+        Duration::from_secs(600),
+    ));
+    turn.add_user("ha-cloud", "secret");
+    let tls = CameraTls::self_signed(&["127.0.0.1"]).expect("a certificate");
+    let server = FakeTurnServer::start_tls(Arc::clone(&turn), 1, &tls)
+        .await
+        .expect("the turn server");
+    let daemon = supervisor();
+    let s = &daemon.supervisor;
+    put_front(s, &cam).await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("viewer socket");
+    let viewer_addr = socket.local_addr().unwrap();
+    lotse_webrtc::install_crypto_provider();
+    let mut viewer = Viewer::new(viewer_addr, clock().now()).expect("a viewer");
+    let url = format!("turns:{}", server.tls_addr().unwrap());
+    let mut events = subscription(
+        call(
+            s,
+            1,
+            &json!({ "id": 2, "type": "webrtc/offer", "stream_id": "front", "session_id": "tls-1",
+                     "sdp": viewer.offer(),
+                     "ice_servers": [{ "urls": [url], "username": "ha-cloud", "credential": "secret" }] }),
+        )
+        .await,
+    );
+    let mut seen = Vec::new();
+    drive(
+        &mut viewer,
+        &socket,
+        &mut events,
+        &mut seen,
+        |event, viewer, out| match event["type"].as_str() {
+            Some("answer") => {
+                viewer
+                    .accept_answer(event["sdp"].as_str().unwrap(), out)
+                    .expect("the answer applies");
+            }
+            Some("candidate") => {
+                viewer.add_remote_candidate(event["candidate"].as_str().unwrap(), out);
+            }
+            _ => {}
+        },
+        |seen, viewer| {
+            seen.iter()
+                .any(|e| e["type"] == "candidate" && e["candidate"] == "")
+                && viewer.is_connected()
+                && viewer.packets().len() >= 20
+        },
+    )
+    .await;
+    assert!(
+        seen.iter().all(|e| e["type"] != "warning"),
+        "turns: over TLS is supported: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|e| e["type"] != "candidate"
+            || relay_address(e["candidate"].as_str().unwrap()).is_none()),
+        "no relay candidate: {seen:?}"
+    );
+    assert_eq!(turn.requests(), Vec::new());
+    assert_eq!(turn.allocations(), Vec::new());
+    close_session(s, "tls-1", events).await;
     stop(daemon, cam).await;
 }
 

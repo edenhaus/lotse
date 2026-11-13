@@ -128,14 +128,13 @@ pub const RECORDING_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// when it authenticates, and holds it while it waits for the serve loop.
 pub const MAX_PENDING_UPGRADES: u16 = 8;
 
-/// A limit whose warning a peer can make again and again, one per
-/// connection or command; each has its own rate limit in [`LimitLines`].
+/// A limit whose warning a peer can make again and again, once per
+/// connection; each has its own rate limit in [`LimitLines`]. A command
+/// refused at a limit is warned about by the connection that refused it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Limit {
     /// [`Config::max_connections`]: an upgrade refused.
     Connections,
-    /// [`Config::max_subscriptions`]: a command refused.
-    Subscriptions,
     /// [`MAX_PENDING_UPGRADES`]: a connection closed at accept.
     PendingUpgrades,
     /// [`UPGRADE_TIMEOUT`]: a connection closed before its upgrade.
