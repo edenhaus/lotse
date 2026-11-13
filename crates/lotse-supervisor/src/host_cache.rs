@@ -219,18 +219,27 @@ impl HostSnapshot {
 /// more than a session's worker may report ([`MAX_WORKER_CANDIDATES`]):
 /// every session on them is refused. Called when a list is new, so a
 /// lasting one is warned about once, not at every offer.
+///
+/// The fix it names is one that works: the TCP host addresses are the UDP
+/// ones, so binding `--webrtc-udp-listen` to one address always does;
+/// turning ICE-TCP off only while the UDP candidates alone fit.
 fn warn_over_budget(snapshot: &HostSnapshot) {
-    let candidates = snapshot
-        .hosts
-        .len()
-        .saturating_add(snapshot.tcp_hosts.len());
-    if u32::try_from(candidates).unwrap_or(u32::MAX) > MAX_WORKER_CANDIDATES {
+    let over = |count: usize| u32::try_from(count).unwrap_or(u32::MAX) > MAX_WORKER_CANDIDATES;
+    let hosts = snapshot.hosts.len();
+    let candidates = hosts.saturating_add(snapshot.tcp_hosts.len());
+    if over(candidates) {
+        let fix = if over(hosts) {
+            "bind `--webrtc-udp-listen` to one address"
+        } else {
+            "bind `--webrtc-udp-listen` to one address or turn ICE-TCP off (`--webrtc-tcp-listen off`)"
+        };
         tracing::warn!(
             candidates,
-            hosts = snapshot.hosts.len(),
+            hosts,
             tcp_hosts = snapshot.tcp_hosts.len(),
             budget = MAX_WORKER_CANDIDATES,
-            "more host candidates than a session may report, server-reflexive and relay ones aside; every session will be refused: bind `--webrtc-udp-listen` to one address or turn ICE-TCP off (`--webrtc-tcp-listen off`)"
+            %fix,
+            "more host candidates than a session may report, server-reflexive and relay ones aside; every session will be refused"
         );
     }
 }
@@ -790,6 +799,19 @@ mod tests {
         ] {
             assert!(warned[0].contains(part), "{part}: {warned:?}");
         }
+        // 65 UDP ones are over it without ICE-TCP: turning it off is no
+        // fix, so the warning does not name it.
+        let _udp_over = HostCache::new(
+            HostSnapshot::new(at(&test_net(65), 7), at(&test_net(65), 8), &[]),
+            None,
+            &[],
+            &clock,
+        );
+        let warned = over_budget(&captured);
+        assert_eq!(warned.len(), 2, "{warned:?}");
+        assert!(warned[1].contains("hosts=65"), "{warned:?}");
+        assert!(warned[1].contains("--webrtc-udp-listen"), "{warned:?}");
+        assert!(!warned[1].contains("--webrtc-tcp-listen"), "{warned:?}");
     }
 
     #[test]
