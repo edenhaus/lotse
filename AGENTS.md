@@ -18,7 +18,7 @@ download checked against `mise.lock`) and installs the git hooks. After
 changing `[tools]`, run `mise lock` and commit both files.
 
 Every check is a prek hook in `.pre-commit-config.yaml`: fmt, clippy,
-rustdoc, cargo-hack, cargo-shear, the fuzz crate's `cargo check`, the
+rustdoc, cargo-hack, cargo-shear, the fuzz crate's `cargo check` (clippy skips it), the
 crate-layering, license-list and fuzz-select checks, cargo-deny, codespell, actionlint, zizmor and file hygiene run on `git commit` (only when matching files changed).
 Add new checks there. No test
 is a hook: the tests, the doctests, coverage and mutants are mise tasks
@@ -73,7 +73,7 @@ workflow and job names start with a capital letter.
 | `mise run compare [engine] [runs] [play]` | the browser test through lotse and through go2rtc, side by side; a report, not a gate (`target/compare-<engine>/compare.json`) |
 | `mise run test-musl` | the tests on the static musl target (Linux only); CI runs them from `coverage-archive`'s archive instead (`coverage-musl`) |
 | `mise run test-archive` | the musl tests built and archived for other machines, then the doctests (CI's Build job) |
-| `mise run audit` | RustSec advisories, the root and the fuzz workspace (network) |
+| `mise run audit` | RustSec advisories of the workspace, the fuzz crate included (network) |
 | `mise run fuzz <target> [secs]` | one `cargo fuzz` target on the date-pinned nightly the task installs, under the contract's time and memory limits (`scripts/fuzz.sh`, as CI; cargo-fuzz installed by hand, the one nightly use) |
 | `mise run set-version <version>` | the workspace version and its lockfile entries; only a release build sets it, from the tag (the repository keeps `0.0.0-dev`) |
 | `mise run release-build [x86_64\|aarch64]` | static musl binary, its dependency list embedded by cargo-auditable for scanners (Linux only); zig links every musl build (`.cargo/config.toml`) |
@@ -92,6 +92,9 @@ the same PR. `cargo shear` fails on declared
 dependencies nothing uses, so never add a dependency ahead of the code that
 uses it. The binary only parses the CLI and dispatches to
 `lotse-supervisor` or `lotse-worker`; both are libraries with tests.
+The fuzz targets are a member too (`fuzz/`, `lotse-fuzz`, outside
+`default-members`), sharing the one `Cargo.lock`; `cargo fuzz build` builds
+them on the pinned nightly, whose AddressSanitizer is the only reason for it.
 The clients, the Python `lotse-client` among them, live in their own repository,
 [lotse-clients](https://github.com/edenhaus/lotse-clients): their models are generated from a copy of the API's JSON Schema bundle.
 

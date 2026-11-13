@@ -5,6 +5,8 @@ test_tool = "nextest"
 # `test-util` feature, exercised by the other crates' tests.
 exclude_globs = [
     "crates/lotse-testing/**",
+    # The fuzz targets: harness code with no tests of its own, run by the Fuzz jobs.
+    "fuzz/**",
     # Built only off Linux (macOS, a development host): the Mutants jobs run on Linux, where no
     # test reaches it.
     "crates/lotse-sandbox/src/other.rs",

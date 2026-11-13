@@ -1,41 +1,40 @@
 [package]
 name = "lotse-fuzz"
-version = "0.0.0"
-edition = "2024"
-publish = false
-description = "cargo-fuzz targets; its own workspace because libfuzzer-sys needs nightly"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "cargo-fuzz targets, one per untrusted input: a member of the root workspace, built for fuzzing by `cargo fuzz build` on the pinned nightly"
 
 [package.metadata]
 cargo-fuzz = true
 
-[workspace]
+# No `[lints] workspace = true` yet: the targets are harness code that predates the workspace
+# lints (a panic is how a target reports a finding; the harnesses drive real sockets on real
+# time), so clippy skips this crate (.pre-commit-config.yaml) and the fuzz-check hook type-checks it.
 
-# Its own workspace, so its own fuzz/Cargo.lock: committed, built with `--locked` and checked by
-# cargo-deny like the root's. The registry crates take the root workspace's features,
-# `default-features = false` first.
+# The workspace's dependencies, with the features the targets drive besides.
 [dependencies]
-bytes = { version = "1", default-features = false }
-libfuzzer-sys = { version = "0.4", default-features = false, features = ["link_libfuzzer"] }
-lotse-api = { path = "../crates/lotse-api" }
-lotse-api-types = { path = "../crates/lotse-api-types" }
-lotse-codec = { path = "../crates/lotse-codec", features = ["test-util"] }
-lotse-core = { path = "../crates/lotse-core", features = ["test-util"] }
-lotse-http = { path = "../crates/lotse-http" }
-lotse-ipc = { path = "../crates/lotse-ipc" }
-lotse-mux = { path = "../crates/lotse-mux" }
-lotse-rtsp = { path = "../crates/lotse-rtsp" }
-lotse-supervisor = { path = "../crates/lotse-supervisor" }
-lotse-testing = { path = "../crates/lotse-testing" }
-lotse-webrtc = { path = "../crates/lotse-webrtc" }
-lotse-worker = { path = "../crates/lotse-worker" }
-mp4-atom = { version = "0.17", default-features = false }
-serde_json = { version = "1", default-features = false, features = ["std"] }
-# Without its default features, as in the root: they link aws-lc-rs, which .cargo/deny.toml bans.
-str0m = { version = "0.25", default-features = false }
-tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "io-util", "macros"] }
-tokio-util = { version = "0.7", default-features = false }
-url = { version = "2", default-features = false, features = ["std"] }
+bytes.workspace = true
+libfuzzer-sys.workspace = true
+lotse-api.workspace = true
+lotse-api-types.workspace = true
+lotse-codec = { workspace = true, features = ["test-util"] }
+lotse-core = { workspace = true, features = ["test-util"] }
+lotse-http.workspace = true
+lotse-ipc.workspace = true
+lotse-mux.workspace = true
+lotse-rtsp.workspace = true
+lotse-supervisor.workspace = true
+lotse-testing.workspace = true
+lotse-webrtc.workspace = true
+lotse-worker.workspace = true
+mp4-atom.workspace = true
+serde_json.workspace = true
+str0m.workspace = true
+tokio = { workspace = true, features = ["net", "time", "io-util", "macros"] }
+tokio-util.workspace = true
+url.workspace = true
 
 [[bin]]
 name = "ipc_message"

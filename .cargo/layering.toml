@@ -2,7 +2,8 @@
 # This is the crate dependency graph written down ahead of the code: every direct dependency
 # edge between workspace crates must be listed under [dependents], a restricted external crate
 # may only be a direct dependency of its owners under [external], and a [dev-only] crate may never
-# be a normal or build dependency. Adding an edge means editing this file.
+# be a normal or build dependency. A [harness] crate's own edges are free of these rules, and no
+# crate may depend on it. Adding an edge means editing this file.
 
 [dependents]
 # crate = the workspace crates that may depend on it directly
@@ -23,6 +24,11 @@ lotse-worker = ["lotse"]
 # Never of lotse-core: it depends on core itself, and a dev-dependency cycle compiles two copies of
 # core whose types do not unify. Core's own fakes live behind its `test-util` feature.
 lotse-testing = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-api-types", "lotse-supervisor", "lotse-worker", "lotse"]
+
+[harness]
+# lotse-fuzz: the fuzz targets reach into every crate they fuzz, fakes (lotse-testing) included, as
+# normal dependencies (a bin has no dev-dependencies); nothing depends on them, nothing ships them.
+crates = ["lotse-fuzz"]
 
 [dev-only]
 # allocation-counter: its global allocator replaces the daemon's in whatever links it. divan: the
