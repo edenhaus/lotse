@@ -1,8 +1,11 @@
-//! TLS to a source's server (an `rtsps://` camera, an `https://` stream):
-//! the client configuration, the certificate check the source's `tls`
-//! chooses, and how a failed handshake becomes a [`SourceError`].
+//! TLS to a source's server (an `rtsps://` camera, an `https://` stream)
+//! and to a `turns:` TURN server: the client configuration, the
+//! certificate check the source's `tls` chooses, and how a failed
+//! handshake becomes a [`SourceError`].
 //!
-//! Runs in a worker, inside a source crate's connection attempt. Depends on
+//! Runs in a worker, inside a source crate's connection attempt, and in
+//! the supervisor, whose TURN client connects a TURN allocation over TLS
+//! (always with [`Trust::Roots`]). Depends on
 //! `lotse-core` (for [`SourceError`]) and `lotse-api-types` (for the `tls`
 //! field it maps to a [`Trust`]) only, never on a source crate or a
 //! protocol engine: a source connects its own TCP stream, hands it to
@@ -15,7 +18,7 @@
 //! when the caller names protocols), RFC 5280 path validation and the
 //! RFC 2818 §3.1 / RFC 6125 host name check through `webpki`. RFC 7826
 //! §19.2 (`rtsps`) and RFC 9110 §4.3.4 (`https`) both take the server's
-//! identity from RFC 2818. rustls with the `ring` provider does the
+//! identity from RFC 2818, and RFC 8489 §6.2.3 (`turns`) from RFC 6125. rustls with the `ring` provider does the
 //! protocol; this crate only decides whom to trust:
 //!
 //! - **Roots** (the default): the chain must end in an embedded
@@ -48,7 +51,7 @@ use tokio_rustls::TlsConnector;
 pub use tokio_rustls::client::TlsStream;
 
 /// Whom a TLS connection trusts: the source's `tls`, its pin parsed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Trust {
     /// The embedded roots and the host name (`"roots"`).
     Roots,
@@ -87,8 +90,9 @@ impl From<Trust> for TlsTrust {
 
 /// Where a TLS connection goes and whom it trusts; built when the source
 /// is validated, so a host that cannot be a TLS server name fails at
-/// `stream/put`.
-#[derive(Debug, Clone)]
+/// `stream/put` (or, for a `turns:` server, at `webrtc/offer`). One value
+/// per name and trust, so a connection may be keyed by it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TlsTarget {
     /// The URL's host: the SNI and the name the certificate must carry
     /// with [`Trust::Roots`].
@@ -118,12 +122,13 @@ fn embedded_roots() -> RootCertStore {
     }
 }
 
-/// Why the certificate check refused the camera, as the message of a
-/// `source_auth_failed` error.
+/// Why the certificate check refused the server (a camera, a stream's
+/// server or a TURN server), as the message of a `source_auth_failed`
+/// error.
 #[derive(Debug, thiserror::Error)]
 enum CertificateRejected {
     /// The pin does not match.
-    #[error("the camera's certificate does not match its pin {expected}; it presented {presented}")]
+    #[error("the server's certificate does not match its pin {expected}; it presented {presented}")]
     PinMismatch {
         /// The pin.
         expected: Fingerprint,
@@ -132,7 +137,7 @@ enum CertificateRejected {
     },
     /// The chain or the name failed against the embedded roots.
     #[error(
-        "the camera's certificate is not trusted ({reason}); its SHA-256 fingerprint is {presented}"
+        "the server's certificate is not trusted ({reason}); its SHA-256 fingerprint is {presented}"
     )]
     Untrusted {
         /// What `webpki` found wrong.
@@ -386,7 +391,7 @@ mod tests {
         let wrapped = io::Error::new(io::ErrorKind::InvalidData, rustls::Error::from(pin));
         let refused = classify(&wrapped);
         assert!(
-            matches!(&refused, SourceError::AuthFailed(m) if m.starts_with("tls: the camera's certificate does not match")),
+            matches!(&refused, SourceError::AuthFailed(m) if m.starts_with("tls: the server's certificate does not match")),
             "{refused:?}"
         );
         let alert = io::Error::new(

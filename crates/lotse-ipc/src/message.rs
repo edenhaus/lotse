@@ -86,7 +86,7 @@ pub enum ToWorker {
     /// relays from. What the session sends from it goes to the
     /// allocation's server as `ChannelData`: from the shared socket for a
     /// UDP allocation, padded on the datagram channel to the supervisor,
-    /// which owns the connection, for a TCP one.
+    /// which owns the connection, for a TCP one (TLS over TCP included).
     RelayCandidate {
         /// The session.
         session_id: String,
@@ -97,7 +97,8 @@ pub enum ToWorker {
         /// The host address the allocation's traffic leaves from: the
         /// candidate's local interface.
         local: SocketAddr,
-        /// The allocation reaches its server over TCP (RFC 8656 §3.1).
+        /// The allocation reaches its server over TCP, plain or with TLS
+        /// over it (RFC 8656 §3.1).
         tcp: bool,
     },
     /// A channel the TURN server bound on a session's relay candidate to

@@ -1,12 +1,16 @@
 //! Gathering for one session: the `stun:` servers of the offer's
 //! `ice_servers`, a Binding from the shared socket to each, and the
-//! `srflx` candidate the mapped address becomes; and the `turn:` servers,
-//! a lease on each one's shared allocation over UDP or TCP, whose relayed
-//! address the worker's agent takes as a relay candidate.
+//! `srflx` candidate the mapped address becomes; and the `turn:` and
+//! `turns:` servers, a lease on each one's shared allocation over UDP, TCP
+//! or TLS over TCP, whose relayed address the worker's agent takes as a
+//! relay candidate.
 //!
 //! Implements RFC 7064 §3.1 (the `stun:` URI: host and optional port,
-//! default 3478), RFC 7065 §3.1 (the `turn:` URI: host, optional port,
-//! default 3478, and optional transport), RFC 8445 §5.1.1.2 (a
+//! default 3478), RFC 7065 §3.1 (the `turn:` and `turns:` URIs: host,
+//! optional port, default 3478 and 5349, and optional transport; a
+//! `turns:` URI over UDP asks for DTLS, RFC 7350, which is not supported),
+//! RFC 8489 §6.2.3 (a `turns:` server proves the URI's host name to the
+//! embedded roots), RFC 8445 §5.1.1.2 (a
 //! server-reflexive candidate and its base), §5.1.2.1 (its priority),
 //! §5.1.1.3 (its foundation) and §5.1.3 (a candidate equal to its base is
 //! redundant and dropped), and RFC 8839 §5.1 (the `candidate` attribute).
@@ -21,11 +25,12 @@ use std::time::Duration;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::session::{IceServer, SessionEvent, WarningCode};
 use lotse_core::secret::Secret;
+use lotse_tls::{TlsTarget, Trust};
 
 use crate::net::allocation::Transport;
 use crate::net::credential::Credentials;
 use crate::net::stun_client::StunClient;
-use crate::net::turn_client::{Lease, TurnClient};
+use crate::net::turn_client::{Lease, TurnClient, Via};
 
 /// How long end-of-candidates waits for the gathers after the offer.
 pub(crate) const GATHER_DEADLINE: Duration = Duration::from_secs(2);
@@ -45,6 +50,9 @@ pub(crate) const MAX_WARNINGS: usize = 4;
 /// The default port of a `stun:` and a `turn:` URI (RFC 7064 §3.1, RFC
 /// 7065 §3.1, RFC 8489 §18.6).
 const STUN_PORT: u16 = 3478;
+
+/// The default port of a `turns:` URI (RFC 7065 §3.1, RFC 8489 §18.6).
+const TURNS_PORT: u16 = 5349;
 
 /// The type preference of a server-reflexive candidate (RFC 8445
 /// §5.1.2.2 recommends 100).
@@ -66,14 +74,15 @@ pub(crate) struct StunServer {
     pub(crate) port: u16,
 }
 
-/// A `turn:` server as its URI names it, with its entry's long-term
-/// credential.
+/// A `turn:` or `turns:` server as its URI names it, with its entry's
+/// long-term credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnServer {
     /// The host and port.
     pub(crate) server: StunServer,
-    /// The transport to it (RFC 7065 §3.1).
-    pub(crate) transport: Transport,
+    /// How it is reached (RFC 7065 §3.1); over TLS, the host as the name
+    /// its certificate must carry, checked against the embedded roots.
+    pub(crate) via: Via,
     /// The entry's username and credential.
     pub(crate) credentials: Credentials,
 }
@@ -90,15 +99,16 @@ pub(crate) struct IcePlan {
 }
 
 /// Checks `ice_servers`: only `stun:`, `turn:` and `turns:` URIs (RFC 7064,
-/// RFC 7065). `turns:` is not supported until M6 and yields a
-/// `turn_unsupported` warning, the first [`MAX_WARNINGS`] of them. A
-/// `turn:` entry without a username and credential is skipped: TURN asks
-/// for the long-term credential (RFC 8656 §5), and browsers refuse such an
-/// entry (W3C WebRTC 1.0 §4.2.1). A `turn:` over TCP is skipped when the
-/// list names its host and port over UDP too: both relay over UDP to the
-/// peer (§7.1), so the UDP allocation is enough, and what a session sends
-/// through a TCP one passes through the supervisor, which owns the
-/// connection.
+/// RFC 7065). A `turns:` URI is TLS over TCP, its host a TLS server name
+/// (RFC 8489 §6.2.3); one with `?transport=udp` asks for DTLS (RFC 7350),
+/// which is not supported, and yields a `turn_unsupported` warning, the
+/// first [`MAX_WARNINGS`] of them. A `turn:` or `turns:` entry without a
+/// username and credential is skipped: TURN asks for the long-term
+/// credential (RFC 8656 §5), and browsers refuse such an entry (W3C WebRTC
+/// 1.0 §4.2.1). A server over TCP or TLS is skipped when the list names
+/// its host and port over UDP too: all relay over UDP to the peer (§7.1),
+/// so the UDP allocation is enough, and what a session sends through a
+/// stream passes through the supervisor, which owns the connection.
 pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
     let mut plan = IcePlan::default();
     for (entry, url) in servers
@@ -118,18 +128,37 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                     tracing::debug!(url, "stun server beyond the per-session limit ignored");
                 }
             }
-            "turn" => {
-                let (server, tcp) = parse_turn(rest).ok_or_else(|| {
-                    ApiError::new(ErrorCode::InvalidRequest, "not a turn: URI (RFC 7065)")
-                        .with_detail("url", url.as_str())
+            scheme @ ("turn" | "turns") => {
+                let tls = scheme == "turns";
+                let default_port = if tls { TURNS_PORT } else { STUN_PORT };
+                let (server, query) = parse_turn(rest, default_port).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("not a {scheme}: URI (RFC 7065)"),
+                    )
+                    .with_detail("url", url.as_str())
                 })?;
+                let via = match (tls, query) {
+                    (false, TransportQuery::Tcp) => Via::Tcp,
+                    (false, TransportQuery::Udp | TransportQuery::None) => Via::Udp,
+                    (true, TransportQuery::Udp) => {
+                        warn_unsupported(&mut plan, url);
+                        continue;
+                    }
+                    (true, TransportQuery::Tcp | TransportQuery::None) => {
+                        Via::Tls(TlsTarget::new(&server.host, Trust::Roots).map_err(|err| {
+                            ApiError::new(ErrorCode::InvalidRequest, err)
+                                .with_detail("url", url.as_str())
+                        })?)
+                    }
+                };
                 let (Some(username), Some(password)) = (&entry.username, &entry.credential) else {
                     tracing::info!(url, "turn server without username and credential ignored");
                     continue;
                 };
                 let turn = TurnServer {
                     server,
-                    transport: if tcp { Transport::Tcp } else { Transport::Udp },
+                    via,
                     credentials: Credentials {
                         username: username.clone(),
                         password: Secret::new(password.clone()),
@@ -140,17 +169,6 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                 } else {
                     plan.turn.push(turn);
                 }
-            }
-            "turns" if plan.warnings.len() < MAX_WARNINGS => {
-                plan.warnings.push(SessionEvent::Warning {
-                    code: WarningCode::TurnUnsupported,
-                    message: format!("{url} ignored: TURN over TLS is not supported yet"),
-                    reason: None,
-                    status: None,
-                });
-            }
-            "turns" => {
-                tracing::debug!(url, "turns: server beyond the warning limit ignored");
             }
             _ => {
                 return Err(ApiError::new(
@@ -164,17 +182,18 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
     let udp: Vec<StunServer> = plan
         .turn
         .iter()
-        .filter(|turn| turn.transport == Transport::Udp)
+        .filter(|turn| turn.via == Via::Udp)
         .map(|turn| turn.server.clone())
         .collect();
     plan.turn.retain(|turn| {
-        let redundant = turn.transport == Transport::Tcp
+        let redundant = turn.via.transport().is_stream()
             && udp.iter().any(|other| same_server(other, &turn.server));
         if redundant {
             tracing::debug!(
                 host = turn.server.host,
                 port = turn.server.port,
-                "turn server over tcp named over udp too; the udp allocation relays"
+                transport = turn.via.transport().name(),
+                "turn server over a stream named over udp too; the udp allocation relays"
             );
         }
         !redundant
@@ -189,30 +208,67 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
     Ok(plan)
 }
 
+/// Warns of a `turns:` URI over UDP, DTLS (RFC 7350), which is not
+/// supported: a `turn_unsupported` warning while fewer than
+/// [`MAX_WARNINGS`] were given, else a log line.
+fn warn_unsupported(plan: &mut IcePlan, url: &str) {
+    if plan.warnings.len() < MAX_WARNINGS {
+        plan.warnings.push(SessionEvent::Warning {
+            code: WarningCode::TurnUnsupported,
+            message: format!("{url} ignored: TURN over DTLS is not supported"),
+            reason: None,
+            status: None,
+        });
+    } else {
+        tracing::debug!(
+            url,
+            "turns: server over dtls beyond the warning limit ignored"
+        );
+    }
+}
+
 /// Whether two URIs name one server: the host ignoring ASCII case (RFC
 /// 3986 §6.2.2.1) and the port.
 fn same_server(one: &StunServer, other: &StunServer) -> bool {
     one.port == other.port && one.host.eq_ignore_ascii_case(&other.host)
 }
 
-/// The server after `turn:` and whether it asks for TCP (RFC 7065 §3.1:
-/// `host [ ":" port ] [ "?transport=" transport ]`, transport `udp` or
-/// `tcp`, UDP when absent). Another transport, or another query, fails.
-fn parse_turn(rest: &str) -> Option<(StunServer, bool)> {
-    let (address, tcp) = match rest.split_once('?') {
-        None => (rest, false),
+/// The `?transport=` query of a `turn:` or `turns:` URI (RFC 7065 §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportQuery {
+    /// None: UDP for `turn:`, TCP for `turns:`.
+    None,
+    /// `udp`: DTLS for `turns:` (RFC 7350).
+    Udp,
+    /// `tcp`.
+    Tcp,
+}
+
+/// The server after `turn:` or `turns:` and the transport it asks for
+/// (RFC 7065 §3.1: `host [ ":" port ] [ "?transport=" transport ]`,
+/// transport `udp` or `tcp`), `default_port` when it names none. Another
+/// transport, or another query, fails.
+fn parse_turn(rest: &str, default_port: u16) -> Option<(StunServer, TransportQuery)> {
+    let (address, transport) = match rest.split_once('?') {
+        None => (rest, TransportQuery::None),
         Some((address, query)) => match query.to_ascii_lowercase().as_str() {
-            "transport=udp" => (address, false),
-            "transport=tcp" => (address, true),
+            "transport=udp" => (address, TransportQuery::Udp),
+            "transport=tcp" => (address, TransportQuery::Tcp),
             _ => return None,
         },
     };
-    parse_stun(address).map(|server| (server, tcp))
+    parse_host(address, default_port).map(|server| (server, transport))
 }
 
 /// The host and port after `stun:` (RFC 7064 §3.1: `host [ ":" port ]`).
 /// User info, a path or a query fail the host or port syntax.
 fn parse_stun(rest: &str) -> Option<StunServer> {
+    parse_host(rest, STUN_PORT)
+}
+
+/// `host [ ":" port ]` of a `stun:`, `turn:` or `turns:` URI (RFC 7064
+/// §3.1, RFC 7065 §3.1), `default_port` when it names none.
+fn parse_host(rest: &str, default_port: u16) -> Option<StunServer> {
     let (host, port) = match rest.rsplit_once(':') {
         // An IPv6 literal without a port ends in its bracket.
         Some((host, port)) if !port.contains(']') => (host, Some(port)),
@@ -231,7 +287,7 @@ fn parse_stun(rest: &str) -> Option<StunServer> {
     };
     let port = match port {
         Some(port) => port.parse().ok().filter(|port| *port != 0)?,
-        None => STUN_PORT,
+        None => default_port,
     };
     valid_host.then(|| StunServer {
         host: host.to_owned(),
@@ -313,7 +369,8 @@ pub(crate) struct Relayed {
     pub(crate) lease: Lease,
     /// The server, as resolved.
     pub(crate) server: SocketAddr,
-    /// The transport to it.
+    /// The transport to it; on a stream (TCP or TLS) what the session
+    /// sends goes through the supervisor.
     pub(crate) transport: Transport,
     /// The host address the allocation's traffic leaves from.
     pub(crate) local: SocketAddr,
@@ -322,7 +379,7 @@ pub(crate) struct Relayed {
 /// Leases the allocation on `server` over its transport (made with its
 /// credential if there is none yet), reached from the host address of the
 /// family it resolves to; `None` when that fails. `hosts` are of
-/// `generation`, which a TCP allocation must have been connected on
+/// `generation`, which a TCP or TLS allocation must have been connected on
 /// (RFC 8656 §5: an allocation is bound to its 5-tuple).
 pub(crate) async fn relay(
     client: &TurnClient,
@@ -332,13 +389,13 @@ pub(crate) async fn relay(
 ) -> Option<Relayed> {
     let (target, local) = reach(&server.server, hosts).await?;
     match client
-        .lease(target, server.transport, generation, &server.credentials)
+        .lease(target, &server.via, generation, &server.credentials)
         .await
     {
         Ok(lease) => Some(Relayed {
             lease,
             server: target,
-            transport: server.transport,
+            transport: server.via.transport(),
             local,
         }),
         Err(err) => {
@@ -398,8 +455,15 @@ mod tests {
     }
 
     #[test]
-    fn plans_keep_stun_servers_warn_on_turns_and_refuse_the_rest() {
-        let plan = plan(&servers(&["stun:a", "STUN:b:1", "turn:t", "turns:t:5349"])).unwrap();
+    fn plans_keep_stun_servers_warn_on_turns_over_dtls_and_refuse_the_rest() {
+        let plan = plan(&servers(&[
+            "stun:a",
+            "STUN:b:1",
+            "turn:t",
+            "turns:t:5349",
+            "turns:t:5349?transport=udp",
+        ]))
+        .unwrap();
         assert_eq!(
             plan.stun,
             [
@@ -414,7 +478,9 @@ mod tests {
             ]
         );
         assert_eq!(plan.warnings.len(), 1);
-        let many: Vec<String> = (0..6).map(|n| format!("turns:t{n}")).collect();
+        let many: Vec<String> = (0..6)
+            .map(|n| format!("turns:t{n}?transport=UDP"))
+            .collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         let warnings = super::plan(&servers(&many)).unwrap().warnings;
         assert_eq!(warnings.len(), MAX_WARNINGS);
@@ -423,7 +489,7 @@ mod tests {
             SessionEvent::Warning {
                 code: WarningCode::TurnUnsupported,
                 message: format!(
-                    "turns:t{} ignored: TURN over TLS is not supported yet",
+                    "turns:t{}?transport=UDP ignored: TURN over DTLS is not supported",
                     MAX_WARNINGS - 1
                 ),
                 reason: None,
@@ -448,18 +514,23 @@ mod tests {
 
     #[test]
     fn turn_uris_parse_per_rfc_7065_3_1() {
-        let parse = |rest: &str| parse_turn(rest).map(|(s, tcp)| (s.host, s.port, tcp));
+        let parse = |rest: &str| parse_turn(rest, STUN_PORT).map(|(s, q)| (s.host, s.port, q));
         assert_eq!(
             parse("turn.example"),
-            Some(("turn.example".into(), 3478, false))
+            Some(("turn.example".into(), 3478, TransportQuery::None))
         );
         assert_eq!(
             parse("turn.example:80?transport=udp"),
-            Some(("turn.example".into(), 80, false))
+            Some(("turn.example".into(), 80, TransportQuery::Udp))
         );
         assert_eq!(
             parse("[2001:db8::1]:443?transport=TCP"),
-            Some(("[2001:db8::1]".into(), 443, true))
+            Some(("[2001:db8::1]".into(), 443, TransportQuery::Tcp))
+        );
+        // `turns:` defaults to 5349.
+        assert_eq!(
+            parse_turn("turn.example", TURNS_PORT).map(|(s, _)| s.port),
+            Some(5349)
         );
         for bad in [
             "",
@@ -483,7 +554,7 @@ mod tests {
         let named = |plan: &IcePlan| -> Vec<(String, u16, Transport)> {
             plan.turn
                 .iter()
-                .map(|t| (t.server.host.clone(), t.server.port, t.transport))
+                .map(|t| (t.server.host.clone(), t.server.port, t.via.transport()))
                 .collect()
         };
         let plan = plan(&[
@@ -534,6 +605,63 @@ mod tests {
             (err.code, &err.details["url"]),
             (ErrorCode::InvalidRequest, &json!("turn:t?transport=sctp"))
         );
+    }
+
+    #[test]
+    fn plans_keep_turns_servers_over_tls_to_the_embedded_roots_rfc_8489_6_2_3() {
+        let entry = |urls: &[&str], credential: Option<&str>| -> IceServer {
+            serde_json::from_value(json!({
+                "urls": urls, "username": credential.map(|_| "ha"), "credential": credential
+            }))
+            .unwrap()
+        };
+        let plan = plan(&[
+            entry(
+                &[
+                    "turns:t1",
+                    "TURNS:t1:5349?transport=tcp",
+                    "turns:t2:443?transport=TCP",
+                    "turns:[2001:db8::1]",
+                    // Named over UDP at its port too: the UDP allocation
+                    // relays.
+                    "turns:t3:443",
+                    "turn:t3:443",
+                ],
+                Some("pw"),
+            ),
+            entry(&["turns:t4"], None),
+        ])
+        .unwrap();
+        let tls = |host: &str| Via::Tls(TlsTarget::new(host, Trust::Roots).unwrap());
+        let reached: Vec<(String, u16, Via)> = plan
+            .turn
+            .iter()
+            .map(|t| (t.server.host.clone(), t.server.port, t.via.clone()))
+            .collect();
+        // Named twice is one server, the default port 5349; no credential,
+        // no server; no warning.
+        assert_eq!(
+            reached,
+            [
+                ("t1".to_owned(), 5349, tls("t1")),
+                ("t2".to_owned(), 443, tls("t2")),
+                ("[2001:db8::1]".to_owned(), 5349, tls("[2001:db8::1]")),
+                ("t3".to_owned(), 443, Via::Udp),
+            ]
+        );
+        assert_eq!(plan.turn[0].credentials.username, "ha");
+        assert_eq!(plan.warnings, []);
+        // A host that is no TLS server name, and another transport, fail.
+        for bad in ["turns:a..b", "turns:-t", "turns:t?transport=sctp"] {
+            let err = super::plan(&[entry(&[bad], Some("pw"))]).unwrap_err();
+            assert_eq!(
+                (err.code, &err.details["url"]),
+                (ErrorCode::InvalidRequest, &json!(bad)),
+                "{bad}"
+            );
+        }
+        let err = super::plan(&[entry(&["turns:t:0"], Some("pw"))]).unwrap_err();
+        assert_eq!(err.message, "not a turns: URI (RFC 7065)");
     }
 
     #[test]

@@ -30,6 +30,7 @@ lotse-api = { workspace = true }
 lotse-api-types = { workspace = true }
 lotse-core = { workspace = true }
 lotse-ipc = { workspace = true }
+lotse-tls = { workspace = true } # the TLS handshake of a TURN allocation over TLS (`turns:`), against the embedded roots
 
 [dev-dependencies]
 allocation-counter = { workspace = true } # the demux's allocation count (tests/allocations.rs)

@@ -1714,6 +1714,7 @@ dependencies = [
  "lotse-core",
  "lotse-ipc",
  "lotse-testing",
+ "lotse-tls",
  "md-5",
  "nix",
  "quinn-udp",

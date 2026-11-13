@@ -2,7 +2,19 @@
 //! transport) and shared by every session that names the server, each run
 //! by a task that drives its [`Allocation`] state machine over the shared
 //! UDP socket (responses come back through the demux by transaction id) or
-//! over a TCP connection of its own.
+//! over a TCP connection of its own, plain or with TLS over it (a `turns:`
+//! server, [`Via::Tls`]). Everything said of a TCP allocation below holds
+//! for one over TLS: TLS only sits between the connection and the
+//! stream framing.
+//!
+//! A TLS connection verifies the server against the embedded roots and
+//! the host name its URI names (RFC 8489 §6.2.3, which takes the server's
+//! identity from RFC 6125), through `lotse-tls`, with TLS 1.3 or 1.2 and
+//! no ALPN protocol: RFC 7443 registers `stun.turn`, but RFC 8656 does
+//! not ask for it, and a server that knows no protocol offered refuses
+//! the handshake (RFC 7301 §3.2). An allocation over TLS is one per server
+//! name too, so a session never shares a connection whose certificate was
+//! checked for another name.
 //!
 //! A TCP allocation is also one per generation of host addresses
 //! (`host_cache`): an allocation is bound to its 5-tuple (RFC 8656 §5),
@@ -49,7 +61,8 @@
 //! its entry of while it relays at that address (`Routes`).
 //!
 //! Implements RFC 8656 §5 (the 5-tuple: the shared socket, or one TCP
-//! connection per allocation, §3.1), on TCP the stream framing of STUN
+//! connection per allocation, §3.1, with TLS over it for `turns:`, RFC
+//! 8489 §6.2.3), on TCP the stream framing of STUN
 //! and `ChannelData` (RFC 8489 §6.2.2, RFC 8656 §12.5) and the unwrapping
 //! of §11.4 and §12.6; the protocol itself is the state machine's.
 
@@ -63,6 +76,7 @@ use std::time::Duration;
 use lotse_core::clock::Clock;
 use lotse_core::task::spawn_named;
 use lotse_ipc::datagram;
+use lotse_tls::TlsTarget;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpStream, UnixDatagram};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -248,19 +262,43 @@ impl Route {
     }
 }
 
-/// Which allocation a lease shares: the server, the transport, and for
-/// TCP the generation of host addresses its connection was made on; UDP
+/// How a lease reaches its TURN server (RFC 8656 §3.1): over the shared
+/// UDP socket, or over a connection of its allocation's own, plain TCP or
+/// TLS over it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Via {
+    /// The shared UDP socket (`turn:`, RFC 7065 §3.1).
+    Udp,
+    /// TCP (`turn:` with `?transport=tcp`).
+    Tcp,
+    /// TLS over TCP (`turns:`): the server must prove the target's name to
+    /// the target's trust (RFC 8489 §6.2.3).
+    Tls(TlsTarget),
+}
+
+impl Via {
+    /// The transport, as the state machine knows it.
+    pub const fn transport(&self) -> Transport {
+        match self {
+            Self::Udp => Transport::Udp,
+            Self::Tcp => Transport::Tcp,
+            Self::Tls(_) => Transport::Tls,
+        }
+    }
+}
+
+/// Which allocation a lease shares: the server, how it is reached (for
+/// TLS with the name its certificate was checked for), and on a stream
+/// the generation of host addresses its connection was made on; UDP
 /// allocations share the socket's 5-tuple across generations
 /// ([module docs](self)).
-type Key = (SocketAddr, Transport, Option<u64>);
+type Key = (SocketAddr, Via, Option<u64>);
 
-/// The [`Key`] of a lease on `server` over `transport` by a session on
-/// the host addresses of `generation`.
-const fn key(server: SocketAddr, transport: Transport, generation: u64) -> Key {
-    match transport {
-        Transport::Udp => (server, transport, None),
-        Transport::Tcp => (server, transport, Some(generation)),
-    }
+/// The [`Key`] of a lease on `server` reached `via` by a session on the
+/// host addresses of `generation`.
+fn key(server: SocketAddr, via: &Via, generation: u64) -> Key {
+    let generation = via.transport().is_stream().then_some(generation);
+    (server, via.clone(), generation)
 }
 
 /// The allocations; see the module documentation.
@@ -321,21 +359,21 @@ impl TurnClient {
             .cloned()
     }
 
-    /// A lease on the allocation for `server` over `transport` of a
-    /// session on the host addresses of `generation` (which a TCP
+    /// A lease on the allocation for `server` reached `via` of a session
+    /// on the host addresses of `generation` (which a TCP or TLS
     /// allocation is bound to and a UDP one confirmed on, [module
     /// docs](self)), made with `credentials` if there is none yet; waits
     /// until it exists. One being deleted is waited out and a new one made.
     pub async fn lease(
         &self,
         server: SocketAddr,
-        transport: Transport,
+        via: &Via,
         generation: u64,
         credentials: &Credentials,
     ) -> Result<Lease, TurnError> {
-        let key = key(canonical(server), transport, generation);
-        match self.try_lease(key, generation, credentials).await {
-            Err(TurnError::Closing) => self.try_lease(key, generation, credentials).await,
+        let key = key(canonical(server), via, generation);
+        match self.try_lease(&key, generation, credentials).await {
+            Err(TurnError::Closing) => self.try_lease(&key, generation, credentials).await,
             other => other,
         }
     }
@@ -345,7 +383,7 @@ impl TurnClient {
     /// request.
     async fn try_lease(
         &self,
-        key: Key,
+        key: &Key,
         generation: u64,
         credentials: &Credentials,
     ) -> Result<Lease, TurnError> {
@@ -378,17 +416,18 @@ impl TurnClient {
     /// addresses of `generation` when there is none.
     fn handle(
         &self,
-        key: Key,
+        key: &Key,
         generation: u64,
         credentials: &Credentials,
     ) -> Result<Handle, TurnError> {
-        let (server, transport, _) = key;
+        let (server, via, _) = key;
+        let (server, transport) = (*server, via.transport());
         let mut allocations = self
             .allocations
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         allocations.retain(|_, handle| !handle.commands.is_closed());
-        if let Some(handle) = allocations.get(&key) {
+        if let Some(handle) = allocations.get(key) {
             return Ok(handle.clone());
         }
         let mut seed = [0; 32];
@@ -403,8 +442,8 @@ impl TurnClient {
             generation,
         );
         let (mut driver, handle) = Driver::new(machine, server, Arc::clone(&self.clock));
-        match transport {
-            Transport::Udp => {
+        match via {
+            Via::Udp => {
                 let local = self.socket.local_addr().ok();
                 let (queue, inbound) = mpsc::channel(INBOUND_QUEUE);
                 let link = Link::Udp {
@@ -418,7 +457,11 @@ impl TurnClient {
                 };
                 let _task = spawn_named("turn.allocation", driver.run(link, inbound));
             }
-            Transport::Tcp => {
+            Via::Tcp | Via::Tls(_) => {
+                let tls = match via {
+                    Via::Tls(target) => Some(target.clone()),
+                    Via::Udp | Via::Tcp => None,
+                };
                 let (queue, frames) = mpsc::channel(OUTBOUND_QUEUE);
                 driver.route = Some(Route {
                     routes: Arc::clone(&self.routes),
@@ -431,10 +474,13 @@ impl TurnClient {
                     Arc::clone(&self.clock),
                 );
                 let timeout = self.config.reliable_timeout;
-                let _task = spawn_named("turn.allocation", driver.run_tcp(timeout, peers, frames));
+                let _task = spawn_named(
+                    "turn.allocation",
+                    driver.run_tcp(timeout, tls, peers, frames),
+                );
             }
         }
-        allocations.insert(key, handle.clone());
+        allocations.insert(key.clone(), handle.clone());
         drop(allocations);
         Ok(handle)
     }
@@ -552,6 +598,28 @@ impl Drop for Lease {
 
 /// The sending half of a byte stream to the server.
 type Writer = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// The receiving half of a byte stream from the server.
+type Reader = Box<dyn AsyncRead + Send + Unpin>;
+
+/// Connects to `server` over TCP and, with a `tls` target, completes the
+/// TLS handshake over the connection, the server proving the target's
+/// name (RFC 8489 §6.2.3; no ALPN, [module docs](self)); the halves of
+/// the stream, or why there is none.
+async fn connect(server: SocketAddr, tls: Option<&TlsTarget>) -> Result<(Reader, Writer), String> {
+    let stream = TcpStream::connect(server)
+        .await
+        .map_err(|err| err.to_string())?;
+    let Some(target) = tls else {
+        let (reader, writer) = stream.into_split();
+        return Ok((Box::new(reader), Box::new(writer)));
+    };
+    let stream = lotse_tls::connect(stream, target, &[])
+        .await
+        .map_err(|err| err.to_string())?;
+    let (reader, writer) = tokio::io::split(stream);
+    Ok((Box::new(reader), Box::new(writer)))
+}
 
 /// How an allocation reaches its server.
 enum Link {
@@ -725,22 +793,28 @@ impl Driver {
         )
     }
 
-    /// Connects to the server, then runs over the connection, routing what
-    /// it relays to `peers` and writing what sessions send on `frames`; a
-    /// connection that fails or takes longer than `timeout` fails the
-    /// allocation.
-    async fn run_tcp(mut self, timeout: Duration, peers: Peers, frames: mpsc::Receiver<Outbound>) {
+    /// Connects to the server, with a `tls` target over TLS, then runs over
+    /// the connection, routing what it relays to `peers` and writing what
+    /// sessions send on `frames`; a connection or handshake that fails, or
+    /// that takes longer than `timeout` in all, fails the allocation.
+    async fn run_tcp(
+        mut self,
+        timeout: Duration,
+        tls: Option<TlsTarget>,
+        peers: Peers,
+        frames: mpsc::Receiver<Outbound>,
+    ) {
+        let over_tls = tls.is_some();
         let connected = tokio::select! {
-            connected = TcpStream::connect(self.server) => connected,
-            () = self.clock.sleep(timeout) => Err(io::ErrorKind::TimedOut.into()),
+            connected = connect(self.server, tls.as_ref()) => connected,
+            () = self.clock.sleep(timeout) => Err(io::Error::from(io::ErrorKind::TimedOut).to_string()),
         };
         match connected {
-            Ok(stream) => {
-                let (reader, writer) = stream.into_split();
+            Ok((reader, writer)) => {
                 self.run_stream(reader, writer, peers, frames).await;
             }
             Err(err) => {
-                tracing::warn!(server = %self.server, error = %err, "connecting to the turn server failed");
+                tracing::warn!(server = %self.server, tls = over_tls, error = err, "connecting to the turn server failed");
                 self.machine.connection_lost();
                 self.dispatch();
                 self.drain();
@@ -1087,11 +1161,7 @@ pub async fn uplink(client: Arc<TurnClient>, datagrams: UnixDatagram, owner: Rel
 /// RFC 8489 §6.2.2; `ChannelData` padded, RFC 8656 §12.5) and queues them
 /// for the task; ends with the stream, on a message neither is (§12), or
 /// with the task.
-async fn read_stream(
-    mut reader: Box<dyn AsyncRead + Send + Unpin>,
-    server: SocketAddr,
-    queue: mpsc::Sender<RawReply>,
-) {
+async fn read_stream(mut reader: Reader, server: SocketAddr, queue: mpsc::Sender<RawReply>) {
     let mut buffer = Vec::new();
     let mut chunk = vec![0; 4096];
     loop {
@@ -1137,7 +1207,9 @@ mod tests {
 
     use lotse_core::clock::{FakeClock, SystemClock};
     use lotse_core::secret::Secret;
+    use lotse_testing::fake_camera::CameraTls;
     use lotse_testing::fake_turn::{FakeTurn, FakeTurnServer, REFRESH};
+    use lotse_tls::{Fingerprint, Trust};
 
     use super::super::demux::test_support::MemorySink;
     use super::super::demux::{Demux, DemuxStats};
@@ -1186,6 +1258,20 @@ mod tests {
         }
 
         async fn serving(config: AllocationConfig, relays: usize) -> Self {
+            Self::serving_tls(config, relays, None).await
+        }
+
+        /// As [`Self::relaying`], the server over TLS too with `tls`'s
+        /// certificate.
+        async fn tls(relays: usize, tls: &CameraTls) -> Self {
+            Self::serving_tls(AllocationConfig::default(), relays, Some(tls)).await
+        }
+
+        async fn serving_tls(
+            config: AllocationConfig,
+            relays: usize,
+            tls: Option<&CameraTls>,
+        ) -> Self {
             let clock = Arc::new(FakeClock::default());
             let turn = Arc::new(FakeTurn::new(
                 clock.clone(),
@@ -1194,7 +1280,10 @@ mod tests {
             ));
             turn.add_user("alice", "alice-pw");
             turn.add_user("bob", "bob-pw");
-            let server = FakeTurnServer::start_relaying(turn, relays).await.unwrap();
+            let server = match tls {
+                None => FakeTurnServer::start_relaying(turn, relays).await.unwrap(),
+                Some(tls) => FakeTurnServer::start_tls(turn, relays, tls).await.unwrap(),
+            };
             let bound = bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
             let local = bound.local;
             let demux =
@@ -1219,23 +1308,24 @@ mod tests {
             self.server.turn()
         }
 
-        async fn lease(&self, transport: Transport, user: &str) -> Result<Lease, TurnError> {
-            self.lease_on(transport, user, 0).await
+        async fn lease(&self, via: Via, user: &str) -> Result<Lease, TurnError> {
+            self.lease_on(via, user, 0).await
         }
 
         /// A lease of a session on the host addresses of `generation`.
         async fn lease_on(
             &self,
-            transport: Transport,
+            via: Via,
             user: &str,
             generation: u64,
         ) -> Result<Lease, TurnError> {
-            let server = match transport {
-                Transport::Udp => self.server.udp_addr(),
-                Transport::Tcp => self.server.tcp_addr(),
+            let server = match via {
+                Via::Udp => self.server.udp_addr(),
+                Via::Tcp => self.server.tcp_addr(),
+                Via::Tls(_) => self.server.tls_addr().unwrap(),
             };
             self.client
-                .lease(server, transport, generation, &creds(user))
+                .lease(server, &via, generation, &creds(user))
                 .await
         }
 
@@ -1299,7 +1389,7 @@ mod tests {
         bounded(async {
             let setup = Setup::new().await;
             let turn = setup.turn();
-            let first = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let first = setup.lease(Via::Udp, "alice").await.unwrap();
             let allocations = turn.allocations();
             assert_eq!(allocations.len(), 1);
             assert_eq!(allocations[0].client, setup.local);
@@ -1334,7 +1424,7 @@ mod tests {
             assert_eq!(allocation.permissions, [peer(1).ip()]);
             assert_eq!(allocation.channels.len(), 4);
             // Bob's session shares it; his credential is not sent.
-            let second = setup.lease(Transport::Udp, "bob").await.unwrap();
+            let second = setup.lease(Via::Udp, "bob").await.unwrap();
             assert_eq!(second.relayed(), first.relayed());
             drop(first);
             // Commands run in order: after this answer, the first lease is gone.
@@ -1373,7 +1463,7 @@ mod tests {
                 .registrations()
                 .register("relay", b"relay-pw".to_vec(), sink.clone());
             let stats = setup.demux.stats();
-            let lease = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let lease = setup.lease(Via::Udp, "alice").await.unwrap();
             let relayed = lease.relayed();
             let browser = peer(7);
             let frames = || sink.frames.lock().unwrap().clone();
@@ -1483,7 +1573,7 @@ mod tests {
                 .registrations()
                 .register("relay", b"relay-pw".to_vec(), sink.clone());
             let stats = setup.demux.stats();
-            let lease = setup.lease(Transport::Tcp, "alice").await.unwrap();
+            let lease = setup.lease(Via::Tcp, "alice").await.unwrap();
             let relayed = lease.relayed();
             // Its relay candidate goes to a worker, before any channel is
             // bound (the commands are read in order).
@@ -1525,7 +1615,7 @@ mod tests {
             // on the one queue.
             let other_browser = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let other_peer = other_browser.local_addr().unwrap();
-            let other_lease = setup.lease(Transport::Tcp, "bob").await.unwrap();
+            let other_lease = setup.lease(Via::Tcp, "bob").await.unwrap();
             assert_eq!(other_lease.relayed(), relayed, "one shared allocation");
             let other_owner = RelayOwner::next();
             assert_ne!(other_owner, owner);
@@ -1615,19 +1705,19 @@ mod tests {
         bounded(async {
             let setup = Setup::relaying(2).await;
             let turn = setup.turn();
-            let old = setup.lease(Transport::Tcp, "alice").await.unwrap();
+            let old = setup.lease(Via::Tcp, "alice").await.unwrap();
             // The host addresses changed: a session on the new ones leases
             // from a new connection, the old lease keeps its own.
-            let new = setup.lease_on(Transport::Tcp, "bob", 1).await.unwrap();
+            let new = setup.lease_on(Via::Tcp, "bob", 1).await.unwrap();
             assert_ne!(new.relayed(), old.relayed());
             assert_eq!(turn.allocations().len(), 2);
             assert_eq!(setup.server.tcp_clients().len(), 2);
             // Another session on the new ones shares the new allocation.
-            let shared = setup.lease_on(Transport::Tcp, "alice", 1).await.unwrap();
+            let shared = setup.lease_on(Via::Tcp, "alice", 1).await.unwrap();
             assert_eq!(shared.relayed(), new.relayed());
             // UDP stays one allocation: its 5-tuple is the shared socket's.
-            let udp = setup.lease(Transport::Udp, "alice").await.unwrap();
-            let udp_after = setup.lease_on(Transport::Udp, "bob", 1).await.unwrap();
+            let udp = setup.lease(Via::Udp, "alice").await.unwrap();
+            let udp_after = setup.lease_on(Via::Udp, "bob", 1).await.unwrap();
             assert_eq!(udp_after.relayed(), udp.relayed());
             assert_eq!(turn.allocations().len(), 3);
             // What each session's worker sends goes out on its own
@@ -1681,20 +1771,20 @@ mod tests {
                 let requests = turn.requests();
                 requests.iter().filter(|r| r.method == REFRESH).count()
             };
-            let first = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let first = setup.lease(Via::Udp, "alice").await.unwrap();
             // The same generation shares it at once.
-            let same = setup.lease(Transport::Udp, "bob").await.unwrap();
+            let same = setup.lease(Via::Udp, "bob").await.unwrap();
             assert_eq!(same.relayed(), first.relayed());
             assert_eq!(refreshes(), 0);
             // A newer one gets it once a Refresh confirmed the 5-tuple.
-            let newer = setup.lease_on(Transport::Udp, "bob", 1).await.unwrap();
+            let newer = setup.lease_on(Via::Udp, "bob", 1).await.unwrap();
             assert_eq!(newer.relayed(), first.relayed());
             assert_eq!(refreshes(), 1);
             assert_eq!(turn.allocations()[0].refreshes, 1);
             // Confirmed on it: neither that generation nor an older one
             // asks again.
-            let again = setup.lease_on(Transport::Udp, "alice", 1).await.unwrap();
-            let older = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let again = setup.lease_on(Via::Udp, "alice", 1).await.unwrap();
+            let older = setup.lease(Via::Udp, "alice").await.unwrap();
             assert_eq!(again.relayed(), first.relayed());
             assert_eq!(older.relayed(), first.relayed());
             assert_eq!(refreshes(), 1);
@@ -1707,11 +1797,11 @@ mod tests {
         bounded(async {
             let setup = Setup::new().await;
             let turn = setup.turn();
-            let old = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let old = setup.lease(Via::Udp, "alice").await.unwrap();
             // The server holds no allocation on the 5-tuple any more, as
             // when the host addresses moved the socket's source address.
             turn.forget_allocations();
-            let new = setup.lease_on(Transport::Udp, "alice", 1).await.unwrap();
+            let new = setup.lease_on(Via::Udp, "alice", 1).await.unwrap();
             assert_ne!(new.relayed(), old.relayed());
             assert_eq!(turn.allocations()[0].relayed, new.relayed());
             assert_eq!(*old.status().borrow(), Some(new.relayed()));
@@ -1762,8 +1852,8 @@ mod tests {
         bounded(async {
             let setup = Setup::new().await;
             let turn = setup.turn();
-            let tcp = setup.lease(Transport::Tcp, "alice").await.unwrap();
-            let udp = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let tcp = setup.lease(Via::Tcp, "alice").await.unwrap();
+            let udp = setup.lease(Via::Udp, "alice").await.unwrap();
             assert_ne!(tcp.relayed(), udp.relayed());
             let allocations = turn.allocations();
             assert_eq!(allocations.len(), 2);
@@ -1782,7 +1872,7 @@ mod tests {
             assert_eq!(tcp.bind_channel(peer(1)).await, Err(TurnError::Closed));
             // The UDP allocation is untouched; a new TCP lease connects again.
             assert_eq!(*udp.status().borrow(), Some(udp.relayed()));
-            let again = setup.lease(Transport::Tcp, "alice").await.unwrap();
+            let again = setup.lease(Via::Tcp, "alice").await.unwrap();
             assert_ne!(again.relayed(), tcp.relayed());
         })
         .await;
@@ -1793,7 +1883,7 @@ mod tests {
         bounded(async {
             let setup = Setup::new().await;
             let turn = setup.turn();
-            let _lease = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let _lease = setup.lease(Via::Udp, "alice").await.unwrap();
             // A stale nonce on the way is answered with the new one.
             turn.rotate_nonce();
             setup.clock.advance(Duration::from_secs(540));
@@ -1810,7 +1900,7 @@ mod tests {
             let setup = Setup::new().await;
             let turn = setup.turn();
             turn.drop_requests(1);
-            let mut lease = pin!(setup.lease(Transport::Udp, "alice"));
+            let mut lease = pin!(setup.lease(Via::Udp, "alice"));
             until_dropped(turn, 1, lease.as_mut()).await;
             setup.clock.advance(Duration::from_millis(500));
             let lease = lease.await.unwrap();
@@ -1826,7 +1916,7 @@ mod tests {
             let turn = setup.turn();
             turn.drop_requests(1);
             {
-                let mut lease = pin!(setup.lease(Transport::Udp, "alice"));
+                let mut lease = pin!(setup.lease(Via::Udp, "alice"));
                 until_dropped(turn, 1, lease.as_mut()).await;
             }
             setup.clock.advance(Duration::from_millis(500));
@@ -1845,7 +1935,7 @@ mod tests {
             // An IPv6 server from an IPv4 socket: every send fails.
             let server: SocketAddr = "[::1]:3478".parse().unwrap();
             let alice = creds("alice");
-            let lease = setup.client.lease(server, Transport::Udp, 0, &alice);
+            let lease = setup.client.lease(server, &Via::Udp, 0, &alice);
             let result = setup.drive(lease, Duration::from_secs(5)).await;
             assert_eq!(
                 result.unwrap_err(),
@@ -1854,6 +1944,133 @@ mod tests {
             // The demux forgets the transactions given up on.
             let responses = setup.demux.responses();
             eventually(|| responses.outstanding() == 0).await;
+        })
+        .await;
+    }
+
+    /// TLS to `name`, trusting exactly `tls`'s certificate.
+    fn pinned(name: &str, tls: &CameraTls) -> Via {
+        let pin = Trust::Pin(Fingerprint::of(tls.certificate_der()));
+        Via::Tls(TlsTarget::new(name, pin).unwrap())
+    }
+
+    #[tokio::test]
+    async fn rfc8489_6_2_3_a_tls_allocation_carries_what_is_relayed_both_ways() {
+        bounded(async {
+            let tls = CameraTls::self_signed(&["127.0.0.1"]).unwrap();
+            let setup = Setup::tls(1, &tls).await;
+            let sink = Arc::new(MemorySink::default());
+            setup
+                .demux
+                .registrations()
+                .register("relay", b"relay-pw".to_vec(), sink.clone());
+            let via = pinned("127.0.0.1", &tls);
+            let lease = setup.lease(via.clone(), "alice").await.unwrap();
+            let relayed = lease.relayed();
+            // The allocation lives on the TLS connection, a stream to the
+            // server.
+            assert_eq!(setup.server.tcp_clients().len(), 1);
+            assert!(setup.turn().allocations()[0].tcp);
+            // A second session naming the server alike shares it.
+            let shared = setup.lease(via, "bob").await.unwrap();
+            assert_eq!(shared.relayed(), relayed);
+            assert_eq!(setup.server.tcp_clients().len(), 1);
+            let owner = RelayOwner::next();
+            lease.grant().to(owner);
+            let browser = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer = browser.local_addr().unwrap();
+            let frames = || sink.frames.lock().unwrap().clone();
+            // What a peer sends the relayed address arrives through TLS as
+            // the peer's datagram: a Data indication, then ChannelData.
+            lease.permit(peer.ip()).await.unwrap();
+            browser.send_to(&check(1), relayed).await.unwrap();
+            eventually(|| frames().len() == 1).await;
+            assert_eq!(frames()[0], (peer, relayed, check(1)));
+            let bound = lease.bind_channel(peer).await.unwrap();
+            browser.send_to(b"media", relayed).await.unwrap();
+            eventually(|| frames().len() == 2).await;
+            assert_eq!(frames()[1], (peer, relayed, b"media".to_vec()));
+            // What the worker frames goes out on the TLS connection to the
+            // peer, from the relayed address.
+            let server = setup.server.tls_addr().unwrap();
+            let (worker, task) = worker_channel(&setup.client, owner);
+            worker
+                .send(&uplink_frame(relayed, server, &padded(bound, b"hello")))
+                .unwrap();
+            let mut buf = [0_u8; 64];
+            let (len, from) = received(&browser, &mut buf).await;
+            assert_eq!((&buf[..len], from), (&b"hello"[..], relayed));
+            worker.send(&[]).unwrap();
+            task.await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8489_6_2_3_tls_allocations_are_one_per_server_name() {
+        bounded(async {
+            let tls = CameraTls::self_signed(&["127.0.0.1", "localhost"]).unwrap();
+            let setup = Setup::tls(2, &tls).await;
+            let by_address = setup
+                .lease(pinned("127.0.0.1", &tls), "alice")
+                .await
+                .unwrap();
+            let by_name = setup
+                .lease(pinned("localhost", &tls), "alice")
+                .await
+                .unwrap();
+            // One server address, two names: a connection each, checked
+            // for its own name.
+            assert_ne!(by_address.relayed(), by_name.relayed());
+            assert_eq!(setup.server.tcp_clients().len(), 2);
+            assert_eq!(setup.turn().allocations().len(), 2);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8489_6_2_3_a_turns_server_the_roots_do_not_trust_fails_the_lease() {
+        bounded(async {
+            let tls = CameraTls::self_signed(&["127.0.0.1"]).unwrap();
+            let setup = Setup::tls(0, &tls).await;
+            // Self-signed: no embedded root vouches for it.
+            let via = Via::Tls(TlsTarget::new("127.0.0.1", Trust::Roots).unwrap());
+            let result = setup.lease(via, "alice").await;
+            assert_eq!(
+                result.unwrap_err(),
+                TurnError::Allocation(AllocationError::Connection)
+            );
+            // Nothing, the credential least of all, was sent to it.
+            assert_eq!(setup.turn().requests(), Vec::new());
+            // A pin for another certificate fails alike.
+            let other = CameraTls::self_signed(&["127.0.0.1"]).unwrap();
+            let result = setup.lease(pinned("127.0.0.1", &other), "alice").await;
+            assert_eq!(
+                result.unwrap_err(),
+                TurnError::Allocation(AllocationError::Connection)
+            );
+            assert_eq!(setup.turn().requests(), Vec::new());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rfc8489_6_2_2_a_tls_handshake_that_never_ends_fails_the_lease_after_ti() {
+        bounded(async {
+            let setup = Setup::new().await;
+            // Accepts the connection, never answers the ClientHello.
+            let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = silent.local_addr().unwrap();
+            let tls = CameraTls::self_signed(&["127.0.0.1"]).unwrap();
+            let via = pinned("127.0.0.1", &tls);
+            let alice = creds("alice");
+            let lease = setup.client.lease(server, &via, 0, &alice);
+            let result = setup.drive(lease, Duration::from_secs(5)).await;
+            assert_eq!(
+                result.unwrap_err(),
+                TurnError::Allocation(AllocationError::Connection)
+            );
+            drop(silent);
         })
         .await;
     }
@@ -1867,7 +2084,7 @@ mod tests {
             drop(listener);
             let result = setup
                 .client
-                .lease(closed, Transport::Tcp, 0, &creds("alice"))
+                .lease(closed, &Via::Tcp, 0, &creds("alice"))
                 .await;
             assert_eq!(
                 result.unwrap_err(),
@@ -1882,13 +2099,13 @@ mod tests {
         bounded(async {
             let setup = Setup::new().await;
             let turn = setup.turn();
-            let first = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let first = setup.lease(Via::Udp, "alice").await.unwrap();
             let relayed = first.relayed();
             // The deleting Refresh is lost, so the deletion is still going on
             // when the next session asks.
             turn.drop_requests(1);
             drop(first);
-            let mut again = pin!(setup.lease(Transport::Udp, "alice"));
+            let mut again = pin!(setup.lease(Via::Udp, "alice"));
             until_dropped(turn, 1, again.as_mut()).await;
             let again = setup
                 .drive(again, Duration::from_millis(500))
@@ -1905,8 +2122,8 @@ mod tests {
         bounded(async {
             let setup = Setup::new().await;
             let turn = setup.turn();
-            let alice = setup.lease(Transport::Udp, "alice").await.unwrap();
-            let _bob = setup.lease(Transport::Udp, "bob").await.unwrap();
+            let alice = setup.lease(Via::Udp, "alice").await.unwrap();
+            let _bob = setup.lease(Via::Udp, "bob").await.unwrap();
             let mut status = alice.status();
             turn.expire_user("alice");
             setup.clock.advance(Duration::from_secs(540));
@@ -1932,7 +2149,7 @@ mod tests {
             })
             .await;
             let turn = setup.turn();
-            let lease = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let lease = setup.lease(Via::Udp, "alice").await.unwrap();
             turn.drop_requests(2);
             let mut permit = pin!(lease.permit(peer(1).ip()));
             until_dropped(turn, 1, permit.as_mut()).await;
@@ -1955,7 +2172,7 @@ mod tests {
         bounded(async {
             let setup = Setup::new().await;
             let turn = setup.turn();
-            let lease = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let lease = setup.lease(Via::Udp, "alice").await.unwrap();
             turn.forget_allocations();
             let mismatch = TransactionError::Rejected {
                 code: 437,
@@ -1978,7 +2195,7 @@ mod tests {
         bounded(async {
             let setup = Setup::new().await;
             let turn = setup.turn();
-            let lease = setup.lease(Transport::Tcp, "alice").await.unwrap();
+            let lease = setup.lease(Via::Tcp, "alice").await.unwrap();
             turn.drop_requests(2);
             let mut permit = pin!(lease.permit(peer(1).ip()));
             until_dropped(turn, 1, permit.as_mut()).await;
@@ -1996,12 +2213,10 @@ mod tests {
         bounded(async {
             let setup = Setup::new().await;
             let turn = setup.turn();
-            let before = setup.lease(Transport::Udp, "alice").await.unwrap();
+            let before = setup.lease(Via::Udp, "alice").await.unwrap();
             let restarted = setup.restarted();
             let server = setup.server.udp_addr();
-            let refused = restarted
-                .lease(server, Transport::Udp, 0, &creds("bob"))
-                .await;
+            let refused = restarted.lease(server, &Via::Udp, 0, &creds("bob")).await;
             assert_eq!(
                 refused.unwrap_err(),
                 TurnError::Allocation(AllocationError::Mismatch(TransactionError::Rejected {
@@ -2010,7 +2225,7 @@ mod tests {
                 }))
             );
             let after = restarted
-                .lease(server, Transport::Udp, 0, &creds("alice"))
+                .lease(server, &Via::Udp, 0, &creds("alice"))
                 .await
                 .unwrap();
             assert_ne!(after.relayed(), before.relayed());

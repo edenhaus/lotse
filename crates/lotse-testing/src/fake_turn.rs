@@ -1,5 +1,6 @@
 //! A fake TURN server: allocations, permissions and channel bindings
-//! behind the long-term credential, on loopback UDP and TCP, with knobs
+//! behind the long-term credential, on loopback UDP and TCP (and TLS over
+//! TCP when started with [`FakeTurnServer::start_tls`]), with knobs
 //! for what real servers do to a client: stale nonces, credentials that
 //! expire, lost requests and restarts.
 //!
@@ -10,7 +11,9 @@
 //! attributes it needs), §9.2.4 (the long-term credential, MD5 keys, no
 //! nonce cookie, like coturn) and RFC 8656 §5 (one allocation per 5-tuple,
 //! 437 for a second Allocate, 441 for another username), §7.2, §8.2,
-//! §10.2 and §12.2. Relayed addresses are made up (RFC 5737 TEST-NET-3),
+//! §10.2 and §12.2; over TLS (RFC 8656 §3.1) a [`CameraTls`] certificate
+//! through rustls, the TLS connection otherwise served as a TCP one.
+//! Relayed addresses are made up (RFC 5737 TEST-NET-3),
 //! so no peer reaches them: a test plays the peer with
 //! [`FakeTurnServer::relay_to_client`], which the server relays as it
 //! would a datagram arriving at the relayed address, as `ChannelData` on the
@@ -34,11 +37,14 @@ use lotse_core::clock::Clock;
 use lotse_core::task::spawn_named;
 use md5::{Digest as _, Md5};
 use sha1::Sha1;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
+
+use crate::fake_camera::CameraTls;
 
 /// The magic cookie (RFC 8489 §5).
 const MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -854,6 +860,8 @@ pub struct FakeTurnServer {
     udp: SocketAddr,
     /// The TCP address.
     tcp: SocketAddr,
+    /// The TLS address, when started with [`Self::start_tls`].
+    tls: Option<SocketAddr>,
     /// Stops the UDP loops and the listener.
     cancel: CancellationToken,
     /// The TCP connections being served.
@@ -878,6 +886,27 @@ impl FakeTurnServer {
     /// relaying on loopback sockets of their own (see the module
     /// documentation).
     pub async fn start_relaying(turn: Arc<FakeTurn>, relays: usize) -> io::Result<Self> {
+        Self::serve(turn, relays, None).await
+    }
+
+    /// As [`Self::start_relaying`], and on a third loopback port over TLS
+    /// with `tls`'s certificate: a `turns:` server (RFC 7065 §3.1). What a
+    /// TLS connection carries is served as a TCP connection's, and its
+    /// client is one of [`Self::tcp_clients`].
+    pub async fn start_tls(
+        turn: Arc<FakeTurn>,
+        relays: usize,
+        tls: &CameraTls,
+    ) -> io::Result<Self> {
+        Self::serve(turn, relays, Some(tls)).await
+    }
+
+    /// Serves `turn` over UDP, TCP and, with `tls`, TLS.
+    async fn serve(
+        turn: Arc<FakeTurn>,
+        relays: usize,
+        tls: Option<&CameraTls>,
+    ) -> io::Result<Self> {
         let udp = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let (udp_addr, tcp_addr) = (udp.local_addr()?, listener.local_addr()?);
@@ -914,15 +943,36 @@ impl FakeTurnServer {
                 cancel.clone(),
             ),
         );
+        let tcp = Tcp {
+            turn: Arc::clone(&turn),
+            relays: sockets,
+            streams: Arc::clone(&streams),
+        };
+        let tls_addr = match tls {
+            Some(tls) => {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+                let addr = listener.local_addr()?;
+                let acceptor = TlsAcceptor::from(Arc::clone(&tls.config));
+                let _tls = spawn_named(
+                    "fake_turn.accept_tls",
+                    accept(
+                        listener,
+                        Some(acceptor),
+                        tcp.clone(),
+                        cancel.clone(),
+                        Arc::clone(&connections),
+                    ),
+                );
+                Some(addr)
+            }
+            None => None,
+        };
         let _tcp = spawn_named(
             "fake_turn.accept",
             accept(
                 listener,
-                Tcp {
-                    turn: Arc::clone(&turn),
-                    relays: sockets,
-                    streams: Arc::clone(&streams),
-                },
+                None,
+                tcp,
                 cancel.clone(),
                 Arc::clone(&connections),
             ),
@@ -932,6 +982,7 @@ impl FakeTurnServer {
             socket: udp,
             udp: udp_addr,
             tcp: tcp_addr,
+            tls: tls_addr,
             cancel,
             connections,
             streams,
@@ -951,6 +1002,11 @@ impl FakeTurnServer {
     /// The TCP address.
     pub const fn tcp_addr(&self) -> SocketAddr {
         self.tcp
+    }
+
+    /// The TLS address; `None` unless started with [`Self::start_tls`].
+    pub const fn tls_addr(&self) -> Option<SocketAddr> {
+        self.tls
     }
 
     /// `peer` sends `data` to the relayed address of `client`'s UDP
@@ -986,7 +1042,7 @@ impl FakeTurnServer {
             .is_some_and(|stream| stream.send(bytes.to_vec()).is_ok())
     }
 
-    /// The clients connected over TCP.
+    /// The clients connected over TCP, TLS included.
     pub fn tcp_clients(&self) -> Vec<SocketAddr> {
         self.streams
             .lock()
@@ -996,7 +1052,7 @@ impl FakeTurnServer {
             .collect()
     }
 
-    /// Closes every TCP connection.
+    /// Closes every TCP connection, TLS included.
     pub fn disconnect_tcp(&self) {
         self.streams
             .lock()
@@ -1127,9 +1183,11 @@ struct Tcp {
     streams: Streams,
 }
 
-/// Accepts TCP connections until cancelled.
+/// Accepts TCP connections until cancelled, each over TLS first when
+/// there is an `acceptor`.
 async fn accept(
     listener: TcpListener,
+    acceptor: Option<TlsAcceptor>,
     tcp: Tcp,
     cancel: CancellationToken,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -1145,7 +1203,18 @@ async fn accept(
             },
             () = cancel.cancelled() => return,
         };
-        let connection = spawn_named("fake_turn.connection", serve_tcp(stream, peer, tcp.clone()));
+        let tcp = tcp.clone();
+        let connection = match acceptor.clone() {
+            None => spawn_named("fake_turn.connection", serve_tcp(stream, peer, tcp)),
+            Some(acceptor) => spawn_named("fake_turn.connection", async move {
+                match acceptor.accept(stream).await {
+                    Ok(stream) => serve_tcp(stream, peer, tcp).await,
+                    Err(err) => {
+                        tracing::debug!(%peer, error = %err, "fake turn: tls handshake failed");
+                    }
+                }
+            }),
+        };
         connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1156,9 +1225,10 @@ async fn accept(
 /// Answers the STUN messages of one TCP connection (RFC 8656 §5: STUN
 /// frames itself on a stream; `ChannelData` is padded, §12.5) and relays
 /// its `ChannelData` on a bound channel to the peer (§12.6); what the
-/// server relays to the client goes on the same connection.
-async fn serve_tcp(stream: tokio::net::TcpStream, peer: SocketAddr, tcp: Tcp) {
-    let (mut reader, mut writer) = stream.into_split();
+/// server relays to the client goes on the same connection, plain TCP or
+/// TLS.
+async fn serve_tcp(stream: impl AsyncRead + AsyncWrite + Send, peer: SocketAddr, tcp: Tcp) {
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let (outgoing, mut queued) = mpsc::unbounded_channel::<Vec<u8>>();
     tcp.streams
         .lock()
