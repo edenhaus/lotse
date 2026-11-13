@@ -29,7 +29,7 @@ cmake = "4.5.0" # builds the bundled libopus (`opusic-sys`, behind the `opus` cr
 "github:taiki-e/cargo-llvm-cov" = "0.9.1" # line coverage gate
 "cargo:cargo-mutants" = "27.1.0" # mutation testing gate (no aarch64-darwin release asset, so built from source)
 "github:taiki-e/cargo-hack" = "0.6.46" # checks every feature combination builds
-"github:boshen/cargo-shear" = "1.14.0" # fails on unused dependencies
+"github:boshen/cargo-shear" = "v1.14.1" # fails on unused dependencies
 "github:EmbarkStudios/cargo-about" = "0.9.3" # THIRD_PARTY_LICENSES.md of a release (`mise run licenses`)
 "github:CycloneDX/cyclonedx-rust-cargo" = { version = "0.5.10", version_prefix = "cargo-cyclonedx-" } # the CycloneDX SBOM of a release (`mise run sbom`)
 uv = "0.13.8" # the browser test's Python, Selenium and pytest, and its checks (tests/browser/uv.lock)
