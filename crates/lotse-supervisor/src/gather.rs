@@ -3,7 +3,9 @@
 //! `srflx` candidate the mapped address becomes; and the `turn:` and
 //! `turns:` servers, a lease on each one's shared allocation over UDP, TCP
 //! or TLS over TCP, whose relayed address the worker's agent takes as a
-//! relay candidate.
+//! relay candidate. Every STUN server is asked at once; the TURN servers
+//! wait in a queue ([`RelayQueue`]) behind [`TURN_IN_FLIGHT`] attempts, a
+//! UDP server with its TCP or TLS twin one entry ([`relay_entry`]).
 //!
 //! Implements RFC 7064 §3.1 (the `stun:` URI: host and optional port,
 //! default 3478), RFC 7065 §3.1 (the `turn:` and `turns:` URIs: host,
@@ -19,27 +21,93 @@
 //! only the browser is told. A relay candidate is the agent's own: it
 //! sends from it, so the worker makes its line.
 
+use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::pin;
 use std::time::Duration;
 
+use futures_util::future::{Either, select};
+use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::session::{IceServer, SessionEvent, WarningCode};
+use lotse_core::clock::Clock;
 use lotse_core::secret::Secret;
+use lotse_core::task::BoxFuture;
 use lotse_tls::{TlsTarget, Trust};
 
+use crate::host_cache::HostSnapshot;
 use crate::net::allocation::Transport;
 use crate::net::credential::Credentials;
 use crate::net::stun_client::StunClient;
 use crate::net::turn_client::{Lease, TurnClient, Via};
 
 /// How long end-of-candidates waits for the gathers after the offer.
-pub(crate) const GATHER_DEADLINE: Duration = Duration::from_secs(2);
+///
+/// No specification sets it: RFC 8838 §13 has end-of-candidates follow
+/// the last candidate and names no time, so 4 s is our choice. It bounds
+/// only how long end-of-candidates waits for slow or silent servers; it
+/// goes out earlier as soon as no gather is in flight or queued. 4 s
+/// covers four tries of a Binding to a silent STUN server (RFC 8489
+/// §6.2.1: an RTO of 500 ms, doubling, sends at 0, 0.5, 1.5 and 3.5 s) and
+/// a TURN allocation's two round trips (the 401 challenge, then the
+/// request with the long-term credential: RFC 8656 §7.2, RFC 8489 §9.2)
+/// with room for retransmissions and for the next server in line after a
+/// fast failure. Waiting longer only delays a failing session's `failed`.
+pub(crate) const GATHER_DEADLINE: Duration = Duration::from_secs(4);
 
-/// STUN servers asked per session; more add no candidate a viewer needs.
-pub(crate) const MAX_STUN_SERVERS: usize = 4;
+/// STUN servers asked per session, all at once; the rest are ignored.
+///
+/// A STUN server is asked in parallel with the others rather than queued:
+/// its failure is usually silence (UDP, no answer), so a queue that moves
+/// on only when an attempt fails would leave a silent server holding its
+/// place until the deadline and never ask the ones behind it. Eight is a
+/// chosen bound, not a specification's: twice the four STUN servers the
+/// client sends by default, with room for servers of its user's own. It
+/// is cheap: a Binding costs one packet and its retransmissions and no
+/// state on the server, the [`StunClient`] caches each server's answer
+/// for 5 min, and identical mappings are told once (RFC 8445 §5.1.3). And
+/// it bounds what one offer makes the daemon send, whose list may name
+/// [`MAX_ICE_SERVERS`](lotse_api_types::limits::MAX_ICE_SERVERS) ×
+/// [`MAX_ICE_URLS`](lotse_api_types::limits::MAX_ICE_URLS) URLs. A server
+/// named twice takes one place.
+pub(crate) const MAX_STUN_SERVERS: usize = 8;
 
-/// TURN servers asked per session; each is one shared allocation.
-pub(crate) const MAX_TURN_SERVERS: usize = 4;
+/// TURN entries of a session in flight at once: an entry that ends
+/// without a lease makes room for the next in line, one that yields a
+/// lease does not, so a session holds at most this many relay candidates.
+/// An entry is a server with its TCP or TLS twin, if any ([`TurnEntry`]): it
+/// takes one place while either of its attempts runs.
+///
+/// TURN is queued, unlike STUN: an allocation is state and quota on the
+/// server, and a TURN failure is mostly fast (an error response, a TCP
+/// connection refused or reset), so the next server in line still runs
+/// within [`GATHER_DEADLINE`].
+pub(crate) const TURN_IN_FLIGHT: usize = 4;
+
+/// TURN entries per session in all, a UDP server and its twin one;
+/// the servers beyond it are ignored. Twice [`TURN_IN_FLIGHT`]: when the
+/// first four fail fast, four more still run, and a list longer than that
+/// (it may name
+/// [`MAX_ICE_SERVERS`](lotse_api_types::limits::MAX_ICE_SERVERS) ×
+/// [`MAX_ICE_URLS`](lotse_api_types::limits::MAX_ICE_URLS) URLs) is no
+/// reason to let one offer open more allocations.
+pub(crate) const MAX_TURN_ATTEMPTS: usize = 8;
+
+/// How long a UDP attempt whose server has a TCP or TLS twin goes without any
+/// answer from the server before the twin starts alongside it.
+///
+/// A network that blocks UDP to the server mostly drops it silently, and
+/// the UDP attempt then fails only at its own timeout (RFC 8489 §6.2.1:
+/// 39.5 s), long after [`GATHER_DEADLINE`]; so the twin does not wait for
+/// that failure. No specification sets the delay: it is our choice, after
+/// the idea of RFC 8305's connection attempt delay (an analogy, not what
+/// is implemented). By 1 s the Allocate went out twice (§6.2.1: an RTO of
+/// 500 ms, sends at 0 and 0.5 s), and any answer, the 401 challenge
+/// included (RFC 8656 §7.2, RFC 8489 §9.2), proves the UDP path, so the
+/// twin then waits for that attempt to fail. A second leaves the twin's
+/// connection and its two round trips room within [`GATHER_DEADLINE`].
+pub(crate) const TWIN_DELAY: Duration = Duration::from_secs(1);
 
 /// Warnings an offer's `ice_servers` yield; the rest are logged. The
 /// session's queue must hold them with its `session` event before them
@@ -87,6 +155,18 @@ pub(crate) struct TurnServer {
     pub(crate) credentials: Credentials,
 }
 
+/// A TURN server to allocate on, with the same server over TCP to try
+/// when this one, over UDP, is silent or fails ([`relay_entry`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnEntry {
+    /// The server.
+    pub(crate) server: TurnServer,
+    /// Its TCP or TLS twin, started alongside it once the server has not
+    /// answered over UDP within [`TWIN_DELAY`], else once this attempt
+    /// failed; only a UDP server has one.
+    pub(crate) twin: Option<TurnServer>,
+}
+
 /// What `ice_servers` asks of a session.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct IcePlan {
@@ -94,8 +174,9 @@ pub(crate) struct IcePlan {
     pub(crate) warnings: Vec<SessionEvent>,
     /// The STUN servers to gather from, at most [`MAX_STUN_SERVERS`].
     pub(crate) stun: Vec<StunServer>,
-    /// The TURN servers to allocate on, at most [`MAX_TURN_SERVERS`].
-    pub(crate) turn: Vec<TurnServer>,
+    /// The TURN servers to allocate on, in list order, at most
+    /// [`MAX_TURN_ATTEMPTS`].
+    pub(crate) turn: Vec<TurnEntry>,
 }
 
 /// Checks `ice_servers`: only `stun:`, `turn:` and `turns:` URIs (RFC 7064,
@@ -105,12 +186,23 @@ pub(crate) struct IcePlan {
 /// first [`MAX_WARNINGS`] of them. A `turn:` or `turns:` entry without a
 /// username and credential is skipped: TURN asks for the long-term
 /// credential (RFC 8656 §5), and browsers refuse such an entry (W3C WebRTC
-/// 1.0 §4.2.1). A server over TCP or TLS is skipped when the list names
-/// its host and port over UDP too: all relay over UDP to the peer (§7.1),
-/// so the UDP allocation is enough, and what a session sends through a
-/// stream passes through the supervisor, which owns the connection.
+/// 1.0 §4.2.1). A server over TCP or TLS whose host and port the list
+/// names over UDP too is that UDP server's twin, whatever their order: all
+/// relay over UDP to the peer (§7.1), so the UDP allocation is enough when
+/// it works, and what a session sends through a stream passes through the
+/// supervisor, which owns the connection; but a network that blocks UDP to
+/// the server still reaches it over TCP. The twin starts only when the
+/// server is silent over UDP or that attempt failed ([`relay_entry`]). A
+/// UDP server has one twin, the first such TCP or TLS entry; a second is
+/// ignored. A TCP or TLS entry without a UDP twin is an ordinary entry. A
+/// server named twice is one (a STUN one by host, ignoring ASCII case, and
+/// port). The servers keep their list order, the first
+/// [`MAX_STUN_SERVERS`] STUN and [`MAX_TURN_ATTEMPTS`] TURN entries (a UDP
+/// server and its twin one); a list that names more is told in one warning
+/// per kind ([`warn_beyond_limit`]).
 pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
     let mut plan = IcePlan::default();
+    let mut turns: Vec<TurnServer> = Vec::new();
     for (entry, url) in servers
         .iter()
         .flat_map(|server| server.urls.iter().map(move |url| (server, url)))
@@ -122,10 +214,10 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                     ApiError::new(ErrorCode::InvalidRequest, "not a stun: URI (RFC 7064)")
                         .with_detail("url", url.as_str())
                 })?;
-                if plan.stun.len() < MAX_STUN_SERVERS {
-                    plan.stun.push(server);
+                if plan.stun.iter().any(|other| same_server(other, &server)) {
+                    tracing::debug!(url, "stun server named twice");
                 } else {
-                    tracing::debug!(url, "stun server beyond the per-session limit ignored");
+                    plan.stun.push(server);
                 }
             }
             scheme @ ("turn" | "turns") => {
@@ -164,10 +256,10 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
                         password: Secret::new(password.clone()),
                     },
                 };
-                if plan.turn.contains(&turn) {
+                if turns.contains(&turn) {
                     tracing::debug!(url, "turn server named twice");
                 } else {
-                    plan.turn.push(turn);
+                    turns.push(turn);
                 }
             }
             _ => {
@@ -179,35 +271,149 @@ pub(crate) fn plan(servers: &[IceServer]) -> Result<IcePlan, ApiError> {
             }
         }
     }
-    let udp: Vec<StunServer> = plan
-        .turn
+    warn_beyond_limit("stun", MAX_STUN_SERVERS, plan.stun.len());
+    let kept = plan.stun.len().min(MAX_STUN_SERVERS);
+    for ignored in plan.stun.drain(kept..) {
+        tracing::debug!(
+            host = ignored.host,
+            port = ignored.port,
+            "stun server beyond the per-session limit ignored"
+        );
+    }
+    plan.turn = turn_entries(turns);
+    Ok(plan)
+}
+
+/// Logs one warning when an offer listed more `kind` servers than a
+/// session asks, `listed` counting the usable ones after those named
+/// twice: a reached limit is a warning, as it drops what the client
+/// asked for. Each server dropped is logged at `debug` beside it. One
+/// line per offer and kind, so the client's offers bound how often it is
+/// logged and it needs no rate limit of its own.
+fn warn_beyond_limit(kind: &'static str, limit: usize, listed: usize) {
+    let ignored = listed.saturating_sub(limit);
+    if ignored > 0 {
+        tracing::warn!(
+            kind,
+            limit,
+            listed,
+            ignored,
+            "ice servers beyond the per-session limit ignored"
+        );
+    }
+}
+
+/// `turns` in list order as entries, each TCP server whose host and port
+/// a UDP one names too as the twin of the first such UDP server that has
+/// none yet; at most [`MAX_TURN_ATTEMPTS`] entries, with one warning when
+/// the list had more ([`warn_beyond_limit`]).
+fn turn_entries(turns: Vec<TurnServer>) -> Vec<TurnEntry> {
+    let udp: Vec<StunServer> = turns
         .iter()
         .filter(|turn| turn.via == Via::Udp)
         .map(|turn| turn.server.clone())
         .collect();
-    plan.turn.retain(|turn| {
-        let transport = turn.via.transport();
-        let redundant =
-            transport.is_stream() && udp.iter().any(|other| same_server(other, &turn.server));
-        if redundant {
-            let transport = transport.name();
+    let (twins, plain): (Vec<TurnServer>, Vec<TurnServer>) = turns.into_iter().partition(|turn| {
+        turn.via.transport().is_stream() && udp.iter().any(|other| same_server(other, &turn.server))
+    });
+    let mut entries: Vec<TurnEntry> = plain
+        .into_iter()
+        .map(|server| TurnEntry { server, twin: None })
+        .collect();
+    // A twin's host and port are named over UDP, so every entry naming
+    // them is over UDP: a TCP or TLS one would be a twin itself.
+    for twin in twins {
+        let free = entries
+            .iter_mut()
+            .find(|entry| entry.twin.is_none() && same_server(&entry.server.server, &twin.server));
+        let transport = twin.via.transport().name();
+        if let Some(entry) = free {
             tracing::debug!(
-                host = turn.server.host,
-                port = turn.server.port,
+                host = twin.server.host,
+                port = twin.server.port,
                 transport,
-                "turn server over a stream named over udp too; the udp allocation relays"
+                "turn server over a stream named over udp too; tried when the udp one is silent or fails"
+            );
+            entry.twin = Some(twin);
+        } else {
+            tracing::debug!(
+                host = twin.server.host,
+                port = twin.server.port,
+                transport,
+                "turn server over a stream whose udp server has a twin already ignored"
             );
         }
-        !redundant
-    });
-    let kept = plan.turn.len().min(MAX_TURN_SERVERS);
-    for ignored in plan.turn.drain(kept..) {
+    }
+    warn_beyond_limit("turn", MAX_TURN_ATTEMPTS, entries.len());
+    let kept = entries.len().min(MAX_TURN_ATTEMPTS);
+    for ignored in entries.drain(kept..) {
         tracing::debug!(
-            host = ignored.server.host,
+            host = ignored.server.server.host,
+            port = ignored.server.server.port,
             "turn server beyond the per-session limit ignored"
         );
     }
-    Ok(plan)
+    entries
+}
+
+/// The order a session's TURN entries start in: [`TURN_IN_FLIGHT`] at
+/// first, then the next in list order each time one ends without a lease;
+/// at most [`MAX_TURN_ATTEMPTS`] in all. An entry is a server with its TCP
+/// twin, if any: it holds one place in flight and one of the total while
+/// either of its attempts runs, and its twin needs none of its own
+/// ([`relay_entry`]). An entry that yields a lease starts none: its place
+/// stays taken by the relay candidate. The policy alone, without sockets;
+/// [`relay_all`] runs it.
+#[derive(Debug)]
+pub(crate) struct RelayQueue {
+    /// The entries not started yet, in list order.
+    waiting: VecDeque<TurnEntry>,
+    /// The entries started, at most [`MAX_TURN_ATTEMPTS`].
+    started: usize,
+}
+
+impl RelayQueue {
+    /// A queue of `entries`, none started.
+    pub(crate) fn new(entries: Vec<TurnEntry>) -> Self {
+        Self {
+            waiting: entries.into(),
+            started: 0,
+        }
+    }
+
+    /// The entries to start at once, at most [`TURN_IN_FLIGHT`].
+    pub(crate) fn first(&mut self) -> Vec<TurnEntry> {
+        let mut first = Vec::new();
+        while first.len() < TURN_IN_FLIGHT
+            && let Some(entry) = self.next()
+        {
+            first.push(entry);
+        }
+        first
+    }
+
+    /// An entry ended without a lease, its twin's attempt included: the
+    /// entry to start in its place, if one is left within the limit.
+    pub(crate) fn failed(&mut self) -> Option<TurnEntry> {
+        self.next()
+    }
+
+    /// The next entry in line; none once [`MAX_TURN_ATTEMPTS`] started.
+    fn next(&mut self) -> Option<TurnEntry> {
+        if self.started >= MAX_TURN_ATTEMPTS {
+            if !self.waiting.is_empty() {
+                tracing::debug!(
+                    limit = MAX_TURN_ATTEMPTS,
+                    "turn attempt limit reached; the servers left are ignored"
+                );
+                self.waiting.clear();
+            }
+            return None;
+        }
+        let next = self.waiting.pop_front()?;
+        self.started = self.started.saturating_add(1);
+        Some(next)
+    }
 }
 
 /// Warns of a `turns:` URI over UDP, DTLS (RFC 7350), which is not
@@ -378,18 +584,18 @@ pub(crate) struct Relayed {
     pub(crate) local: SocketAddr,
 }
 
-/// Leases the allocation on `server` over its transport (made with its
-/// credential if there is none yet), reached from the host address of the
-/// family it resolves to; `None` when that fails. `hosts` are of
-/// `generation`, which a TCP or TLS allocation must have been connected on
-/// (RFC 8656 §5: an allocation is bound to its 5-tuple).
-pub(crate) async fn relay(
+/// Leases the allocation on `server` at `target`, as resolved, over its
+/// transport (made with its credential if there is none yet), its traffic
+/// leaving from the host address `local` of `generation`, which a TCP or
+/// TLS allocation must have been connected on (RFC 8656 §5: an allocation
+/// is bound to its 5-tuple); `None` when that fails.
+async fn lease(
     client: &TurnClient,
     server: &TurnServer,
-    hosts: &[SocketAddr],
+    target: SocketAddr,
+    local: SocketAddr,
     generation: u64,
 ) -> Option<Relayed> {
-    let (target, local) = reach(&server.server, hosts).await?;
     match client
         .lease(target, &server.via, generation, &server.credentials)
         .await
@@ -401,357 +607,113 @@ pub(crate) async fn relay(
             local,
         }),
         Err(err) => {
-            tracing::warn!(server = %target, error = %err, "turn allocation failed");
+            tracing::warn!(server = %target, transport = ?server.via.transport(), error = %err, "turn allocation failed");
             None
+        }
+    }
+}
+
+/// `relayed` when it is a lease, else what `other`, the entry's other
+/// attempt, yields.
+async fn or_other(
+    relayed: Option<Relayed>,
+    other: impl Future<Output = Option<Relayed>>,
+) -> Option<Relayed> {
+    if relayed.is_some() {
+        return relayed;
+    }
+    tracing::debug!("turn attempt failed; its twin's attempt decides the entry");
+    other.await
+}
+
+/// One entry's attempts, reached from the host address among `hosts`, of
+/// `generation`, of the family its server resolves to: a lease on its
+/// server, and for a UDP server with a
+/// TCP or TLS twin, on the twin at the same address. The twin starts alongside
+/// the UDP attempt once [`TWIN_DELAY`] passed on `clock` without any
+/// answer from the server over UDP ([`TurnClient::answered`]); when the
+/// server answered, or the UDP attempt failed sooner, it starts once that
+/// attempt failed. The first lease is the entry's: the other attempt is
+/// dropped with this future, and a lease its allocation grants it, read
+/// or not, is released at once (nobody holds it). `None` when no attempt
+/// yields one.
+pub(crate) async fn relay_entry(
+    client: &TurnClient,
+    clock: &dyn Clock,
+    entry: TurnEntry,
+    hosts: &[SocketAddr],
+    generation: u64,
+) -> Option<Relayed> {
+    let TurnEntry { server, twin } = entry;
+    let (target, local) = reach(&server.server, hosts).await?;
+    let Some(twin) = twin else {
+        return lease(client, &server, target, local, generation).await;
+    };
+    let mut first = pin!(lease(client, &server, target, local, generation));
+    let second = pin!(lease(client, &twin, target, local, generation));
+    let silent = tokio::select! {
+        relayed = &mut first => return or_other(relayed, second).await,
+        () = clock.sleep(TWIN_DELAY) => !client.answered(target, &Via::Udp, generation),
+    };
+    if !silent {
+        tracing::debug!(server = %target, "turn server answered over udp; its twin over a stream waits for that attempt to fail");
+        let relayed = first.await;
+        return or_other(relayed, second).await;
+    }
+    tracing::debug!(server = %target, delay = ?TWIN_DELAY, "no answer from the turn server over udp; its twin over a stream started alongside");
+    match select(first, second).await {
+        Either::Left((relayed, other)) | Either::Right((relayed, other)) => {
+            or_other(relayed, other).await
+        }
+    }
+}
+
+/// Runs a session's TURN entries in [`RelayQueue`]'s order, each by
+/// [`relay_entry`] on `clock` and reached from the session's `hosts`
+/// (their addresses, of their generation), and hands each
+/// lease to `leased` as it comes, until `deadline` (the session's
+/// [`GATHER_DEADLINE`]) passes. `false` once no entry is running or left
+/// to start, `true` when the deadline passed first and cut the queue
+/// short: the attempts still running then are dropped. The deadline is
+/// looked at first: once it passed, a lease that is ready at the same
+/// time is dropped with its attempt, and so released (nobody holds it),
+/// never handed to `leased`. Dropping it drops the attempts running.
+pub(crate) async fn relay_all(
+    client: &TurnClient,
+    clock: &dyn Clock,
+    entries: Vec<TurnEntry>,
+    hosts: &HostSnapshot,
+    mut deadline: BoxFuture<'static, ()>,
+    leased: &mut (dyn FnMut(Relayed) + Send),
+) -> bool {
+    let mut queue = RelayQueue::new(entries);
+    let attempt = |entry: TurnEntry| async move {
+        let host = entry.server.server.host.clone();
+        let relayed = relay_entry(client, clock, entry, &hosts.hosts, hosts.generation).await;
+        (relayed, host)
+    };
+    let mut running: FuturesUnordered<_> = queue.first().into_iter().map(attempt).collect();
+    loop {
+        let next = tokio::select! {
+            biased;
+            () = &mut deadline => return true,
+            next = running.next() => next,
+        };
+        let Some((relayed, failed)) = next else {
+            return false;
+        };
+        if let Some(relayed) = relayed {
+            leased(relayed);
+        } else if let Some(next) = queue.failed() {
+            tracing::debug!(
+                failed,
+                next = next.server.server.host,
+                "turn server failed; the next in line tried"
+            );
+            running.push(attempt(next));
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(
-        clippy::arithmetic_side_effects,
-        clippy::missing_docs_in_private_items,
-        reason = "test code"
-    )]
-
-    use std::net::UdpSocket;
-    use std::sync::Arc;
-
-    use lotse_core::clock::SystemClock;
-    use serde_json::json;
-
-    use super::*;
-    use crate::net::demux::Demux;
-    use crate::net::stun::{self, Builder, Class, METHOD_BINDING};
-    use crate::net::stun_client::StunClientConfig;
-
-    fn servers(urls: &[&str]) -> Vec<IceServer> {
-        vec![serde_json::from_value(json!({ "urls": urls })).unwrap()]
-    }
-
-    #[test]
-    fn stun_uris_parse_per_rfc_7064_3_1() {
-        let parse = |rest: &str| parse_stun(rest).map(|s| (s.host, s.port));
-        assert_eq!(parse("stun.example"), Some(("stun.example".into(), 3478)));
-        assert_eq!(parse("stun.example:80"), Some(("stun.example".into(), 80)));
-        assert_eq!(parse("192.0.2.1:19302"), Some(("192.0.2.1".into(), 19302)));
-        assert_eq!(parse("[2001:db8::1]"), Some(("[2001:db8::1]".into(), 3478)));
-        assert_eq!(parse("[2001:db8::1]:5"), Some(("[2001:db8::1]".into(), 5)));
-        for bad in [
-            "",
-            "host:",
-            "host:0",
-            "host:99999",
-            "host:x",
-            "user@host",
-            "host/path",
-            "host?x",
-            "[not-v6]",
-            "[2001:db8::1",
-            "ho st",
-            ":80",
-        ] {
-            assert_eq!(parse(bad), None, "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn plans_keep_stun_servers_warn_on_turns_over_dtls_and_refuse_the_rest() {
-        let plan = plan(&servers(&[
-            "stun:a",
-            "STUN:b:1",
-            "turn:t",
-            "turns:t:5349",
-            "turns:t:5349?transport=udp",
-        ]))
-        .unwrap();
-        assert_eq!(
-            plan.stun,
-            [
-                StunServer {
-                    host: "a".into(),
-                    port: 3478
-                },
-                StunServer {
-                    host: "b".into(),
-                    port: 1
-                }
-            ]
-        );
-        assert_eq!(plan.warnings.len(), 1);
-        let many: Vec<String> = (0..6)
-            .map(|n| format!("turns:t{n}?transport=UDP"))
-            .collect();
-        let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        let warnings = super::plan(&servers(&many)).unwrap().warnings;
-        assert_eq!(warnings.len(), MAX_WARNINGS);
-        assert_eq!(
-            warnings[MAX_WARNINGS - 1],
-            SessionEvent::Warning {
-                code: WarningCode::TurnUnsupported,
-                message: format!(
-                    "turns:t{}?transport=UDP ignored: TURN over DTLS is not supported",
-                    MAX_WARNINGS - 1
-                ),
-                reason: None,
-                status: None,
-            }
-        );
-        let many: Vec<String> = (0..6).map(|n| format!("stun:s{n}")).collect();
-        let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        assert_eq!(
-            super::plan(&servers(&many)).unwrap().stun.len(),
-            MAX_STUN_SERVERS
-        );
-        for bad in ["http://x/", "stun:", "stun:a/b", "nocolon"] {
-            let err = super::plan(&servers(&[bad])).unwrap_err();
-            assert_eq!(
-                (err.code, &err.details["url"]),
-                (ErrorCode::InvalidRequest, &json!(bad))
-            );
-        }
-        assert_eq!(super::plan(&[]).unwrap(), IcePlan::default());
-    }
-
-    #[test]
-    fn turn_uris_parse_per_rfc_7065_3_1() {
-        let parse = |rest: &str| parse_turn(rest, STUN_PORT).map(|(s, q)| (s.host, s.port, q));
-        assert_eq!(
-            parse("turn.example"),
-            Some(("turn.example".into(), 3478, TransportQuery::None))
-        );
-        assert_eq!(
-            parse("turn.example:80?transport=udp"),
-            Some(("turn.example".into(), 80, TransportQuery::Udp))
-        );
-        assert_eq!(
-            parse("[2001:db8::1]:443?transport=TCP"),
-            Some(("[2001:db8::1]".into(), 443, TransportQuery::Tcp))
-        );
-        // `turns:` defaults to 5349.
-        assert_eq!(
-            parse_turn("turn.example", TURNS_PORT).map(|(s, _)| s.port),
-            Some(5349)
-        );
-        for bad in [
-            "",
-            "host?transport=sctp",
-            "host?x=1",
-            "host:0?transport=udp",
-            "user@host",
-        ] {
-            assert_eq!(parse(bad), None, "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn plans_keep_turn_servers_with_credentials_over_udp_and_tcp_rfc_7065() {
-        let entry = |urls: &[&str], credential: Option<&str>| -> IceServer {
-            serde_json::from_value(json!({
-                "urls": urls, "username": credential.map(|_| "ha"), "credential": credential
-            }))
-            .unwrap()
-        };
-        let named = |plan: &IcePlan| -> Vec<(String, u16, Transport)> {
-            plan.turn
-                .iter()
-                .map(|t| (t.server.host.clone(), t.server.port, t.via.transport()))
-                .collect()
-        };
-        let plan = plan(&[
-            entry(
-                &[
-                    "turn:t2?transport=tcp",
-                    "turn:t1",
-                    "TURN:t1:3478",
-                    "turn:T1:3478?transport=tcp",
-                    "turn:t1:443?transport=tcp",
-                    "turn:t2:3478?transport=tcp",
-                ],
-                Some("pw"),
-            ),
-            entry(&["turn:t3"], None),
-        ])
-        .unwrap();
-        // Named twice is one server; TCP to a server named over UDP too is
-        // left to the UDP one, whatever the order; no credential, no
-        // server; no warning.
-        assert_eq!(
-            named(&plan),
-            [
-                ("t2".to_owned(), 3478, Transport::Tcp),
-                ("t1".to_owned(), 3478, Transport::Udp),
-                ("t1".to_owned(), 443, Transport::Tcp),
-            ]
-        );
-        assert_eq!(plan.turn[0].credentials.username, "ha");
-        assert_eq!(plan.turn[0].credentials.password.expose_secret(), "pw");
-        assert_eq!(plan.warnings, []);
-        // The limit counts what is left.
-        let mut many: Vec<String> = (0..6).map(|n| format!("turn:t{n}?transport=tcp")).collect();
-        many.extend((0..3).map(|n| format!("turn:t{n}")));
-        let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        let plan = super::plan(&[entry(&many, Some("pw"))]).unwrap();
-        assert_eq!(
-            named(&plan),
-            [
-                ("t3".to_owned(), 3478, Transport::Tcp),
-                ("t4".to_owned(), 3478, Transport::Tcp),
-                ("t5".to_owned(), 3478, Transport::Tcp),
-                ("t0".to_owned(), 3478, Transport::Udp),
-            ]
-        );
-        let err = super::plan(&[entry(&["turn:t?transport=sctp"], Some("pw"))]).unwrap_err();
-        assert_eq!(
-            (err.code, &err.details["url"]),
-            (ErrorCode::InvalidRequest, &json!("turn:t?transport=sctp"))
-        );
-    }
-
-    #[test]
-    fn plans_keep_turns_servers_over_tls_to_the_embedded_roots_rfc_8489_6_2_3() {
-        let entry = |urls: &[&str], credential: Option<&str>| -> IceServer {
-            serde_json::from_value(json!({
-                "urls": urls, "username": credential.map(|_| "ha"), "credential": credential
-            }))
-            .unwrap()
-        };
-        let plan = plan(&[
-            entry(
-                &[
-                    "turns:t1",
-                    "TURNS:t1:5349?transport=tcp",
-                    "turns:t2:443?transport=TCP",
-                    "turns:[2001:db8::1]",
-                    // Named over UDP at its port too: the UDP allocation
-                    // relays.
-                    "turns:t3:443",
-                    "turn:t3:443",
-                ],
-                Some("pw"),
-            ),
-            entry(&["turns:t4"], None),
-        ])
-        .unwrap();
-        let tls = |host: &str| Via::Tls(TlsTarget::new(host, Trust::Roots).unwrap());
-        let reached: Vec<(String, u16, Via)> = plan
-            .turn
-            .iter()
-            .map(|t| (t.server.host.clone(), t.server.port, t.via.clone()))
-            .collect();
-        // Named twice is one server, the default port 5349; no credential,
-        // no server; no warning.
-        assert_eq!(
-            reached,
-            [
-                ("t1".to_owned(), 5349, tls("t1")),
-                ("t2".to_owned(), 443, tls("t2")),
-                ("[2001:db8::1]".to_owned(), 5349, tls("[2001:db8::1]")),
-                ("t3".to_owned(), 443, Via::Udp),
-            ]
-        );
-        assert_eq!(plan.turn[0].credentials.username, "ha");
-        assert_eq!(plan.warnings, []);
-        // A host that is no TLS server name, and another transport, fail.
-        for bad in ["turns:a..b", "turns:-t", "turns:t?transport=sctp"] {
-            let err = super::plan(&[entry(&[bad], Some("pw"))]).unwrap_err();
-            assert_eq!(
-                (err.code, &err.details["url"]),
-                (ErrorCode::InvalidRequest, &json!(bad)),
-                "{bad}"
-            );
-        }
-        let err = super::plan(&[entry(&["turns:t:0"], Some("pw"))]).unwrap_err();
-        assert_eq!(err.message, "not a turns: URI (RFC 7065)");
-    }
-
-    #[test]
-    fn srflx_candidates_carry_the_rfc_8445_5_1_2_1_priority_and_their_base() {
-        let line = srflx_candidate(
-            2,
-            "203.0.113.7:40000".parse().unwrap(),
-            "192.168.1.2:18556".parse().unwrap(),
-        );
-        // (2^24)·100 + (2^8)·65535 + (256 − 1)
-        assert_eq!(
-            line,
-            "candidate:s2 1 udp 1694498815 203.0.113.7 40000 typ srflx raddr 192.168.1.2 rport 18556"
-        );
-    }
-
-    /// A STUN server on loopback that answers every request with `mapped`.
-    fn server(mapped: SocketAddr) -> SocketAddr {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = socket.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let mut buf = [0_u8; 1500];
-            while let Ok((n, from)) = socket.recv_from(&mut buf) {
-                let request = stun::parse(&buf[..n]).unwrap();
-                let reply = Builder::new(Class::Success, METHOD_BINDING, request.transaction_id)
-                    .xor_mapped_address(mapped)
-                    .build();
-                let _sent = socket.send_to(&reply, from);
-            }
-        });
-        addr
-    }
-
-    fn client() -> (Arc<StunClient>, Demux, SocketAddr) {
-        let bound = crate::net::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
-        let local = bound.local;
-        let demux = Demux::start(
-            Arc::clone(&bound.socket),
-            local,
-            vec![local],
-            Arc::new(SystemClock),
-        )
-        .unwrap();
-        let client = StunClient::new(
-            bound.socket,
-            demux.responses(),
-            Arc::new(SystemClock),
-            StunClientConfig {
-                rto: Duration::from_millis(50),
-                retries: 1,
-                cache: Duration::from_secs(60),
-            },
-        );
-        (Arc::new(client), demux, local)
-    }
-
-    #[tokio::test]
-    async fn gathering_yields_srflx_only_behind_a_nat() {
-        let (client, demux, local) = client();
-        let natted = server("203.0.113.7:40000".parse().unwrap());
-        let open = server(local);
-        let stun = |addr: SocketAddr| StunServer {
-            host: addr.ip().to_string(),
-            port: addr.port(),
-        };
-        assert_eq!(
-            gather(&client, &stun(natted), &[local], 0).await,
-            Some(("203.0.113.7:40000".parse().unwrap(), local))
-        );
-        // RFC 8445 §5.1.3: mapped == base is redundant.
-        assert_eq!(gather(&client, &stun(open), &[local], 0).await, None);
-        // No host of the server's family, an unresolvable name, silence.
-        let v6 = StunServer {
-            host: "[::1]".into(),
-            port: 3478,
-        };
-        assert_eq!(gather(&client, &v6, &[local], 0).await, None);
-        let unresolvable = StunServer {
-            host: "stun.invalid".into(),
-            port: 3478,
-        };
-        assert_eq!(gather(&client, &unresolvable, &[local], 0).await, None);
-        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
-        assert_eq!(
-            gather(&client, &stun(silent.local_addr().unwrap()), &[local], 0).await,
-            None
-        );
-
-        demux.stop();
-    }
-}
+mod tests;

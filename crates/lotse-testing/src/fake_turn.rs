@@ -362,6 +362,8 @@ struct State {
     allocations: HashMap<(bool, SocketAddr), Allocation>,
     /// Requests seen.
     log: Vec<Logged>,
+    /// Requests still to answer before `drop` starts.
+    pass: usize,
     /// Requests still to drop unanswered.
     drop: usize,
     /// Requests dropped.
@@ -403,6 +405,7 @@ impl FakeTurn {
                 nonces: 0,
                 allocations: HashMap::new(),
                 log: Vec::new(),
+                pass: 0,
                 drop: 0,
                 dropped: 0,
                 relays: 0,
@@ -444,7 +447,15 @@ impl FakeTurn {
 
     /// The next `count` requests go unanswered, as if lost.
     pub fn drop_requests(&self, count: usize) {
-        self.state().drop = count;
+        self.drop_requests_after(0, count);
+    }
+
+    /// The next `answered` requests are answered, then the `count` after
+    /// them go unanswered, as if lost.
+    pub fn drop_requests_after(&self, answered: usize, count: usize) {
+        let mut state = self.state();
+        state.pass = answered;
+        state.drop = count;
     }
 
     /// Refuses permissions and channels for `peer` with 403 (RFC 8656
@@ -611,7 +622,9 @@ impl FakeTurn {
         let now = self.clock.now();
         let mut state = self.state();
         state.allocations.retain(|_, a| a.expires > now);
-        if state.drop > 0 {
+        if state.pass > 0 {
+            state.pass = state.pass.saturating_sub(1);
+        } else if state.drop > 0 {
             state.drop = state.drop.saturating_sub(1);
             state.dropped = state.dropped.saturating_add(1);
             return None;
