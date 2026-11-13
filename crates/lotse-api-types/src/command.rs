@@ -966,12 +966,15 @@ fn cap_stream_id(stream_id: &str) -> Result<(), ApiError> {
 /// `invalid_request` when a `signaling/error`'s `code` is not
 /// [`crate::limits::SIGNAL_ERROR_CODE_PATTERN`]:
 /// one to [`MAX_SIGNAL_ERROR_CODE_CHARS`] lowercase ASCII letters, digits
-/// and underscores. Not repeated: it is the client's to log.
+/// and underscores. Not repeated: it is the client's to log. A longer one
+/// is refused at its cap, its `limit` detail `maxLength` ([`cap_chars`]);
+/// within it, any other character is a shape, with no `limit`.
 fn check_signal_error_code(code: &str) -> Result<(), ApiError> {
+    cap_chars("code", code, MAX_SIGNAL_ERROR_CODE_CHARS)?;
     let shaped = code
         .bytes()
         .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
-    if code.is_empty() || code.len() > MAX_SIGNAL_ERROR_CODE_CHARS || !shaped {
+    if code.is_empty() || !shaped {
         return Err(ApiError::new(
             ErrorCode::InvalidRequest,
             "`code` must be 1 to 64 of a-z, 0-9 and _",
@@ -1391,11 +1394,17 @@ mod tests {
         for code in ["a", "camera_offline", "e404", "_", &"x".repeat(64)] {
             assert!(limited(&error(code)).is_ok(), "{code}");
         }
-        for code in ["", "Camera", "a-b", "a b", "é", "a.b", &"x".repeat(65)] {
+        // Within the cap a shape, with no `limit` (as `limited` asserts),
+        // even when its UTF-8 is longer than 64 bytes.
+        for code in ["", "Camera", "a-b", "a b", "é", "a.b", &"é".repeat(64)] {
             let (field, message) = limited(&error(code)).unwrap_err();
             assert_eq!(field, "code", "{code}");
             assert_eq!(message, "`code` must be 1 to 64 of a-z, 0-9 and _");
         }
+        // Past it the cap, its `limit` `maxLength`.
+        let (field, message) = limited(&error(&"x".repeat(65))).unwrap_err();
+        assert_eq!(field, "code");
+        assert_eq!(message, "`code` is 65 characters long, the maximum is 64");
     }
 
     #[test]
