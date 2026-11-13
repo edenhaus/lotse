@@ -1550,6 +1550,7 @@ dependencies = [
  "lotse-api-types",
  "lotse-core",
  "lotse-ipc",
+ "lotse-tls",
  "md-5",
  "nix",
  "quinn-udp",
