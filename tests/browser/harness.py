@@ -31,9 +31,10 @@ class Case:
     keyframe request of its own), `reconnect` (the harness restarts the camera's publisher) or
     `crash` (the harness kills the worker); `None` plays one window after join."""
     about: str
-    mse: bool = False
-    """Whether the page also plays the stream as live fMP4 through the browser's Media Source
-    Extensions, beside the WebRTC session, and the test places the one picture against the other."""
+    player: str | None = None
+    """The player the page runs beside the WebRTC session, whose picture the test places against
+    WebRTC's: `mse` (live fMP4 through the browser's Media Source Extensions) or `llhls` (LL-HLS
+    through hls.js, or the browser's own HLS where hls.js has no MSE); `None` for WebRTC alone."""
 
 
 CASES = {
@@ -53,22 +54,36 @@ CASES = {
             name="mse",
             audio="aac",
             disrupt=None,
-            mse=True,
+            player="mse",
             about="AAC, live fMP4 through MSE beside WebRTC",
         ),
         Case(
             name="mse-pcmu",
             audio="pcmu",
             disrupt=None,
-            mse=True,
+            player="mse",
             about="PCMU, live fMP4 through MSE without the audio, beside WebRTC",
         ),
         Case(
             name="mse-opus",
             audio="opus",
             disrupt=None,
-            mse=True,
+            player="mse",
             about="Opus, live fMP4 through MSE beside WebRTC",
+        ),
+        Case(
+            name="llhls",
+            audio="aac",
+            disrupt=None,
+            player="llhls",
+            about="AAC, LL-HLS through hls.js beside WebRTC",
+        ),
+        Case(
+            name="llhls-opus",
+            audio="opus",
+            disrupt=None,
+            player="llhls",
+            about="Opus, LL-HLS through hls.js beside WebRTC",
         ),
     )
 }

@@ -399,12 +399,14 @@ def play(
     play_s: float,
     disrupt: str | None = None,
     *,
-    mse: bool = False,
+    player: str | None = None,
 ) -> tuple[str, Any]:
     """Runs the page once: the browser's user agent and what the page measured.
 
     Loads the page, hands it the camera, the play time, the disruption and whether it plays live
-    fMP4 through MSE beside the WebRTC session (`mse`), clicks Start (a real
+    fMP4 through MSE (`player` `mse`) or LL-HLS through hls.js (`llhls`) beside the WebRTC session,
+    clicks
+    Start (a real
     user gesture, which lets WebAudio run in Safari) and waits for the page's result. Where the
     page reaches its checkpoint first, the harness acts (`_act`) and tells it to go on.
     """
@@ -417,7 +419,8 @@ def play(
             "play_ms": round(play_s * 1000),
             "warm_ms": WARM_MS,
             "disrupt": disrupt,
-            "mse": mse,
+            "mse": player == "mse",
+            "llhls": player == "llhls",
         },
     )
     user_agent: str = driver.execute_script("return navigator.userAgent;")

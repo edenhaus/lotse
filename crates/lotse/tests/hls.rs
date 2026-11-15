@@ -5,8 +5,8 @@
 //! the init segment, a part and a segment, read back with mp4-atom, an
 //! independent reader of ISO/IEC 14496-12, as one fragmented MP4 that starts
 //! at a keyframe and runs without a hole; `hls/close` ends the session
-//! `closed` and its routes with it. ffprobe decoding a segment is the
-//! interop test's to come. Needs the `source-rtsp` and `output-hls` features
+//! `closed` and its routes with it. ffmpeg playing a session and ffprobe
+//! decoding what it took are the interop tests' (`mediamtx_hls_ll_`). Needs the `source-rtsp` and `output-hls` features
 //! (the defaults).
 
 #![cfg(all(feature = "source-rtsp", feature = "output-hls"))]

@@ -87,7 +87,13 @@ def test_a_driver_without_a_shutdown_endpoint_stops_without_a_warning(driver_por
 
 
 def test_the_mse_cases_play_each_audio_the_live_output_meets() -> None:
-    mse = {name: case.audio for name, case in CASES.items() if case.mse}
+    mse = {name: case.audio for name, case in CASES.items() if case.player == "mse"}
     assert mse == {"mse": "aac", "mse-pcmu": "pcmu", "mse-opus": "opus"}
     assert all(CASES[name].disrupt is None for name in mse)
-    assert not any(case.mse for case in CASES.values() if case.name not in mse)
+    assert not any(case.player == "mse" for case in CASES.values() if case.name not in mse)
+
+
+def test_the_llhls_cases_play_aac_and_opus_through_hls_js() -> None:
+    llhls = {name: case.audio for name, case in CASES.items() if case.player == "llhls"}
+    assert llhls == {"llhls": "aac", "llhls-opus": "opus"}
+    assert all(CASES[name].disrupt is None for name in llhls)

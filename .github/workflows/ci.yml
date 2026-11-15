@@ -855,7 +855,8 @@ jobs:
 
   # The browser test (scripts/browser.sh): one pytest test in tests/browser/, run once per browser
   # and case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash; live
-  # fMP4 through the browser's MSE beside WebRTC with AAC, PCMU and Opus), has
+  # fMP4 through the browser's MSE beside WebRTC with AAC, PCMU and Opus; LL-HLS through hls.js,
+  # pinned and loaded from jsDelivr with its Subresource Integrity hash, with AAC and Opus), has
   # Selenium drive a real browser that plays the synthetic camera (ffmpeg publishing to MediaMTX,
   # both pinned in mise.toml) through a release daemon and the dev viewer, and checks what it
   # showed, played and reported in getStats(). Chrome and Firefox on the x86-64 Linux runner,

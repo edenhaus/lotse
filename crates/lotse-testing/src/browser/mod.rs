@@ -13,7 +13,10 @@
 //! shows and plays, and returns it to the test as JSON. In the MSE cases
 //! it also plays the stream as live fMP4 through the browser's own Media
 //! Source Extensions (W3C MSE), its bytes proxied by the dev viewer from
-//! the daemon, beside the WebRTC session.
+//! the daemon, beside the WebRTC session; in the LL-HLS cases as an LL-HLS
+//! session (draft-pantos-hls-rfc8216bis-22) through hls.js, a pinned release
+//! loaded with its Subresource Integrity hash, or the browser's own HLS
+//! where hls.js has no MSE, its playlist and media proxied the same way.
 //!
 //! [`Served::start`] starts both and [`Ready`] is what the test reads
 //! from the `lotse-browser` example: the page's URL, the camera's, and
@@ -276,6 +279,55 @@ mod tests {
             "one SourceBuffer"
         );
         assert!(!PAGE.contains("<script src"), "no library");
+        let mse = PAGE
+            .split("function startMse(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the MSE player");
+        assert!(!mse.contains("Hls"), "the MSE player is the browser's own");
+    }
+
+    /// The LL-HLS cases play the session through hls.js in low-latency mode,
+    /// which holds the server's PART-HOLD-BACK
+    /// (draft-pantos-hls-rfc8216bis-22 §6.3.3) without a `liveSyncDuration`
+    /// of its own: an exact release, loaded only for them, whose bytes the
+    /// browser checks against a pinned hash before it runs them (W3C SRI
+    /// §3.3.5) in a CORS fetch without credentials (§3.3.2); the browser's
+    /// own HLS where hls.js has no MSE; the session asked again without its
+    /// audio when the player refuses its type; `hls/close` at the end.
+    #[test]
+    fn rfc8216bis_s6_3_3_the_page_plays_ll_hls_with_a_pinned_hls_js() {
+        for needle in [
+            r#"src: "https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js","#,
+            r#"version: "1.7.4","#,
+            "script.integrity = HLS_JS.integrity;",
+            r#"script.crossOrigin = "anonymous";"#,
+            "const LLHLS_CONFIG = { lowLatencyMode: true, maxLiveSyncPlaybackRate: MSE_CATCH_UP_RATE };",
+            r#"llhls.path = Hls?.isSupported() ? "hls.js" : llhls.native ? "native" : null;"#,
+            "video.src = session.playlist;",
+            "hls.loadSource(playlist);",
+            r#"command({ type: "hls/create", stream_id: config.stream_id, audio })"#,
+            r#"must({ type: "hls/close", hls_id: which.hls_id })"#,
+            "session = await create(false);",
+            "const llhls = config.llhls && out.signaling === \"lotse\" ? startLlhls(marks) : undefined;",
+        ] {
+            assert!(PAGE.contains(needle), "{needle}");
+        }
+        assert!(
+            !PAGE.contains("liveSyncDuration:"),
+            "the server's hold-back"
+        );
+        let integrity = PAGE
+            .split(r#"integrity: "sha384-"#)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("an SRI hash");
+        assert_eq!(integrity.len(), 64, "SHA-384 in base64: {integrity}");
+        assert_eq!(
+            PAGE.matches("document.createElement(\"script\")").count(),
+            1,
+            "hls.js alone is loaded"
+        );
     }
 
     #[tokio::test]
