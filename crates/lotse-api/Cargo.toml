@@ -21,8 +21,7 @@ futures-util = { workspace = true }
 hyper = { workspace = true } # the HTTP/1.1 connection with the upgrade limits; `axum::serve` sets none
 hyper-util = { workspace = true } # `TokioIo` and the tower-to-hyper adapter for the router
 rcgen = { workspace = true } # the TLS listener's self-signed server certificate, made on the first start
-headers-accept = { workspace = true } # the metrics' `Accept` negotiation
-mediatype = { workspace = true } # the media types offered to that negotiation
+mediatype = { workspace = true } # the media ranges of the metrics' `Accept` header
 pem = { workspace = true } # the server certificate's PEM alone, for a client's CA file
 prometheus-client = { workspace = true } # the metrics' OpenMetrics and Prometheus text encoders
 rustls = { workspace = true } # the TLS listener: TLS 1.3, the client-pin verifier

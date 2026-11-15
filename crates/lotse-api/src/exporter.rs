@@ -27,10 +27,10 @@
 //!
 //! Which one follows the scraper's `Accept` header, as Prometheus' "Scrape
 //! protocol content negotiation" (`docs/instrumenting/
-//! content_negotiation.md`) asks of a target: the offered format the header
-//! weighs highest, by RFC 9110 §12.5.1 (q-values, then the most specific
-//! range, then the header's order), which `headers-accept` decides; with
-//! none offered, or a header that does not parse, the text format 0.0.4,
+//! content_negotiation.md`) asks of a target: the representation the header
+//! weighs highest, each weighed by the most specific range taking it in
+//! (RFC 9110 §12.5.1), the header parsed by `mediatype`; with none taken in,
+//! or a header that does not parse, the text format 0.0.4,
 //! which "Selection of Format" makes the last resort a target MUST use. A
 //! wildcard (`*/*`, as curl sends) gets the text format too: it names no
 //! protocol. Prometheus' default `Accept` weighs OpenMetrics 1.0.0 highest,
@@ -72,14 +72,12 @@
 //! [`Handler::metrics_snapshot`]: crate::Handler::metrics_snapshot
 
 use std::fmt;
-use std::str::FromStr as _;
 use std::time::Duration;
 
 use axum::Extension;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse as _, Response};
-use headers_accept::Accept;
 use lotse_api_types::Metrics;
 use lotse_api_types::error::ErrorCode;
 use lotse_api_types::info::{DemuxMetrics, ProcessMetrics, WorkerMetrics};
@@ -173,67 +171,210 @@ impl Format {
     }
 }
 
-/// The offers, as media types `Accept` is matched against, in the
-/// server's order for a range that matches several: the text format first,
-/// so a wildcard gets the last resort, then OpenMetrics 1.0.0 without an
-/// escaping scheme and with each one. A parameter the scraper adds that is
-/// not here (an OpenMetrics `version=0.0.1`, an unknown scheme) matches
-/// none: `headers-accept` compares every parameter but `q`. Each media type
-/// is offered bare too: a range without parameters matches every offer of
-/// its type (RFC 9110 §12.5.1), but one with only a `q` (`text/plain;q=0.5`)
-/// matches only a bare offer in `headers-accept` 0.3.0, which counts the `q`
-/// among the parameters there (observed 2026-11-15).
-const OFFERS: [(&str, Format); 8] = [
-    ("text/plain;version=0.0.4", Format::PrometheusText),
-    ("text/plain", Format::PrometheusText),
-    (
-        "application/openmetrics-text",
-        Format::OpenMetrics(Escaping::Underscores),
-    ),
-    (
-        "application/openmetrics-text;version=1.0.0",
-        Format::OpenMetrics(Escaping::Underscores),
-    ),
-    (
-        "application/openmetrics-text;version=1.0.0;escaping=allow-utf-8",
-        Format::OpenMetrics(Escaping::AllowUtf8),
-    ),
-    (
-        "application/openmetrics-text;version=1.0.0;escaping=underscores",
-        Format::OpenMetrics(Escaping::Underscores),
-    ),
-    (
-        "application/openmetrics-text;version=1.0.0;escaping=dots",
-        Format::OpenMetrics(Escaping::Dots),
-    ),
-    (
-        "application/openmetrics-text;version=1.0.0;escaping=values",
-        Format::OpenMetrics(Escaping::Values),
-    ),
+/// One representation the route can send, with every parameter its
+/// `Content-Type` carries: what an `Accept` range is matched against.
+#[derive(Debug, Clone, Copy)]
+struct Representation {
+    /// The format it is written in.
+    format: Format,
+    /// The media type's type.
+    ty: &'static str,
+    /// The media type's subtype.
+    subty: &'static str,
+    /// Its parameters, names in lowercase.
+    params: &'static [(&'static str, &'static str)],
+}
+
+/// The representations, in the server's order for a tie: the text format
+/// 0.0.4 first, the last resort a wildcard gets too, then OpenMetrics 1.0.0
+/// under each escaping scheme, `underscores` first, which a range naming
+/// none gets.
+const REPRESENTATIONS: [Representation; 5] = [
+    Representation {
+        format: Format::PrometheusText,
+        ty: "text",
+        subty: "plain",
+        params: &[("version", "0.0.4"), ("charset", "utf-8")],
+    },
+    Representation {
+        format: Format::OpenMetrics(Escaping::Underscores),
+        ty: "application",
+        subty: "openmetrics-text",
+        params: &[
+            ("version", "1.0.0"),
+            ("charset", "utf-8"),
+            ("escaping", "underscores"),
+        ],
+    },
+    Representation {
+        format: Format::OpenMetrics(Escaping::AllowUtf8),
+        ty: "application",
+        subty: "openmetrics-text",
+        params: &[
+            ("version", "1.0.0"),
+            ("charset", "utf-8"),
+            ("escaping", "allow-utf-8"),
+        ],
+    },
+    Representation {
+        format: Format::OpenMetrics(Escaping::Dots),
+        ty: "application",
+        subty: "openmetrics-text",
+        params: &[
+            ("version", "1.0.0"),
+            ("charset", "utf-8"),
+            ("escaping", "dots"),
+        ],
+    },
+    Representation {
+        format: Format::OpenMetrics(Escaping::Values),
+        ty: "application",
+        subty: "openmetrics-text",
+        params: &[
+            ("version", "1.0.0"),
+            ("charset", "utf-8"),
+            ("escaping", "values"),
+        ],
+    },
 ];
 
-/// The format for a request with `headers`: the offer the `Accept` fields
-/// (combined into one list, RFC 9110 §5.3) weigh highest, else the text
-/// format 0.0.4 ("Selection of Format": the last resort a target MUST
-/// use), also for a header that does not parse ("Security
-/// Considerations": the header is validated, not trusted).
+/// The weight `text` stands for, in thousandths (RFC 9110 §12.4.2:
+/// `qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )`);
+/// `None` for anything else.
+fn qvalue(text: &str) -> Option<u16> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if fraction.len() > 3 || !fraction.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    let thousandths = fraction
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(3)
+        .fold(0_u16, |sum, digit| {
+            sum.saturating_mul(10)
+                .saturating_add(u16::from(digit.saturating_sub(b'0')))
+        });
+    match whole {
+        "0" => Some(thousandths),
+        "1" if thousandths == 0 => Some(1000),
+        _ => None,
+    }
+}
+
+/// One media range of `Accept`: its type, subtype and parameters before
+/// the weight, which RFC 9110 §12.5.1's grammar puts last (`media-range
+/// weight`), and the weight in thousandths, 1000 without one.
+struct Range {
+    /// The type, `*` for any.
+    ty: String,
+    /// The subtype, `*` for any.
+    subty: String,
+    /// The parameters before the weight, names in lowercase.
+    params: Vec<(String, String)>,
+    /// The weight.
+    quality: u16,
+}
+
+impl Range {
+    /// The range `media_type` stands for; `None` when its weight is no
+    /// qvalue.
+    fn of(media_type: &MediaType<'_>) -> Option<Self> {
+        use mediatype::ReadParams as _;
+
+        let mut params = Vec::new();
+        let mut quality = 1000;
+        for (name, value) in media_type.params() {
+            if name == "q" {
+                quality = qvalue(&value.unquoted_str())?;
+                break;
+            }
+            params.push((
+                name.as_str().to_ascii_lowercase(),
+                value.unquoted_str().into_owned(),
+            ));
+        }
+        Some(Self {
+            ty: media_type.ty.as_str().to_owned(),
+            subty: media_type.subty.as_str().to_owned(),
+            params,
+            quality,
+        })
+    }
+
+    /// Whether the range takes in `representation` (RFC 9110 §12.5.1): its
+    /// type and subtype, or `*` for either, and every parameter it names
+    /// with the same value, names and values compared without case.
+    fn matches(&self, representation: &Representation) -> bool {
+        let named = |range: &str, ours: &str| range == "*" || range.eq_ignore_ascii_case(ours);
+        named(&self.ty, representation.ty)
+            && named(&self.subty, representation.subty)
+            && self.params.iter().all(|(name, value)| {
+                representation.params.iter().any(|(ours, ours_value)| {
+                    name == ours && value.eq_ignore_ascii_case(ours_value)
+                })
+            })
+    }
+
+    /// How specific the range is: a named type, a named subtype, then each
+    /// parameter outranks the range without it (RFC 9110 §12.5.1: "the
+    /// most specific reference has precedence").
+    fn specificity(&self) -> usize {
+        usize::from(self.ty != "*")
+            .saturating_add(usize::from(self.subty != "*"))
+            .saturating_add(self.params.len())
+    }
+}
+
+/// The media ranges of `accept`, the `Accept` fields as one list (RFC 9110
+/// §5.3); `None` when one does not parse or its weight is no qvalue
+/// ("Security Considerations": the header is validated, not trusted).
+fn ranges(accept: &str) -> Option<Vec<Range>> {
+    mediatype::MediaTypeList::new(accept)
+        .map(|media_type| media_type.ok().as_ref().and_then(Range::of))
+        .collect()
+}
+
+/// The representation `ranges` accept most: each weighs what the most
+/// specific range taking it in weighs (RFC 9110 §12.5.1), 0 without one,
+/// and the heaviest above 0 wins, the first in the server's order on a
+/// tie; `None` when every one weighs 0, which RFC 9110 §12.4.2 makes "not
+/// acceptable".
+fn chosen(ranges: &[Range]) -> Option<Format> {
+    let mut best: Option<(u16, Format)> = None;
+    for representation in &REPRESENTATIONS {
+        let quality = ranges
+            .iter()
+            .filter(|range| range.matches(representation))
+            .max_by_key(|range| range.specificity())
+            .map_or(0, |range| range.quality);
+        if quality > 0 && best.is_none_or(|(heaviest, _)| quality > heaviest) {
+            best = Some((quality, representation.format));
+        }
+    }
+    best.map(|(_, format)| format)
+}
+
+/// The format for `accept`, the `Accept` fields as one list: the
+/// representation its ranges accept most, else the text format 0.0.4, the
+/// last resort a target MUST use ("Selection of Format"), also for a header
+/// that does not parse. An empty header takes in nothing, so it gets the
+/// last resort too. Runs on any text: it never panics (fuzzed).
+pub fn negotiate_accept(accept: &str) -> Format {
+    ranges(accept)
+        .as_deref()
+        .and_then(chosen)
+        .unwrap_or(Format::PrometheusText)
+}
+
+/// The format for a request with `headers` ([`negotiate_accept`] of its
+/// `Accept` fields, an unreadable one left out).
 pub fn negotiate(headers: &HeaderMap) -> Format {
     let fields: Vec<&str> = headers
         .get_all(header::ACCEPT)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .collect();
-    let Ok(accept) = Accept::from_str(&fields.join(", ")) else {
-        return Format::PrometheusText;
-    };
-    let offers: Vec<(MediaType<'static>, Format)> = OFFERS
-        .iter()
-        .filter_map(|(text, format)| MediaType::parse(text).ok().map(|offer| (offer, *format)))
-        .collect();
-    accept
-        .negotiate(offers.iter().map(|(offer, _)| offer))
-        .and_then(|chosen| offers.iter().find(|(offer, _)| std::ptr::eq(offer, chosen)))
-        .map_or(Format::PrometheusText, |(_, format)| *format)
+    negotiate_accept(&fields.join(", "))
 }
 
 /// A metric's type, as its `TYPE` line names it.
@@ -856,7 +997,11 @@ fn refusal(
 }
 
 /// `GET /v0/metrics` (HEAD answered alike, without the body): the checks,
-/// then the handler's snapshot as the exposition in the negotiated format.
+/// then the handler's snapshot as the exposition in the negotiated format,
+/// the TLS client's enrollment checked once more after the snapshot, so a
+/// scraper removed while it was collected gets none of it. The whole
+/// exposition is one body written at once, so nothing is left to stop
+/// once it is answered.
 pub(crate) async fn fetch<H: Handler>(
     State(state): State<AppState<H>>,
     Extension(peer): Extension<PeerInfo>,
@@ -868,6 +1013,11 @@ pub(crate) async fn fetch<H: Handler>(
     }
     let format = negotiate(&headers);
     let snapshot = state.handler.metrics_snapshot().await;
+    // The client may have been removed while the snapshot was collected:
+    // checked again before a byte of it is sent, which is all at once.
+    if let Some(refused) = refusal(&peer, &headers, shutting_down, state.clients.as_deref()) {
+        return refused;
+    }
     respond(snapshot, format, &state.limit_lines)
 }
 
@@ -1067,6 +1217,131 @@ mod tests {
         let mut opaque = HeaderMap::new();
         opaque.insert(header::ACCEPT, HeaderValue::from_bytes(b"\xff").unwrap());
         assert_eq!(negotiate(&opaque), Format::PrometheusText, "not text");
+    }
+
+    #[test]
+    fn a_range_takes_in_a_representation_whose_parameters_it_names_rfc9110_12_5_1() {
+        // A range naming a subset of a representation's parameters takes
+        // it in, `charset` included, alone or with others.
+        for (accept, expected) in [
+            (
+                "application/openmetrics-text;version=1.0.0;charset=utf-8",
+                Format::OpenMetrics(Escaping::Underscores),
+            ),
+            (
+                "application/openmetrics-text;charset=UTF-8;escaping=dots",
+                Format::OpenMetrics(Escaping::Dots),
+            ),
+            (
+                "application/openmetrics-text;version=1.0.0;charset=\"utf-8\";escaping=values;q=0.7",
+                Format::OpenMetrics(Escaping::Values),
+            ),
+            (
+                "text/plain;charset=utf-8;q=0.9,application/openmetrics-text;q=0.5",
+                Format::PrometheusText,
+            ),
+        ] {
+            assert_eq!(negotiated(&[accept]), expected, "{accept}");
+        }
+        // A parameter the representation lacks, or another value of one,
+        // takes nothing in.
+        for accept in [
+            "application/openmetrics-text;charset=iso-8859-1",
+            "application/openmetrics-text;version=1.0.0;format=other",
+        ] {
+            assert_eq!(negotiated(&[accept]), Format::PrometheusText, "{accept}");
+        }
+    }
+
+    #[test]
+    fn the_most_specific_range_weighs_a_representation_and_q_0_excludes_it_rfc9110_12_5_1() {
+        // The versioned range forbids OpenMetrics 1.0.0, whatever the bare
+        // one allows: it is more specific.
+        for accept in [
+            "application/openmetrics-text;version=1.0.0;q=0,application/openmetrics-text;q=1,text/plain;q=0.5",
+            "application/openmetrics-text;q=1,application/openmetrics-text;version=1.0.0;q=0,text/plain;q=0.5",
+            "*/*,application/openmetrics-text;q=0",
+        ] {
+            assert_eq!(negotiated(&[accept]), Format::PrometheusText, "{accept}");
+        }
+        // And allows it over a heavier, less specific one.
+        assert_eq!(
+            negotiated(&[
+                "text/*;q=0.8,application/openmetrics-text;q=0.1,application/openmetrics-text;version=1.0.0;q=0.9"
+            ]),
+            Format::OpenMetrics(Escaping::Underscores)
+        );
+        // An escaping scheme narrows the range to its representation.
+        assert_eq!(
+            negotiated(&[
+                "application/openmetrics-text;q=0.2,application/openmetrics-text;escaping=dots;q=0.9"
+            ]),
+            Format::OpenMetrics(Escaping::Dots)
+        );
+    }
+
+    #[test]
+    fn a_named_type_outranks_a_wildcard_and_a_weight_of_0_is_not_acceptable_rfc9110_12_5_1() {
+        // The named range weighs OpenMetrics, the wildcard only what no
+        // named range takes in, wherever each stands in the header.
+        for accept in [
+            "application/openmetrics-text;q=0.9,*/*;q=0.1,text/plain;q=0.5",
+            "*/*;q=0.1,application/openmetrics-text;q=0.9,text/plain;q=0.5",
+            "application/openmetrics-text;q=0.9,application/*;q=0.1,text/plain;q=0.5",
+        ] {
+            let ranges = ranges(accept).unwrap();
+            assert_eq!(
+                chosen(&ranges),
+                Some(Format::OpenMetrics(Escaping::Underscores)),
+                "{accept}"
+            );
+        }
+        // Every representation weighed 0: none is acceptable, and the
+        // route falls back to the last resort.
+        let refused = "application/openmetrics-text;q=0,text/plain;q=0";
+        assert_eq!(chosen(&ranges(refused).unwrap()), None);
+        assert_eq!(negotiate_accept(refused), Format::PrometheusText);
+        assert_eq!(chosen(&ranges("").unwrap()), None, "an empty header");
+        assert!(ranges("text/plain;q=x").is_none());
+        // A tie goes to the first in the server's order.
+        assert_eq!(
+            chosen(&ranges("*/*").unwrap()),
+            Some(Format::PrometheusText)
+        );
+    }
+
+    #[test]
+    fn a_weight_is_a_qvalue_and_ends_the_range_s_parameters_rfc9110_12_4_2() {
+        for (text, expected) in [
+            ("0", Some(0)),
+            ("0.", Some(0)),
+            ("0.5", Some(500)),
+            ("0.25", Some(250)),
+            ("0.125", Some(125)),
+            ("0.999", Some(999)),
+            ("1", Some(1000)),
+            ("1.", Some(1000)),
+            ("1.000", Some(1000)),
+            ("1.001", None),
+            ("0.1234", None),
+            ("2", None),
+            ("0.5x", None),
+            ("-0", None),
+            (".5", None),
+            ("", None),
+        ] {
+            assert_eq!(qvalue(text), expected, "{text:?}");
+        }
+        // A weight that is no qvalue makes the header invalid.
+        assert_eq!(
+            negotiated(&["application/openmetrics-text;q=2"]),
+            Format::PrometheusText
+        );
+        // Parameters after the weight are `accept-ext`, not the media type's.
+        assert_eq!(
+            negotiated(&["application/openmetrics-text;q=0.9;version=0.0.1"]),
+            Format::OpenMetrics(Escaping::Underscores)
+        );
     }
 
     #[test]

@@ -55,6 +55,16 @@ struct Minimal;
 /// Notified each time [`Minimal`] begins a `metrics/get`.
 static STALLED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
+/// Set by a test to hold [`Minimal`]'s metrics snapshot: it notifies
+/// [`SNAPSHOT_HELD`] and waits for [`SNAPSHOT_RELEASED`].
+static HOLD_SNAPSHOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Notified once a held snapshot has begun.
+static SNAPSHOT_HELD: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Notified to let a held snapshot finish.
+static SNAPSHOT_RELEASED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 /// How many times [`Minimal`] handed out recording `kept`; only one test asks
 /// for it.
 static KEPT_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -99,7 +109,9 @@ impl Handler for Minimal {
     }
 
     /// One stream, `front`, with nine packets lost.
+    /// Held while [`HOLD_SNAPSHOT`] is set, until [`SNAPSHOT_RELEASED`].
     fn metrics_snapshot(&self) -> impl Future<Output = Option<lotse_api_types::Metrics>> + Send {
+        let held = HOLD_SNAPSHOT.load(std::sync::atomic::Ordering::SeqCst);
         let snapshot = serde_json::json!({
             "supervisor": { "pid": 1, "uptime_ms": 2000, "rss_bytes": null, "pss_bytes": null, "tasks": null, "demux": null },
             "workers": {},
@@ -107,7 +119,13 @@ impl Handler for Minimal {
             "sessions": 0,
             "streams": { "front": { "packets_lost": 9 } },
         });
-        std::future::ready(serde_json::from_value(snapshot).ok())
+        async move {
+            if held {
+                SNAPSHOT_HELD.notify_one();
+                SNAPSHOT_RELEASED.notified().await;
+            }
+            serde_json::from_value(snapshot).ok()
+        }
     }
 
     fn recording_body(
@@ -1943,6 +1961,39 @@ async fn rfc9110_15_5_4_a_metrics_client_removed_after_its_handshake_reads_no_mo
     assert_eq!(answer["success"], true, "{answer}");
     let (status, body) = request_once(connected, "GET", lotse_api_types::METRICS_PATH).await;
     assert_eq!((status, code_of(&body)), (403, "not_permitted".into()));
+    assert!(
+        logs.text()
+            .contains("metrics refused: its client was removed")
+    );
+    drop(admin);
+    running.finish().await;
+}
+
+/// Regression (Copilot's review of edenhaus/lotse#183): the scraper's
+/// enrollment was checked only before the snapshot, so a pin removed while
+/// it was collected still got the metrics.
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9110_15_5_4_a_metrics_client_removed_while_its_snapshot_is_collected_gets_none_of_it() {
+    let (logs, _guard) = capture();
+    let scraper = ClientIdentity::generate().unwrap();
+    let running = start("metrics-removed-during", vec![]);
+    let mut admin = local(&running).await;
+    let answer = call(&mut admin, add(1, scraper.pin, "metrics")).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    HOLD_SNAPSHOT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let connected = connect(running.addr, running.config(ClientCert::Own(&scraper))).await;
+    let removal = async {
+        within_5_s(SNAPSHOT_HELD.notified()).await;
+        let answer = call(&mut admin, remove(2, scraper.pin)).await;
+        assert_eq!(answer["success"], true, "{answer}");
+        SNAPSHOT_RELEASED.notify_one();
+    };
+    let ((status, body), ()) = tokio::join!(
+        request_once(connected, "GET", lotse_api_types::METRICS_PATH),
+        removal
+    );
+    assert_eq!((status, code_of(&body)), (403, "not_permitted".into()));
+    assert!(!body.contains("lotse_"), "none of the metrics: {body}");
     assert!(
         logs.text()
             .contains("metrics refused: its client was removed")
