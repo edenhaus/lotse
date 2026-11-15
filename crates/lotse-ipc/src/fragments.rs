@@ -326,6 +326,14 @@ mod tests {
             1,
             "the bounds are in"
         );
+        let mut largest = good;
+        largest[12..].copy_from_slice(&MAX_RECORD_BYTES.to_be_bytes());
+        let mut decoder = Decoder::new();
+        assert!(
+            decoder.push(&largest).unwrap().is_empty(),
+            "the largest record is in, its body awaited"
+        );
+        assert_eq!(decoder.wants(), usize::try_from(MAX_RECORD_BYTES).unwrap());
         assert_eq!(
             RecordError::TooLarge.to_string(),
             "a live record over its bound"
