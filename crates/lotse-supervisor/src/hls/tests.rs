@@ -388,6 +388,13 @@ async fn sessions_share_an_output_per_audio_choice_within_the_limits() {
     let video = spawn_create(&s, 4, false);
     let (video_spec, _video_pipe) = output_start(&mut commands).await;
     assert!(!video_spec.audio);
+    // Its warning reaches its own sessions only: the first output's next
+    // event is its close.
+    let video_warning = lotse_ipc::LiveReport::Warning {
+        code: "audio_omitted".into(),
+        message: "video".into(),
+    };
+    live_report(&s, &video_spec.live_id, video_warning);
     assert_eq!(demand(&s).viewers, 2);
     let err = error(call(&s, &hls_create(5, "front", true)).await);
     assert_eq!(err.details["limit"], "max_hls_sessions");
@@ -790,7 +797,7 @@ async fn a_pipe_whose_read_fails_ends_its_output() {
     read(
         Arc::clone(&s.shared),
         live_id.clone(),
-        Failing,
+        Box::new(Failing),
         feed,
         HlsLimits::DEFAULT.window(),
     )

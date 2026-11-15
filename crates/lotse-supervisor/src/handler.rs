@@ -7440,6 +7440,35 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// `unsubscribe` of a live output's subscription ends it
+    /// `session_closed`, asked of its worker; nothing answers but the
+    /// unsubscribe itself.
+    #[tokio::test]
+    async fn unsubscribing_a_live_output_ends_it_session_closed() {
+        let dir = private_dir("live-unsubscribe");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        live_report(&s, &live_id, live_started());
+        let (_answer, _events) = started(within(create).await.unwrap());
+        assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        assert_eq!(
+            s.shared.lock().lives[&live_id].ending,
+            Some(LiveCloseReason::SessionClosed)
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// `live/create` holds the request to its stream, a container to write
     /// with, the limits (refused at either, logged rate-limited) and room in
     /// the connection's queue for its start, fetch and stop.

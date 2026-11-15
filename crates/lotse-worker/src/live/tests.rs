@@ -513,6 +513,62 @@ async fn a_reader_that_falls_behind_costs_it_the_frames_up_to_the_next_keyframe_
     assert_eq!(rig.video().stats().frames, 12);
 }
 
+/// A frame lost while the container still waits for its first keyframe
+/// finishes nothing (it holds nothing) and the media starts at that
+/// keyframe all the same.
+#[tokio::test]
+async fn a_frame_lost_before_the_first_keyframe_drops_to_it_with_nothing_to_finish() {
+    let limits = TrackLimits {
+        max_frame_bytes: 100,
+        ..TrackLimits::default()
+    };
+    let mut rig = Rig::with(Some(h264()), None, true, limits, 8);
+    let reader = rig.fetched().await;
+    rig.video_frame(0, false, 1);
+    settle().await;
+    assert!(
+        !rig.video_frame(1, false, 101),
+        "over max_frame_bytes: lost"
+    );
+    settle().await;
+    rig.video_frame(2, true, 1);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h264", "frame v 0 7200 k 1"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    let (_, _, dropped, drops) = rig.closed().await;
+    assert_eq!((dropped, drops), (1, 1));
+}
+
+/// The buffer bound is exclusive: with none at all, a reader that keeps up
+/// with the pipe loses nothing, as nothing waits in the queue.
+#[tokio::test]
+async fn a_reader_that_keeps_up_costs_no_frame_even_without_a_buffer() {
+    let mut rig = Rig::new(None);
+    let reader = rig.start(spec(false, 0));
+    rig.started().await;
+    assert!(rig.lives.fetch("l1"));
+    settle().await;
+    for index in 0..4 {
+        rig.video_frame(index, index == 0, 3);
+        settle().await;
+    }
+    assert_eq!(
+        lines(&available(&reader).await),
+        [
+            "init video=h264",
+            "frame v 0 0 k 3",
+            "frame v 0 3600 - 3",
+            "frame v 0 7200 - 3",
+            "frame v 0 10800 - 3"
+        ]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    let (_, _, dropped, drops) = rig.closed().await;
+    assert_eq!((dropped, drops), (0, 0));
+}
+
 #[tokio::test]
 async fn a_frame_the_subscription_lost_drops_to_the_next_keyframe() {
     let limits = TrackLimits {
