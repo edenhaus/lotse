@@ -8,8 +8,12 @@
 //! path is a third party's: the DNS name in the server certificate (Go's
 //! x509 refuses a Common Name alone), the leaf as its own root, TLS 1.3
 //! with the client certificate (RFC 8446 §4.4.2), and the exposition as
-//! Prometheus parses it. A second job presents a certificate the daemon
-//! never enrolled, and its scrapes fail.
+//! Prometheus parses it, in both formats the daemon offers: one job with
+//! Prometheus' default scrape protocols, which negotiate OpenMetrics 1.0.0,
+//! and one limited to the Prometheus text format 0.0.4. Which one each job
+//! parsed shows in Prometheus' target metadata: only OpenMetrics carries a
+//! metric's unit. A third job presents a certificate the daemon never
+//! enrolled, and its scrapes fail.
 //!
 //! Ignored by default: it needs `prometheus` and `openssl` on `PATH`,
 //! which `mise run interop` provides (Prometheus pinned in `mise.toml`)
@@ -223,9 +227,9 @@ fn prometheus_scrapes_the_metrics_over_mutual_tls_with_an_openssl_p256_client_rf
     let server = host.join("lotse-server.pem");
     std::fs::write(&server, &output.stdout).unwrap();
 
-    let job = |name: &str, client: &str| {
+    let job = |name: &str, client: &str, protocols: &str| {
         format!(
-            "  - job_name: {name}\n    scheme: https\n    metrics_path: /v0/metrics\n    static_configs: [{{ targets: [\"{addr}\"] }}]\n    tls_config:\n      ca_file: {}\n      server_name: lotse\n      cert_file: {}\n      key_file: {}\n",
+            "  - job_name: {name}\n{protocols}    scheme: https\n    metrics_path: /v0/metrics\n    static_configs: [{{ targets: [\"{addr}\"] }}]\n    tls_config:\n      ca_file: {}\n      server_name: lotse\n      cert_file: {}\n      key_file: {}\n",
             server.display(),
             host.join(format!("{client}.pem")).display(),
             host.join(format!("{client}.key")).display(),
@@ -235,9 +239,14 @@ fn prometheus_scrapes_the_metrics_over_mutual_tls_with_an_openssl_p256_client_rf
     std::fs::write(
         &config,
         format!(
-            "global:\n  scrape_interval: 1s\n  scrape_timeout: 1s\nscrape_configs:\n{}{}",
-            job("lotse", "scraper"),
-            job("unenrolled", "stranger"),
+            "global:\n  scrape_interval: 1s\n  scrape_timeout: 1s\nscrape_configs:\n{}{}{}",
+            job("lotse", "scraper", ""),
+            job(
+                "lotse_text",
+                "scraper",
+                "    scrape_protocols: [PrometheusText0.0.4]\n"
+            ),
+            job("unenrolled", "stranger", ""),
         ),
     )
     .unwrap();
@@ -245,20 +254,26 @@ fn prometheus_scrapes_the_metrics_over_mutual_tls_with_an_openssl_p256_client_rf
     let _prometheus = prometheus(&host, &config, port);
 
     let polls = SCRAPED_WITHIN.as_millis() / POLL.as_millis();
-    let mut both = None;
+    let mut all = None;
     for _ in 0..polls {
         if let Some(targets) = api(port, "/api/v1/targets")
-            && let (Some(lotse), Some(unenrolled)) =
-                (scraped(&targets, "lotse"), scraped(&targets, "unenrolled"))
+            && let (Some(lotse), Some(text), Some(unenrolled)) = (
+                scraped(&targets, "lotse"),
+                scraped(&targets, "lotse_text"),
+                scraped(&targets, "unenrolled"),
+            )
         {
-            both = Some((lotse, unenrolled));
+            all = Some((lotse, text, unenrolled));
             break;
         }
         pause();
     }
-    let (scraped_lotse, unenrolled) = both.expect("Prometheus scraped both targets in time");
-    assert_eq!(scraped_lotse["health"], "up", "{scraped_lotse}");
-    assert_eq!(scraped_lotse["lastError"], "", "{scraped_lotse}");
+    let (scraped_lotse, scraped_text, unenrolled) =
+        all.expect("Prometheus scraped every target in time");
+    for target in [&scraped_lotse, &scraped_text] {
+        assert_eq!(target["health"], "up", "{target}");
+        assert_eq!(target["lastError"], "", "{target}");
+    }
     // Refused in the handshake: no certificate the daemon knows.
     assert_eq!(unenrolled["health"], "down", "{unenrolled}");
     assert_ne!(unenrolled["lastError"], "", "{unenrolled}");
@@ -284,7 +299,30 @@ fn prometheus_scrapes_the_metrics_over_mutual_tls_with_an_openssl_p256_client_rf
     let uptime: f64 = uptime.expect("the uptime sample").parse().unwrap();
     assert!(uptime > 0.0, "{uptime}");
     let streams = api(port, "/api/v1/query?query=lotse_streams").unwrap();
-    assert_eq!(streams["data"]["result"][0]["value"][1], "0", "{streams}");
+    for series in streams["data"]["result"].as_array().unwrap() {
+        assert_eq!(series["value"][1], "0", "{streams}");
+    }
+    // OpenMetrics' `# UNIT` reached the default job, the text format has
+    // none: each job parsed the format it negotiated.
+    let unit_of = |job: &str| {
+        let metadata = api(
+            port,
+            &format!(
+                "/api/v1/targets/metadata?metric=lotse_supervisor_uptime_seconds&match_target=%7Bjob%3D%22{job}%22%7D"
+            ),
+        )
+        .unwrap();
+        metadata["data"][0]["unit"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(unit_of("lotse"), "seconds", "OpenMetrics 1.0.0");
+    assert_eq!(
+        unit_of("lotse_text"),
+        "",
+        "the Prometheus text format 0.0.4"
+    );
 
     let (code, rest) = daemon.terminate();
     assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));

@@ -6,45 +6,55 @@
 //!
 //! The numbers are the snapshot `metrics/get` returns
 //! ([`Handler::metrics_snapshot`]): one source, read once per request and
-//! nothing collected on the media path for it. They are rendered in the
-//! Prometheus text format, version 0.0.4, as the Prometheus documentation
-//! defines it ("Exposition formats", section "Prometheus Text Format",
-//! `docs/instrumenting/exposition_formats.md` of prometheus/docs, read on
-//! 2026-11-15), and sent as `Content-Type: text/plain; version=0.0.4;
-//! charset=utf-8` ([`CONTENT_TYPE`]; "Basic info": `text/plain` with the
-//! `version=0.0.4` parameter, encoding UTF-8; "HTTP Content-Type
-//! requirements": from Prometheus 3.0 a scrape without a valid
-//! `Content-Type` fails). What the format asks and how it is met:
+//! nothing collected on the media path for it. The exposition is written
+//! by the Prometheus project's Rust client, `prometheus-client`, whose
+//! `Collector` is made for metrics "retrieved ad-hoc on each scrape": each
+//! request registers one over its snapshot, as `ConstCounter`s and
+//! `ConstGauge`s, and has the client's encoder write it in one of two
+//! formats, both as the Prometheus documentation defines them
+//! (prometheus/docs, read on 2026-11-15):
 //!
-//! - "Details": lines separated by a line feed, the last one ended by one.
-//! - "Comments, help text, and type information": one `# HELP` and one
-//!   `# TYPE` line per metric name, before its first sample; `HELP` text
-//!   escapes the backslash and the line feed as `\\` and `\n`
-//!   (`escape_help`).
-//! - The sample syntax: `metric_name [ "{" labels "}" ] value`, every name
-//!   in the legacy character set, so none is quoted; a label value escapes
-//!   the backslash, the double quote and the line feed as `\\`, `\"` and
-//!   `\n` (`escape_label`); a value is what Go's `ParseFloat` reads, here
-//!   an integer or a decimal fraction; no timestamp.
-//! - "Grouping and sorting": every line of a metric in one group, each
-//!   name and label set once, in the same order on every scrape.
+//! - OpenMetrics 1.0 text (`docs/specs/om/open_metrics_spec.md`): the
+//!   client's `encoding::text`, with `# UNIT` lines and the closing
+//!   `# EOF`, so a cut exposition is refused whole ("Partial or invalid
+//!   expositions MUST be considered erroneous in their entirety"); sent as
+//!   `application/openmetrics-text; version=1.0.0; charset=utf-8` with the
+//!   escaping scheme the scraper named.
+//! - The Prometheus text format 0.0.4 (`docs/instrumenting/
+//!   exposition_formats.md`, "Prometheus Text Format"): the client's
+//!   `encoding::prometheus_text`, sent as its `CONTENT_TYPE`,
+//!   `text/plain; version=0.0.4; charset=utf-8`.
 //!
-//! Names follow the Prometheus naming guidance (`docs/practices/naming.md`
-//! of prometheus/docs, read on 2026-11-15): the application prefix
-//! `lotse_`, base units in the name (`_bytes`, `_seconds`), and `_total`
-//! on every counter. Labels are `connection` (the daemon's own connection
-//! ids, `c1`) and `stream` (the client's stream ids, `[A-Za-z0-9._-]`,
-//! escaped all the same): never a URL, a credential, or anything a camera
-//! or browser sent. Their cardinality is bounded by the daemon's stream
-//! cap, and the exposition by [`MAX_EXPORTED_STREAMS`] and
-//! [`MAX_EXPORTED_WORKERS`] besides, whatever `max_streams` is set to:
-//! what lies beyond is left out, which logs one warning, rate-limited.
+//! Which one follows the scraper's `Accept` header, as Prometheus' "Scrape
+//! protocol content negotiation" (`docs/instrumenting/
+//! content_negotiation.md`) asks of a target: the offered format the header
+//! weighs highest, by RFC 9110 §12.5.1 (q-values, then the most specific
+//! range, then the header's order), which `headers-accept` decides; with
+//! none offered, or a header that does not parse, the text format 0.0.4,
+//! which "Selection of Format" makes the last resort a target MUST use. A
+//! wildcard (`*/*`, as curl sends) gets the text format too: it names no
+//! protocol. Prometheus' default `Accept` weighs OpenMetrics 1.0.0 highest,
+//! so it gets OpenMetrics. Every metric name is in the legacy character
+//! set, so the exposition is the same under every escaping scheme
+//! (`allow-utf-8`, `underscores`, `dots`, `values`): the one asked for is
+//! named in the response, as "Content-Type Response" requires of a text
+//! format from 1.0.0 on, `underscores` when none was; an unknown scheme is
+//! not offered. Not offered: the Prometheus text format 1.0.0 and
+//! OpenMetrics 0.0.1, which the client does not write, and the protobuf
+//! formats, which both specifications make optional; nor `gzip`, an
+//! optional content coding.
 //!
-//! SPEC-DEVIATION: `OpenMetrics` is not offered, whatever the scrape's
-//! `Accept` asks: Prometheus falls back to the text format, which a target
-//! may answer any scrape with ("Basic info": a missing `version` falls back
-//! to the most recent text format; the response names its one format in
-//! `Content-Type`).
+//! Names follow the Prometheus naming guidance (`docs/practices/naming.md`):
+//! the application prefix `lotse_`, base units in the name (`_bytes`,
+//! `_seconds`, which the client appends from the metric's unit), and
+//! `_total` on every counter (the client's suffix). Labels are `connection`
+//! (the daemon's own connection ids, `c1`) and `stream` (the client's
+//! stream ids, `[A-Za-z0-9._-]`, which the encoders escape all the same):
+//! never a URL, a credential, or anything a camera or browser sent. Their
+//! cardinality is bounded by the daemon's stream cap, and the exposition
+//! by [`MAX_EXPORTED_STREAMS`] and [`MAX_EXPORTED_WORKERS`] besides,
+//! whatever `max_streams` is set to: what lies beyond is left out, which
+//! logs one warning, rate-limited.
 //!
 //! Refusals carry the error body of the WebSocket's results and are those
 //! of a recording's request: 403 for a request carrying `Origin` (RFC 6455
@@ -55,229 +65,399 @@
 //! and its connection gives its place among the pending upgrades back at
 //! once.
 //!
-//! Standards: the Prometheus text format 0.0.4 (above), RFC 9110 (HTTP),
-//! RFC 9112 §9.6 (`Connection: close`).
+//! Standards: OpenMetrics 1.0, the Prometheus text format 0.0.4 and
+//! Prometheus' scrape content negotiation (above), RFC 9110 §12.5.1
+//! (`Accept`), RFC 9112 §9.6 (`Connection: close`).
 //!
 //! [`Handler::metrics_snapshot`]: crate::Handler::metrics_snapshot
 
-use std::fmt::Write as _;
+use std::fmt;
+use std::str::FromStr as _;
+use std::time::Duration;
 
 use axum::Extension;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse as _, Response};
+use headers_accept::Accept;
 use lotse_api_types::Metrics;
 use lotse_api_types::error::ErrorCode;
 use lotse_api_types::info::{DemuxMetrics, ProcessMetrics, WorkerMetrics};
 use lotse_api_types::stream::StreamStats;
+use mediatype::MediaType;
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric as _, MetricEncoder};
+use prometheus_client::metrics::MetricType;
+use prometheus_client::metrics::counter::ConstCounter;
+use prometheus_client::metrics::gauge::ConstGauge;
+use prometheus_client::registry::{Registry, Unit};
 
 use crate::clients::ClientStore;
 use crate::connection::refuse;
 use crate::listener::PeerInfo;
 use crate::{AppState, Handler, Limit, LimitLines};
 
-/// The response's media type: the Prometheus text format, version 0.0.4,
-/// in UTF-8 ("Basic info").
-pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
-
-/// The most streams in one exposition: 1024, each one `STREAM_FAMILIES`
-/// series. The daemon's default `max_streams` is 256.
+/// The most streams in one exposition: 1024, each one series per stream
+/// family. The daemon's default `max_streams` is 256.
 pub const MAX_EXPORTED_STREAMS: usize = 1024;
 
-/// The most workers in one exposition: 1024, each one
-/// `WORKER_FAMILIES` series. A worker runs one camera connection, which
-/// at least one stream reads.
+/// The most workers in one exposition: 1024, each one series per worker
+/// family. A worker runs one camera connection, which at least one stream
+/// reads.
 pub const MAX_EXPORTED_WORKERS: usize = 1024;
 
-/// A metric's type, as its `# TYPE` line names it ("Comments, help text,
-/// and type information").
+/// The prefix of every metric's name (`docs/practices/naming.md`: "a
+/// (single-word) application prefix").
+const PREFIX: &str = "lotse";
+
+/// An escaping scheme of metric and label names a scraper may ask for with
+/// a text format from version 1.0.0 on (`content_negotiation.md`,
+/// "Escaping Scheme"). Every name here is in the legacy character set, so
+/// none changes the exposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escaping {
+    /// `allow-utf-8`: names as they are.
+    AllowUtf8,
+    /// `underscores`: other characters as `_`; named when the scraper
+    /// named none.
+    Underscores,
+    /// `dots`: `.` as `_dot_`, other characters as `__`.
+    Dots,
+    /// `values`: other characters as their code point values.
+    Values,
+}
+
+impl Escaping {
+    /// The scheme's name in a media type's `escaping` parameter.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowUtf8 => "allow-utf-8",
+            Self::Underscores => "underscores",
+            Self::Dots => "dots",
+            Self::Values => "values",
+        }
+    }
+}
+
+/// An exposition format the route offers (`content_negotiation.md`,
+/// "Protocol Headers").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// `OpenMetricsText1.0.0`, with the escaping scheme named in the
+    /// response.
+    OpenMetrics(Escaping),
+    /// `PrometheusText0.0.4`, the last resort.
+    PrometheusText,
+}
+
+impl Format {
+    /// The response's `Content-Type` ("Content-Type Response": the media
+    /// type, its version and, for a text format from 1.0.0 on, the
+    /// escaping scheme).
+    pub fn content_type(self) -> String {
+        match self {
+            Self::OpenMetrics(escaping) => format!(
+                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping={}",
+                escaping.as_str()
+            ),
+            Self::PrometheusText => {
+                prometheus_client::encoding::prometheus_text::CONTENT_TYPE.to_owned()
+            }
+        }
+    }
+}
+
+/// The offers, as media types `Accept` is matched against, in the
+/// server's order for a range that matches several: the text format first,
+/// so a wildcard gets the last resort, then OpenMetrics 1.0.0 without an
+/// escaping scheme and with each one. A parameter the scraper adds that is
+/// not here (an OpenMetrics `version=0.0.1`, an unknown scheme) matches
+/// none: `headers-accept` compares every parameter but `q`. Each media type
+/// is offered bare too: a range without parameters matches every offer of
+/// its type (RFC 9110 §12.5.1), but one with only a `q` (`text/plain;q=0.5`)
+/// matches only a bare offer in `headers-accept` 0.3.0, which counts the `q`
+/// among the parameters there (observed 2026-11-15).
+const OFFERS: [(&str, Format); 8] = [
+    ("text/plain;version=0.0.4", Format::PrometheusText),
+    ("text/plain", Format::PrometheusText),
+    (
+        "application/openmetrics-text",
+        Format::OpenMetrics(Escaping::Underscores),
+    ),
+    (
+        "application/openmetrics-text;version=1.0.0",
+        Format::OpenMetrics(Escaping::Underscores),
+    ),
+    (
+        "application/openmetrics-text;version=1.0.0;escaping=allow-utf-8",
+        Format::OpenMetrics(Escaping::AllowUtf8),
+    ),
+    (
+        "application/openmetrics-text;version=1.0.0;escaping=underscores",
+        Format::OpenMetrics(Escaping::Underscores),
+    ),
+    (
+        "application/openmetrics-text;version=1.0.0;escaping=dots",
+        Format::OpenMetrics(Escaping::Dots),
+    ),
+    (
+        "application/openmetrics-text;version=1.0.0;escaping=values",
+        Format::OpenMetrics(Escaping::Values),
+    ),
+];
+
+/// The format for a request with `headers`: the offer the `Accept` fields
+/// (combined into one list, RFC 9110 §5.3) weigh highest, else the text
+/// format 0.0.4 ("Selection of Format": the last resort a target MUST
+/// use), also for a header that does not parse ("Security
+/// Considerations": the header is validated, not trusted).
+pub fn negotiate(headers: &HeaderMap) -> Format {
+    let fields: Vec<&str> = headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    let Ok(accept) = Accept::from_str(&fields.join(", ")) else {
+        return Format::PrometheusText;
+    };
+    let offers: Vec<(MediaType<'static>, Format)> = OFFERS
+        .iter()
+        .filter_map(|(text, format)| MediaType::parse(text).ok().map(|offer| (offer, *format)))
+        .collect();
+    accept
+        .negotiate(offers.iter().map(|(offer, _)| offer))
+        .and_then(|chosen| offers.iter().find(|(offer, _)| std::ptr::eq(offer, chosen)))
+        .map_or(Format::PrometheusText, |(_, format)| *format)
+}
+
+/// A metric's type, as its `TYPE` line names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// Only ever grows while the process (or, for a worker's, its
-    /// connection) lives; its name ends in `_total`.
+    /// connection) lives; the encoder adds `_total`.
     Counter,
     /// Goes up and down.
     Gauge,
 }
 
 impl Kind {
-    /// The `# TYPE` line's word.
-    const fn as_str(self) -> &'static str {
+    /// The client's type.
+    const fn metric_type(self) -> MetricType {
         match self {
-            Self::Counter => "counter",
-            Self::Gauge => "gauge",
+            Self::Counter => MetricType::Counter,
+            Self::Gauge => MetricType::Gauge,
         }
     }
 }
 
-/// A sample's value: what Go's `ParseFloat` reads.
+/// The base unit a metric's name ends in (`naming.md`, "Base units"),
+/// which the encoders append and OpenMetrics names in `# UNIT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Value {
-    /// A count or a number of bytes, as an integer.
-    Count(u64),
-    /// Milliseconds, as decimal seconds with three places (`1.234`): the
-    /// base unit of time.
-    Seconds(u64),
+enum Base {
+    /// No unit: a count.
+    None,
+    /// `bytes`.
+    Bytes,
+    /// `seconds`.
+    Seconds,
 }
 
-impl std::fmt::Display for Value {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+/// The client's [`Unit::Bytes`], for the encoders, which borrow it.
+static BYTES: Unit = Unit::Bytes;
+
+/// The client's [`Unit::Seconds`].
+static SECONDS: Unit = Unit::Seconds;
+
+impl Base {
+    /// The client's unit, if any.
+    fn unit(self) -> Option<&'static Unit> {
         match self {
-            Self::Count(count) => write!(f, "{count}"),
-            Self::Seconds(ms) => write!(f, "{}.{:03}", ms / 1000, ms % 1000),
+            Self::None => None,
+            Self::Bytes => Some(&BYTES),
+            Self::Seconds => Some(&SECONDS),
         }
     }
 }
 
-/// One metric of the exposition: its name, type and help.
+/// A sample's value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Number {
+    /// A count or a number of bytes, written as an integer.
+    Count(u64),
+    /// A time in seconds, from milliseconds: an uptime, always a gauge.
+    Seconds(f64),
+}
+
+impl Number {
+    /// `ms` milliseconds as seconds.
+    fn millis(ms: u64) -> Self {
+        Self::Seconds(Duration::from_millis(ms).as_secs_f64())
+    }
+}
+
+/// One metric of the exposition: its name without the prefix, the unit
+/// and the counter suffix, its help, type and unit.
 #[derive(Debug, Clone, Copy)]
 struct Family {
-    /// The metric name, `lotse_`-prefixed.
+    /// The name's middle part.
     name: &'static str,
+    /// Its `HELP` text, without a backslash or a line feed: the OpenMetrics
+    /// encoder writes it as it is.
+    help: &'static str,
     /// Its type.
     kind: Kind,
-    /// Its `# HELP` text.
-    help: &'static str,
+    /// Its unit.
+    base: Base,
 }
 
-/// The process figures of the supervisor or a worker, as the families
-/// [`process_families`] names: what each takes from [`ProcessMetrics`].
-type ProcessField = fn(&ProcessMetrics) -> Option<Value>;
+/// A counter family without a unit.
+const fn counter(name: &'static str, help: &'static str) -> Family {
+    Family {
+        name,
+        help,
+        kind: Kind::Counter,
+        base: Base::None,
+    }
+}
 
-/// The process families with their prefix (`supervisor` or `worker`).
-fn process_families(prefix: &'static str) -> [(Family, ProcessField); 4] {
-    let (uptime, rss, pss, tasks) = if prefix == "supervisor" {
-        (
-            "lotse_supervisor_uptime_seconds",
-            "lotse_supervisor_resident_memory_bytes",
-            "lotse_supervisor_proportional_memory_bytes",
-            "lotse_supervisor_tasks",
-        )
-    } else {
-        (
-            "lotse_worker_uptime_seconds",
-            "lotse_worker_resident_memory_bytes",
-            "lotse_worker_proportional_memory_bytes",
-            "lotse_worker_tasks",
-        )
+/// A gauge family without a unit.
+const fn gauge(name: &'static str, help: &'static str) -> Family {
+    Family {
+        name,
+        help,
+        kind: Kind::Gauge,
+        base: Base::None,
+    }
+}
+
+/// A family and what it takes from a part of the snapshot, `T`; `None`
+/// where the snapshot lacks the figure, which is then left out.
+type Field<T> = (Family, fn(&T) -> Option<Number>);
+
+/// The process families, with their name's first part (`supervisor` or
+/// `worker`).
+fn process_families(of: &'static str) -> [Field<ProcessMetrics>; 4] {
+    let supervisor = of == "supervisor";
+    let name = |supervisor_name, worker_name| {
+        if supervisor {
+            supervisor_name
+        } else {
+            worker_name
+        }
     };
     [
         (
             Family {
-                name: uptime,
+                name: name("supervisor_uptime", "worker_uptime"),
+                help: "Time since the process started.",
                 kind: Kind::Gauge,
-                help: "Seconds since the process started.",
+                base: Base::Seconds,
             },
-            |process| Some(Value::Seconds(process.uptime_ms)),
+            |process| Some(Number::millis(process.uptime_ms)),
         ),
         (
             Family {
-                name: rss,
-                kind: Kind::Gauge,
+                name: name("supervisor_resident_memory", "worker_resident_memory"),
                 help: "Resident set size of the process (Rss of smaps_rollup).",
+                kind: Kind::Gauge,
+                base: Base::Bytes,
             },
-            |process| process.rss_bytes.map(Value::Count),
+            |process| process.rss_bytes.map(Number::Count),
         ),
         (
             Family {
-                name: pss,
-                kind: Kind::Gauge,
+                name: name(
+                    "supervisor_proportional_memory",
+                    "worker_proportional_memory",
+                ),
                 help: "Proportional set size of the process (Pss of smaps_rollup): shared pages divided among the processes mapping them.",
+                kind: Kind::Gauge,
+                base: Base::Bytes,
             },
-            |process| process.pss_bytes.map(Value::Count),
+            |process| process.pss_bytes.map(Number::Count),
         ),
         (
-            Family {
-                name: tasks,
-                kind: Kind::Gauge,
-                help: "Tokio tasks alive in the process's runtime.",
-            },
-            |process| process.tasks.map(Value::Count),
+            gauge(
+                name("supervisor_tasks", "worker_tasks"),
+                "Tokio tasks alive in the process's runtime.",
+            ),
+            |process| process.tasks.map(Number::Count),
         ),
     ]
 }
-
-/// A family and what it takes from a part of the snapshot, `T`.
-type Field<T> = (Family, fn(&T) -> u64);
 
 /// The demux's families and what each takes from [`DemuxMetrics`].
 const DEMUX_FAMILIES: [Field<DemuxMetrics>; 11] = [
     (
         counter(
-            "lotse_demux_datagrams_received_total",
+            "demux_datagrams_received",
             "Datagrams read from the shared WebRTC UDP socket.",
         ),
-        |demux| demux.received,
+        |demux| Some(Number::Count(demux.received)),
+    ),
+    (
+        counter("demux_datagrams_forwarded", "Datagrams handed to a worker."),
+        |demux| Some(Number::Count(demux.forwarded)),
     ),
     (
         counter(
-            "lotse_demux_datagrams_forwarded_total",
-            "Datagrams handed to a worker.",
-        ),
-        |demux| demux.forwarded,
-    ),
-    (
-        counter(
-            "lotse_demux_datagrams_unroutable_total",
+            "demux_datagrams_unroutable",
             "Datagrams from unknown addresses that were not a usable STUN request.",
         ),
-        |demux| demux.unroutable,
+        |demux| Some(Number::Count(demux.unroutable)),
     ),
     (
         counter(
-            "lotse_demux_stun_rejected_total",
+            "demux_stun_rejected",
             "STUN requests with an unknown ufrag or a wrong password.",
         ),
-        |demux| demux.stun_rejected,
+        |demux| Some(Number::Count(demux.stun_rejected)),
     ),
     (
         counter(
-            "lotse_demux_addresses_learned_total",
+            "demux_addresses_learned",
             "Addresses learned through verified STUN requests.",
         ),
-        |demux| demux.addresses_learned,
+        |demux| Some(Number::Count(demux.addresses_learned)),
     ),
     (
         counter(
-            "lotse_demux_addresses_moved_total",
+            "demux_addresses_moved",
             "Learned addresses moved to another session by a verified STUN request.",
         ),
-        |demux| demux.addresses_moved,
+        |demux| Some(Number::Count(demux.addresses_moved)),
     ),
     (
         counter(
-            "lotse_demux_datagrams_worker_full_total",
+            "demux_datagrams_worker_full",
             "Datagrams dropped because the worker's channel was full.",
         ),
-        |demux| demux.worker_full,
+        |demux| Some(Number::Count(demux.worker_full)),
     ),
     (
         counter(
-            "lotse_demux_responses_total",
+            "demux_responses",
             "Responses to the supervisor's own STUN and TURN requests.",
         ),
-        |demux| demux.responses,
+        |demux| Some(Number::Count(demux.responses)),
     ),
     (
         counter(
-            "lotse_demux_datagrams_relayed_total",
+            "demux_datagrams_relayed",
             "Datagrams a TURN server relayed from a peer, unwrapped and routed.",
         ),
-        |demux| demux.relayed,
+        |demux| Some(Number::Count(demux.relayed)),
     ),
     (
         counter(
-            "lotse_demux_relay_discarded_total",
+            "demux_relay_discarded",
             "Datagrams from a TURN server discarded.",
         ),
-        |demux| demux.relay_discarded,
+        |demux| Some(Number::Count(demux.relay_discarded)),
     ),
     (
-        counter(
-            "lotse_demux_idle_wakeups_total",
-            "Receive wake-ups without a datagram.",
-        ),
-        |demux| demux.idle_wakeups,
+        counter("demux_idle_wakeups", "Receive wake-ups without a datagram."),
+        |demux| Some(Number::Count(demux.idle_wakeups)),
     ),
 ];
 
@@ -286,31 +466,28 @@ const DEMUX_FAMILIES: [Field<DemuxMetrics>; 11] = [
 const WORKER_FAMILIES: [Field<WorkerMetrics>; 4] = [
     (
         counter(
-            "lotse_connection_worker_restarts_total",
+            "connection_worker_restarts",
             "Crash restarts of the connection's worker.",
         ),
-        |worker| u64::from(worker.restarts),
+        |worker| Some(Number::Count(u64::from(worker.restarts))),
     ),
     (
-        gauge(
-            "lotse_worker_sessions",
-            "Open viewer sessions on the connection.",
-        ),
-        |worker| u64::from(worker.sessions),
+        gauge("worker_sessions", "Open viewer sessions on the connection."),
+        |worker| Some(Number::Count(u64::from(worker.sessions))),
     ),
     (
         counter(
-            "lotse_worker_send_failures_total",
+            "worker_send_failures",
             "Datagrams the connection's sessions could not send.",
         ),
-        |worker| worker.send_failures,
+        |worker| Some(Number::Count(worker.send_failures)),
     ),
     (
         counter(
-            "lotse_worker_relay_unbound_total",
+            "worker_relay_unbound",
             "Datagrams from a relay candidate dropped for want of a channel.",
         ),
-        |worker| worker.relay_unbound,
+        |worker| Some(Number::Count(worker.relay_unbound)),
     ),
 ];
 
@@ -318,108 +495,234 @@ const WORKER_FAMILIES: [Field<WorkerMetrics>; 4] = [
 /// takes from [`StreamStats`].
 const STREAM_FAMILIES: [Field<StreamStats>; 10] = [
     (
-        counter(
-            "lotse_stream_frames_dropped_total",
-            "Frames dropped as oversize.",
-        ),
-        |stats| stats.frames_dropped,
+        counter("stream_frames_dropped", "Frames dropped as oversize."),
+        |stats| Some(Number::Count(stats.frames_dropped)),
     ),
     (
         counter(
-            "lotse_stream_frames_over_browser_limit_total",
+            "stream_frames_over_browser_limit",
             "Video frames carried in more RTP packets than some browsers assemble.",
         ),
-        |stats| stats.frames_over_browser_limit,
+        |stats| Some(Number::Count(stats.frames_over_browser_limit)),
     ),
     (
         counter(
-            "lotse_stream_av_sync_lost_total",
+            "stream_av_sync_lost",
             "Times the skew watchdog withdrew the stream's audio.",
         ),
-        |stats| stats.av_sync_lost,
+        |stats| Some(Number::Count(stats.av_sync_lost)),
     ),
     (
         counter(
-            "lotse_stream_packets_lost_total",
+            "stream_packets_lost",
             "RTP packets from the camera that never arrived.",
         ),
-        |stats| stats.packets_lost,
+        |stats| Some(Number::Count(stats.packets_lost)),
     ),
     (
         counter(
-            "lotse_stream_packets_out_of_order_total",
+            "stream_packets_out_of_order",
             "RTP packets from the camera dropped as duplicates or reordered.",
         ),
-        |stats| stats.packets_out_of_order,
+        |stats| Some(Number::Count(stats.packets_out_of_order)),
     ),
     (
         counter(
-            "lotse_stream_datagrams_rejected_total",
+            "stream_datagrams_rejected",
             "Datagrams refused before they were read (RTSP over UDP).",
         ),
-        |stats| stats.datagrams_rejected,
+        |stats| Some(Number::Count(stats.datagrams_rejected)),
     ),
     (
         counter(
-            "lotse_stream_recordings_started_total",
+            "stream_recordings_started",
             "Recordings started on the stream.",
         ),
-        |stats| stats.recordings_started,
+        |stats| Some(Number::Count(stats.recordings_started)),
     ),
     (
         counter(
-            "lotse_stream_recordings_completed_total",
+            "stream_recordings_completed",
             "Recordings that ended with their whole file written.",
         ),
-        |stats| stats.recordings_completed,
+        |stats| Some(Number::Count(stats.recordings_completed)),
     ),
     (
-        counter(
-            "lotse_stream_recording_gaps_total",
-            "Gaps in the stream's recordings.",
-        ),
-        |stats| stats.recording_gaps,
+        counter("stream_recording_gaps", "Gaps in the stream's recordings."),
+        |stats| Some(Number::Count(stats.recording_gaps)),
     ),
     (
-        counter(
-            "lotse_stream_recording_bytes_total",
-            "Bytes of the stream's recording files, as their workers report them.",
-        ),
-        |stats| stats.recording_bytes,
+        Family {
+            name: "stream_recording",
+            help: "The stream's recording files, as their workers report them.",
+            kind: Kind::Counter,
+            base: Base::Bytes,
+        },
+        |stats| Some(Number::Count(stats.recording_bytes)),
     ),
 ];
 
-/// A counter family.
-const fn counter(name: &'static str, help: &'static str) -> Family {
-    Family {
-        name,
-        kind: Kind::Counter,
-        help,
+/// Writes `number` as `metric`'s sample: a count as an integer counter or
+/// gauge, seconds as a gauge (only uptimes are in seconds).
+fn sample(metric: MetricEncoder<'_>, kind: Kind, number: Number) -> fmt::Result {
+    match (kind, number) {
+        (Kind::Counter, Number::Count(count)) => ConstCounter::new(count).encode(metric),
+        (Kind::Gauge, Number::Count(count)) => ConstGauge::new(count).encode(metric),
+        (_, Number::Seconds(seconds)) => ConstGauge::new(seconds).encode(metric),
     }
 }
 
-/// A gauge family.
-const fn gauge(name: &'static str, help: &'static str) -> Family {
-    Family {
-        name,
-        kind: Kind::Gauge,
-        help,
+/// `family` with its one unlabelled sample, if there is one.
+fn single(
+    encoder: &mut DescriptorEncoder<'_>,
+    family: &Family,
+    number: Option<Number>,
+) -> fmt::Result {
+    let Some(number) = number else {
+        return Ok(());
+    };
+    let metric = encoder.encode_descriptor(
+        family.name,
+        family.help,
+        family.base.unit(),
+        family.kind.metric_type(),
+    )?;
+    sample(metric, family.kind, number)
+}
+
+/// `family` with one sample per `(label value, number)`, labelled `label`;
+/// nothing for a family without a sample.
+fn labelled<'v>(
+    encoder: &mut DescriptorEncoder<'_>,
+    family: &Family,
+    label: &'static str,
+    samples: impl IntoIterator<Item = (&'v str, Number)>,
+) -> fmt::Result {
+    let mut samples = samples.into_iter().peekable();
+    if samples.peek().is_none() {
+        return Ok(());
+    }
+    let mut metric = encoder.encode_descriptor(
+        family.name,
+        family.help,
+        family.base.unit(),
+        family.kind.metric_type(),
+    )?;
+    for (value, number) in samples {
+        let labels = [(label, value)];
+        sample(metric.encode_family(&labels)?, family.kind, number)?;
+    }
+    Ok(())
+}
+
+/// One scrape's numbers, for the client's encoders: the snapshot within the
+/// caps, and the counts before them.
+#[derive(Debug)]
+struct Exposition {
+    /// The snapshot, at most [`MAX_EXPORTED_WORKERS`] workers and
+    /// [`MAX_EXPORTED_STREAMS`] streams, the first by id.
+    metrics: Metrics,
+    /// The snapshot's workers, before the cap.
+    workers: usize,
+    /// The snapshot's streams, before the cap.
+    streams: usize,
+}
+
+impl Exposition {
+    /// `metrics` within the caps, and what they left out.
+    fn capped(metrics: &Metrics) -> (Self, LeftOut) {
+        let capped = Metrics {
+            supervisor: metrics.supervisor.clone(),
+            workers: metrics
+                .workers
+                .iter()
+                .take(MAX_EXPORTED_WORKERS)
+                .map(|(id, worker)| (id.clone(), worker.clone()))
+                .collect(),
+            worker_restarts: metrics.worker_restarts,
+            sessions: metrics.sessions,
+            streams: metrics
+                .streams
+                .iter()
+                .take(MAX_EXPORTED_STREAMS)
+                .map(|(id, stats)| (id.clone(), *stats))
+                .collect(),
+        };
+        let left_out = LeftOut {
+            streams: metrics.streams.len().saturating_sub(capped.streams.len()),
+            workers: metrics.workers.len().saturating_sub(capped.workers.len()),
+        };
+        let exposition = Self {
+            metrics: capped,
+            workers: metrics.workers.len(),
+            streams: metrics.streams.len(),
+        };
+        (exposition, left_out)
     }
 }
 
-/// `text` as a `# HELP` line's docstring: the backslash and the line feed
-/// escaped as `\\` and `\n` ("Comments, help text, and type information").
-fn escape_help(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('\n', "\\n")
-}
-
-/// `text` as a label value: the backslash, the double quote and the line
-/// feed escaped as `\\`, `\"` and `\n` (the sample syntax's
-/// `label_value`).
-fn escape_label(text: &str) -> String {
-    text.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+impl Collector for Exposition {
+    /// The supervisor's process figures and demux, the daemon's totals,
+    /// then each worker's figures by `connection` and each stream's
+    /// counters by `stream`, in the snapshot's order (by id), so repeated
+    /// scrapes list them alike.
+    fn encode(&self, mut encoder: DescriptorEncoder<'_>) -> fmt::Result {
+        let metrics = &self.metrics;
+        let supervisor = &metrics.supervisor;
+        for (family, field) in process_families("supervisor") {
+            single(&mut encoder, &family, field(&supervisor.process))?;
+        }
+        for (family, field) in DEMUX_FAMILIES {
+            single(
+                &mut encoder,
+                &family,
+                supervisor.demux.as_ref().and_then(field),
+            )?;
+        }
+        let count = |value: usize| Number::Count(u64::try_from(value).unwrap_or(u64::MAX));
+        let totals = [
+            (
+                counter(
+                    "worker_restarts",
+                    "Worker crash restarts since the daemon started.",
+                ),
+                Number::Count(metrics.worker_restarts),
+            ),
+            (
+                gauge("sessions", "Open viewer sessions on all connections."),
+                Number::Count(u64::from(metrics.sessions)),
+            ),
+            (
+                gauge("workers", "Running workers, one per camera connection."),
+                count(self.workers),
+            ),
+            (gauge("streams", "Streams."), count(self.streams)),
+        ];
+        for (family, number) in totals {
+            single(&mut encoder, &family, Some(number))?;
+        }
+        for (family, field) in process_families("worker") {
+            let samples = metrics.workers.iter().filter_map(|(id, worker)| {
+                field(&worker.process).map(|number| (id.as_str(), number))
+            });
+            labelled(&mut encoder, &family, "connection", samples)?;
+        }
+        for (family, field) in WORKER_FAMILIES {
+            let samples = metrics
+                .workers
+                .iter()
+                .filter_map(|(id, worker)| field(worker).map(|number| (id.as_str(), number)));
+            labelled(&mut encoder, &family, "connection", samples)?;
+        }
+        for (family, field) in STREAM_FAMILIES {
+            let samples = metrics
+                .streams
+                .iter()
+                .filter_map(|(id, stats)| field(stats).map(|number| (id.as_str(), number)));
+            labelled(&mut encoder, &family, "stream", samples)?;
+        }
+        Ok(())
+    }
 }
 
 /// What one exposition left out at its caps.
@@ -431,135 +734,27 @@ pub(crate) struct LeftOut {
     pub(crate) workers: usize,
 }
 
-/// The exposition being written: one group per family, `# HELP` and
-/// `# TYPE` first, only for a family with a sample.
-struct Writer {
-    /// The text so far.
-    text: String,
-}
-
-impl Writer {
-    /// `family`'s group with `samples`, each an optional label (its name and
-    /// raw value) and a value; nothing for a family without a sample.
-    fn family<'s>(
-        &mut self,
-        family: &Family,
-        samples: impl IntoIterator<Item = (Option<(&'static str, &'s str)>, Value)>,
-    ) {
-        let mut samples = samples.into_iter().peekable();
-        if samples.peek().is_none() {
-            return;
+/// `metrics` in `format`, by the client's encoder, and what the caps left
+/// out; an error only if an encoder failed, which writing to a `String`
+/// never does.
+pub(crate) fn render(metrics: &Metrics, format: Format) -> Result<(String, LeftOut), fmt::Error> {
+    let (exposition, left_out) = Exposition::capped(metrics);
+    let mut registry = Registry::with_prefix(PREFIX);
+    registry.register_collector(Box::new(exposition));
+    let mut text = String::new();
+    match format {
+        Format::OpenMetrics(_) => prometheus_client::encoding::text::encode(&mut text, &registry),
+        Format::PrometheusText => {
+            prometheus_client::encoding::prometheus_text::encode(&mut text, &registry)
         }
-        // Writing to a `String` never fails.
-        let _written = writeln!(
-            self.text,
-            "# HELP {} {}\n# TYPE {} {}",
-            family.name,
-            escape_help(family.help),
-            family.name,
-            family.kind.as_str()
-        );
-        for (label, value) in samples {
-            let _written = match label {
-                Some((name, raw)) => writeln!(
-                    self.text,
-                    "{}{{{name}=\"{}\"}} {value}",
-                    family.name,
-                    escape_label(raw)
-                ),
-                None => writeln!(self.text, "{} {value}", family.name),
-            };
-        }
-    }
+    }?;
+    Ok((text, left_out))
 }
 
-/// `metrics` in the text format, and what the caps left out: the
-/// supervisor's process figures and demux, the daemon's totals, then each
-/// worker's figures by `connection` and each stream's counters by
-/// `stream`, in the snapshot's order (by id), so repeated scrapes list
-/// them alike.
-pub(crate) fn render(metrics: &Metrics) -> (String, LeftOut) {
-    let mut out = Writer {
-        text: String::new(),
-    };
-    let supervisor = &metrics.supervisor;
-    for (family, field) in process_families("supervisor") {
-        out.family(
-            &family,
-            field(&supervisor.process).map(|value| (None, value)),
-        );
-    }
-    for (family, field) in DEMUX_FAMILIES {
-        let value = supervisor.demux.as_ref().map(field);
-        out.family(&family, value.map(|value| (None, Value::Count(value))));
-    }
-    let workers: Vec<_> = metrics.workers.iter().take(MAX_EXPORTED_WORKERS).collect();
-    let streams: Vec<_> = metrics.streams.iter().take(MAX_EXPORTED_STREAMS).collect();
-    let totals = [
-        (
-            counter(
-                "lotse_worker_restarts_total",
-                "Worker crash restarts since the daemon started.",
-            ),
-            metrics.worker_restarts,
-        ),
-        (
-            gauge("lotse_sessions", "Open viewer sessions on all connections."),
-            u64::from(metrics.sessions),
-        ),
-        (
-            gauge(
-                "lotse_workers",
-                "Running workers, one per camera connection.",
-            ),
-            u64::try_from(metrics.workers.len()).unwrap_or(u64::MAX),
-        ),
-        (
-            gauge("lotse_streams", "Streams."),
-            u64::try_from(metrics.streams.len()).unwrap_or(u64::MAX),
-        ),
-    ];
-    for (family, value) in totals {
-        out.family(&family, [(None, Value::Count(value))]);
-    }
-    for (family, field) in process_families("worker") {
-        out.family(
-            &family,
-            workers.iter().filter_map(|(id, worker)| {
-                field(&worker.process).map(|value| (Some(("connection", id.as_str())), value))
-            }),
-        );
-    }
-    for (family, field) in WORKER_FAMILIES {
-        out.family(
-            &family,
-            workers.iter().map(|(id, worker)| {
-                (
-                    Some(("connection", id.as_str())),
-                    Value::Count(field(worker)),
-                )
-            }),
-        );
-    }
-    for (family, field) in STREAM_FAMILIES {
-        out.family(
-            &family,
-            streams
-                .iter()
-                .map(|(id, stats)| (Some(("stream", id.as_str())), Value::Count(field(stats)))),
-        );
-    }
-    let left_out = LeftOut {
-        streams: metrics.streams.len().saturating_sub(streams.len()),
-        workers: metrics.workers.len().saturating_sub(workers.len()),
-    };
-    (out.text, left_out)
-}
-
-/// The exposition of `snapshot` as the response, after a warning, at most
-/// one per interval on `limit_lines`, when the caps left anything out;
-/// 503 without a snapshot.
-fn respond(snapshot: Option<Metrics>, limit_lines: &LimitLines) -> Response {
+/// The exposition of `snapshot` in `format` as the response, after a
+/// warning, at most one per interval on `limit_lines`, when the caps left
+/// anything out; 503 without a snapshot, 500 if the encoder failed.
+fn respond(snapshot: Option<Metrics>, format: Format, limit_lines: &LimitLines) -> Response {
     let Some(metrics) = snapshot else {
         tracing::error!("metrics refused: the handler keeps no metrics");
         return closing(refuse(
@@ -568,7 +763,24 @@ fn respond(snapshot: Option<Metrics>, limit_lines: &LimitLines) -> Response {
             "no metrics",
         ));
     };
-    let (text, left_out) = render(&metrics);
+    answer(render(&metrics, format), &metrics, format, limit_lines)
+}
+
+/// The response to an exposition `rendered` from `metrics` in `format`.
+fn answer(
+    rendered: Result<(String, LeftOut), fmt::Error>,
+    metrics: &Metrics,
+    format: Format,
+    limit_lines: &LimitLines,
+) -> Response {
+    let Ok((text, left_out)) = rendered else {
+        tracing::error!("metrics refused: the exposition could not be encoded");
+        return closing(refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::InternalError,
+            "the metrics could not be encoded",
+        ));
+    };
     if left_out != LeftOut::default()
         && let Some(scrapes) = limit_lines.hit(Limit::ExportedSeries)
     {
@@ -583,14 +795,9 @@ fn respond(snapshot: Option<Metrics>, limit_lines: &LimitLines) -> Response {
             "metrics exposition capped: streams or workers beyond the cap are left out"
         );
     }
-    closing(
-        (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE))],
-            text,
-        )
-            .into_response(),
-    )
+    let content_type = HeaderValue::from_str(&format.content_type())
+        .unwrap_or_else(|_| HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"));
+    closing((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], text).into_response())
 }
 
 /// `response` with `Connection: close` (RFC 9112 §9.6).
@@ -642,7 +849,7 @@ fn refusal(
 }
 
 /// `GET /v0/metrics` (HEAD answered alike, without the body): the checks,
-/// then the handler's snapshot as the exposition.
+/// then the handler's snapshot as the exposition in the negotiated format.
 pub(crate) async fn fetch<H: Handler>(
     State(state): State<AppState<H>>,
     Extension(peer): Extension<PeerInfo>,
@@ -652,8 +859,9 @@ pub(crate) async fn fetch<H: Handler>(
     if let Some(refused) = refusal(&peer, &headers, shutting_down, state.clients.as_deref()) {
         return refused;
     }
+    let format = negotiate(&headers);
     let snapshot = state.handler.metrics_snapshot().await;
-    respond(snapshot, &state.limit_lines)
+    respond(snapshot, format, &state.limit_lines)
 }
 
 /// Any other method on the metrics path: 405 with `Allow: GET, HEAD` (RFC
@@ -725,16 +933,8 @@ mod tests {
         }
     }
 
-    /// Every sample line's metric name, in order of appearance.
-    fn sample_names(text: &str) -> Vec<&str> {
-        text.lines()
-            .filter(|line| !line.starts_with('#'))
-            .map(|line| line.split(['{', ' ']).next().unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn the_exposition_is_text_format_0_0_4_with_help_and_type_before_each_group() {
+    /// A snapshot with a figure in every family.
+    fn full() -> Metrics {
         let mut metrics = snapshot(0, 0);
         metrics.supervisor.process = process(1_500, Some(8192));
         metrics.supervisor.demux = Some(DemuxMetrics {
@@ -763,23 +963,145 @@ mod tests {
                 ..StreamStats::default()
             },
         );
-        let (text, left_out) = render(&metrics);
-        assert_eq!(left_out, LeftOut::default());
-        // "Details": line feeds, the last line ended by one.
-        assert!(text.ends_with('\n') && !text.contains('\r'));
+        metrics
+    }
+
+    fn text(metrics: &Metrics, format: Format) -> String {
+        render(metrics, format).unwrap().0
+    }
+
+    fn has(text: &str, line: &str) -> bool {
+        text.lines().any(|got| got == line)
+    }
+
+    /// The `Accept` of Prometheus 3's default scrape protocols, as
+    /// `content_negotiation.md` gives it ("Default Accept Header"; its
+    /// catch-all is `*/*`, which the page's Markdown shows as `/`).
+    const PROMETHEUS_DEFAULT: &str = "application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.3,text/plain;version=0.0.4;q=0.2,*/*;q=0.1";
+
+    fn negotiated(accept: &[&str]) -> Format {
+        let mut headers = HeaderMap::new();
+        for value in accept {
+            headers.append(header::ACCEPT, value.parse().unwrap());
+        }
+        negotiate(&headers)
+    }
+
+    #[test]
+    fn prometheus_default_accept_gets_openmetrics_1_0_0_content_negotiation_selection_of_format() {
+        assert_eq!(
+            negotiated(&[PROMETHEUS_DEFAULT]),
+            Format::OpenMetrics(Escaping::AllowUtf8)
+        );
+        for (scheme, escaping) in [
+            ("allow-utf-8", Escaping::AllowUtf8),
+            ("underscores", Escaping::Underscores),
+            ("dots", Escaping::Dots),
+            ("values", Escaping::Values),
+        ] {
+            let accept = format!(
+                "application/openmetrics-text;version=1.0.0;escaping={scheme};q=0.5,text/plain;version=0.0.4;q=0.2"
+            );
+            assert_eq!(
+                negotiated(&[&accept]),
+                Format::OpenMetrics(escaping),
+                "{scheme}"
+            );
+        }
+        // OpenMetrics without a version is its oldest, 1.0.0 (OpenMetrics
+        // 1.0, "Protocol Negotiation"); with one and no escaping, as asked.
+        for accept in [
+            "application/openmetrics-text",
+            "application/openmetrics-text;version=1.0.0",
+            "Application/OpenMetrics-Text;version=1.0.0;q=0.9",
+            "application/openmetrics-text;q=0.9,text/plain;q=0.5",
+        ] {
+            assert_eq!(
+                negotiated(&[accept]),
+                Format::OpenMetrics(Escaping::Underscores),
+                "{accept}"
+            );
+        }
+        // Two fields are one list (RFC 9110 §5.3).
+        assert_eq!(
+            negotiated(&[
+                "text/plain;version=0.0.4;q=0.1",
+                "application/openmetrics-text;q=0.9"
+            ]),
+            Format::OpenMetrics(Escaping::Underscores)
+        );
+    }
+
+    #[test]
+    fn prometheus_text_0_0_4_is_the_last_resort_content_negotiation_selection_of_format() {
+        for accept in [
+            // Prometheus limited to the text format.
+            "text/plain;version=0.0.4;q=0.2,*/*;q=0.1",
+            "text/plain",
+            "text/plain;q=0.5,application/openmetrics-text;q=0.4",
+            // A wildcard names no protocol: curl's.
+            "*/*",
+            "text/*",
+            // Offers it does not weigh higher, or none at all.
+            "text/plain;version=0.0.4;q=0.9,application/openmetrics-text;version=1.0.0;q=0.5",
+            "application/openmetrics-text;version=1.0.0;q=0,*/*",
+            "application/openmetrics-text;version=0.0.1",
+            "application/openmetrics-text;version=1.0.0;escaping=bogus",
+            "text/plain;version=1.0.0;escaping=allow-utf-8",
+            "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited",
+            "application/json",
+            // A header that does not parse is not trusted.
+            "@@@",
+            "",
+        ] {
+            assert_eq!(negotiated(&[accept]), Format::PrometheusText, "{accept}");
+        }
+        assert_eq!(negotiated(&[]), Format::PrometheusText, "no Accept");
+        let mut opaque = HeaderMap::new();
+        opaque.insert(header::ACCEPT, HeaderValue::from_bytes(b"\xff").unwrap());
+        assert_eq!(negotiate(&opaque), Format::PrometheusText, "not text");
+    }
+
+    #[test]
+    fn the_content_type_names_the_format_its_version_and_the_escaping_scheme() {
+        assert_eq!(
+            Format::PrometheusText.content_type(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        for (escaping, name) in [
+            (Escaping::AllowUtf8, "allow-utf-8"),
+            (Escaping::Underscores, "underscores"),
+            (Escaping::Dots, "dots"),
+            (Escaping::Values, "values"),
+        ] {
+            assert_eq!(escaping.as_str(), name);
+            assert_eq!(
+                Format::OpenMetrics(escaping).content_type(),
+                format!(
+                    "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping={name}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_openmetrics_exposition_has_units_counter_suffixes_and_eof_openmetrics_1_0() {
+        let text = text(&full(), Format::OpenMetrics(Escaping::AllowUtf8));
         let expected_start = "\
-# HELP lotse_supervisor_uptime_seconds Seconds since the process started.
+# HELP lotse_supervisor_uptime_seconds Time since the process started.
 # TYPE lotse_supervisor_uptime_seconds gauge
-lotse_supervisor_uptime_seconds 1.500
-# HELP lotse_supervisor_resident_memory_bytes Resident set size of the process (Rss of smaps_rollup).
-# TYPE lotse_supervisor_resident_memory_bytes gauge
-lotse_supervisor_resident_memory_bytes 8192
+# UNIT lotse_supervisor_uptime_seconds seconds
+lotse_supervisor_uptime_seconds 1.5
 ";
         assert!(text.starts_with(expected_start), "{text}");
+        assert!(text.ends_with("# EOF\n"), "{text}");
         for line in [
+            "# UNIT lotse_supervisor_resident_memory_bytes bytes",
+            "lotse_supervisor_resident_memory_bytes 8192",
             "lotse_supervisor_proportional_memory_bytes 4096",
             "lotse_supervisor_tasks 3",
-            "# TYPE lotse_demux_datagrams_received_total counter",
+            // A counter's family has no suffix, its sample `_total`.
+            "# TYPE lotse_demux_datagrams_received counter",
             "lotse_demux_datagrams_received_total 11",
             "lotse_demux_datagrams_worker_full_total 2",
             "lotse_demux_idle_wakeups_total 0",
@@ -787,24 +1109,61 @@ lotse_supervisor_resident_memory_bytes 8192
             "lotse_sessions 3",
             "lotse_workers 1",
             "lotse_streams 1",
-            "lotse_worker_uptime_seconds{connection=\"c1\"} 0.250",
+            "lotse_worker_uptime_seconds{connection=\"c1\"} 0.25",
             "lotse_worker_resident_memory_bytes{connection=\"c1\"} 4096",
             "lotse_worker_proportional_memory_bytes{connection=\"c1\"} 2048",
             "lotse_worker_tasks{connection=\"c1\"} 3",
-            "# TYPE lotse_connection_worker_restarts_total counter",
             "lotse_connection_worker_restarts_total{connection=\"c1\"} 2",
             "# TYPE lotse_worker_sessions gauge",
             "lotse_worker_sessions{connection=\"c1\"} 3",
             "lotse_worker_send_failures_total{connection=\"c1\"} 5",
             "lotse_worker_relay_unbound_total{connection=\"c1\"} 6",
             "lotse_stream_packets_lost_total{stream=\"front\"} 9",
+            "# TYPE lotse_stream_recording_bytes counter",
+            "# UNIT lotse_stream_recording_bytes bytes",
             "lotse_stream_recording_bytes_total{stream=\"front\"} 1099511627776",
-            "lotse_stream_frames_dropped_total{stream=\"front\"} 0",
         ] {
-            assert!(text.lines().any(|got| got == line), "{line}\n{text}");
+            assert!(has(&text, line), "{line}\n{text}");
         }
-        // "Grouping and sorting": one HELP and one TYPE per name, before
-        // its samples, which are one group; each name and label set once.
+        // 4 + 11 supervisor, 4 totals, 8 worker, 10 stream families, each
+        // described once.
+        let types: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("# TYPE "))
+            .collect();
+        assert_eq!(types.len(), 37);
+        assert_eq!(types.iter().collect::<HashSet<_>>().len(), 37);
+        assert_eq!(
+            text,
+            self::text(&full(), Format::OpenMetrics(Escaping::Dots)),
+            "every scheme alike"
+        );
+    }
+
+    #[test]
+    fn the_text_exposition_is_prometheus_text_0_0_4_without_units_or_eof() {
+        let text = text(&full(), Format::PrometheusText);
+        let expected_start = "\
+# HELP lotse_supervisor_uptime_seconds Time since the process started.
+# TYPE lotse_supervisor_uptime_seconds gauge
+lotse_supervisor_uptime_seconds 1.5
+";
+        assert!(text.starts_with(expected_start), "{text}");
+        assert!(
+            !text.contains("# EOF") && !text.contains("# UNIT"),
+            "{text}"
+        );
+        for line in [
+            "# TYPE lotse_demux_datagrams_received_total counter",
+            "lotse_demux_datagrams_received_total 11",
+            "# TYPE lotse_stream_recording_bytes_total counter",
+            "lotse_stream_recording_bytes_total{stream=\"front\"} 1099511627776",
+            "lotse_worker_uptime_seconds{connection=\"c1\"} 0.25",
+        ] {
+            assert!(has(&text, line), "{line}\n{text}");
+        }
+        // "Grouping and sorting": one HELP and TYPE per name, before its
+        // samples, each name and label set once; the same on every scrape.
         let mut seen = HashSet::new();
         let mut current = "";
         let mut series = HashSet::new();
@@ -815,64 +1174,63 @@ lotse_supervisor_resident_memory_bytes 8192
             } else if let Some(rest) = line.strip_prefix("# TYPE ") {
                 assert_eq!(rest.split(' ').next().unwrap(), current);
             } else {
-                assert_eq!(sample_names(line), [current], "{line}");
+                assert_eq!(line.split(['{', ' ']).next().unwrap(), current, "{line}");
                 assert!(series.insert(line.rsplit_once(' ').unwrap().0), "{line}");
             }
         }
-        // 4 + 11 supervisor, 4 totals, 8 worker, 10 stream families.
         assert_eq!(seen.len(), 37);
-        // The same snapshot, the same text.
-        assert_eq!(render(&metrics).0, text);
+        assert_eq!(text, self::text(&full(), Format::PrometheusText));
     }
 
     #[test]
     fn a_figure_the_snapshot_lacks_is_left_out_not_zero() {
-        let (text, _) = render(&snapshot(0, 1));
-        assert!(!text.contains("lotse_supervisor_resident_memory_bytes"));
-        assert!(!text.contains("lotse_demux_"), "no front door");
-        assert!(!text.contains("lotse_worker_tasks"));
-        assert!(!text.contains("lotse_stream_"), "no stream");
-        assert!(text.contains("lotse_worker_uptime_seconds{connection=\"c0\"} 0.001\n"));
-        assert!(text.contains("lotse_streams 0\n"));
+        for format in [
+            Format::PrometheusText,
+            Format::OpenMetrics(Escaping::AllowUtf8),
+        ] {
+            let text = text(&snapshot(0, 1), format);
+            assert!(!text.contains("lotse_supervisor_resident_memory_bytes"));
+            assert!(!text.contains("lotse_demux_"), "no front door");
+            assert!(!text.contains("lotse_worker_tasks"));
+            assert!(!text.contains("lotse_stream_"), "no stream");
+            assert!(
+                has(
+                    &text,
+                    "lotse_worker_uptime_seconds{connection=\"c0\"} 0.001"
+                ),
+                "{text}"
+            );
+            assert!(
+                has(&text, "lotse_supervisor_uptime_seconds 61.001"),
+                "{text}"
+            );
+            assert!(has(&text, "lotse_streams 0"), "{text}");
+        }
     }
 
     #[test]
-    fn label_values_escape_backslash_quote_and_line_feed_text_format_label_value() {
-        assert_eq!(escape_label(r#"a\b"c"#), r#"a\\b\"c"#);
-        assert_eq!(escape_label("a\nb"), r"a\nb");
-        assert_eq!(escape_label("front.door-1_x"), "front.door-1_x");
+    fn label_values_escape_backslash_quote_and_line_feed_in_both_formats() {
         let mut metrics = snapshot(0, 0);
         metrics
             .streams
             .insert("q\"\\\n".into(), StreamStats::default());
-        let (text, _) = render(&metrics);
-        assert!(
-            text.contains("lotse_stream_packets_lost_total{stream=\"q\\\"\\\\\\n\"} 0\n"),
-            "{text}"
-        );
-        assert!(
-            text.lines().all(|line| !line.is_empty()),
-            "no raw line feed"
-        );
+        for format in [
+            Format::PrometheusText,
+            Format::OpenMetrics(Escaping::AllowUtf8),
+        ] {
+            let text = text(&metrics, format);
+            assert!(
+                has(
+                    &text,
+                    "lotse_stream_packets_lost_total{stream=\"q\\\"\\\\\\n\"} 0"
+                ),
+                "{text}"
+            );
+        }
     }
 
     #[test]
-    fn help_text_escapes_backslash_and_line_feed_text_format_help() {
-        assert_eq!(escape_help("a\\b\nc \"d\""), "a\\\\b\\nc \"d\"");
-    }
-
-    #[test]
-    fn values_are_integers_or_seconds_with_three_places_as_go_parsefloat_reads() {
-        assert_eq!(Value::Count(0).to_string(), "0");
-        assert_eq!(Value::Count(u64::MAX).to_string(), "18446744073709551615");
-        assert_eq!(Value::Seconds(0).to_string(), "0.000");
-        assert_eq!(Value::Seconds(1_500).to_string(), "1.500");
-        assert_eq!(Value::Seconds(61_001).to_string(), "61.001");
-        assert_eq!(Value::Seconds(999).to_string(), "0.999");
-    }
-
-    #[test]
-    fn names_have_the_lotse_prefix_and_counters_end_in_total_prometheus_naming() {
+    fn names_have_the_lotse_prefix_counters_get_total_and_help_needs_no_escaping() {
         let mut families: Vec<Family> = process_families("supervisor")
             .into_iter()
             .chain(process_families("worker"))
@@ -884,8 +1242,7 @@ lotse_supervisor_resident_memory_bytes 8192
         let mut names = HashSet::new();
         for family in &families {
             assert!(names.insert(family.name), "{} once", family.name);
-            assert!(family.name.starts_with("lotse_"), "{}", family.name);
-            // The legacy name character set, so no name is quoted.
+            // The legacy character set, and no suffix the encoders add.
             assert!(
                 family
                     .name
@@ -894,23 +1251,22 @@ lotse_supervisor_resident_memory_bytes 8192
                 "{}",
                 family.name
             );
-            assert_eq!(
-                family.name.ends_with("_total"),
-                family.kind == Kind::Counter,
-                "{}",
-                family.name
-            );
+            assert!(!family.name.ends_with("_total"), "{}", family.name);
             assert!(!family.help.contains(['\\', '\n']), "{}", family.name);
         }
-        assert_eq!(Kind::Counter.as_str(), "counter");
-        assert_eq!(Kind::Gauge.as_str(), "gauge");
+        assert_eq!(Kind::Counter.metric_type(), MetricType::Counter);
+        assert_eq!(Kind::Gauge.metric_type(), MetricType::Gauge);
+        assert_eq!(Base::None.unit(), None);
+        assert_eq!(Base::Bytes.unit(), Some(&Unit::Bytes));
+        assert_eq!(Base::Seconds.unit(), Some(&Unit::Seconds));
+        assert_eq!(Number::millis(1_500), Number::Seconds(1.5));
     }
 
     #[test]
     fn the_exposition_stops_at_its_caps_and_says_so_once_per_interval() {
         let (logs, _guard) = crate::pairing::test_support::capture();
         let metrics = snapshot(MAX_EXPORTED_STREAMS + 2, MAX_EXPORTED_WORKERS + 1);
-        let (text, left_out) = render(&metrics);
+        let (text, left_out) = render(&metrics, Format::PrometheusText).unwrap();
         assert_eq!(
             left_out,
             LeftOut {
@@ -918,22 +1274,19 @@ lotse_supervisor_resident_memory_bytes 8192
                 workers: 1
             }
         );
-        let streams = text
-            .lines()
-            .filter(|line| line.starts_with("lotse_stream_packets_lost_total{"))
-            .count();
-        assert_eq!(streams, MAX_EXPORTED_STREAMS);
+        let count = |prefix: &str| text.lines().filter(|line| line.starts_with(prefix)).count();
+        assert_eq!(
+            count("lotse_stream_packets_lost_total{"),
+            MAX_EXPORTED_STREAMS
+        );
+        assert_eq!(count("lotse_worker_sessions{"), MAX_EXPORTED_WORKERS);
         assert!(text.contains("{stream=\"s01023\"}"));
         assert!(
             !text.contains("{stream=\"s01024\"}"),
             "by id, the first ones"
         );
-        let workers = text
-            .lines()
-            .filter(|line| line.starts_with("lotse_worker_sessions{"))
-            .count();
-        assert_eq!(workers, MAX_EXPORTED_WORKERS);
-        assert!(text.contains("lotse_streams 1026\n"), "the whole count");
+        assert!(has(&text, "lotse_streams 1026"), "the whole count");
+        assert!(has(&text, "lotse_workers 1025"), "the whole count");
 
         let clock = Arc::new(FakeClock::default());
         let lines = LimitLines::new(clock.clone());
@@ -945,22 +1298,23 @@ lotse_supervisor_resident_memory_bytes 8192
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         };
+        let format = Format::PrometheusText;
         for _ in 0..3 {
-            assert_eq!(respond(Some(metrics.clone()), &lines).status(), 200);
+            assert_eq!(respond(Some(metrics.clone()), format, &lines).status(), 200);
         }
         let logged = capped();
         assert_eq!(logged.len(), 1, "{logged:?}");
         assert!(logged[0].contains("streams_left_out=2"), "{logged:?}");
         assert!(logged[0].contains("workers_left_out=1"), "{logged:?}");
         clock.advance(lotse_core::throttle::SUMMARY_INTERVAL);
-        assert_eq!(respond(Some(metrics), &lines).status(), 200);
+        assert_eq!(respond(Some(metrics), format, &lines).status(), 200);
         let logged = capped();
         assert_eq!(logged.len(), 2, "{logged:?}");
         assert!(logged[1].ends_with("scrapes=3"), "{logged:?}");
         // Under the caps nothing is said.
-        assert_eq!(respond(Some(snapshot(3, 3)), &lines).status(), 200);
+        assert_eq!(respond(Some(snapshot(3, 3)), format, &lines).status(), 200);
         clock.advance(lotse_core::throttle::SUMMARY_INTERVAL);
-        assert_eq!(respond(Some(snapshot(3, 3)), &lines).status(), 200);
+        assert_eq!(respond(Some(snapshot(3, 3)), format, &lines).status(), 200);
         assert_eq!(capped().len(), 2);
     }
 
@@ -974,23 +1328,35 @@ lotse_supervisor_resident_memory_bytes 8192
     }
 
     #[tokio::test]
-    async fn an_exposition_is_200_in_its_content_type_and_closes_the_connection() {
+    async fn an_exposition_is_200_in_its_format_s_content_type_and_closes_the_connection() {
         let clock = Arc::new(FakeClock::default());
         let lines = LimitLines::new(clock);
-        let (status, headers, body) = body_of(respond(Some(snapshot(1, 1)), &lines)).await;
-        assert_eq!(status, 200);
-        assert_eq!(
-            headers[header::CONTENT_TYPE],
-            "text/plain; version=0.0.4; charset=utf-8"
-        );
-        assert_eq!(headers[header::CONNECTION], "close");
-        assert_eq!(body, render(&snapshot(1, 1)).0);
+        for format in [
+            Format::PrometheusText,
+            Format::OpenMetrics(Escaping::Values),
+        ] {
+            let (status, headers, body) = body_of(respond(Some(full()), format, &lines)).await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                headers[header::CONTENT_TYPE],
+                format.content_type().as_str()
+            );
+            assert_eq!(headers[header::CONNECTION], "close");
+            assert_eq!(body, text(&full(), format));
+        }
         let (logs, _guard) = crate::pairing::test_support::capture();
-        let (status, headers, body) = body_of(respond(None, &lines)).await;
+        let (status, headers, body) = body_of(respond(None, Format::PrometheusText, &lines)).await;
         assert_eq!(status, 503);
         assert_eq!(headers[header::CONNECTION], "close");
         assert!(body.contains("internal_error"), "{body}");
         assert!(logs.text().contains("the handler keeps no metrics"));
+        // An encoder that failed: nothing of it is sent.
+        let failed = answer(Err(fmt::Error), &full(), Format::PrometheusText, &lines);
+        let (status, headers, body) = body_of(failed).await;
+        assert_eq!(status, 500);
+        assert_eq!(headers[header::CONNECTION], "close");
+        assert!(body.contains("internal_error"), "{body}");
+        assert!(logs.text().contains("the exposition could not be encoded"));
     }
 
     #[tokio::test]

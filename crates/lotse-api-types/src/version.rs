@@ -39,8 +39,8 @@ macro_rules! api_version {
         /// not the route.
         pub const PAIR_PATH: &str = concat!("/v", $major, "/pair");
 
-        /// Where the daemon's metrics are read in the Prometheus text
-        /// format: `GET /v<major>/metrics`, by any client of either
+        /// Where the daemon's metrics are read, in OpenMetrics or the
+        /// Prometheus text format: `GET /v<major>/metrics`, by any client of either
         /// listener, a `metrics` client of the TLS listener included.
         pub const METRICS_PATH: &str = concat!("/v", $major, "/metrics");
     };

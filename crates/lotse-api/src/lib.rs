@@ -18,8 +18,9 @@
 //! it serves event recordings' bytes, `GET /v0/recording/{recording_id}`, as chunked
 //! response bodies the handler hands over ([`Handler::recording_body`]),
 //! bounded by the client taking them and, over TLS, by its client staying
-//! enrolled. Beside them it serves the daemon's metrics in the Prometheus
-//! text format, `GET /v0/metrics` ([`exporter`]). A TLS client's role
+//! enrolled. Beside them it serves the daemon's metrics, `GET /v0/metrics`,
+//! in OpenMetrics or the Prometheus text format as the scraper negotiates
+//! ([`exporter`]). A TLS client's role
 //! decides which routes it reaches (the `access` module): a `metrics`
 //! client only the metrics.
 //!

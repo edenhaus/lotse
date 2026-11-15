@@ -293,9 +293,12 @@ container's. What the rootless network does to this, observed on
 
 ## Metrics with Prometheus
 
-The daemon serves its metrics in the Prometheus text format at
-`GET /v0/metrics`, on the control socket and on the mutual-TLS control
-listener (`LOTSE_CONTROL_LISTEN`), never anywhere without authentication.
+The daemon serves its metrics at `GET /v0/metrics`, on the control socket
+and on the mutual-TLS control listener (`LOTSE_CONTROL_LISTEN`), never
+anywhere without authentication. The scraper's `Accept` header picks the
+format, as Prometheus negotiates it: OpenMetrics 1.0, which Prometheus asks
+for by default, or the Prometheus text format 0.0.4, the fallback for
+anything else (a wildcard included).
 They are the numbers `metrics/get` returns: the supervisor's and each
 worker's memory and tasks, the WebRTC demux's counters, and each stream's
 counters, labelled with its stream id. A Prometheus scrapes them over the

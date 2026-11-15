@@ -1856,22 +1856,29 @@ fn a_pin_fixed_with_both_roles_or_enrolled_with_the_other_stops_the_start() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// One request with `Connection: close`, and the whole answer's text.
+/// One request with `Connection: close` and the header fields `extra`
+/// (each ended by CRLF), and the whole answer's text.
 async fn answer_once<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
     connected: io::Result<S>,
     method: &str,
     path: &str,
+    extra: &str,
 ) -> String {
     let mut stream = connected.unwrap();
-    let head = format!("{method} {path} HTTP/1.1\r\nHost: lotse\r\nConnection: close\r\n\r\n");
+    let head =
+        format!("{method} {path} HTTP/1.1\r\nHost: lotse\r\n{extra}Connection: close\r\n\r\n");
     stream.write_all(head.as_bytes()).await.unwrap();
     let mut answer = Vec::new();
     within_5_s(stream.read_to_end(&mut answer)).await.unwrap();
     String::from_utf8(answer).unwrap()
 }
 
+/// The `Accept` of Prometheus 3's default scrape protocols
+/// (`content_negotiation.md`, "Default Accept Header").
+const PROMETHEUS_ACCEPT: &str = "Accept: application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.3,text/plain;version=0.0.4;q=0.2,*/*;q=0.1\r\n";
+
 #[tokio::test(flavor = "current_thread")]
-async fn either_role_and_the_socket_read_the_metrics_in_the_prometheus_text_format() {
+async fn either_role_and_the_socket_read_the_metrics_in_the_format_they_accept() {
     let control = ClientIdentity::generate().unwrap();
     let metrics = ClientIdentity::generate().unwrap();
     let (dir, data) = dirs("metrics-route");
@@ -1879,34 +1886,46 @@ async fn either_role_and_the_socket_read_the_metrics_in_the_prometheus_text_form
     let socket = || tokio::net::UnixStream::connect(running.dir.join("lotse.sock"));
     let as_metrics = || connect(running.addr, running.config(ClientCert::Own(&metrics)));
     let as_control = || connect(running.addr, running.config(ClientCert::Own(&control)));
-    for answer in [
-        answer_once(as_metrics().await, "GET", lotse_api_types::METRICS_PATH).await,
-        answer_once(as_control().await, "GET", lotse_api_types::METRICS_PATH).await,
-        answer_once(socket().await, "GET", lotse_api_types::METRICS_PATH).await,
+    let path = lotse_api_types::METRICS_PATH;
+    let text = "content-type: text/plain; version=0.0.4; charset=utf-8\r\n";
+    let openmetrics = "content-type: application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=allow-utf-8\r\n";
+    for (answer, content_type) in [
+        (answer_once(as_metrics().await, "GET", path, "").await, text),
+        (answer_once(as_control().await, "GET", path, "").await, text),
+        (answer_once(socket().await, "GET", path, "").await, text),
+        (
+            answer_once(as_metrics().await, "GET", path, PROMETHEUS_ACCEPT).await,
+            openmetrics,
+        ),
+        (
+            answer_once(socket().await, "GET", path, PROMETHEUS_ACCEPT).await,
+            openmetrics,
+        ),
     ] {
         let (head, body) = answer.split_once("\r\n\r\n").unwrap();
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
         let head = head.to_ascii_lowercase();
-        assert!(
-            head.contains("content-type: text/plain; version=0.0.4; charset=utf-8\r\n"),
-            "{head}"
-        );
+        assert!(head.contains(content_type), "{head}");
         assert!(head.contains("connection: close"), "{head}");
         assert!(
-            body.contains("lotse_supervisor_uptime_seconds 2.000\n"),
+            body.contains("lotse_supervisor_uptime_seconds 2.0\n"),
             "{body}"
         );
         assert!(
             body.contains("lotse_stream_packets_lost_total{stream=\"front\"} 9\n"),
             "{body}"
         );
+        assert_eq!(
+            body.ends_with("# EOF\n"),
+            content_type == openmetrics,
+            "{body}"
+        );
     }
     // HEAD as GET without the body; any other method 405.
-    let answer = answer_once(as_metrics().await, "HEAD", lotse_api_types::METRICS_PATH).await;
+    let answer = answer_once(as_metrics().await, "HEAD", path, "").await;
     assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
     assert!(answer.ends_with("\r\n\r\n"), "no body: {answer}");
-    let (status, body) =
-        request_once(as_metrics().await, "POST", lotse_api_types::METRICS_PATH).await;
+    let (status, body) = request_once(as_metrics().await, "POST", path).await;
     assert_eq!((status, code_of(&body)), (405, "invalid_request".into()));
     running.finish().await;
 }
