@@ -20,8 +20,8 @@ use crate::MAX_SAMPLE_BYTES;
 use crate::fragment::Sample;
 use crate::init::{NON_SYNC_SAMPLE, SYNC_SAMPLE, codecs};
 use crate::tests::{
-    FRAME, aac_track, annex_b, base, frame, h264_au, h264_codec, h264_track, h265_au, h265_codec,
-    h265_sps, h265_track, length_prefixed, ms, opus_track, read, samples,
+    FRAME, Read, aac_track, annex_b, base, frame, h264_au, h264_codec, h264_track, h265_au,
+    h265_codec, h265_sps, h265_track, length_prefixed, ms, opus_track, read, samples,
 };
 
 /// One AAC-LC frame of the 16 kHz fixture: 1024 samples, 64 ms.
@@ -90,6 +90,51 @@ fn aac(base: Instant, at: u64, ts: i64, epoch: u32, n: usize) -> Arc<MediaFrame>
 
 fn is_fragment(step: &LiveStep) -> bool {
     matches!(step, LiveStep::Fragment(_))
+}
+
+/// A sample's presentation time: its decode time plus its composition
+/// offset (ISO/IEC 14496-12 §8.8.8).
+fn pts(sample: &Read) -> i64 {
+    i64::try_from(sample.dts).unwrap() + i64::from(sample.cts)
+}
+
+/// Where a sample's presentation ends as written: its presentation time
+/// plus its duration.
+fn pts_end(sample: &Read) -> i64 {
+    pts(sample) + i64::from(sample.duration)
+}
+
+/// The video's samples and the audio's, read back.
+fn tracks(out: &Output) -> (Vec<Read>, Vec<Read>) {
+    (samples(&out.file, 1), samples(&out.file, 2))
+}
+
+/// `ms` milliseconds of the 90 kHz video timescale.
+fn video_ticks(ms: i64) -> i64 {
+    ms * 90
+}
+
+/// `ms` milliseconds of the 16 kHz audio timescale.
+fn audio_ticks(ms: i64) -> i64 {
+    ms * 16
+}
+
+/// Checks the video at the keyframe at `index` that started it again:
+/// presented where the samples before it end and decoded where their
+/// decode ends, so no gap either way; returns its presentation time.
+fn resumed_at(video: &[Read], index: usize) -> i64 {
+    let key = &video[index];
+    assert_eq!(key.flags, Some(SYNC_SAMPLE), "{video:?}");
+    let before = &video[..index];
+    let shown = before.iter().map(pts_end).max().unwrap();
+    assert_eq!(pts(key), shown, "no hole in the presentation: {video:?}");
+    let decoded = before.last().unwrap();
+    assert_eq!(
+        decoded.dts + u64::from(decoded.duration),
+        key.dts,
+        "no hole in the decode times: {video:?}"
+    );
+    pts(key)
 }
 
 #[test]
@@ -339,6 +384,208 @@ fn rfc3550_5_1_a_reconnect_starts_at_its_first_keyframe_where_the_video_ends() {
     assert_eq!(audio, [(0, 1024), (1440, 1024)]);
 }
 
+#[test]
+fn iso14496_12_8_8_12_after_audio_went_out_alone_the_video_s_last_frame_lasts_until_it_ends() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    // The video stalls; the audio goes on, and out alone, until 640 ms.
+    let alone = (1..10_u8)
+        .filter(|&i| {
+            let ts = i64::from(i) * AAC_FRAME;
+            let at = u64::from(i) * 64;
+            is_fragment(&out.push(Kind::Audio, aac(base, at, ts, 0, usize::from(i))))
+        })
+        .count();
+    assert_eq!(alone, 1, "the audio went out alone once");
+    assert!(out.skip());
+    out.push(Kind::Video, video(base, 3000, 75 * FRAME, true, 0, 2));
+    out.push(Kind::Audio, aac(base, 3010, 47 * AAC_FRAME, 0, 1));
+    out.push(Kind::Video, video(base, 3040, 76 * FRAME, false, 0, 3));
+    out.push(Kind::Audio, aac(base, 3074, 48 * AAC_FRAME, 0, 2));
+    out.push(Kind::Video, video(base, 3080, 77 * FRAME, false, 0, 4));
+    let (video, audio) = tracks(&out);
+    let key = resumed_at(&video, 2);
+    assert_eq!(
+        key,
+        video_ticks(640),
+        "the video resumes where the audio ends"
+    );
+    assert_eq!(
+        (video[1].dts, video[1].duration),
+        (3600, 54_000),
+        "the frame before the stall lasts until then"
+    );
+    assert_eq!(pts_end(&audio[9]), audio_ticks(640));
+    assert_eq!(
+        pts(&audio[10]),
+        audio_ticks(640 + 10),
+        "the audio is 10 ms after the keyframe, as captured"
+    );
+}
+
+#[test]
+fn iso14496_12_8_8_8_a_keyframe_after_reordered_video_is_presented_where_its_pictures_end() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), None);
+    // `I0 P3 B1 B2 P6 B4 B5` at 25 fps, each captured at its presentation:
+    // decoded until 400 ms, presented until 280 ms, where `P6` ends.
+    for (n, i) in [0_u8, 3, 1, 2, 6, 4, 5].into_iter().zip(0..) {
+        let at = u64::from(n) * 40;
+        out.push(
+            Kind::Video,
+            video(base, at, i64::from(n) * FRAME, n == 0, 0, i),
+        );
+    }
+    assert!(out.skip());
+    out.push(Kind::Video, video(base, 2000, 50 * FRAME, true, 0, 7));
+    out.push(Kind::Video, video(base, 2040, 51 * FRAME, false, 0, 8));
+    out.push(Kind::Video, video(base, 2080, 52 * FRAME, false, 0, 9));
+    let (video, _) = tracks(&out);
+    assert_eq!(resumed_at(&video, 7), video_ticks(280));
+    let resumed: Vec<(u64, i32)> = video[7..]
+        .iter()
+        .map(|sample| (sample.dts, sample.cts))
+        .collect();
+    assert_eq!(
+        resumed,
+        [(36_000, -10_800), (39_600, -10_800)],
+        "decoded where the video's decode ends, 120 ms after its presentation"
+    );
+}
+
+#[test]
+fn a_keyframe_captured_before_the_video_s_end_keeps_the_audio_after_it_by_capture_time() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    assert!(out.skip());
+    // Captured at 50 ms, before the video's end at 80 ms: the keyframe
+    // follows the video, and the audio 20 ms after it follows it.
+    out.push(Kind::Video, video(base, 50, 9 * FRAME, true, 0, 2));
+    out.push(Kind::Audio, aac(base, 70, 5 * AAC_FRAME, 0, 1));
+    out.push(Kind::Video, video(base, 90, 10 * FRAME, false, 0, 3));
+    out.push(Kind::Audio, aac(base, 134, 6 * AAC_FRAME, 0, 2));
+    out.push(Kind::Video, video(base, 130, 11 * FRAME, false, 0, 4));
+    let (video, audio) = tracks(&out);
+    let key = resumed_at(&video, 2);
+    assert_eq!(key, video_ticks(80));
+    assert_eq!(pts(&audio[1]), audio_ticks(80 + 20));
+}
+
+#[test]
+fn rfc3550_5_1_audio_of_a_reconnect_before_any_audio_keeps_its_place_by_capture_time() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    out.push(Kind::Video, video(base, 80, 2 * FRAME, false, 0, 2));
+    // No audio before: the writer cannot tell the reconnect's from the
+    // stream's first, which may come after the first keyframe.
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 1000, 0, 1, 0)),
+        LiveStep::Held
+    );
+    out.push(Kind::Video, video(base, 1040, 0, true, 1, 3));
+    out.push(Kind::Audio, aac(base, 1050, 10 * AAC_FRAME, 1, 1));
+    out.push(Kind::Video, video(base, 1080, FRAME, false, 1, 4));
+    out.push(Kind::Audio, aac(base, 1114, 11 * AAC_FRAME, 1, 2));
+    out.push(Kind::Video, video(base, 1120, 2 * FRAME, false, 1, 5));
+    let (video, audio) = tracks(&out);
+    // The video's last frame lasts until that audio ends, at 1064 ms.
+    let key = resumed_at(&video, 3);
+    assert_eq!(key, video_ticks(1064));
+    assert_eq!(pts(&audio[0]), audio_ticks(1000));
+    assert_eq!(
+        pts(&audio[1]),
+        audio_ticks(1064 + 10),
+        "the audio after the keyframe is 10 ms after it, as captured"
+    );
+}
+
+#[test]
+fn rfc3550_5_1_audio_of_a_reconnect_waits_for_the_video_when_the_audio_before_was_left_out() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 0, 0, 0, 0)),
+        LiveStep::Dropped,
+        "before the first keyframe"
+    );
+    out.push(Kind::Video, video(base, 16, 0, true, 0, 0));
+    out.push(Kind::Video, video(base, 56, FRAME, false, 0, 1));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 1000, 0, 1, 1)),
+        LiveStep::Dropped,
+        "a new epoch: it waits for the video's"
+    );
+    out.push(Kind::Video, video(base, 1040, 0, true, 1, 2));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 1050, 2 * AAC_FRAME, 1, 2)),
+        LiveStep::Held
+    );
+    out.push(Kind::Video, video(base, 1080, FRAME, false, 1, 3));
+    let (written, audio) = tracks(&out);
+    let key = resumed_at(&written, 2);
+    assert_eq!(key, video_ticks(80));
+    assert_eq!(audio.len(), 0, "the audio's frame is held");
+    out.push(Kind::Audio, aac(base, 1114, 3 * AAC_FRAME, 1, 3));
+    out.push(Kind::Video, video(base, 1120, 2 * FRAME, false, 1, 4));
+    let (_, audio) = tracks(&out);
+    assert_eq!(pts(&audio[0]), audio_ticks(80 + 10));
+}
+
+#[test]
+fn rfc3550_5_1_audio_of_a_reconnect_after_a_resumed_skip_waits_for_the_video_s_keyframe() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    assert!(out.skip());
+    // The video resumes in its epoch, and the audio of it with it.
+    out.push(Kind::Video, video(base, 2000, 50 * FRAME, true, 0, 2));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 2010, 40 * AAC_FRAME, 0, 1)),
+        LiveStep::Held
+    );
+    out.push(Kind::Video, video(base, 2040, 51 * FRAME, false, 0, 3));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 3000, 0, 1, 2)),
+        LiveStep::Dropped,
+        "a reconnect's audio before its video's keyframe"
+    );
+    out.push(Kind::Video, video(base, 3040, 0, true, 1, 4));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 3050, AAC_FRAME, 1, 3)),
+        LiveStep::Held
+    );
+    out.push(Kind::Video, video(base, 3080, FRAME, false, 1, 5));
+    out.push(Kind::Audio, aac(base, 3114, 2 * AAC_FRAME, 1, 4));
+    out.push(Kind::Video, video(base, 3120, 2 * FRAME, false, 1, 6));
+    let (video, audio) = tracks(&out);
+    let key = resumed_at(&video, 4);
+    assert_eq!(pts(&audio[2]), key / 90 * 16 + audio_ticks(10));
+}
+
+#[test]
+fn iso14496_12_8_8_8_the_video_s_last_frame_lasts_at_most_what_its_duration_field_holds() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    // The stream's first audio, captured 50 000 s on: past the 32 bits a
+    // sample's duration has at 90 kHz (47 721 s).
+    out.push(Kind::Audio, aac(base, 50_000_000, 0, 0, 0));
+    assert!(out.skip());
+    let (video, _) = tracks(&out);
+    assert_eq!((video[1].dts, video[1].duration), (3600, u32::MAX));
+}
+
 fn audio_alone(limits: Limits, track: &RecordingTrack, count: usize) -> (Vec<usize>, Output) {
     let base = base();
     let mut out = Output::with(LiveWriter::with_limits(limits), &h264_track(), Some(track));
@@ -372,6 +619,35 @@ fn audio_goes_out_alone_once_it_spans_the_bound_while_the_video_waits() {
     let (cuts, _) = audio_alone(limits(Duration::from_millis(512)), &aac_track(), 10);
     assert_eq!(cuts, [8], "a span of exactly the bound reaches it");
     assert_eq!(AUDIO_FRAGMENT_SPAN, Duration::from_millis(500));
+}
+
+/// Audio that goes out alone while the video waits is placed where the
+/// video's decode ends (ISO/IEC 14496-12 §8.8.12: its `tfdt` is the track's
+/// next decode time), not at the start of the media.
+#[test]
+fn iso14496_12_8_8_12_audio_out_alone_is_placed_where_the_video_s_decode_ends() {
+    let base = base();
+    let mut out = Output::with(LiveWriter::new(), &h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Video, video(base, 40, 3_600, false, 0, 1));
+    assert_eq!(out.fragments.len(), 1, "the keyframe, finished by the next");
+    let mut alone = None;
+    for i in 0..12 {
+        let n = u64::try_from(i).unwrap();
+        let ts = i64::try_from(i).unwrap() * AAC_FRAME;
+        if is_fragment(&out.push(Kind::Audio, aac(base, n * 64, ts, 0, i))) {
+            alone = out.fragments.last().cloned();
+            break;
+        }
+    }
+    let alone = alone.expect("the audio went out alone");
+    assert!(!alone.independent);
+    assert_eq!(alone.duration, Duration::ZERO, "no video in it");
+    assert_eq!(
+        alone.decode_time,
+        Duration::from_millis(40),
+        "where the video's decode ends"
+    );
 }
 
 #[test]
