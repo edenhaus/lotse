@@ -10,7 +10,8 @@
 //! start (`hls.reader`), and once the worker's `Started` comes it tells the
 //! worker a reader took it, at once and with no fetch deadline. The first
 //! record makes the window ([`Window::new`]), each later one is pushed into
-//! it, and a push that publishes a part wakes the blocked requests. The
+//! it; the window's making and a push that publishes a part wake the
+//! blocked requests. The
 //! records are untrusted: a broken one, a second init segment or a fragment
 //! before the first ends the output `internal_error`; one the window cannot
 //! hold (no keyframe within `limits.hls_window_bytes`) ends it
@@ -237,13 +238,16 @@ impl Start {
 }
 
 /// An output's window, shared by its reader, which fills it, and the
-/// requests, which read it; a publish counter wakes the blocked ones.
+/// requests, which read it; a change counter wakes the blocked ones.
 #[derive(Debug)]
 pub(crate) struct Feed {
     /// The window, from the init segment on.
     window: Mutex<Option<Window>>,
-    /// Counts the pushes that published: a change wakes every blocked
-    /// request, which asks the window again.
+    /// Counts the window's making and the pushes that published: a change
+    /// wakes every blocked request, which asks the window again. A request
+    /// may wait before the window is made (one for the init segment
+    /// between `hls/create`'s answer and the reader taking the first
+    /// record), so the making wakes too.
     published: watch::Sender<u64>,
 }
 
@@ -299,8 +303,9 @@ impl Feed {
     }
 }
 
-/// Takes one record into `window`, made by the first; whether a part was
-/// published, or the reason the output ends at the record.
+/// Takes one record into `window`, made by the first; whether a blocked
+/// request may now be answered (the window was made, or a part was
+/// published), or the reason the output ends at the record.
 fn push_record(
     window: &mut Option<Window>,
     record: Record,
@@ -312,7 +317,7 @@ fn push_record(
                 tracing::error!(%error, "LL-HLS window refused its configuration");
                 HlsCloseReason::InternalError
             })?);
-            Ok(false)
+            Ok(true)
         }
         (RecordKind::Init, Some(_)) => {
             tracing::warn!("LL-HLS records: a second init segment");

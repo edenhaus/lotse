@@ -101,10 +101,10 @@ fn feed(s: &Supervisor, live_id: &str) -> Arc<Feed> {
     Arc::clone(&s.shared.lock().hls.outputs[live_id].feed)
 }
 
-/// Waits until `live_id`'s window published `count` parts.
-async fn published(s: &Supervisor, live_id: &str, count: u64) {
+/// Waits until `live_id`'s window was made and published `parts` parts.
+async fn published(s: &Supervisor, live_id: &str, parts: u64) {
     let mut published = feed(s, live_id).published.subscribe();
-    within(published.wait_for(|n| *n >= count)).await.unwrap();
+    within(published.wait_for(|n| *n > parts)).await.unwrap();
 }
 
 fn hls_id(answer: &Value) -> HlsId {
@@ -693,6 +693,29 @@ async fn rfc8216bis_6_2_5_2_blocked_requests_are_bounded_in_number_and_time() {
     let close = json!({ "id": 7, "type": "hls/close", "hls_id": third.as_str() });
     result(call(&s, &close.to_string()).await);
     assert_eq!(within(gone).await.unwrap(), Err(HlsError::NotFound));
+    stop(&s, &clock).await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// An init segment asked for after `hls/create` answered but before the
+/// reader made the window waits for the window, and is answered as the
+/// window is made, before any part publishes: on a fake clock that never
+/// moves, nothing else would end its wait.
+#[tokio::test]
+async fn an_init_request_waiting_for_the_window_is_answered_as_the_window_is_made() {
+    let dir = private_dir("hls-init-wait");
+    let clock = Arc::new(FakeClock::from_system());
+    let (s, mut commands) = rig(&dir, HlsLimits::DEFAULT, clock.clone()).await;
+    let (live_id, mut pipe, id, _events) = first_session(&s, &mut commands).await;
+    let early = spawn_request(&s, &id, HlsRequest::Media(Resource::Init));
+    let all = HlsLimits::DEFAULT.max_blocked as usize;
+    while s.shared.lock().hls.blocked.available_permits() == all {
+        settle().await;
+    }
+    pipe.write_all(&record(RecordKind::Init, b"init")).unwrap();
+    let_assert!(Ok(Ok(HlsReply::Media(init))) = within(early).await);
+    assert_eq!(init.as_slice().concat(), b"init");
+    assert_eq!(*feed(&s, &live_id).published.borrow(), 1, "no part yet");
     stop(&s, &clock).await;
     std::fs::remove_dir_all(dir).unwrap();
 }
