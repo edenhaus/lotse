@@ -405,6 +405,30 @@ async fn a_container_that_fails_ends_the_output_internal_error() {
 }
 
 #[tokio::test]
+async fn a_container_that_fails_at_a_hole_ends_the_output_internal_error() {
+    let limits = TrackLimits {
+        max_frame_bytes: 100,
+        ..TrackLimits::default()
+    };
+    let mut rig = Rig::with(Some(h264()), None, true, limits, 8);
+    let _reader = rig.start_with(
+        spec(false, 1 << 20),
+        FakeLiveMuxerFactory {
+            fail: Some(FakeLiveFailure::Skip),
+        },
+    );
+    rig.started().await;
+    assert!(rig.lives.fetch("l1"));
+    settle().await;
+    rig.video_frame(0, true, 1);
+    settle().await;
+    assert!(!rig.video_frame(1, false, 101), "lost: a hole");
+    settle().await;
+    rig.video_frame(2, false, 1);
+    assert_eq!(rig.closed().await.0, "internal_error");
+}
+
+#[tokio::test]
 async fn after_the_fetch_an_output_without_a_keyframe_in_time_ends() {
     let (logs, _guard) = Logs::capture();
     let mut rig = Rig::new(None);
