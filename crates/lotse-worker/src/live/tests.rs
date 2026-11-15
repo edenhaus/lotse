@@ -513,6 +513,34 @@ async fn a_reader_that_falls_behind_costs_it_the_frames_up_to_the_next_keyframe_
     assert_eq!(rig.video().stats().frames, 12);
 }
 
+/// A frame lost while the container still waits for its first keyframe
+/// finishes nothing (it holds nothing) and the media starts at that
+/// keyframe all the same.
+#[tokio::test]
+async fn a_frame_lost_before_the_first_keyframe_drops_to_it_with_nothing_to_finish() {
+    let limits = TrackLimits {
+        max_frame_bytes: 100,
+        ..TrackLimits::default()
+    };
+    let mut rig = Rig::with(Some(h264()), None, true, limits, 8);
+    let reader = rig.fetched().await;
+    rig.video_frame(0, false, 1);
+    settle().await;
+    assert!(
+        !rig.video_frame(1, false, 101),
+        "over max_frame_bytes: lost"
+    );
+    settle().await;
+    rig.video_frame(2, true, 1);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h264", "frame v 0 7200 k 1"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    let (_, _, dropped, drops) = rig.closed().await;
+    assert_eq!((dropped, drops), (1, 1));
+}
+
 #[tokio::test]
 async fn a_frame_the_subscription_lost_drops_to_the_next_keyframe() {
     let limits = TrackLimits {
