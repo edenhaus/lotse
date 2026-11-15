@@ -728,6 +728,51 @@ impl TrackWriter {
         self.ready_bytes
     }
 
+    /// Whether a sample is ready for the next fragment.
+    pub(crate) const fn has_ready(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
+    /// The decode time of the first sample ready for the next fragment and
+    /// where the last one's decode ends, from the media time 0; `None` with
+    /// none ready.
+    pub(crate) fn ready_span(&self) -> Option<(Duration, Duration)> {
+        let first = self.ready.first()?;
+        let last = self.ready.last()?;
+        let end = u64::from(last.duration).saturating_add(last.dts);
+        Some((
+            duration_of(i128::from(first.dts), self.clock_rate),
+            duration_of(i128::from(end), self.clock_rate),
+        ))
+    }
+
+    /// Whether the first sample ready for the next fragment is a sync
+    /// sample (ISO/IEC 14496-12 §8.8.3.1): a video keyframe.
+    pub(crate) fn ready_starts_with_sync(&self) -> bool {
+        self.ready
+            .first()
+            .is_some_and(|sample| sample.flags == Some(SYNC_SAMPLE))
+    }
+
+    /// Where the decode of the samples finished so far ends, from the media
+    /// time 0: where the next epoch's decode begins at the earliest.
+    pub(crate) fn decode_end(&self) -> Duration {
+        duration_of(self.end, self.clock_rate)
+    }
+
+    /// Ends the current epoch here, as a reconnect would: the held sample
+    /// is finished as [`close`](Self::close) finishes it, and the next frame
+    /// starts a new epoch, anchored at its capture time and no earlier than
+    /// where the track's decode and presentation so far end, whatever its
+    /// epoch number. A live output's hole: the frames between were left
+    /// out.
+    pub(crate) fn break_epoch(&mut self) {
+        // Closing the held sample settles where the epoch's presentation
+        // ends (`close_before`); an epoch without one was closed before.
+        self.close();
+        self.epoch = None;
+    }
+
     /// Takes the samples ready for the next fragment.
     pub(crate) fn take_ready(&mut self) -> Run {
         self.ready_bytes = 0;

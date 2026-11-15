@@ -252,3 +252,10 @@ path = "fuzz_targets/webrtc_ingest.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fmp4_live"
+path = "fuzz_targets/fmp4_live.rs"
+test = false
+doc = false
+bench = false

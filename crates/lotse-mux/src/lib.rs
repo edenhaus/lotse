@@ -1,8 +1,11 @@
-//! Fragmented MP4 for event recordings: the [`RecordingMuxer`] that writes one recording's
+//! Fragmented MP4 for event recordings and live outputs: the [`RecordingMuxer`] that writes one recording's
 //! frames, H.264 or H.265 video and optionally AAC-LC or Opus audio, as
-//! one fragmented MP4 file, and the [`Factory`] the binary registers.
+//! one fragmented MP4 file, and the [`Factory`] the binary registers; and
+//! the [`LiveWriter`] that writes a live output's frames of the same codecs
+//! as an init segment and one fragment per video frame (see the `live`
+//! module), with the [`LiveFactory`] the binary registers for it.
 //!
-//! Runs in a worker, inside a recording task, on frames the worker's tracks
+//! Runs in a worker, inside a recording or live task, on frames the worker's tracks
 //! already accepted. Sans-IO and pure: every call returns the bytes it
 //! completed and the caller writes them; no I/O, no clock (the frames'
 //! capture times are the only time), no logging (the recording task logs the
@@ -42,6 +45,7 @@
 
 mod fragment;
 mod init;
+mod live;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,6 +58,7 @@ use lotse_core::{Codec, Kind, MediaFrame};
 
 use crate::fragment::TrackWriter;
 use crate::init::{AUDIO_TRACK_ID, VIDEO_TRACK_ID};
+pub use crate::live::{AUDIO_FRAGMENT_BYTES, AUDIO_FRAGMENT_SPAN, LiveFactory, LiveWriter};
 
 /// The largest frame a sample takes: far above any camera's frame
 /// (`limits.max_frame_bytes` defaults to 4 MiB), and small enough that a
@@ -267,11 +272,11 @@ impl Muxer {
             state: State::Idle,
         }
     }
+}
 
-    /// The error of a call out of order.
-    fn out_of_order(call: &str) -> RecordingError {
-        RecordingError::Failed(format!("{call} out of order"))
-    }
+/// The error of a call out of order.
+pub(crate) fn out_of_order(call: &str) -> RecordingError {
+    RecordingError::Failed(format!("{call} out of order"))
 }
 
 impl RecordingMuxer for Muxer {
@@ -281,7 +286,7 @@ impl RecordingMuxer for Muxer {
         audio: Option<&RecordingTrack>,
     ) -> Result<Vec<Bytes>, RecordingError> {
         if !matches!(self.state, State::Idle) {
-            return Err(Self::out_of_order("start"));
+            return Err(out_of_order("start"));
         }
         let init = init::init_segment(video, audio)?;
         self.state = State::Running(Box::new(Recording::new(video, audio)));
@@ -298,7 +303,7 @@ impl RecordingMuxer for Muxer {
 
     fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, RecordingError> {
         let State::Running(recording) = &mut self.state else {
-            return Err(Self::out_of_order("push"));
+            return Err(out_of_order("push"));
         };
         let bytes = frame.payload.len();
         if bytes > self.limits.sample_bytes {
@@ -345,7 +350,7 @@ impl RecordingMuxer for Muxer {
     fn finish(&mut self) -> Result<Vec<Bytes>, RecordingError> {
         let State::Running(mut recording) = std::mem::replace(&mut self.state, State::Finished)
         else {
-            return Err(Self::out_of_order("finish"));
+            return Err(out_of_order("finish"));
         };
         recording.finish()
     }

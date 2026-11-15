@@ -1,5 +1,5 @@
 //! The muxer's fixtures, in `crates/lotse-mux/testdata/`: whole recordings
-//! (init segment and fragments) made here through the public API from the
+//! and a live output (init segment and fragments) made here through the public API from the
 //! codec crate's test data (its hand-built parameter sets and recorded
 //! AAC) and from synthetic frames (slices of a few bytes, B-frame order,
 //! Opus packets of one 20 ms CELT frame).
@@ -31,9 +31,10 @@ use bytes::Bytes;
 use lotse_codec::aac::test_data::{CONFIG_16K_MONO, SINE_16K_MONO, frames};
 use lotse_codec::{h264, h265};
 use lotse_core::clock::{Clock as _, FakeClock};
+use lotse_core::live::{LiveMuxer as _, LiveStep};
 use lotse_core::recording::{RecordingMuxer as _, RecordingPolicy, RecordingTrack};
 use lotse_core::{Codec, Kind, MediaFrame, MediaTime};
-use lotse_mux::Muxer;
+use lotse_mux::{LiveWriter, Muxer};
 use mp4_atom::{Any, Decode as _};
 use serde_json::Value;
 
@@ -44,11 +45,12 @@ const FRAME: i64 = 3600;
 type Make = fn() -> Vec<u8>;
 
 /// The fixtures by file name.
-const FIXTURES: [(&str, Make); 4] = [
+const FIXTURES: [(&str, Make); 5] = [
     ("h264_aac.mp4", h264_aac),
     ("h265.mp4", h265),
     ("h264_opus.mp4", h264_opus),
     ("h264_bframes.mp4", h264_bframes),
+    ("live_h264_aac.mp4", live_h264_aac),
 ];
 
 fn path(name: &str) -> PathBuf {
@@ -102,18 +104,52 @@ fn recording(video: &RecordingTrack, audio: Option<&RecordingTrack>, frames: Vec
     };
     write(muxer.start(video, audio).unwrap());
     for frame in frames {
-        let media = MediaFrame {
-            ts: MediaTime::from_ticks(frame.ts),
-            wallclock: base + frame.after,
-            arrival: base + frame.after,
-            keyframe: frame.keyframe,
-            discontinuity: false,
-            epoch: 0,
-            payload: frame.payload,
-        };
-        write(muxer.push(frame.kind, Arc::new(media)).unwrap());
+        write(muxer.push(frame.kind, media(base, frame)).unwrap());
     }
     write(muxer.finish().unwrap());
+    file
+}
+
+/// The frame `frame` captured at `base` plus its offset.
+fn media(base: Instant, frame: At) -> Arc<MediaFrame> {
+    Arc::new(MediaFrame {
+        ts: MediaTime::from_ticks(frame.ts),
+        wallclock: base + frame.after,
+        arrival: base + frame.after,
+        keyframe: frame.keyframe,
+        discontinuity: false,
+        epoch: 0,
+        payload: frame.payload,
+    })
+}
+
+/// The live output of `video`, `audio` and `frames` ([`merged`]) as one
+/// file, its reader having fallen behind once, at `skip_at`: the frames
+/// held then go out, and the writer leaves out the rest up to the next
+/// keyframe.
+fn live(
+    video: &RecordingTrack,
+    audio: Option<&RecordingTrack>,
+    frames: Vec<At>,
+    skip_at: Duration,
+) -> Vec<u8> {
+    let base: Instant = FakeClock::from_system().now();
+    let mut writer = LiveWriter::new();
+    let mut file = writer.start(video, audio).unwrap().bytes.to_vec();
+    let mut skipped = false;
+    for frame in merged(frames) {
+        if !skipped && frame.after >= skip_at {
+            skipped = true;
+            for piece in writer.skip().unwrap().into_iter().flat_map(|out| out.bytes) {
+                file.extend_from_slice(&piece);
+            }
+        }
+        if let LiveStep::Fragment(fragment) = writer.push(frame.kind, media(base, frame)).unwrap() {
+            for piece in fragment.bytes {
+                file.extend_from_slice(&piece);
+            }
+        }
+    }
     file
 }
 
@@ -167,31 +203,56 @@ fn h264_frames(order: &[u32], first_ms: u64, gop: u32) -> Vec<At> {
         .collect()
 }
 
-/// H.264 for 3 s with a keyframe every 2 s, from 16 ms on, and AAC-LC
-/// at 16 kHz mono from 0 ms on: 75 access units and 47 AAC frames, the
-/// first captured before the first keyframe.
-fn h264_aac() -> Vec<u8> {
-    let order: Vec<u32> = (0..75).collect();
-    let mut all = h264_frames(&order, 16, 50);
-    let aac = frames(SINE_16K_MONO);
-    for j in 0..47_u32 {
-        all.push(At {
-            kind: Kind::Audio,
-            after: Duration::from_millis(u64::from(j) * 64),
-            ts: i64::from(j) * 1024,
-            keyframe: true,
-            payload: Bytes::copy_from_slice(aac[usize::try_from(j).unwrap() % aac.len()]),
-        });
-    }
-    let audio = RecordingTrack {
+/// The AAC-LC track of the fixtures: 16 kHz mono.
+fn aac_track() -> RecordingTrack {
+    RecordingTrack {
         codec: Codec::AacLc {
             sample_rate: 16_000,
             channels: 1,
             config: Bytes::from_static(&CONFIG_16K_MONO),
         },
         clock_rate: 16_000,
-    };
-    recording(&h264_track(), Some(&audio), all)
+    }
+}
+
+/// `count` AAC-LC frames of 64 ms from 0 ms on.
+fn aac_frames(count: u32) -> Vec<At> {
+    let aac = frames(SINE_16K_MONO);
+    (0..count)
+        .map(|j| At {
+            kind: Kind::Audio,
+            after: Duration::from_millis(u64::from(j) * 64),
+            ts: i64::from(j) * 1024,
+            keyframe: true,
+            payload: Bytes::copy_from_slice(aac[usize::try_from(j).unwrap() % aac.len()]),
+        })
+        .collect()
+}
+
+/// A live output of H.264 for 3 s with a keyframe every second, from 16 ms
+/// on, and AAC-LC at 16 kHz mono from 0 ms on, whose reader fell behind at
+/// 1.5 s: the frames up to the keyframe at 2 s are left out, and the
+/// output goes on from where its video ended.
+fn live_h264_aac() -> Vec<u8> {
+    let order: Vec<u32> = (0..75).collect();
+    let mut all = h264_frames(&order, 16, 25);
+    all.extend(aac_frames(47));
+    live(
+        &h264_track(),
+        Some(&aac_track()),
+        all,
+        Duration::from_millis(1500),
+    )
+}
+
+/// H.264 for 3 s with a keyframe every 2 s, from 16 ms on, and AAC-LC
+/// at 16 kHz mono from 0 ms on: 75 access units and 47 AAC frames, the
+/// first captured before the first keyframe.
+fn h264_aac() -> Vec<u8> {
+    let order: Vec<u32> = (0..75).collect();
+    let mut all = h264_frames(&order, 16, 50);
+    all.extend(aac_frames(47));
+    recording(&h264_track(), Some(&aac_track()), all)
 }
 
 /// H.265 for 2 s at 25 fps with a keyframe every second.
@@ -449,5 +510,39 @@ fn ffprobe_iso14496_12_8_8_8_1_reads_negative_composition_offsets_in_presentatio
             .iter()
             .any(|packet| packet.0 - packet.1 < first.0 - first.1),
         "no negative composition offset"
+    );
+}
+
+#[test]
+#[ignore = "needs ffprobe on PATH: mise run interop"]
+fn ffprobe_iso14496_12_8_8_reads_a_live_output_s_one_frame_fragments_without_a_hole() {
+    let probe = ffprobe("live_h264_aac.mp4");
+    let video = stream(&probe, 0);
+    assert_eq!(video["codec_name"], "h264");
+    assert_eq!(stream(&probe, 1)["codec_name"], "aac");
+    let video = packets(&probe, 0);
+    // The 38 frames before the reader fell behind at 1.5 s (the first at
+    // 16 ms, the last at 1496 ms, held then and sent with the skip), then
+    // the 25 from the keyframe at 2016 ms on but the last, still held.
+    assert_eq!(video.len(), 38 + 24);
+    assert_eq!(video[0], (0, 0, true), "the first keyframe is media time 0");
+    let keyframes: Vec<usize> = (0..video.len()).filter(|&i| video[i].2).collect();
+    assert_eq!(keyframes, [0, 25, 38]);
+    assert!(
+        video.windows(2).all(|pair| pair[1].1 - pair[0].1 == FRAME),
+        "the decode times run on through the hole"
+    );
+    let file = std::fs::read(path("live_h264_aac.mp4")).unwrap();
+    let mut rest = file.as_slice();
+    let mut video_per_fragment = Vec::new();
+    while !rest.is_empty() {
+        if let Any::Moof(moof) = Any::decode(&mut rest).unwrap() {
+            let video = moof.traf.iter().find(|traf| traf.tfhd.track_id == 1);
+            video_per_fragment.push(video.map_or(0, |traf| traf.trun[0].samples.len()));
+        }
+    }
+    assert!(
+        video_per_fragment.iter().all(|&count| count <= 1),
+        "one video frame per fragment: {video_per_fragment:?}"
     );
 }

@@ -18,6 +18,16 @@
 //!
 //! The parameter sets are in the sample entry; which of them the samples
 //! keep is the fragments' business (see [`crate::fragment`]).
+//!
+//! The `codecs` parameter of the MIME type (RFC 6381 §3) names each sample
+//! entry as a player checks it before it plays a byte: `avc1.PPCCLL` with
+//! the SPS's profile, constraint flags and level in hex (RFC 6381 §3.3),
+//! `hvc1` with the profile space, profile, compatibility flags, tier,
+//! level and constraint flags of ISO/IEC 14496-15 Annex E.3, `mp4a.40.2`
+//! for AAC-LC (RFC 6381 §3.3: the `objectTypeIndication` in hex, then the
+//! audio object type in decimal) and `Opus`, the sample entry's four
+//! characters (RFC 6381 §3.3: "the first element is the sample
+//! description entry four-character code"; Opus in ISOBMFF §4.3.1).
 
 use bytes::Bytes;
 use lotse_codec::h265::nal::{PPS_NUT, SPS_NUT, VPS_NUT};
@@ -32,6 +42,10 @@ use mp4_atom::{
 };
 
 use crate::encode_failed;
+
+/// The audio object type of AAC-LC (ISO/IEC 14496-3 §1.5.1.1, Table 1.17),
+/// the last element of its `codecs` entry (RFC 6381 §3.3).
+const AAC_LC_OBJECT_TYPE: u8 = 2;
 
 /// The track ID of the video track (ISO/IEC 14496-12 §8.3.2, `track_ID`).
 pub(crate) const VIDEO_TRACK_ID: u32 = 1;
@@ -390,6 +404,82 @@ fn audio_entry(codec: &Codec) -> Result<SampleEntry, RecordingError> {
             btrt: None,
         }
         .into()),
+        other => Err(RecordingError::Unsupported(other.family())),
+    }
+}
+
+/// The `codecs` parameter of a file of `video` and, when it has one,
+/// `audio` (see the module): one entry per sample entry, comma-separated
+/// (RFC 6381 §3.2).
+pub(crate) fn codecs(video: &Codec, audio: Option<&Codec>) -> Result<String, RecordingError> {
+    let mut entries = vec![video_codecs(video)?];
+    if let Some(audio) = audio {
+        entries.push(audio_codecs(audio)?);
+    }
+    Ok(entries.join(","))
+}
+
+/// The `codecs` entry of the video sample entry.
+fn video_codecs(codec: &Codec) -> Result<String, RecordingError> {
+    match codec {
+        Codec::H264 { sps: Some(sps), .. } => {
+            let info = h264::parse_sps(sps)
+                .map_err(|err| RecordingError::Failed(format!("h264 sps: {err}")))?;
+            let [profile, constraints, level] = info.profile_level_id;
+            Ok(format!("avc1.{profile:02x}{constraints:02x}{level:02x}"))
+        }
+        Codec::H265 { sps: Some(sps), .. } => {
+            let info = h265::parse_sps(sps)
+                .map_err(|err| RecordingError::Failed(format!("h265 sps: {err}")))?;
+            Ok(hvc1_codecs(&info))
+        }
+        other => Err(RecordingError::Unsupported(other.family())),
+    }
+}
+
+/// The `hvc1` entry of ISO/IEC 14496-15 Annex E.3: `general_profile_space`
+/// as nothing, `A`, `B` or `C`, then `general_profile_idc` in decimal; the
+/// 32 compatibility flags in reverse bit order in hex; `L` or `H` for the
+/// tier, then `general_level_idc` in decimal; then each of the six bytes
+/// of constraint flags in hex, the trailing zero bytes left out.
+fn hvc1_codecs(info: &h265::SpsInfo) -> String {
+    let space = match info.profile_space {
+        1 => "A",
+        2 => "B",
+        3 => "C",
+        _ => "",
+    };
+    // `compatibility` has flag 0 in its most significant bit, Annex E.3
+    // wants it in the least.
+    let compatibility = info.compatibility.reverse_bits();
+    let tier = if info.high_tier { 'H' } else { 'L' };
+    let head = format!(
+        "hvc1.{space}{}.{compatibility:X}.{tier}{}",
+        info.profile_idc, info.level_idc
+    );
+    let kept = info
+        .constraint_flags
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |last| last.saturating_add(1));
+    let flags = info
+        .constraint_flags
+        .iter()
+        .take(kept)
+        .map(|byte| format!("{byte:02X}"));
+    std::iter::once(head)
+        .chain(flags)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The `codecs` entry of the audio sample entry.
+fn audio_codecs(codec: &Codec) -> Result<String, RecordingError> {
+    match codec {
+        Codec::AacLc { .. } => Ok(format!(
+            "mp4a.{OBJECT_TYPE_MPEG4_AUDIO:02x}.{AAC_LC_OBJECT_TYPE}"
+        )),
+        Codec::Opus { .. } => Ok("Opus".to_owned()),
         other => Err(RecordingError::Unsupported(other.family())),
     }
 }
