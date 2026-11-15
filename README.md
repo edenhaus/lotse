@@ -216,6 +216,77 @@ needs the camera's parameter sets.
 - **Limits.** `limits.max_live` (16) outputs at once and
   `limits.max_live_per_stream` (8) per stream; one more is `limit_reached`.
 
+## LL-HLS
+
+Where a player wants a playlist rather than one fMP4 body (a native HLS
+player, one without Media Source Extensions), a client plays the stream as
+Low-Latency HLS (draft-pantos-hls-rfc8216bis-22):
+
+```json
+{ "id": 8, "type": "hls/create", "stream_id": "front", "audio": true }
+```
+
+The result names the session, the MIME type of its segments with their
+`codecs`, and its Media Playlist:
+
+```json
+{ "hls_id": "01JE…", "mime": "video/mp4; codecs=\"avc1.640028,mp4a.40.2\"", "playlist": "/v0/hls/01JE…/index.m3u8" }
+```
+
+`GET /v0/hls/{hls_id}/index.m3u8` on the same socket (or the mTLS listener)
+is the playlist; it names `init.mp4`, the segments `seg{msn}.m4s` and the
+parts `part{msn}.{index}.m4s` relative to itself. The client proxies them to
+the player; the daemon refuses a request that carries `Origin`.
+
+- **One window per stream.** The sessions of one stream and `audio` choice
+  share one live output, which the daemon reads itself into a window of
+  segments and parts: the first `hls/create` starts it and waits, as
+  `live/create` does, for the init segment; later ones join at once. A
+  segment starts with a keyframe and lasts `limits.hls_segment_target_ms`
+  (1 s) or the camera's keyframe interval if that is longer; a part is the
+  whole frames that fit `limits.hls_part_target_ms` (200 ms). The playlist
+  lists 6 segments and the parts of the last three Target Durations.
+- **Latency.** A player starts three parts behind the playlist's end
+  (`PART-HOLD-BACK`, three Part Target Durations: about 600 ms with the
+  default), so it plays a little under a second behind the camera, one
+  frame interval more since a frame waits for the next to know its
+  duration. Lower part targets lower it at the price of more requests: a
+  player makes a blocking playlist request and a part request per part.
+- **Blocking requests.** `index.m3u8?_HLS_msn=M&_HLS_part=N` is held until
+  the playlist holds that part (a Blocking Playlist Reload), and so is a
+  request for the part the playlist's `EXT-X-PRELOAD-HINT` names, or any
+  request before the first segment completes. A held request is answered
+  503 `source_timeout` after three Target Durations; `limits.max_hls_blocked_per_session`
+  (4: the reload and the part a player holds, twice) and
+  `limits.max_hls_blocked` (128) bound how many wait at once, past which a
+  request is 429 `limit_reached`. A directive asking too far ahead is 400.
+- **Answers.** The playlist is `application/vnd.apple.mpegurl` with
+  `Cache-Control: no-cache`, a segment or part `video/mp4` with
+  `max-age=60`; each has its `Content-Length`, and each response closes its
+  connection: a player holds a few at once. A name the window no longer
+  holds is 404 `hls_resource_not_found`, a session that is gone 404
+  `hls_not_found`.
+- **The end.** A session ends on `hls/close` (`closed`), when the control
+  connection that created it closes or unsubscribes (`session_closed`),
+  without a request for `limits.hls_idle_timeout_ms` (30 s: a player asks
+  several times a second; `idle`), or with its output, whose `closed`
+  carries the live output's reasons, or `window_full` when the stream sends
+  no keyframe within `limits.hls_window_bytes`. The output ends when its
+  last session leaves.
+- **Limits.** `limits.max_hls_outputs` (8, each also a live output under
+  `limits.max_live`) windows of at most `limits.hls_window_bytes` (32 MiB:
+  seven 2 s segments of a 16 Mbit/s stream) each, so at most 256 MiB of
+  media in the daemon; `limits.max_hls_sessions` (32) and
+  `limits.max_hls_sessions_per_stream` (8) sessions; one more is
+  `limit_reached` naming the limit.
+- **Deviations from the draft.** The Target Duration and Part Target
+  Duration rise when a camera's keyframe interval grows or its frame rate
+  falls, where §6.2.1 says they never change (the alternative breaks their
+  upper bounds); the window's segment count and byte cap drop a segment
+  even when the playlist then lasts less than three Target Durations
+  (§6.2.2); and the playlist has no `EXT-X-PROGRAM-DATE-TIME` (Appendix
+  B.1), there being one rendition and no wall clock in the window.
+
 ## Running in a container
 
 The release image (`ghcr.io/<owner>/lotse`, built from `Dockerfile`)

@@ -9,7 +9,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -19,8 +19,8 @@ use clap::parser::ValueSource;
 use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::{Mode, SandboxConfig};
 use lotse_supervisor::{
-    AdvertisedAddress, ControlTls, DEFAULT_CONNECT_CONCURRENCY, Limits, LiveLimits, MAX_ADVERTISED,
-    RecordingLimits, SHUTDOWN_BUDGET,
+    AdvertisedAddress, ControlTls, DEFAULT_CONNECT_CONCURRENCY, HlsLimits, Limits, LiveLimits,
+    MAX_ADVERTISED, RecordingLimits, SHUTDOWN_BUDGET,
 };
 use serde::Deserialize;
 
@@ -391,6 +391,24 @@ struct LimitsFile {
     max_live: Option<u32>,
     /// `limits.max_live_per_stream`.
     max_live_per_stream: Option<u32>,
+    /// `limits.max_hls_outputs`.
+    max_hls_outputs: Option<u32>,
+    /// `limits.max_hls_sessions`.
+    max_hls_sessions: Option<u32>,
+    /// `limits.max_hls_sessions_per_stream`.
+    max_hls_sessions_per_stream: Option<u32>,
+    /// `limits.hls_window_bytes`; zero is refused.
+    hls_window_bytes: Option<NonZeroU32>,
+    /// `limits.hls_part_target_ms`; zero is refused.
+    hls_part_target_ms: Option<NonZeroU64>,
+    /// `limits.hls_segment_target_ms`.
+    hls_segment_target_ms: Option<u64>,
+    /// `limits.hls_idle_timeout_ms`; zero is refused.
+    hls_idle_timeout_ms: Option<NonZeroU64>,
+    /// `limits.max_hls_blocked_per_session`.
+    max_hls_blocked_per_session: Option<u32>,
+    /// `limits.max_hls_blocked`.
+    max_hls_blocked: Option<u32>,
 }
 
 /// `[stream]` in the file.
@@ -557,11 +575,97 @@ impl Resolver<'_> {
             ),
             recordings: RecordingLimits::NONE,
             live: LiveLimits::NONE,
+            hls: None,
         };
+        let hls = self.hls_limits(args, file);
         Limits {
             recordings: self.recording_limits(args, file, limits.worker_address_space),
             live: self.live_limits(args, file),
+            // Resolved, and so reported, in every build; held only in one
+            // with LL-HLS.
+            hls: cfg!(feature = "output-hls").then_some(hls),
             ..limits
+        }
+    }
+
+    /// The LL-HLS limits of the `[limits]` group, defaults
+    /// [`HlsLimits::DEFAULT`]; the supervisor holds them when the build has
+    /// LL-HLS and a live container.
+    fn hls_limits(&mut self, args: &ServeArgs, file: &LimitsFile) -> HlsLimits {
+        let default = HlsLimits::DEFAULT;
+        let nonzero = |value: u64| NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN);
+        HlsLimits {
+            max_outputs: self.pick(
+                "limits.max_hls_outputs",
+                "max_hls_outputs",
+                args.max_hls_outputs,
+                file.max_hls_outputs,
+                default.max_outputs,
+            ),
+            max_sessions: self.pick(
+                "limits.max_hls_sessions",
+                "max_hls_sessions",
+                args.max_hls_sessions,
+                file.max_hls_sessions,
+                default.max_sessions,
+            ),
+            max_sessions_per_stream: self.pick(
+                "limits.max_hls_sessions_per_stream",
+                "max_hls_sessions_per_stream",
+                args.max_hls_sessions_per_stream,
+                file.max_hls_sessions_per_stream,
+                default.max_sessions_per_stream,
+            ),
+            window_bytes: self
+                .pick(
+                    "limits.hls_window_bytes",
+                    "hls_window_bytes",
+                    args.hls_window_bytes,
+                    file.hls_window_bytes,
+                    NonZeroU32::new(default.window_bytes).unwrap_or(NonZeroU32::MIN),
+                )
+                .get(),
+            part_target: Duration::from_millis(
+                self.pick(
+                    "limits.hls_part_target_ms",
+                    "hls_part_target_ms",
+                    args.hls_part_target_ms,
+                    file.hls_part_target_ms,
+                    nonzero(millis(default.part_target)),
+                )
+                .get(),
+            ),
+            segment_target: Duration::from_millis(self.pick(
+                "limits.hls_segment_target_ms",
+                "hls_segment_target_ms",
+                args.hls_segment_target_ms,
+                file.hls_segment_target_ms,
+                millis(default.segment_target),
+            )),
+            idle_timeout: Duration::from_millis(
+                self.pick(
+                    "limits.hls_idle_timeout_ms",
+                    "hls_idle_timeout_ms",
+                    args.hls_idle_timeout_ms,
+                    file.hls_idle_timeout_ms,
+                    nonzero(millis(default.idle_timeout)),
+                )
+                .get(),
+            ),
+            max_blocked_per_session: self.pick(
+                "limits.max_hls_blocked_per_session",
+                "max_hls_blocked_per_session",
+                args.max_hls_blocked_per_session,
+                file.max_hls_blocked_per_session,
+                default.max_blocked_per_session,
+            ),
+            max_blocked: self.pick(
+                "limits.max_hls_blocked",
+                "max_hls_blocked",
+                args.max_hls_blocked,
+                file.max_hls_blocked,
+                default.max_blocked,
+            ),
         }
     }
 
@@ -1214,6 +1318,98 @@ mod tests {
             source_of(&provenance, "limits.live_buffer_bytes"),
             ("1024".into(), Source::Flag)
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_hls_limits_come_from_flags_over_the_file_over_the_defaults() {
+        let (settings, provenance) = resolve(&["lotse", "serve", "--socket", "/s"]).unwrap();
+        assert_eq!(
+            settings.supervisor.limits.hls,
+            cfg!(feature = "output-hls").then_some(HlsLimits::DEFAULT)
+        );
+        assert_eq!(
+            source_of(&provenance, "limits.hls_idle_timeout_ms"),
+            ("30000".into(), Source::Default)
+        );
+        let dir = std::env::temp_dir().join(format!("lotse-config-hls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lotse.toml");
+        std::fs::write(
+            &path,
+            "socket = \"/s\"\n[limits]\nmax_hls_outputs = 2\nmax_hls_sessions = 6\n\
+             max_hls_sessions_per_stream = 3\nhls_window_bytes = 1048576\n\
+             hls_part_target_ms = 300\nhls_segment_target_ms = 2000\n\
+             hls_idle_timeout_ms = 5000\nmax_hls_blocked_per_session = 2\nmax_hls_blocked = 12\n",
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+        let (settings, provenance) = resolve(&["lotse", "serve", "--config", config]).unwrap();
+        let expected = HlsLimits {
+            max_outputs: 2,
+            max_sessions: 6,
+            max_sessions_per_stream: 3,
+            window_bytes: 1 << 20,
+            part_target: Duration::from_millis(300),
+            segment_target: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(5),
+            max_blocked_per_session: 2,
+            max_blocked: 12,
+        };
+        assert_eq!(
+            settings.supervisor.limits.hls,
+            cfg!(feature = "output-hls").then_some(expected)
+        );
+        for (name, value) in [
+            ("limits.max_hls_outputs", "2"),
+            ("limits.max_hls_sessions", "6"),
+            ("limits.max_hls_sessions_per_stream", "3"),
+            ("limits.hls_window_bytes", "1048576"),
+            ("limits.hls_part_target_ms", "300"),
+            ("limits.hls_segment_target_ms", "2000"),
+            ("limits.hls_idle_timeout_ms", "5000"),
+            ("limits.max_hls_blocked_per_session", "2"),
+            ("limits.max_hls_blocked", "12"),
+        ] {
+            assert_eq!(
+                source_of(&provenance, name),
+                (value.into(), Source::File),
+                "{name}"
+            );
+        }
+        let (_flagged, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--config",
+            config,
+            "--hls-part-target-ms",
+            "100",
+            "--max-hls-blocked",
+            "1",
+        ])
+        .unwrap();
+        for (name, value) in [
+            ("limits.hls_part_target_ms", "100"),
+            ("limits.max_hls_blocked", "1"),
+        ] {
+            assert_eq!(
+                source_of(&provenance, name),
+                (value.into(), Source::Flag),
+                "{name}"
+            );
+        }
+        for zero in [
+            "--hls-part-target-ms",
+            "--hls-window-bytes",
+            "--hls-idle-timeout-ms",
+        ] {
+            assert!(
+                Cli::command()
+                    .try_get_matches_from(["lotse", "serve", "--socket", "/s", zero, "0"])
+                    .is_err(),
+                "{zero} 0 is refused"
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -1,7 +1,7 @@
 //! The identifiers a client and the daemon exchange: [`StreamId`],
-//! [`SessionId`], [`RecordingId`] and [`LiveId`]. All match `^[A-Za-z0-9._-]{1,128}$`,
+//! [`SessionId`], [`RecordingId`], [`LiveId`] and [`HlsId`]. All match `^[A-Za-z0-9._-]{1,128}$`,
 //! checked on construction so an invalid id never exists inside the daemon;
-//! a [`RecordingId`] and a [`LiveId`] are path segments of their bytes' routes besides, so each is
+//! a [`RecordingId`], a [`LiveId`] and an [`HlsId`] are path segments of their bytes' routes besides, so each is
 //! never `.` or `..`, which URL resolution would remove (RFC 3986 §3.3,
 //! §5.2.4). The API maps [`IdError`] to `invalid_stream_id` or
 //! `invalid_request`.
@@ -141,6 +141,16 @@ identifier! {
 }
 
 identifier! {
+    /// The id of an LL-HLS session (`hls_id` in the API), which names its
+    /// routes, `/v0/hls/{hls_id}/{name}`, and so is never a dot segment.
+    /// Always a ULID the daemon generates; a request's path is checked
+    /// against the identifier pattern before anything looks it up.
+    HlsId,
+    validate_segment,
+    "`^[A-Za-z0-9._-]{1,128}$`, `.` and `..` excepted"
+}
+
+identifier! {
     /// The id of an event recording (`recording_id` in the API), which names its
     /// bytes' route, `/v0/recording/{recording_id}`, and so is never a dot segment.
     /// The client passes its own; the daemon generates a ULID when it does
@@ -204,6 +214,16 @@ mod tests {
         assert_eq!(LiveId::new("..").unwrap_err(), IdError::DotSegment(".."));
         assert_eq!(
             LiveId::new("a/b").unwrap_err(),
+            IdError::InvalidChar { ch: '/', index: 1 }
+        );
+    }
+
+    #[test]
+    fn rfc3986_3_3_an_hls_id_is_a_path_segment_never_a_dot_one() {
+        assert_eq!(HlsId::new("01JH").unwrap().as_str(), "01JH");
+        assert_eq!(HlsId::new(".").unwrap_err(), IdError::DotSegment("."));
+        assert_eq!(
+            HlsId::new("a/b").unwrap_err(),
             IdError::InvalidChar { ch: '/', index: 1 }
         );
     }

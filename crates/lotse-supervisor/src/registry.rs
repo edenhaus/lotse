@@ -410,6 +410,8 @@ pub(crate) struct State {
     /// The warning of a `live/create` refused at a limit, which a client
     /// can repeat: the first, then a summary per interval.
     pub(crate) full_lives: Throttle,
+    /// The LL-HLS outputs and sessions.
+    pub(crate) hls: crate::hls::Hls,
     /// The demux's sessions; `None` without a front door (tests).
     pub(crate) registrations: Option<Arc<Registrations>>,
     /// The signaled sources' signaling: subscriptions, opens and signals.

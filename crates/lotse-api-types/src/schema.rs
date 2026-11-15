@@ -35,6 +35,7 @@ mod generator {
     use crate::clients::ClientList;
     use crate::command::Command;
     use crate::frame::{Empty, EventFrame, Failure, Hello, Pong, Shutdown, Success};
+    use crate::hls::{HlsCreateResult, HlsEvent};
     use crate::info::{InfoResult, Metrics};
     use crate::live::{LiveCreateResult, LiveEvent};
     use crate::pairing::PairingCreateResult;
@@ -92,6 +93,7 @@ mod generator {
             "signaling/candidate",
             "signaling/error",
             "live/close",
+            "hls/close",
         ] {
             results.insert(name.into(), reference::<Success<Empty>>(generator));
         }
@@ -119,6 +121,10 @@ mod generator {
             "live/create".into(),
             reference::<Success<LiveCreateResult>>(generator),
         );
+        results.insert(
+            "hls/create".into(),
+            reference::<Success<HlsCreateResult>>(generator),
+        );
         results
     }
 
@@ -137,6 +143,7 @@ mod generator {
         let recording_events = reference::<EventFrame<RecordingEvent>>(&mut generator);
         let signaling_events = reference::<EventFrame<SignalingEvent>>(&mut generator);
         let live_events = reference::<EventFrame<LiveEvent>>(&mut generator);
+        let hls_events = reference::<EventFrame<HlsEvent>>(&mut generator);
         json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "lotse control API",
@@ -152,6 +159,7 @@ mod generator {
                 "session/adopt": session_events,
                 "recording/create": recording_events,
                 "live/create": live_events,
+                "hls/create": hls_events,
                 "signaling/subscribe": signaling_events,
             },
             "$defs": generator.take_definitions(true),
@@ -280,6 +288,7 @@ mod tests {
             "session/adopt",
             "recording/create",
             "live/create",
+            "hls/create",
             "signaling/subscribe",
         ] {
             assert_eq!(tag_of(&bundle, &bundle["events"][name]), "event", "{name}");

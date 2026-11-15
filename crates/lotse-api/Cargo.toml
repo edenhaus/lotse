@@ -33,6 +33,7 @@ tracing = { workspace = true }
 rustix = { workspace = true, features = ["process", "fs"] } # umask around the bind (`fs` for the mode type)
 lotse-api-types = { workspace = true }
 lotse-core = { workspace = true }
+lotse-hls = { workspace = true } # the LL-HLS route's request parsing (names, delivery directives) and the window's chunks it sends
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "time"] } # `time`: a real-time bound where a regression would hang a test

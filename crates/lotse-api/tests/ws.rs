@@ -155,7 +155,9 @@ impl Handler for FakeHandler {
             | Command::SignalingCandidate(_)
             | Command::SignalingError(_)
             | Command::LiveCreate(_)
-            | Command::LiveClose(_) => Outcome::Result(json!({})),
+            | Command::LiveClose(_)
+            | Command::HlsCreate(_)
+            | Command::HlsClose(_) => Outcome::Result(json!({})),
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)

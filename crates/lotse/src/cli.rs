@@ -5,7 +5,7 @@
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -293,6 +293,43 @@ pub(crate) struct ServeArgs {
     /// Live outputs at once on one stream.
     #[arg(long, env = "LOTSE_MAX_LIVE_PER_STREAM", value_name = "N")]
     pub(crate) max_live_per_stream: Option<u32>,
+
+    /// LL-HLS outputs (windows) at once, over every stream.
+    #[arg(long, env = "LOTSE_MAX_HLS_OUTPUTS", value_name = "N")]
+    pub(crate) max_hls_outputs: Option<u32>,
+
+    /// LL-HLS sessions at once, over every stream.
+    #[arg(long, env = "LOTSE_MAX_HLS_SESSIONS", value_name = "N")]
+    pub(crate) max_hls_sessions: Option<u32>,
+
+    /// LL-HLS sessions at once on one stream.
+    #[arg(long, env = "LOTSE_MAX_HLS_SESSIONS_PER_STREAM", value_name = "N")]
+    pub(crate) max_hls_sessions_per_stream: Option<u32>,
+
+    /// The media one LL-HLS window holds, in bytes; at least 1.
+    #[arg(long, env = "LOTSE_HLS_WINDOW_BYTES", value_name = "BYTES")]
+    pub(crate) hls_window_bytes: Option<NonZeroU32>,
+
+    /// The LL-HLS part target until a window measures its Part Target
+    /// Duration; at least 1.
+    #[arg(long, env = "LOTSE_HLS_PART_TARGET_MS", value_name = "MS")]
+    pub(crate) hls_part_target_ms: Option<NonZeroU64>,
+
+    /// After how long the next keyframe starts an LL-HLS segment.
+    #[arg(long, env = "LOTSE_HLS_SEGMENT_TARGET_MS", value_name = "MS")]
+    pub(crate) hls_segment_target_ms: Option<u64>,
+
+    /// How long an LL-HLS session lives without a request; at least 1.
+    #[arg(long, env = "LOTSE_HLS_IDLE_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) hls_idle_timeout_ms: Option<NonZeroU64>,
+
+    /// LL-HLS requests of one session blocked at once.
+    #[arg(long, env = "LOTSE_MAX_HLS_BLOCKED_PER_SESSION", value_name = "N")]
+    pub(crate) max_hls_blocked_per_session: Option<u32>,
+
+    /// LL-HLS requests blocked at once, over every session.
+    #[arg(long, env = "LOTSE_MAX_HLS_BLOCKED", value_name = "N")]
+    pub(crate) max_hls_blocked: Option<u32>,
 
     /// Source connection attempts at once, across every camera; at least 1.
     #[arg(long, env = "LOTSE_CONNECT_CONCURRENCY", value_name = "N")]

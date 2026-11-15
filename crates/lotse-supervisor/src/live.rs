@@ -201,8 +201,10 @@ fn worker_reason(reason: &str, ending: Option<LiveCloseReason>) -> Option<LiveCl
 
 /// What a worker's report does to its output.
 enum Applied {
-    /// Nothing more.
-    Nothing,
+    /// It started, with this MIME type.
+    Started(String),
+    /// It warned: the code and the message, made plain.
+    Warned(LiveWarningCode, String),
     /// The output ends, with these figures.
     End {
         /// Why.
@@ -243,9 +245,9 @@ impl LiveEntry {
                 self.mime = Some(mime.clone());
                 if let Some(waiting) = self.waiting.take() {
                     // The command gave up meanwhile: nobody to tell.
-                    let _told = waiting.send(Ok(mime));
+                    let _told = waiting.send(Ok(mime.clone()));
                 }
-                Ok(Applied::Nothing)
+                Ok(Applied::Started(mime))
             }
             LiveReport::Warning { code, message } => {
                 let Some(code) = LiveWarningCode::parse(&code) else {
@@ -257,8 +259,14 @@ impl LiveEntry {
                 self.warned = true;
                 let message = plain(&message, MAX_MESSAGE_BYTES);
                 tracing::info!(live.id = live_id, code = code.as_str(), message = %message, "live output warned");
-                self.deliver(live_id, &LiveEvent::Warning { code, message });
-                Ok(Applied::Nothing)
+                self.deliver(
+                    live_id,
+                    &LiveEvent::Warning {
+                        code,
+                        message: message.clone(),
+                    },
+                );
+                Ok(Applied::Warned(code, message))
             }
             LiveReport::Closed {
                 reason,
@@ -313,7 +321,8 @@ impl State {
             return;
         }
         match entry.apply(live_id, report) {
-            Ok(Applied::Nothing) => {}
+            Ok(Applied::Started(mime)) => self.hls_live_started(live_id, &mime),
+            Ok(Applied::Warned(code, message)) => self.hls_live_warned(live_id, code, &message),
             Ok(Applied::End {
                 reason,
                 bytes,
@@ -425,6 +434,7 @@ impl State {
         let connection = entry.connection.clone();
         drop(entry);
         self.refresh_connection(&connection);
+        self.hls_live_closed(live_id, reason);
     }
 
     /// The control connection `connection` closed: its live outputs end

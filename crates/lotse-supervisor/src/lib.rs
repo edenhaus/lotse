@@ -11,8 +11,9 @@
 //! the shared allocations over UDP, TCP and TLS over TCP (`turns:`, the
 //! handshake through `lotse-tls`), whose servers' relayed datagrams the
 //! demux or the TCP allocation's task unwraps as the peers', and the TCP
-//! allocations' writing of what workers frame); later snapshot
-//! orchestration.
+//! allocations' writing of what workers frame), the LL-HLS sessions (the
+//! windows it fills from framed live outputs and the requests it answers
+//! from them); later snapshot orchestration.
 //!
 //! The network front door. Parses no camera bytes: only JSON, STUN, TURN
 //! and `ChannelData`, RFC 4571 framing and IPC, all fuzzed. Implements the
@@ -26,7 +27,8 @@
 //! RFC 4571, RFC 6544, RFC 8445 §5.1 and §7.2.5.2.1, RFC 8839 §5.1 and §5.4, RFC 8866 §5
 //! and §9, RFC 5888 §4, RFC 3542 §6.1,
 //! RFC 4291 §2.5.1 and §2.5.5.2, RFC 6724 §5, RFC 7064, RFC 7065, RFC 7350 (only to
-//! refuse `turns:` over DTLS), the ULID spec,
+//! refuse `turns:` over DTLS), draft-pantos-hls-rfc8216bis-22 §6.2.5.2 (the
+//! blocked LL-HLS requests, in `hls`), RFC 6585 §4, the ULID spec,
 //! `getaddrinfo(3)`, `getifaddrs(3)`.
 
 use std::future::Future;
@@ -47,6 +49,7 @@ mod connect;
 mod driver;
 mod gather;
 mod handler;
+mod hls;
 mod host_cache;
 mod live;
 pub mod memory;
@@ -61,6 +64,7 @@ mod worker_text;
 
 pub use advertise::{AdvertiseError, AdvertisedAddress, MAX_ADVERTISED};
 pub use handler::{Environment, FrontDoor, Identity, Supervisor};
+pub use hls::HlsLimits;
 pub use host_cache::HostScan;
 pub use live::LiveLimits;
 pub use lotse_api::Owners;
@@ -115,6 +119,9 @@ pub struct Limits {
     /// the live outputs. Without a live container the supervisor holds
     /// [`LiveLimits::NONE`] instead.
     pub live: LiveLimits,
+    /// `limits.*hls*`: the LL-HLS outputs and sessions; `None` in a build
+    /// without LL-HLS, and held as `None` without a live container.
+    pub hls: Option<HlsLimits>,
 }
 
 /// The supervisor's effective settings, resolved by the binary.
@@ -528,6 +535,7 @@ pub(crate) mod test_support {
                 worker_address_space: 1 << 30,
                 recordings: RecordingLimits::DEFAULT,
                 live: LiveLimits::DEFAULT,
+                hls: Some(HlsLimits::DEFAULT),
             },
             linger: Duration::from_secs(5),
             connect_concurrency: DEFAULT_CONNECT_CONCURRENCY,

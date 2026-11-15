@@ -18,13 +18,17 @@
 //! it serves event recordings' bytes, `GET /v0/recording/{recording_id}`, and
 //! live outputs' bytes, `GET /v0/live/{live_id}`, as chunked
 //! response bodies the handler hands over ([`Handler::recording_body`],
-//! [`Handler::live_body`]),
+//! [`Handler::live_body`]), and LL-HLS sessions' playlists and segments,
+//! `GET /v0/hls/{hls_id}/{name}`, as the handler answers them
+//! ([`Handler::hls`], [`hls`]),
 //! bounded by the client taking them and, over TLS, by its client staying
 //! enrolled.
 //!
 //! Standards: RFC 6455 (WebSocket, close codes §7.4.1, `Origin` §10.2),
 //! RFC 9110 (HTTP), RFC 9112 (HTTP/1.1, the chunked transfer coding §7.1
-//! of a recording's body), RFC 6585 §5 (431 for an oversized request head),
+//! of a recording's body), RFC 6585 §5 (431 for an oversized request head)
+//! and §4 (429 for too many blocked LL-HLS requests),
+//! draft-pantos-hls-rfc8216bis-22 (LL-HLS, in [`hls`]),
 //! unix(7) `SO_PEERCRED`, RFC 8446 (TLS 1.3, in [`tls`]).
 
 use std::future::Future;
@@ -44,7 +48,7 @@ use lotse_api_types::command::Command;
 use lotse_api_types::error::ApiError;
 use lotse_api_types::frame::Hello;
 use lotse_core::clock::Clock;
-use lotse_core::id::{LiveId, RecordingId};
+use lotse_core::id::{HlsId, LiveId, RecordingId};
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::CallSites;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -55,6 +59,7 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 
 mod clients;
 mod connection;
+pub mod hls;
 pub mod identity;
 mod listener;
 mod live;
@@ -67,6 +72,7 @@ pub mod test_util;
 pub mod tls;
 
 pub use clients::ClientsError;
+pub use hls::{HlsError, HlsReply, HlsRequest};
 pub use listener::{BindError, PeerInfo};
 pub use live::{LiveBody, LiveBodyError, live_id_of};
 pub use owners::Owners;
@@ -263,6 +269,23 @@ pub trait Handler: Send + Sync + 'static {
     fn live_body(&self, live_id: &LiveId) -> Result<LiveBody, LiveBodyError> {
         let _ = live_id;
         Err(LiveBodyError::NotFound)
+    }
+
+    /// `GET /v0/hls/{hls_id}/{name}`, from any peer either listener admits
+    /// (over TLS, one whose client is still allowed), parsed: the playlist
+    /// or a resource of LL-HLS session `hls_id`. May wait, bounded: a
+    /// Blocking Playlist Reload or a request for a hinted part is held until
+    /// the window can answer it (draft-pantos-hls-rfc8216bis-22 §6.2.5.2,
+    /// §4.4.5.3), at most three Target Durations, then
+    /// [`HlsError::Timeout`]. The future is dropped when the client goes.
+    /// Without LL-HLS, every id is [`HlsError::NotFound`].
+    fn hls(
+        &self,
+        hls_id: &HlsId,
+        request: HlsRequest,
+    ) -> impl Future<Output = Result<HlsReply, HlsError>> + Send {
+        let _ = (hls_id, request);
+        std::future::ready(Err(HlsError::NotFound))
     }
 }
 
@@ -540,6 +563,12 @@ impl Admission {
                 get(live::fetch::<H>)
                     .head(live::not_allowed)
                     .fallback(live::not_allowed),
+            )
+            .route(
+                &format!("{}/{{hls_id}}/{{name}}", lotse_api_types::HLS_PATH),
+                get(hls::fetch::<H>)
+                    .head(hls::not_allowed)
+                    .fallback(hls::not_allowed),
             )
             .with_state(state);
         let mut http = http1::Builder::new();
@@ -1238,6 +1267,133 @@ mod tests {
             .unwrap();
         let head = String::from_utf8_lossy(&take(&mut client, 12).await).into_owned();
         assert_eq!(head, "HTTP/1.1 404", "no live output without a handler's");
+    }
+
+    /// A handler with LL-HLS sessions of any id whose answers wait until
+    /// `release` is notified: a playlist, an init segment, else not found.
+    struct HeldHls {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Handler for HeldHls {
+        fn hello(&self) -> Hello {
+            Minimal.hello()
+        }
+
+        fn handle(
+            &self,
+            connection: ConnectionId,
+            command: Command,
+        ) -> impl Future<Output = Outcome> + Send {
+            Minimal.handle(connection, command)
+        }
+
+        fn hls(
+            &self,
+            hls_id: &HlsId,
+            request: HlsRequest,
+        ) -> impl Future<Output = Result<HlsReply, HlsError>> + Send {
+            let release = Arc::clone(&self.release);
+            let id = hls_id.clone();
+            async move {
+                release.notified().await;
+                match request {
+                    HlsRequest::Playlist(_) => Ok(HlsReply::Playlist(format!("#EXTM3U\n#{id}\n"))),
+                    HlsRequest::Media(lotse_hls::Resource::Init) => Ok(HlsReply::Media(
+                        lotse_hls::Chunks::from(axum::body::Bytes::from_static(b"init")),
+                    )),
+                    HlsRequest::Media(_) => Err(HlsError::ResourceNotFound),
+                }
+            }
+        }
+    }
+
+    /// An LL-HLS request goes through the router to the handler, leaves the
+    /// pending upgrades while the handler holds it (a blocked request is no
+    /// upgrade), and is answered with its length on a closing connection;
+    /// any other method is 405, and the default handler has no session.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rfc8216bis_6_2_5_2_an_hls_request_held_by_its_handler_leaves_the_pending_upgrades() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = HeldHls {
+            release: Arc::clone(&release),
+        };
+        assert_eq!(handler.hello(), Minimal.hello());
+        let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
+        assert!(matches!(
+            handler.handle(ConnectionId(1), info).await,
+            Outcome::Result(serde_json::Value::Null)
+        ));
+        let (admission, pending) = admission_with(&clock, handler);
+        for (request, expected) in [
+            (
+                &b"GET /v0/hls/01JH/index.m3u8?_HLS_msn=3 HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "content-type: application/vnd.apple.mpegurl\r\n",
+            ),
+            (
+                &b"GET /v0/hls/01JH/init.mp4 HTTP/1.0\r\n\r\n"[..],
+                "content-length: 4\r\n",
+            ),
+            (
+                &b"GET /v0/hls/01JH/seg9.m4s HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "hls_resource_not_found",
+            ),
+        ] {
+            let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client.write_all(request).await.unwrap();
+            settle().await;
+            assert_eq!(
+                pending.available_permits(),
+                usize::from(MAX_PENDING_UPGRADES),
+                "a held request holds no pending upgrade"
+            );
+            clock.advance(UPGRADE_TIMEOUT);
+            settle().await;
+            release.notify_one();
+            let seen = finish(&mut client).await;
+            let text = String::from_utf8_lossy(&seen);
+            assert!(text.contains("connection: close\r\n"), "{text}");
+            assert!(text.contains(expected), "{text}");
+        }
+        for (request, status) in [
+            (
+                &b"HEAD /v0/hls/01JH/index.m3u8 HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "405",
+            ),
+            // Refused by the route before the handler is asked, which would
+            // hold it: the name is no resource's.
+            (
+                &b"GET /v0/hls/01JH/nothing HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "404",
+            ),
+        ] {
+            let (admission, _pending) = admission_with(
+                &clock,
+                HeldHls {
+                    release: Arc::new(tokio::sync::Notify::new()),
+                },
+            );
+            let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client.write_all(request).await.unwrap();
+            let head = String::from_utf8_lossy(&take(&mut client, 12).await).into_owned();
+            assert_eq!(head, format!("HTTP/1.1 {status}"));
+        }
+        let (admission, _pending) = admission_with(&clock, Minimal);
+        let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+        admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+        client
+            .write_all(b"GET /v0/hls/01JH/index.m3u8 HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .await
+            .unwrap();
+        let seen = finish(&mut client).await;
+        let text = String::from_utf8_lossy(&seen);
+        assert!(text.starts_with("HTTP/1.1 404"), "{text}");
+        assert!(text.contains("hls_not_found"), "{text}");
     }
 
     /// The socket here is a pipe the client empties 4 KiB a second, so the
