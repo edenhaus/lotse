@@ -240,7 +240,10 @@ fn qvalue(text: &str) -> Option<u16> {
 struct Range {
     /// The type, `*` for any.
     ty: String,
-    /// The subtype, `*` for any.
+    /// The subtype, `*` for any, with its structured syntax suffix
+    /// (RFC 6838 §4.2.8: `+json` in `openmetrics-text+json`), which names
+    /// another media type than the subtype alone, so no representation
+    /// here.
     subty: String,
     /// The parameters before the weight, names in lowercase.
     params: Vec<(String, String)>,
@@ -266,9 +269,14 @@ impl Range {
                 value.unquoted_str().into_owned(),
             ));
         }
+        let subty = media_type.subty.as_str();
+        let subty = match &media_type.suffix {
+            Some(suffix) => format!("{subty}+{}", suffix.as_str()),
+            None => subty.to_owned(),
+        };
         Some(Self {
             ty: media_type.ty.as_str().to_owned(),
-            subty: media_type.subty.as_str().to_owned(),
+            subty,
             params,
             quality,
         })
@@ -1250,6 +1258,30 @@ mod tests {
                 "application/openmetrics-text;q=0.2,application/openmetrics-text;escaping=allow-utf-8;q=0.9"
             ]),
             Format::OpenMetrics(Escaping::AllowUtf8)
+        );
+    }
+
+    #[test]
+    fn a_structured_syntax_suffix_names_another_media_type_rfc6838_4_2_8() {
+        // `openmetrics-text+json` is not `openmetrics-text`: it takes
+        // nothing in, neither to choose OpenMetrics nor to exclude it.
+        for accept in [
+            "application/openmetrics-text+json",
+            "application/openmetrics-text+json;version=1.0.0;q=0.9,text/plain;q=0.1",
+            "text/plain+xml",
+        ] {
+            let ranges = ranges(accept).unwrap();
+            assert_eq!(
+                chosen(&ranges),
+                (accept.contains(",text/plain;")).then_some(Format::PrometheusText),
+                "{accept}"
+            );
+        }
+        assert_eq!(
+            negotiated(&[
+                "application/openmetrics-text+json;q=0,application/openmetrics-text;q=0.5"
+            ]),
+            Format::OpenMetrics(Escaping::Underscores)
         );
     }
 
