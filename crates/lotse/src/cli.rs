@@ -40,7 +40,8 @@ pub(crate) enum Command {
     /// Talk to a running daemon over its control socket; prints JSON.
     Ctl(CtlArgs),
     /// Print the pin of the control TLS listener's certificate, the SHA-256
-    /// clients check, from the data directory.
+    /// clients check, from the data directory; or the certificate itself, or
+    /// replace it with one that names the DNS name `lotse`.
     Identity(IdentityArgs),
     /// Print a one-time code that pairs a client with the control TLS
     /// listener, asking the daemon over its control socket.
@@ -58,6 +59,19 @@ pub(crate) struct IdentityArgs {
     /// data directory that belongs to that uid, as a start as root does.
     #[arg(long, env = "LOTSE_USER", value_name = "UID")]
     pub(crate) user: Option<u32>,
+
+    /// Print the certificate as PEM instead of its pin, never the key: what
+    /// a client that verifies the daemon by name (Prometheus) trusts as its
+    /// CA file, with `lotse` as the server name.
+    #[arg(long, conflicts_with = "reissue")]
+    pub(crate) certificate: bool,
+
+    /// Replace the certificate with one from the same key that names the
+    /// DNS name `lotse`, as an identity made by an older daemon does not,
+    /// and print its pin. The pin changes: every client must pair again,
+    /// and the daemon serves the new certificate once restarted.
+    #[arg(long)]
+    pub(crate) reissue: bool,
 }
 
 /// `lotse worker`: the flags the supervisor passes. No environment, no

@@ -4,6 +4,18 @@
 //! before the privilege drop. Clients pin the certificate by its SHA-256
 //! ([`Fingerprint`]), which every start logs.
 //!
+//! A generated certificate names [`SERVER_NAME`] as a DNS name in its
+//! subject alternative names, so a client whose TLS stack verifies by name
+//! can trust it as its own root and verify it by that name: Go's x509
+//! refuses a certificate that names its host only in the Common Name
+//! (observed with Go 1.15 and later: "certificate relies on legacy Common
+//! Name field, use SANs instead"), and Go accepts a leaf that is itself in
+//! the root pool as a chain of one, which amounts to pinning it. An
+//! identity made before the name keeps working as it is: the pin is the
+//! SHA-256 of the whole certificate, so a new certificate is a new pin
+//! and every client pairs again. Only [`ServerIdentity::reissue`] makes
+//! one, from the same key, when the operator asks.
+//!
 //! The key and the certificate share one PEM file, so a generation is one
 //! atomic rename and a crash leaves either no identity or a whole one. The
 //! file is written with mode 0600 from its creation (`O_EXCL`, then
@@ -20,8 +32,12 @@
 //! first starts agree on one identity.
 //!
 //! Standards: RFC 5280 §4.1.2.5 (validity: `notAfter` 99991231235959Z, "no
-//! well-defined expiration date"), RFC 5958 (PKCS #8 private keys), RFC
-//! 7468 (PEM), FIPS 186-4 (P-256 ECDSA).
+//! well-defined expiration date"), §4.1.2.2 (a serial unique per
+//! certificate of an issuer), §4.2.1.6 (the subject alternative name's
+//! `dNSName`), RFC 6125 §6.4.4 (a client checks the Common Name only
+//! without a DNS name in the subject alternative names), RFC 5958 (PKCS #8
+//! private keys), RFC 7468 (PEM, §5 the certificate's), FIPS 186-4 (P-256
+//! ECDSA).
 
 use std::fmt;
 use std::fs::File;
@@ -30,11 +46,14 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use lotse_core::fingerprint::Fingerprint;
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SignatureAlgorithm};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, KeyPair, PublicKeyData as _, SerialNumber,
+    SignatureAlgorithm,
+};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
 use crate::owners::Owners;
 
@@ -47,6 +66,16 @@ const PARTIAL_FILE: &str = "control-identity.pem.partial";
 
 /// The certificate's subject and issuer common name.
 const CERTIFICATE_NAME: &str = "lotse control";
+
+/// The DNS name a generated certificate names in its subject alternative
+/// names (RFC 5280 §4.2.1.6), fixed whatever host the daemon runs on: a
+/// client that verifies by name trusts the certificate itself and gives
+/// this name as the server's (Prometheus' `server_name`).
+pub const SERVER_NAME: &str = "lotse";
+
+/// The serial's longest length (RFC 5280 §4.1.2.2: "MUST NOT use
+/// serialNumber values longer than 20 octets").
+const SERIAL_BYTES: usize = 20;
 
 /// The daemon's control identity: its certificate, the key, and the pin
 /// clients check. The key never leaves the process: `Debug` redacts it.
@@ -153,6 +182,54 @@ impl ServerIdentity {
     /// The certificate's SHA-256, the pin clients check.
     pub const fn pin(&self) -> Fingerprint {
         self.pin
+    }
+
+    /// The certificate alone as PEM (RFC 7468 §5), never the key: what a
+    /// client trusts as its CA file to verify the daemon by
+    /// [`SERVER_NAME`].
+    pub fn certificate_pem(&self) -> String {
+        let block = pem::Pem::new("CERTIFICATE", self.certificate.as_ref());
+        pem::encode_config(
+            &block,
+            pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
+        )
+    }
+
+    /// Whether the certificate names [`SERVER_NAME`] as a DNS name in its
+    /// subject alternative names, as every certificate made since does: a
+    /// client that verifies by name (RFC 6125 §6.4.4: not by the Common
+    /// Name once a DNS name is there; Go's x509 never by it) accepts
+    /// only such a one. An identity made before has none until
+    /// [`Self::reissue`].
+    pub fn names_server(&self) -> bool {
+        ServerName::try_from(SERVER_NAME).is_ok_and(|name| {
+            webpki::EndEntityCert::try_from(&self.certificate).is_ok_and(|certificate| {
+                certificate.verify_is_valid_for_subject_name(&name).is_ok()
+            })
+        })
+    }
+
+    /// A new certificate for the identity in `dir`, from the same key and
+    /// naming [`SERVER_NAME`], in place of the old one, which `dir` must
+    /// hold; checked and locked as [`Self::load_or_create`] does it, and
+    /// written as atomically. The pin changes, so every client pairs
+    /// again; a running daemon serves the old certificate until it
+    /// restarts. Asked for by the operator only, never on a start.
+    pub fn reissue(dir: &Path, owners: Owners) -> Result<Self, IdentityError> {
+        let locked = checked_directory(dir, owners, true)?;
+        let old = Self::load_in(&locked, dir, owners)?;
+        let key = KeyPair::try_from(&old.key).map_err(IdentityError::Generate)?;
+        let pem = certify(&key)?;
+        write_new(&locked, dir, &pem)?;
+        let identity = Self::load_in(&locked, dir, owners)?;
+        tracing::info!(
+            event = "control_identity_reissued",
+            path = %dir.join(IDENTITY_FILE).display(),
+            old_pin = %old.pin,
+            server_pin = %identity.pin,
+            "control identity reissued: every client must pair again"
+        );
+        Ok(identity)
     }
 
     /// The identity in `dir`, made there first when there is none. `dir`
@@ -312,14 +389,23 @@ fn directory_error(path: &str, source: io::Error) -> IdentityError {
     }
 }
 
-/// A fresh key for `alg` and its self-signed certificate, as the PEM text
-/// of [`IDENTITY_FILE`]. Valid from 2000-01-01 and without expiry (RFC
-/// 5280 §4.1.2.5), so neither a wrong clock at boot nor a date turns into
-/// an outage: replacing the identity is a decision, not a deadline. The
-/// serial is derived from the public key, so nothing reads a clock.
+/// A fresh key for `alg` and its self-signed certificate ([`certify`]),
+/// as the PEM text of [`IDENTITY_FILE`].
 fn generate(alg: &'static SignatureAlgorithm) -> Result<String, IdentityError> {
     let key = KeyPair::generate_for(alg).map_err(IdentityError::Generate)?;
-    let mut params = CertificateParams::default();
+    certify(&key)
+}
+
+/// `key`'s self-signed certificate naming [`SERVER_NAME`], with the key
+/// before it, as the PEM text of [`IDENTITY_FILE`]. Valid from 2000-01-01
+/// and without expiry (RFC 5280 §4.1.2.5), so neither a wrong clock at
+/// boot nor a date turns into an outage: replacing the identity is a
+/// decision, not a deadline. The serial is derived from the public key
+/// and the name ([`serial`]), so nothing reads a clock.
+fn certify(key: &KeyPair) -> Result<String, IdentityError> {
+    let mut params =
+        CertificateParams::new(vec![SERVER_NAME.to_owned()]).map_err(IdentityError::Generate)?;
+    params.serial_number = Some(serial(key));
     let mut name = DistinguishedName::new();
     name.push(DnType::CommonName, CERTIFICATE_NAME);
     params.distinguished_name = name;
@@ -333,8 +419,24 @@ fn generate(alg: &'static SignatureAlgorithm) -> Result<String, IdentityError> {
         .and_then(|at| at.replace_minute(59))
         .and_then(|at| at.replace_second(59))
         .unwrap_or(last_day);
-    let certificate = params.self_signed(&key).map_err(IdentityError::Generate)?;
+    let certificate = params.self_signed(key).map_err(IdentityError::Generate)?;
     Ok(format!("{}{}", key.serialize_pem(), certificate.pem()))
+}
+
+/// The serial of `key`'s certificate: the first 20 bytes (RFC 5280
+/// §4.1.2.2) of the SHA-256 of [`SERVER_NAME`] and the public key, the
+/// top bit clear so the integer is positive. An identity made before the
+/// name has rcgen's serial, the hash of the key alone, so its reissue,
+/// the same issuer with the same key, never repeats its serial.
+fn serial(key: &KeyPair) -> SerialNumber {
+    let mut named = SERVER_NAME.as_bytes().to_vec();
+    named.extend_from_slice(&key.subject_public_key_info());
+    let mut bytes = Fingerprint::of(&named).as_bytes().to_vec();
+    bytes.truncate(SERIAL_BYTES);
+    if let Some(first) = bytes.first_mut() {
+        *first &= 0x7f;
+    }
+    SerialNumber::from(bytes)
 }
 
 /// Writes `pem` as [`IDENTITY_FILE`] in `handle`, the directory `dir`
@@ -467,6 +569,126 @@ mod tests {
         let general_9999 = b"\x18\x0f99991231235959Z";
         assert!(der.windows(utc_2000.len()).any(|w| w == utc_2000));
         assert!(der.windows(general_9999.len()).any(|w| w == general_9999));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An identity as lotse made it before its certificate named
+    /// [`SERVER_NAME`]: the Common Name alone, rcgen's serial.
+    fn legacy_pem() -> String {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::default();
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, CERTIFICATE_NAME);
+        params.distinguished_name = name;
+        let certificate = params.self_signed(&key).unwrap();
+        format!("{}{}", key.serialize_pem(), certificate.pem())
+    }
+
+    /// The DER of the public key in the identity `pem`'s key.
+    fn public_key(pem: &str) -> Vec<u8> {
+        KeyPair::from_pem(pem).unwrap().subject_public_key_info()
+    }
+
+    #[test]
+    fn a_new_certificate_names_lotse_as_its_dns_name_rfc5280_4_2_1_6() {
+        let dir = data_dir("san", 0o700);
+        let made = ServerIdentity::load_or_create(&dir, me()).unwrap();
+        assert!(made.names_server());
+        // The name is in the subject alternative names as a dNSName ([2]
+        // IA5String, RFC 5280 §4.2.1.6), not only in the Common Name.
+        let san = b"\x82\x05lotse";
+        let der = made.certificate.as_ref();
+        assert!(der.windows(san.len()).any(|w| w == san));
+        assert_eq!(SERVER_NAME, "lotse");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_serial_is_the_hash_of_the_name_and_key_positive_and_20_bytes_rfc5280_4_1_2_2() {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut named = b"lotse".to_vec();
+        named.extend_from_slice(&key.subject_public_key_info());
+        let mut expected = Fingerprint::of(&named).as_bytes()[..20].to_vec();
+        expected[0] &= 0x7f;
+        let serial = serial(&key);
+        assert_eq!(serial.as_ref(), expected.as_slice());
+        assert!(serial.as_ref()[0] < 0x80, "positive");
+        // In the certificate as a DER INTEGER of 20 bytes, or 21 with a
+        // zero byte before a top bit that is set.
+        let pem = certify(&key).unwrap();
+        let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        let mut encoded = vec![0x02, 20];
+        encoded.extend_from_slice(&expected);
+        assert!(der.windows(encoded.len()).any(|w| w == encoded.as_slice()));
+    }
+
+    #[test]
+    fn an_identity_without_the_name_keeps_working_untouched() {
+        let dir = data_dir("legacy", 0o700);
+        let legacy = legacy_pem();
+        write_new(&open_directory(&dir).unwrap(), &dir, &legacy).unwrap();
+        let loaded = ServerIdentity::load_or_create(&dir, me()).unwrap();
+        assert!(!loaded.names_server());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(IDENTITY_FILE)).unwrap(),
+            legacy,
+            "a start never replaces it"
+        );
+        assert_eq!(
+            ServerIdentity::load(&dir, me()).unwrap().pin(),
+            loaded.pin()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reissue_names_lotse_from_the_same_key_and_changes_the_pin_and_serial() {
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let dir = data_dir("reissue", 0o700);
+        let err = ServerIdentity::reissue(&dir, me()).unwrap_err();
+        assert!(matches!(err, IdentityError::Missing(_)), "{err}");
+        let err = ServerIdentity::reissue(&dir, someone_else()).unwrap_err();
+        assert!(matches!(err, IdentityError::DirectoryOwner { .. }), "{err}");
+        let legacy = legacy_pem();
+        write_new(&open_directory(&dir).unwrap(), &dir, &legacy).unwrap();
+        let old = ServerIdentity::load(&dir, me()).unwrap();
+        let new = ServerIdentity::reissue(&dir, me()).unwrap();
+        assert!(new.names_server());
+        assert_ne!(new.pin(), old.pin());
+        let path = dir.join(IDENTITY_FILE);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(public_key(&written), public_key(&legacy), "the same key");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(ServerIdentity::load(&dir, me()).unwrap().pin(), new.pin());
+        // rcgen's serial of the old one is the hash of the key alone.
+        let key = KeyPair::from_pem(&legacy).unwrap();
+        let key_hash = Fingerprint::of(key.der_bytes());
+        let rcgen_serial = &key_hash.as_bytes()[1..20];
+        let contains = |der: &[u8]| der.windows(19).any(|w| w == rcgen_serial);
+        assert!(contains(old.certificate.as_ref()));
+        assert!(!contains(new.certificate.as_ref()), "a serial of its own");
+        let text = logs.text();
+        assert!(text.contains("control identity reissued"), "{text}");
+        assert!(text.contains(&format!("old_pin={}", old.pin())), "{text}");
+        assert!(
+            text.contains(&format!("server_pin={}", new.pin())),
+            "{text}"
+        );
+        assert!(!dir.join(PARTIAL_FILE).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_certificate_pem_is_the_certificate_alone_rfc7468_5() {
+        let dir = data_dir("certificate-pem", 0o700);
+        let made = ServerIdentity::load_or_create(&dir, me()).unwrap();
+        let pem = made.certificate_pem();
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"), "{pem}");
+        assert!(pem.ends_with("-----END CERTIFICATE-----\n"), "{pem}");
+        assert!(!pem.contains('\r'), "LF line endings");
+        assert!(!pem.contains("PRIVATE"), "never the key");
+        let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        assert_eq!(der, made.certificate);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

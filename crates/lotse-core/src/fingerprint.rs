@@ -41,6 +41,12 @@ impl Fingerprint {
         Self(Sha256::digest(der).into())
     }
 
+    /// The digest's 32 bytes, for what is derived from a hash: the control
+    /// identity's certificate serial.
+    pub const fn as_bytes(&self) -> &[u8; FINGERPRINT_LEN] {
+        &self.0
+    }
+
     /// The digest as 64 lowercase hex digits, without colons.
     pub fn to_hex(&self) -> String {
         self.0
@@ -137,6 +143,10 @@ mod tests {
         assert_eq!(
             format!("{:?}", Fingerprint::of(b"abc")),
             format!("Fingerprint({ABC})")
+        );
+        assert_eq!(
+            Fingerprint::of(b"abc").as_bytes()[..4],
+            [0xba, 0x78, 0x16, 0xbf]
         );
     }
 

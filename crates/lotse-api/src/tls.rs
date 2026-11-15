@@ -160,6 +160,7 @@ pub(crate) fn bind(settings: &TlsConfig, owners: Owners) -> Result<BoundTls, Bin
     tracing::info!(
         addr = %local,
         server_pin = %identity.pin(),
+        names_server = identity.names_server(),
         clients = settings.clients.len(),
         "control TLS listener bound"
     );
