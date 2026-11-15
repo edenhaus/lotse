@@ -262,6 +262,31 @@ fn rfc8216bis_4_4_2_1_a_keyframe_exactly_at_the_target_starts_a_segment() {
     );
 }
 
+/// 30 frames a second of 3000 ticks at 90 kHz each convert to 33 333 333 ns,
+/// so a second of them sums to 10 ns short of it: the keyframe a second in
+/// still starts the next segment, as it would one exactly at the target.
+#[test]
+fn rfc8216bis_4_4_2_1_a_keyframe_a_rounding_short_of_the_target_starts_a_segment() {
+    let mut window = window(Config::default());
+    for n in 0_u8..30 {
+        window.push(fragment(n, 10, n == 0, 33_333_333)).unwrap();
+    }
+    assert_eq!(
+        window.push(fragment(30, 10, true, 33_333_333)),
+        Ok(Pushed::Published)
+    );
+    assert_eq!(
+        tags(window.get(Resource::Segment { msn: 0 })),
+        (0..30).collect::<Vec<u8>>()
+    );
+    // JITTER short of the target is at it; a nanosecond more short is not.
+    for (nanos, pushed) in [(999 * MS, Pushed::Published), (999 * MS - 1, Pushed::Held)] {
+        let mut short = Window::new(Config::default(), Bytes::from_static(INIT)).unwrap();
+        short.push(fragment(0, 10, true, nanos)).unwrap();
+        assert_eq!(short.push(fragment(1, 10, true, MS)), Ok(pushed), "{nanos}");
+    }
+}
+
 #[test]
 fn a_zero_segment_target_starts_a_segment_at_every_independent_fragment() {
     let mut window = window(Config {

@@ -541,6 +541,34 @@ async fn a_frame_lost_before_the_first_keyframe_drops_to_it_with_nothing_to_fini
     assert_eq!((dropped, drops), (1, 1));
 }
 
+/// The buffer bound is exclusive: with none at all, a reader that keeps up
+/// with the pipe loses nothing, as nothing waits in the queue.
+#[tokio::test]
+async fn a_reader_that_keeps_up_costs_no_frame_even_without_a_buffer() {
+    let mut rig = Rig::new(None);
+    let reader = rig.start(spec(false, 0));
+    rig.started().await;
+    assert!(rig.lives.fetch("l1"));
+    settle().await;
+    for index in 0..4 {
+        rig.video_frame(index, index == 0, 3);
+        settle().await;
+    }
+    assert_eq!(
+        lines(&available(&reader).await),
+        [
+            "init video=h264",
+            "frame v 0 0 k 3",
+            "frame v 0 3600 - 3",
+            "frame v 0 7200 - 3",
+            "frame v 0 10800 - 3"
+        ]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    let (_, _, dropped, drops) = rig.closed().await;
+    assert_eq!((dropped, drops), (0, 0));
+}
+
 #[tokio::test]
 async fn a_frame_the_subscription_lost_drops_to_the_next_keyframe() {
     let limits = TrackLimits {
