@@ -720,7 +720,7 @@ mod tests {
             .unwrap()
             + version_then_integer.len();
         let len = usize::from(der[at]);
-        assert!(len <= 20, "a serial of {len} octets");
+        assert!(len <= 20, "a short-form length of at most 20 octets");
         der[at + 1..][..len].to_vec()
     }
 
