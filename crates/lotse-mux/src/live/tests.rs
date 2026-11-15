@@ -504,6 +504,14 @@ fn calls_out_of_order_and_frames_the_output_cannot_take_fail() {
     assert_eq!(
         small.push(
             Kind::Video,
+            frame(base, 0, true, 0, Bytes::from(vec![0; 10]))
+        ),
+        Ok(LiveStep::Held),
+        "a frame of exactly the bound is a sample"
+    );
+    assert_eq!(
+        small.push(
+            Kind::Video,
             frame(base, 0, true, 0, Bytes::from(vec![0; 11]))
         ),
         Err(RecordingError::Failed(
