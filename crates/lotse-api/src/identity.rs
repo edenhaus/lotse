@@ -708,15 +708,33 @@ mod tests {
     }
 
     /// The serial of the DER certificate `der`: the INTEGER after the
-    /// version (RFC 5280 §4.1: `[0] INTEGER 2`, then `serialNumber`), all
-    /// 20 octets, as [`serial`] makes it.
+    /// version (RFC 5280 §4.1: `[0] INTEGER 2`, then `serialNumber`), as
+    /// long as its length octet says (X.690 §8.1.3.4, the short form: at
+    /// most 20 octets, RFC 5280 §4.1.2.2). Not always 20: rcgen's own
+    /// serial, a legacy identity's, loses a leading zero octet in DER.
     fn serial_of(der: &[u8]) -> Vec<u8> {
-        let version_then_serial = [0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x14];
+        let version_then_integer = [0xa0, 0x03, 0x02, 0x01, 0x02, 0x02];
         let at = der
-            .windows(version_then_serial.len())
-            .position(|w| w == version_then_serial)
-            .unwrap();
-        der[at + version_then_serial.len()..][..20].to_vec()
+            .windows(version_then_integer.len())
+            .position(|w| w == version_then_integer)
+            .unwrap()
+            + version_then_integer.len();
+        let len = usize::from(der[at]);
+        assert!(len <= 20, "a serial of {len} octets");
+        der[at + 1..][..len].to_vec()
+    }
+
+    #[test]
+    fn a_serial_is_read_at_the_length_der_gives_it_x690_8_1_3_4() {
+        // A legacy identity's serial is rcgen's: when its first octet is
+        // 0, DER drops it, which the old fixed 20-octet read panicked on.
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        for serial in [vec![0x01], vec![0x7f; 19], vec![0x40; 20]] {
+            let mut params = CertificateParams::default();
+            params.serial_number = Some(SerialNumber::from(serial.clone()));
+            let certificate = params.self_signed(&key).unwrap();
+            assert_eq!(serial_of(certificate.der()), serial);
+        }
     }
 
     #[test]
