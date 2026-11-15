@@ -156,7 +156,12 @@ fn host_is_literal(host: &str) -> bool {
 /// one `Host` names the machine ([`host_is_literal`]), and an `Origin`, which
 /// a same-origin `fetch()` of a `GET` leaves out (WHATWG Fetch §3.1), is the
 /// page's own; a page of another origin, or one reached by DNS rebinding,
-/// gets nothing.
+/// gets nothing. A cross-origin request can leave `Origin` out too (a
+/// `no-cors` fetch, a media element's load), so one the browser marks as
+/// coming from another site (`Sec-Fetch-Site: cross-site` or `same-site`,
+/// W3C Fetch Metadata §2.1.2) is refused whatever its `Origin`; the page's
+/// own requests say `same-origin`, and a client that sends no fetch metadata
+/// is no browser page.
 fn may_fetch(headers: &HeaderMap) -> bool {
     let Some(host) = single(headers, header::HOST) else {
         return false;
@@ -164,8 +169,16 @@ fn may_fetch(headers: &HeaderMap) -> bool {
     if !host_is_literal(host) {
         return false;
     }
-    headers.get(header::ORIGIN).is_none() || same_origin(headers)
+    let other_site = headers
+        .get_all(SEC_FETCH_SITE)
+        .iter()
+        .any(|site| site != "same-origin" && site != "none");
+    !other_site && (headers.get(header::ORIGIN).is_none() || same_origin(headers))
 }
+
+/// The fetch metadata header saying which site a browser's request comes
+/// from (W3C Fetch Metadata Request Headers §2.1.2).
+const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 
 /// The live output `path` names, `/v0/live/{live_id}`, checked against the
 /// identifier pattern as the daemon checks it; `None` for anything else.
@@ -1837,6 +1850,20 @@ mod tests {
             ("host", "127.0.0.1:8080"),
             ("origin", "http://evil.example")
         ]));
+        // W3C Fetch Metadata §2.1.2: a request of another site is refused
+        // even without an Origin (a no-cors fetch, a media element's load).
+        for site in ["cross-site", "same-site"] {
+            assert!(
+                !with(&[("host", "127.0.0.1:8080"), ("sec-fetch-site", site)]),
+                "{site}"
+            );
+        }
+        for site in ["same-origin", "none"] {
+            assert!(
+                with(&[("host", "127.0.0.1:8080"), ("sec-fetch-site", site)]),
+                "{site}"
+            );
+        }
     }
 
     type Connected = Result<
