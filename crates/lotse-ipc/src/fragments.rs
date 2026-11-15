@@ -335,6 +335,7 @@ mod tests {
     #[test]
     fn a_header_is_made_only_within_the_bounds() {
         let max = usize::try_from(MAX_RECORD_BYTES).unwrap();
+        assert_eq!(max, 64 << 20, "64 MiB, as documented");
         assert!(header(RecordKind::Init, max).is_some());
         assert!(header(RecordKind::Init, max + 1).is_none());
         let longest = RecordKind::Fragment {
