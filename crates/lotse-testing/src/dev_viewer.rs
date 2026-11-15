@@ -32,7 +32,20 @@
 //! they come, the chunked body streamed through, never cached (RFC 9111
 //! §5.2.2.5). Like the relay, it answers only a request whose `Host` names
 //! the machine by address or as `localhost`, and with an `Origin` only the
-//! page's own. A development tool, never part of the daemon.
+//! page's own.
+//!
+//! `GET /v0/hls/{hls_id}/{name}` is proxied the same way, as a client proxies
+//! an LL-HLS session's playlist and media (draft-pantos-hls-rfc8216bis-22) to
+//! its player: the id checked against the identifier pattern and the name as
+//! the playlist (`index.m3u8`) or exactly as the playlist writes a resource
+//! (`lotse_hls::Resource::parse`) before anything else, the query (a
+//! playlist's Delivery Directives, §6.2.5, or a cache buster) bounded and
+//! limited to the characters a directive is written in, then passed through
+//! for the daemon to parse. The daemon's status, `Content-Type`,
+//! `Content-Length`, `Cache-Control` and body come back as they come. A
+//! Blocking Playlist Reload (§6.2.5.2) or a hinted part's request (§6.2.6) is
+//! held by the daemon, up to three Target Durations, and the proxy holds the
+//! browser's with it. A development tool, never part of the daemon.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -46,8 +59,10 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt as _, StreamExt as _};
+use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
-use lotse_core::id::LiveId;
+use lotse_api_types::hls::PLAYLIST_NAME;
+use lotse_core::id::{HlsId, LiveId};
 use lotse_core::task::spawn_named;
 use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, UnixStream};
@@ -65,6 +80,16 @@ pub const RELAY_PATH: &str = "/ws";
 /// The route of a live output's bytes, the daemon's own path
 /// (`lotse_api_types::LIVE_PATH`, `/v0/live`) and its id.
 const LIVE_ROUTE: &str = "/v0/live/{live_id}";
+
+/// The route of an LL-HLS session's playlist and media, the daemon's own
+/// path (`lotse_api_types::HLS_PATH`, `/v0/hls`), its id and the name.
+const HLS_ROUTE: &str = "/v0/hls/{hls_id}/{name}";
+
+/// The longest query of an LL-HLS request passed to the daemon, in bytes:
+/// `_HLS_msn` and `_HLS_part` with values of up to 20 digits each
+/// (draft-pantos-hls-rfc8216bis-22 §4.2) take 54, `_HLS_skip=YES` (§6.2.5.1)
+/// 13 more, and a player's cache buster fits the rest.
+const MAX_HLS_QUERY_BYTES: usize = 256;
 
 /// The largest message the relay takes from a page, and its largest frame:
 /// the daemon's own inbound limit, 64 KiB (`lotse_api::MAX_MESSAGE_BYTES`),
@@ -173,6 +198,50 @@ fn live_id_of(path: &str) -> Option<LiveId> {
         .and_then(|raw| LiveId::new(raw).ok())
 }
 
+/// Why an LL-HLS request is refused before the daemon is asked: its status
+/// and its reason.
+type HlsRefusal = (StatusCode, &'static str);
+
+/// The path and query to ask the daemon for what an LL-HLS request's `path`,
+/// `/v0/hls/{hls_id}/{name}`, and `query` name, each part checked first, as
+/// the daemon checks it: the id against the identifier pattern, the name as
+/// the playlist or exactly as the playlist writes a resource
+/// (draft-pantos-hls-rfc8216bis-22 §4.1, `lotse_hls::Resource`), written
+/// back from what it parsed to. The query, which the daemon parses as a
+/// playlist's Delivery Directives (§6.2.5) and ignores on a resource, is
+/// passed as it is if it is at most [`MAX_HLS_QUERY_BYTES`] of what a
+/// directive is written in: letters, digits, `_`, `-`, `.`, `~`, `=`, `&`
+/// and `%` (RFC 3986 §2.3 and §3.4). A path is a `404`, a query a `400`.
+fn hls_target_of(path: &str, query: Option<&str>) -> Result<String, HlsRefusal> {
+    const NO_SESSION: HlsRefusal = (StatusCode::NOT_FOUND, "no such LL-HLS session");
+    let (raw_id, name) = path
+        .strip_prefix(lotse_api_types::HLS_PATH)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.split_once('/'))
+        .ok_or(NO_SESSION)?;
+    let hls_id = HlsId::new(raw_id).map_err(|_| NO_SESSION)?;
+    let name = if name == PLAYLIST_NAME {
+        PLAYLIST_NAME.to_owned()
+    } else {
+        lotse_hls::Resource::parse(name)
+            .ok_or((StatusCode::NOT_FOUND, "no such LL-HLS resource"))?
+            .to_string()
+    };
+    let mut target = format!("{}/{hls_id}/{name}", lotse_api_types::HLS_PATH);
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        let allowed = |byte: u8| byte.is_ascii_alphanumeric() || b"_-.~=&%".contains(&byte);
+        if query.len() > MAX_HLS_QUERY_BYTES || !query.bytes().all(allowed) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "the query is not one the daemon takes",
+            ));
+        }
+        target.push('?');
+        target.push_str(query);
+    }
+    Ok(target)
+}
+
 /// Whether an upgrade comes from the page itself (RFC 6455 §10.2).
 fn same_origin(headers: &HeaderMap) -> bool {
     match (
@@ -184,8 +253,8 @@ fn same_origin(headers: &HeaderMap) -> bool {
     }
 }
 
-/// The routes: the page, the browser test's page, the relay and the live
-/// outputs' bytes; anything else is `404` (axum answers a wrong method on a
+/// The routes: the page, the browser test's page, the relay, the live
+/// outputs' bytes and the LL-HLS sessions' playlists and media; anything else is `404` (axum answers a wrong method on a
 /// route `405`, and a malformed request or upgrade `400`).
 fn router(socket: PathBuf, cancel: CancellationToken) -> Router {
     Router::new()
@@ -193,6 +262,7 @@ fn router(socket: PathBuf, cancel: CancellationToken) -> Router {
         .route(crate::browser::PAGE_PATH, get(test_page))
         .route(RELAY_PATH, get(upgrade))
         .route(LIVE_ROUTE, get(live))
+        .route(HLS_ROUTE, get(hls))
         .fallback(|| async { refuse(StatusCode::NOT_FOUND, "not found\n".to_owned()) })
         .with_state(Shared {
             socket: socket.into(),
@@ -395,36 +465,8 @@ async fn live(State(shared): State<Shared>, headers: HeaderMap, uri: Uri) -> Res
 /// own to the control socket, as the response to the browser; why there is
 /// none when the daemon cannot be reached or does not answer.
 async fn fetch_live(shared: &Shared, live_id: &LiveId) -> Result<Response, String> {
-    let stream = UnixStream::connect(&shared.socket).await.map_err(|err| {
-        format!(
-            "the daemon's control socket {}: {err}",
-            shared.socket.display()
-        )
-    })?;
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(|err| format!("the daemon's HTTP connection: {err}"))?;
-    // The connection runs until the body ends, or the dev viewer stops.
-    let cancel = shared.cancel.clone();
-    spawn_named("dev_viewer.live", async move {
-        tokio::select! {
-            ended = connection => {
-                if let Err(err) = ended {
-                    tracing::debug!(error = %err, "live body: the daemon's connection ended");
-                }
-            }
-            () = cancel.cancelled() => {}
-        }
-    });
     let path = lotse_api_types::live::live_path(live_id.as_str());
-    let request = axum::http::Request::get(path.as_str())
-        .header(header::HOST, "lotse")
-        .body(Body::empty())
-        .map_err(|err| format!("the daemon's request: {err}"))?;
-    let answer = sender
-        .send_request(request)
-        .await
-        .map_err(|err| format!("the daemon did not answer: {err}"))?;
+    let answer = ask_daemon(shared, &path).await?;
     let status = answer.status();
     let content_type = answer.headers().get(header::CONTENT_TYPE).cloned();
     tracing::info!(live.id = %live_id, %status, "live body: relaying the daemon's answer");
@@ -439,6 +481,94 @@ async fn fetch_live(shared: &Shared, live_id: &LiveId) -> Result<Response, Strin
     }
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
+}
+
+/// `GET /v0/hls/{hls_id}/{name}`: an LL-HLS session's playlist or media
+/// from the daemon, as a client proxies them. The checks ([`may_fetch`],
+/// [`hls_target_of`]), then the daemon's `GET` of the same path and query on
+/// a connection of its own, without the browser's header fields, held as
+/// long as the daemon holds it; its status, `Content-Type`,
+/// `Content-Length`, `Cache-Control` (the playlist's `no-cache`, a
+/// resource's `max-age`, RFC 9111 §5.2.2) and body passed through. No daemon
+/// is a `502`.
+async fn hls(State(shared): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
+    if !may_fetch(&headers) {
+        tracing::warn!(
+            host = ?headers.get(header::HOST),
+            origin = ?headers.get(header::ORIGIN),
+            "LL-HLS request refused: not the page"
+        );
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "only the viewer's pages may fetch an LL-HLS session\n".to_owned(),
+        );
+    }
+    let target = match hls_target_of(uri.path(), uri.query()) {
+        Ok(target) => target,
+        Err((status, reason)) => {
+            tracing::warn!(path = ?capped(uri.path()), query = ?uri.query().map(capped), reason, "LL-HLS request refused");
+            return refuse(status, format!("{reason}\n"));
+        }
+    };
+    let answer = match ask_daemon(&shared, &target).await {
+        Ok(answer) => answer,
+        Err(reason) => {
+            tracing::warn!(target, socket = %shared.socket.display(), %reason, "LL-HLS request refused: no answer from the daemon");
+            return refuse(StatusCode::BAD_GATEWAY, format!("{reason}\n"));
+        }
+    };
+    // Several a second for each player: not worth more than debug.
+    tracing::debug!(target, status = %answer.status(), "LL-HLS request: relaying the daemon's answer");
+    let (parts, body) = answer.into_parts();
+    let mut response = Response::new(Body::new(body));
+    *response.status_mut() = parts.status;
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::CACHE_CONTROL,
+    ] {
+        if let Some(value) = parts.headers.get(&name) {
+            response.headers_mut().insert(name, value.clone());
+        }
+    }
+    response
+}
+
+/// The daemon's answer to `GET path` (its path and query) on a connection of
+/// its own to the control socket (HTTP/1.1, RFC 9112), sent with `Host:
+/// lotse` and none of the browser's header fields: the daemon refuses a
+/// request carrying `Origin`. The connection runs until the answer's body
+/// ends or the dev viewer stops. Why there is no answer when the daemon
+/// cannot be reached or does not answer.
+async fn ask_daemon(shared: &Shared, path: &str) -> Result<axum::http::Response<Incoming>, String> {
+    let stream = UnixStream::connect(&shared.socket).await.map_err(|err| {
+        format!(
+            "the daemon's control socket {}: {err}",
+            shared.socket.display()
+        )
+    })?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|err| format!("the daemon's HTTP connection: {err}"))?;
+    let cancel = shared.cancel.clone();
+    spawn_named("dev_viewer.daemon_request", async move {
+        tokio::select! {
+            ended = connection => {
+                if let Err(err) = ended {
+                    tracing::debug!(error = %err, "the daemon's HTTP connection ended");
+                }
+            }
+            () = cancel.cancelled() => {}
+        }
+    });
+    let request = axum::http::Request::get(path)
+        .header(header::HOST, "lotse")
+        .body(Body::empty())
+        .map_err(|err| format!("the daemon's request: {err}"))?;
+    sender
+        .send_request(request)
+        .await
+        .map_err(|err| format!("the daemon did not answer: {err}"))
 }
 
 /// Relays text frames both ways until either side closes, then closes
@@ -1767,6 +1897,281 @@ mod tests {
             ("host", "127.0.0.1:8080"),
             ("origin", "http://evil.example")
         ]));
+    }
+
+    /// A client's proxy of an LL-HLS session: the playlist's Blocking
+    /// Playlist Reload (draft-pantos-hls-rfc8216bis-22 §6.2.5.2) reaches the
+    /// daemon with its Delivery Directives as they were sent, without the
+    /// browser's `Origin` (which the daemon refuses) or anything else of the
+    /// browser's, and is held until the daemon answers; its status,
+    /// `Content-Type` (§4), `Content-Length`, `Cache-Control` and body come
+    /// back as the daemon sent them, nothing else.
+    #[tokio::test]
+    async fn rfc8216bis_s6_2_5_2_a_blocking_playlist_reload_is_held_and_passed_through() {
+        let playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n";
+        let answer: &'static str = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\nX-Hls-Id: 01JH\r\n\r\n{playlist}",
+            playlist.len()
+        )
+        .leak();
+        // Nothing until the test says so: the daemon holds the request.
+        let (dir, socket, mut asked, go) =
+            fake_live_daemon("hls-playlist", String::new(), vec![answer]);
+        let (addr, cancel) = start(socket).await;
+        let mut browser = TcpStream::connect(addr).await.unwrap();
+        browser
+            .write_all(
+                format!(
+                    "GET /v0/hls/01JH/index.m3u8?_HLS_msn=12&_HLS_part=3 HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nCookie: c=1\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let request = asked.recv().await.unwrap();
+        assert!(
+            request.starts_with("GET /v0/hls/01JH/index.m3u8?_HLS_msn=12&_HLS_part=3 HTTP/1.1\r\n"),
+            "{request}"
+        );
+        let lower = request.to_ascii_lowercase();
+        assert!(lower.contains("host: lotse\r\n"), "{request}");
+        assert!(
+            !lower.contains("origin:"),
+            "the daemon refuses Origin: {request}"
+        );
+        assert!(
+            !lower.contains("cookie:"),
+            "nothing of the browser's: {request}"
+        );
+        lotse_core::clock::Clock::sleep(
+            &lotse_core::clock::SystemClock,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        let mut early = [0_u8; 1];
+        assert!(
+            browser.try_read(&mut early).is_err(),
+            "held while the daemon holds it"
+        );
+        go.send(()).unwrap();
+        let mut response = Vec::new();
+        browser.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        let lower = response.to_ascii_lowercase();
+        for field in [
+            "content-type: application/vnd.apple.mpegurl\r\n".to_owned(),
+            "cache-control: no-cache\r\n".to_owned(),
+            format!("content-length: {}\r\n", playlist.len()),
+        ] {
+            assert!(lower.contains(&field), "{field}: {response}");
+        }
+        assert!(!lower.contains("x-hls-id"), "{response}");
+        assert!(
+            !lower.contains("transfer-encoding"),
+            "the length, not chunks: {response}"
+        );
+        assert!(response.ends_with(playlist), "{response}");
+        drop(go);
+        cancel.cancel();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A part (§3.2) is asked for by its name as the playlist writes it, with
+    /// whatever query came along, and comes back with its `max-age`; the
+    /// daemon's refusal of a resource comes back as the daemon wrote it.
+    #[tokio::test]
+    async fn rfc8216bis_s3_2_a_part_and_the_daemon_s_refusal_are_passed_through() {
+        let part = "moofmdat";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{part}",
+            part.len()
+        );
+        let (dir, socket, mut asked, go) = fake_live_daemon("hls-part", head, Vec::new());
+        let (addr, cancel) = start(socket).await;
+        let response = get(addr, "/v0/hls/01JH/part7.2.m4s?v=1").await;
+        drop(go);
+        let request = asked.recv().await.unwrap();
+        assert!(
+            request.starts_with("GET /v0/hls/01JH/part7.2.m4s?v=1 HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        let lower = response.to_ascii_lowercase();
+        assert!(lower.contains("content-type: video/mp4\r\n"), "{response}");
+        assert!(
+            lower.contains("cache-control: max-age=60\r\n"),
+            "{response}"
+        );
+        assert!(lower.contains("content-length: 8\r\n"), "{response}");
+        assert!(response.ends_with(part), "{response}");
+        cancel.cancel();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let body = r#"{"error":{"code":"hls_resource_not_found","message":"the session's window holds no such resource"}}"#;
+        let head = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (dir, socket, mut asked, go) = fake_live_daemon("hls-refused", head, Vec::new());
+        let (addr, cancel) = start(socket).await;
+        let response = get(addr, "/v0/hls/01JH/seg3.m4s").await;
+        drop(go);
+        assert!(
+            asked
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("GET /v0/hls/01JH/seg3.m4s HTTP/1.1\r\n"),
+            "no query, none added"
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{response}"
+        );
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-type: application/json\r\n"),
+            "{response}"
+        );
+        assert!(!lower.contains("cache-control"), "{response}");
+        assert!(response.ends_with(body), "{response}");
+        cancel.cancel();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The id, the name and the query are untrusted: each checked before the
+    /// daemon is asked; a request from another origin or by a name a
+    /// rebinding DNS server controls is refused, and so is one with no
+    /// daemon to ask.
+    #[tokio::test]
+    async fn an_ll_hls_request_is_refused_for_a_bad_name_or_query_another_origin_or_no_daemon() {
+        let (dir, socket) = socket_dir("hls-checks");
+        let (addr, cancel) = start(socket).await;
+        for (path, reason) in [
+            ("/v0/hls/../index.m3u8", "no such LL-HLS session\n"),
+            ("/v0/hls/a%2Fb/index.m3u8", "no such LL-HLS session\n"),
+            ("/v0/hls/01JH/seg01.m4s", "no such LL-HLS resource\n"),
+            ("/v0/hls/01JH/index.m3u", "no such LL-HLS resource\n"),
+            ("/v0/hls/01JH/..", "no such LL-HLS resource\n"),
+            // No name: no route.
+            ("/v0/hls/01JH/", "not found\n"),
+        ] {
+            let refused = get(addr, path).await;
+            assert!(refused.starts_with("HTTP/1.1 404"), "{path}: {refused}");
+            assert!(refused.ends_with(reason), "{path}: {refused}");
+        }
+        let long = format!("/v0/hls/{}/index.m3u8", "a".repeat(129));
+        assert!(get(addr, &long).await.ends_with("no such LL-HLS session\n"));
+        for query in [
+            format!("v={}", "1".repeat(MAX_HLS_QUERY_BYTES - 1)),
+            "_HLS_msn=1;x".to_owned(),
+            "a=b+c".to_owned(),
+            "a=/".to_owned(),
+        ] {
+            let refused = get(addr, &format!("/v0/hls/01JH/index.m3u8?{query}")).await;
+            assert!(refused.starts_with("HTTP/1.1 400"), "{query}: {refused}");
+            assert!(
+                refused.ends_with("the query is not one the daemon takes\n"),
+                "{refused}"
+            );
+        }
+        for (host, origin) in [
+            (format!("{addr}"), Some("http://evil.example".to_owned())),
+            (format!("evil.example:{}", addr.port()), None),
+        ] {
+            let origin = origin
+                .map(|o| format!("Origin: {o}\r\n"))
+                .unwrap_or_default();
+            let refused = raw(
+                addr,
+                &format!("GET /v0/hls/01JH/index.m3u8 HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(
+                refused.starts_with("HTTP/1.1 403"),
+                "{host} {origin}: {refused}"
+            );
+            assert!(
+                refused.ends_with("only the viewer's pages may fetch an LL-HLS session\n"),
+                "{refused}"
+            );
+        }
+        let post = raw(
+            addr,
+            "POST /v0/hls/01JH/index.m3u8 HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(post.starts_with("HTTP/1.1 405"), "{post}");
+        // Good requests, the longest query among them, with no daemon behind
+        // the socket.
+        let longest = format!("v={}", "1".repeat(MAX_HLS_QUERY_BYTES - 2));
+        for path in [
+            format!("/v0/hls/01JH/index.m3u8?{longest}"),
+            "/v0/hls/01JH/init.mp4?".to_owned(),
+        ] {
+            let gateway = get(addr, &path).await;
+            assert!(gateway.starts_with("HTTP/1.1 502"), "{path}: {gateway}");
+            assert!(gateway.contains("the daemon's control socket"), "{gateway}");
+        }
+        cancel.cancel();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rfc8216bis_s4_1_an_ll_hls_target_is_the_name_the_playlist_writes() {
+        let target = |path: &str, query: Option<&str>| hls_target_of(path, query);
+        assert_eq!(
+            target("/v0/hls/01JH/index.m3u8", Some("_HLS_msn=1&_HLS_part=0")).unwrap(),
+            "/v0/hls/01JH/index.m3u8?_HLS_msn=1&_HLS_part=0"
+        );
+        assert_eq!(
+            target("/v0/hls/01JH/index.m3u8", Some("")).unwrap(),
+            "/v0/hls/01JH/index.m3u8",
+            "an empty query, none"
+        );
+        for name in ["init.mp4", "seg0.m4s", "part18446744073709551615.9.m4s"] {
+            assert_eq!(
+                target(&format!("/v0/hls/01JH/{name}"), None).unwrap(),
+                format!("/v0/hls/01JH/{name}")
+            );
+        }
+        for path in [
+            "/v0/hls",
+            "/v0/hls/",
+            "/v0/hls/01JH",
+            "/v0/hlsx/01JH/index.m3u8",
+            "/v0/live/01JH/index.m3u8",
+            "/v0/hls/./index.m3u8",
+        ] {
+            assert_eq!(
+                target(path, None).unwrap_err(),
+                (StatusCode::NOT_FOUND, "no such LL-HLS session"),
+                "{path}"
+            );
+        }
+        for path in [
+            "/v0/hls/01JH/index.m3u8/x",
+            "/v0/hls/01JH/seg-1.m4s",
+            "/v0/hls/01JH/part1.m4s",
+            "/v0/hls/01JH/INIT.MP4",
+        ] {
+            assert_eq!(
+                target(path, None).unwrap_err(),
+                (StatusCode::NOT_FOUND, "no such LL-HLS resource"),
+                "{path}"
+            );
+        }
+        let longest = "a".repeat(MAX_HLS_QUERY_BYTES);
+        assert!(target("/v0/hls/01JH/init.mp4", Some(&longest)).is_ok());
+        let longer = "a".repeat(MAX_HLS_QUERY_BYTES + 1);
+        assert_eq!(
+            target("/v0/hls/01JH/init.mp4", Some(&longer))
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(target("/v0/hls/01JH/init.mp4", Some("a-b.c~d%20e_f=1&g")).is_ok());
     }
 
     type Connected = Result<

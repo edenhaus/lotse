@@ -1811,6 +1811,7 @@ dependencies = [
  "lotse-api-types",
  "lotse-codec",
  "lotse-core",
+ "lotse-hls",
  "lotse-webrtc",
  "md-5",
  "nix",
