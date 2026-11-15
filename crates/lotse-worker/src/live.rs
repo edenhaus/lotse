@@ -814,20 +814,24 @@ impl Output {
     }
 
     /// Queues `fragment`'s bytes for the pipe, behind its record header in a
-    /// framed output, its duration held to the longest a header says (a
-    /// minute: a camera whose timestamps jumped).
+    /// framed output, which says the fragment's real duration: one over
+    /// what a header may say (a minute: a camera whose timestamps jumped)
+    /// ends a framed output rather than tell the LL-HLS window a duration
+    /// the media it serves does not have ([`Self::queue_record`]). An
+    /// output that is not framed writes no header and goes on.
     fn queue_fragment(&mut self, fragment: LiveFragment) -> Result<(), LiveEnd> {
-        let longest = Duration::from_micros(u64::from(fragments::MAX_DURATION_US));
         let kind = RecordKind::Fragment {
             independent: fragment.independent,
-            duration: fragment.duration.min(longest),
+            duration: fragment.duration,
         };
         self.queue_record(kind, fragment.bytes)
     }
 
     /// Queues `bytes` for the pipe, in a framed output behind the header of
     /// a record of `kind` ([`lotse_ipc::fragments`]); one the header cannot
-    /// describe (over its bounds, far above any frame) ends the output.
+    /// describe (its length or its video's duration over the framing's
+    /// bounds, far above any frame of a working camera) ends the output
+    /// `internal_error`, logged with both.
     fn queue_record(&mut self, kind: RecordKind, bytes: Vec<Bytes>) -> Result<(), LiveEnd> {
         if self.framed {
             let len = bytes
@@ -835,7 +839,12 @@ impl Output {
                 .map(Bytes::len)
                 .fold(0_usize, usize::saturating_add);
             let Some(header) = fragments::header(kind, len) else {
-                tracing::warn!(live.id = %self.id, len, "live: a record over the framing's bounds");
+                tracing::warn!(
+                    live.id = %self.id,
+                    len,
+                    duration = ?video_duration(kind),
+                    "live: a record's length or its video's duration is over the framing's bound"
+                );
                 return Err(LiveEnd::InternalError);
             };
             self.queue(vec![Bytes::copy_from_slice(&header)]);
@@ -944,6 +953,15 @@ fn entry(track: &Arc<Track>) -> RecordingTrack {
     RecordingTrack {
         codec: (*track.codec()).clone(),
         clock_rate: track.clock_rate(),
+    }
+}
+
+/// How long the video of a record of `kind` lasts, for the log: `None` for
+/// the init segment.
+const fn video_duration(kind: RecordKind) -> Option<Duration> {
+    match kind {
+        RecordKind::Fragment { duration, .. } => Some(duration),
+        RecordKind::Init => None,
     }
 }
 

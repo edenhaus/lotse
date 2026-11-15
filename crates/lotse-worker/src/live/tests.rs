@@ -397,7 +397,10 @@ async fn a_container_that_fails_ends_the_output_internal_error() {
         rig.video_frame(0, true, 1);
         let _reader = rig.start_with(
             spec(false, 1 << 20),
-            FakeLiveMuxerFactory { fail: Some(fail) },
+            FakeLiveMuxerFactory {
+                fail: Some(fail),
+                ..FakeLiveMuxerFactory::default()
+            },
         );
         if fetch {
             rig.started().await;
@@ -418,6 +421,7 @@ async fn a_container_that_fails_at_a_hole_ends_the_output_internal_error() {
         spec(false, 1 << 20),
         FakeLiveMuxerFactory {
             fail: Some(FakeLiveFailure::Skip),
+            ..FakeLiveMuxerFactory::default()
         },
     );
     rig.started().await;
@@ -965,6 +969,68 @@ async fn a_framed_output_writes_each_record_behind_its_header() {
     assert_eq!(&records[0].bytes[..], b"init video=h264\n");
     rig.lives.stop("l1", LiveEnd::Stopped);
     rig.closed().await;
+}
+
+/// A frame's fragment that lasts over what a record header may say (a
+/// camera whose timestamps jumped): a framed output ends rather than tell
+/// the LL-HLS window a duration the media does not have, with a warning
+/// carrying the duration; an output that is not framed writes no header
+/// and goes on.
+#[tokio::test]
+async fn a_frame_over_the_framing_s_duration_ends_a_framed_output_and_not_another() {
+    let (logs, _guard) = Logs::capture();
+    let over = Duration::from_micros(u64::from(fragments::MAX_DURATION_US) + 1);
+    let long = FakeLiveMuxerFactory {
+        duration: over,
+        ..FakeLiveMuxerFactory::default()
+    };
+    let mut rig = Rig::new(None);
+    let _reader = rig.start_with(
+        LiveSpec {
+            framed: true,
+            ..spec(false, 1 << 20)
+        },
+        long,
+    );
+    rig.started().await;
+    rig.lives.fetch("l1");
+    settle().await;
+    rig.video_frame(0, true, 3);
+    assert_eq!(rig.closed().await.0, "internal_error");
+    let warning = "live: a record's length or its video's duration is over the framing's bound";
+    let warned = logs.lines(Level::WARN, warning);
+    assert_eq!(warned.len(), 1);
+    assert!(
+        warned[0].fields.contains(" len=")
+            && warned[0].fields.contains(" duration=Some(60.000001s)"),
+        "{warned:?}"
+    );
+
+    let mut rig = Rig::new(None);
+    let reader = rig.start_with(spec(false, 1 << 20), long);
+    rig.started().await;
+    rig.lives.fetch("l1");
+    settle().await;
+    rig.video_frame(0, true, 3);
+    rig.video_frame(1, false, 2);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h264", "frame v 0 0 k 3", "frame v 0 3600 - 2"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    assert_eq!(rig.closed().await.0, "stopped");
+    assert_eq!(logs.count(Level::WARN, warning), 1, "no second warning");
+}
+
+#[test]
+fn a_record_s_video_duration_is_its_fragment_s_and_none_for_the_init_segment() {
+    let duration = Duration::from_millis(40);
+    let fragment = RecordKind::Fragment {
+        independent: false,
+        duration,
+    };
+    assert_eq!(video_duration(fragment), Some(duration));
+    assert_eq!(video_duration(RecordKind::Init), None);
 }
 
 #[tokio::test]

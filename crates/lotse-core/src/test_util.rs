@@ -1409,9 +1409,10 @@ pub enum FakeLiveFailure {
 /// fragments, as [`FakeRecordingMuxerFactory`] does: `init video=<codec>[
 /// audio=<codec>]` at the start, its MIME type `video/fake;
 /// codecs="<codec>[,<codec>]"`; per frame taken `frame <v|a> <epoch> <ts>
-/// <k|-> <bytes>` and the payload, each a fragment of its own at once (it
-/// holds nothing back, but a frame without a payload, which it takes and
-/// writes nothing for, [`LiveStep::Held`]); `skip` for a hole. As the real one, it starts at a
+/// <k|-> <bytes>` and the payload, each a fragment of its own at once
+/// that says it lasts [`Self::duration`] (it holds nothing back, but a
+/// frame without a payload, which it takes and writes nothing for,
+/// [`LiveStep::Held`]); `skip` for a hole. As the real one, it starts at a
 /// video keyframe and, after a hole, leaves out every frame up to the next
 /// one; a frame of another epoch needs no keyframe. It carries H.264, H.265,
 /// AAC-LC and Opus whatever their parameters, and an output continues while
@@ -1420,6 +1421,9 @@ pub enum FakeLiveFailure {
 pub struct FakeLiveMuxerFactory {
     /// Where its writers fail.
     pub fail: Option<FakeLiveFailure>,
+    /// How long each frame's fragment says it lasts: zero by default, more
+    /// for a camera whose timestamps jumped.
+    pub duration: Duration,
 }
 
 impl LiveMuxerFactory for FakeLiveMuxerFactory {
@@ -1433,6 +1437,7 @@ impl LiveMuxerFactory for FakeLiveMuxerFactory {
     fn muxer(&self) -> Box<dyn LiveMuxer> {
         Box::new(FakeLiveMuxer {
             fail: self.fail,
+            duration: self.duration,
             entries: None,
             waiting: true,
             origin: None,
@@ -1445,6 +1450,8 @@ impl LiveMuxerFactory for FakeLiveMuxerFactory {
 struct FakeLiveMuxer {
     /// Where it fails.
     fail: Option<FakeLiveFailure>,
+    /// How long each frame's fragment says it lasts.
+    duration: Duration,
     /// The tracks it started with.
     entries: Option<(RecordingTrack, Option<RecordingTrack>)>,
     /// Whether it waits for a video keyframe.
@@ -1502,7 +1509,7 @@ impl LiveMuxer for FakeLiveMuxer {
             bytes: vec![line.into(), frame.payload.clone()],
             independent: track == Kind::Video && frame.keyframe,
             decode_time: frame.wallclock.saturating_duration_since(origin),
-            duration: Duration::ZERO,
+            duration: self.duration,
         }))
     }
 
@@ -3695,10 +3702,12 @@ mod tests {
         let t0 = SystemClock.now();
         let mut failing = FakeLiveMuxerFactory {
             fail: Some(FakeLiveFailure::Push),
+            ..FakeLiveMuxerFactory::default()
         }
         .muxer();
         let mut writer = FakeLiveMuxerFactory {
             fail: Some(FakeLiveFailure::Start),
+            ..FakeLiveMuxerFactory::default()
         }
         .muxer();
         assert_eq!(
@@ -3713,6 +3722,7 @@ mod tests {
         ));
         let mut skipping = FakeLiveMuxerFactory {
             fail: Some(FakeLiveFailure::Skip),
+            ..FakeLiveMuxerFactory::default()
         }
         .muxer();
         assert!(matches!(skipping.skip(), Err(RecordingError::Failed(_))));
