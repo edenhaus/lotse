@@ -472,13 +472,17 @@ impl ClientStore {
     }
 
     /// Registers connection `id`, authenticated with `pin`, and returns the
-    /// token cancelled when `pin` is removed: already cancelled when it was
-    /// removed after the handshake.
+    /// token cancelled when `pin` is removed: already cancelled when it is
+    /// no `control` client by now. Only the routes a `control` client alone
+    /// may take register a connection (the upgrade, a recording's body),
+    /// and the role was checked before, but not under the connections'
+    /// lock: a pin removed since then and enrolled again as a `metrics`
+    /// client was missed by its removal, and is caught here.
     pub(crate) fn attach(&self, id: ConnectionId, pin: Fingerprint) -> CancellationToken {
         let token = CancellationToken::new();
         let mut open = self.connections();
         open.insert(id, (pin, token.clone()));
-        if !self.allows(&pin) {
+        if self.role(&pin) != Some(ClientRole::Control) {
             token.cancel();
         }
         drop(open);
@@ -859,6 +863,38 @@ mod tests {
             store.add(scraper, ClientRole::Control).unwrap(),
             Addition::Added
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression (Copilot's review of edenhaus/lotse#182): a WebSocket
+    /// upgrade checked as a `control` client registers its connection
+    /// later; if its pin is removed and enrolled again as `metrics` in
+    /// between, the removal finds no connection to close, and the
+    /// registration must not then hand the metrics pin a control
+    /// connection.
+    #[test]
+    fn a_connection_registered_after_its_pin_became_a_metrics_client_is_closed_at_once() {
+        let dir = data_dir("role-race");
+        let store = open(&dir, &[], runtime()).unwrap();
+        let pin = Fingerprint::of(b"pin");
+        store.enroll(pin).unwrap();
+        // The upgrade's role check passed here, as a control client.
+        assert_eq!(store.role(&pin), Some(ClientRole::Control));
+        assert_eq!(
+            store.remove(pin, ConnectionId(9)).unwrap(),
+            Removal::Removed { closed: 0 },
+            "nothing registered yet to close"
+        );
+        assert_eq!(
+            store.add(pin, ClientRole::Metrics).unwrap(),
+            Addition::Added
+        );
+        // Then the upgraded connection registers.
+        assert!(store.attach(ConnectionId(1), pin).is_cancelled());
+        // A control client's connection stays open.
+        let control = Fingerprint::of(b"control");
+        store.enroll(control).unwrap();
+        assert!(!store.attach(ConnectionId(2), control).is_cancelled());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
