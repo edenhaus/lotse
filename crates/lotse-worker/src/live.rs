@@ -19,9 +19,10 @@
 //! first frame a player gets is so the GOP's keyframe, as old as the GOP
 //! (at most the camera's keyframe interval, and what `limits.gop_cache_*`
 //! keeps); the player plays the burst and jumps to the live edge. A GOP
-//! the cache cut short (only its keyframe kept) is not sent: the frames after
-//! it would miss their references, and the output starts at the next
-//! keyframe instead.
+//! the cache cut short (only its keyframe kept: it outgrew the cache, or
+//! lost a frame over `max_frame_bytes` before the output's subscription) is
+//! not sent: the frames after it would miss their references, and the
+//! output starts at the next keyframe instead.
 //!
 //! Back-pressure: the media path never waits for a reader. The bytes the
 //! container completed go to the pipe as it takes them, without blocking,

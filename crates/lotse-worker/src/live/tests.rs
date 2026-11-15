@@ -466,6 +466,51 @@ async fn a_gop_the_cache_cut_short_is_not_sent_and_the_next_keyframe_starts_the_
     rig.closed().await;
 }
 
+/// The GOP lost a frame over `max_frame_bytes` before the fetch, which the
+/// output's subscription, taken at the fetch, never saw: the frames after
+/// the hole may reference it, so the GOP is not sent.
+#[tokio::test]
+async fn a_gop_that_lost_a_frame_before_the_fetch_is_not_sent_and_the_next_keyframe_starts_the_media()
+ {
+    let limits = TrackLimits {
+        max_frame_bytes: 100,
+        ..TrackLimits::default()
+    };
+    let mut rig = Rig::with(Some(h264()), None, true, limits, 8);
+    rig.video_frame(0, true, 1);
+    assert!(!rig.video_frame(1, false, 101), "lost");
+    rig.video_frame(2, false, 2);
+    let reader = rig.fetched().await;
+    rig.video_frame(3, false, 3);
+    rig.video_frame(4, true, 4);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h264", "frame v 0 14400 k 4"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    rig.closed().await;
+}
+
+/// An output started after a codec family change, before the new
+/// family's first keyframe, writes the new family's init segment: the old
+/// family's GOP is not sent under it.
+#[tokio::test]
+async fn an_output_started_after_a_codec_family_change_joins_at_the_new_family_s_first_keyframe() {
+    let mut rig = Rig::new(None);
+    rig.video_frame(0, true, 1);
+    rig.video_frame(1, false, 2);
+    rig.video().set_codec(h265());
+    let reader = rig.fetched().await;
+    rig.video_frame(2, false, 3);
+    rig.video_frame(3, true, 4);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h265", "frame v 0 10800 k 4"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    rig.closed().await;
+}
+
 #[tokio::test]
 async fn a_reader_that_falls_behind_costs_it_the_frames_up_to_the_next_keyframe_and_never_the_track()
  {
