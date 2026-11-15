@@ -23,7 +23,11 @@ fn fragment(tag: u8, len: usize, independent: bool, nanos: u64) -> Fragment {
     }
 }
 
-/// Pushes `count` fragments of `ms` each and 72 bytes (200 with the
+/// What a fragment of [`push_frames`] and [`push_200_ms`] costs the window:
+/// its 72 bytes and the overhead.
+const EACH: usize = 72 + FRAGMENT_OVERHEAD;
+
+/// Pushes `count` fragments of `ms` each and 72 bytes ([`EACH`] with the
 /// overhead), the `n`th tagged `n` and independent when `n % gop == 0`;
 /// returns what the last became.
 fn push_frames(window: &mut Window, from: usize, count: usize, ms: u64, gop: usize) -> Pushed {
@@ -49,8 +53,8 @@ fn five_part_segments(config: Config, count: usize) -> Window {
     window
 }
 
-/// Pushes fragments `from` to `to` (excluded) of 200 ms and 72 bytes (200
-/// with the overhead), the `n`th tagged `n` (wrapping) and independent when
+/// Pushes fragments `from` to `to` (excluded) of 200 ms and 72 bytes
+/// ([`EACH`] with the overhead), the `n`th tagged `n` (wrapping) and independent when
 /// `independent(n)`: one fragment a part. The window's clock is then `to`
 /// × 200 ms.
 fn push_200_ms(window: &mut Window, from: usize, to: usize, independent: fn(usize) -> bool) {
@@ -486,10 +490,10 @@ fn rfc8216bis_6_2_2_a_delisted_segment_is_served_its_availability_duration_past_
     assert!(serves(&window, 0), "8.6 s");
     push_200_ms(&mut window, 43, 46, first_1400_ms);
     assert!(serves(&window, 0), "9.2 s");
-    assert_eq!(window.bytes(), 46 * 200 + INIT.len());
+    assert_eq!(window.bytes(), 46 * EACH + INIT.len());
     push_200_ms(&mut window, 46, 47, first_1400_ms);
     assert!(!serves(&window, 0), "9.4 s");
-    assert_eq!(window.bytes(), (47 - 7) * 200 + INIT.len());
+    assert_eq!(window.bytes(), (47 - 7) * EACH + INIT.len());
     // Segment 1 appeared at 2.6 s and was listed in the 6.4 s playlist too,
     // not only in the 6 s ones of segments of 1 s: served until 10 s.
     assert!(serves(&window, 1));
@@ -566,15 +570,15 @@ fn rfc8216bis_6_2_2_the_media_sequence_advances_as_segments_are_delisted() {
     );
     assert_eq!(tags(window.get(Resource::Part { msn: 1, index: 4 })), [9]);
     assert!(serves(&window, 0));
-    // Segments 0 to 3 of 5 fragments and the open one of 2, 200 bytes each.
-    assert_eq!(window.bytes(), 22 * 200 + INIT.len());
+    // Segments 0 to 3 of 5 fragments and the open one of 2, EACH each.
+    assert_eq!(window.bytes(), 22 * EACH + INIT.len());
     // 6.2 s: segment 0 is retired.
     push_frames(&mut window, 22, 8, 200, 5);
     assert!(serves(&window, 0));
     push_frames(&mut window, 30, 1, 200, 5);
     assert!(!serves(&window, 0));
     assert!(serves(&window, 1));
-    assert_eq!(window.bytes(), (31 - 5) * 200 + INIT.len());
+    assert_eq!(window.bytes(), (31 - 5) * EACH + INIT.len());
 }
 
 #[test]
@@ -755,24 +759,24 @@ fn rfc8216bis_4_4_4_9_the_part_target_rises_to_a_part_of_one_longer_fragment() {
 
 #[test]
 fn the_byte_cap_drops_the_delisted_segment_first_and_holds_up_to_the_cap() {
-    // 200 bytes a fragment, 1000 a segment; one segment listed.
+    // EACH a fragment, 5 × EACH a segment; one segment listed.
     let mut window = window(Config {
         segments: 1,
-        max_bytes: 2_400,
+        max_bytes: 12 * EACH,
         ..Config::default()
     });
     push_frames(&mut window, 0, 11, 200, 5);
-    assert_eq!(window.bytes(), 2_200 + INIT.len());
-    // 2400: at the cap, nothing drops.
+    assert_eq!(window.bytes(), 11 * EACH + INIT.len());
+    // 12 fragments: at the cap, nothing drops.
     push_frames(&mut window, 11, 1, 200, 5);
-    assert_eq!(window.bytes(), 2_400 + INIT.len());
+    assert_eq!(window.bytes(), 12 * EACH + INIT.len());
     assert!(matches!(
         window.get(Resource::Segment { msn: 0 }),
         Lookup::Ready(_)
     ));
-    // 2600: the delisted segment drops first.
+    // 13: the delisted segment drops first.
     push_frames(&mut window, 12, 1, 200, 5);
-    assert_eq!(window.bytes(), 1_600 + INIT.len());
+    assert_eq!(window.bytes(), 8 * EACH + INIT.len());
     assert_eq!(window.get(Resource::Segment { msn: 0 }), Lookup::NotFound);
     assert!(matches!(
         window.get(Resource::Segment { msn: 1 }),
@@ -783,14 +787,14 @@ fn the_byte_cap_drops_the_delisted_segment_first_and_holds_up_to_the_cap() {
 #[test]
 fn the_byte_cap_drops_listed_segments_down_to_the_open_one() {
     let mut window = window(Config {
-        max_bytes: 1_000,
+        max_bytes: 5 * EACH,
         ..Config::default()
     });
     // Segment 0 holds the cap exactly; the keyframe that starts segment 1
     // joins no segment, and segment 0 drops for it.
     push_frames(&mut window, 0, 5, 200, 5);
     assert_eq!(push_frames(&mut window, 5, 1, 200, 5), Pushed::Published);
-    assert_eq!(window.bytes(), 200 + INIT.len());
+    assert_eq!(window.bytes(), EACH + INIT.len());
     assert_eq!(window.get(Resource::Segment { msn: 0 }), Lookup::NotFound);
     let playlist = window.playlist().unwrap();
     assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:1\n"));
@@ -805,15 +809,17 @@ fn the_byte_cap_drops_listed_segments_down_to_the_open_one() {
 #[test]
 fn an_open_segment_past_the_byte_cap_ends_the_window() {
     let mut window = window(Config {
-        max_bytes: 1_000,
+        max_bytes: 5 * EACH,
         ..Config::default()
     });
     push_frames(&mut window, 0, 5, 200, 100);
-    let overflow = Err(PushError::Overflow { max_bytes: 1_000 });
+    let overflow = Err(PushError::Overflow {
+        max_bytes: 5 * EACH,
+    });
     assert_eq!(window.push(fragment(5, 72, false, 200 * MS)), overflow);
     // It takes nothing more, a keyframe neither, and serves what it holds.
     assert_eq!(window.push(fragment(6, 72, true, 200 * MS)), overflow);
-    assert_eq!(window.bytes(), 1_000 + INIT.len());
+    assert_eq!(window.bytes(), 5 * EACH + INIT.len());
     assert_eq!(tags(window.get(Resource::Part { msn: 0, index: 4 })), [4]);
 }
 
@@ -826,6 +832,77 @@ fn a_first_fragment_past_the_byte_cap_ends_the_window() {
     assert_eq!(
         window.push(fragment(0, 1_000, true, 200 * MS)),
         Err(PushError::Overflow { max_bytes: 1_000 })
+    );
+    assert_eq!(window.bytes(), INIT.len());
+}
+
+/// The most the window allocates for a fragment that is its own part and
+/// its own segment, on the target the test runs on, as
+/// [`FRAGMENT_OVERHEAD`]'s docs count it: 4 handles and 4 parts (a `Vec`'s
+/// first capacity), a segment and a delisted one twice over (a
+/// `VecDeque`'s doubling), the 3 words of a `Bytes`' shared header, and an
+/// allocator's header on its buffer, that header and the two vectors.
+fn worst_case_fragment_footprint() -> usize {
+    /// An allocator's header, rounded up: glibc's and musl's are at most 16
+    /// bytes on the 64-bit targets.
+    const ALLOCATION_HEADER: usize = 16;
+    4 * size_of::<Bytes>()
+        + 4 * size_of::<Part>()
+        + 2 * size_of::<Segment>()
+        + 2 * size_of::<Delisted>()
+        + 3 * size_of::<usize>()
+        + 4 * ALLOCATION_HEADER
+}
+
+#[test]
+fn the_fragment_overhead_covers_a_one_fragment_segment_s_allocations() {
+    assert!(
+        worst_case_fragment_footprint() <= FRAGMENT_OVERHEAD,
+        "{} bytes",
+        worst_case_fragment_footprint()
+    );
+}
+
+/// Fragments of no byte, each its own segment: each costs the overhead, at
+/// least its footprint, so a cap of 10 overheads holds 10 of them (the open
+/// segment and 9 listed) and drops the oldest for the 11th; a cap below one
+/// overhead takes none.
+#[test]
+fn fragments_of_no_byte_are_charged_their_worst_case_footprint() {
+    let config = Config {
+        segment_target: Duration::ZERO,
+        segments: 100,
+        max_bytes: 10 * FRAGMENT_OVERHEAD,
+        ..Config::default()
+    };
+    let mut window = window(config);
+    for n in 1..=10 {
+        window.push(fragment(0, 0, true, 40 * MS)).unwrap();
+        assert_eq!(window.bytes(), n * FRAGMENT_OVERHEAD + INIT.len());
+        assert!(window.bytes() >= n * worst_case_fragment_footprint() + INIT.len());
+    }
+    assert!(matches!(
+        window.get(Resource::Segment { msn: 0 }),
+        Lookup::Ready(_)
+    ));
+    window.push(fragment(0, 0, true, 40 * MS)).unwrap();
+    assert_eq!(window.bytes(), 10 * FRAGMENT_OVERHEAD + INIT.len());
+    assert_eq!(window.listed.len(), 9);
+    assert_eq!(window.get(Resource::Segment { msn: 0 }), Lookup::NotFound);
+    assert!(matches!(
+        window.get(Resource::Segment { msn: 1 }),
+        Lookup::Ready(_)
+    ));
+
+    let mut window = self::window(Config {
+        max_bytes: FRAGMENT_OVERHEAD - 1,
+        ..config
+    });
+    assert_eq!(
+        window.push(fragment(0, 0, true, 40 * MS)),
+        Err(PushError::Overflow {
+            max_bytes: FRAGMENT_OVERHEAD - 1
+        })
     );
     assert_eq!(window.bytes(), INIT.len());
 }

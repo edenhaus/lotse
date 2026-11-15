@@ -189,11 +189,30 @@ pub const DEFAULT_SEGMENTS: usize = 6;
 /// about 16 Mbit/s.
 pub const DEFAULT_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-/// What a fragment costs the window beyond its bytes: its handle, and its
-/// share of the part and segment that hold it, rounded up. A fragment of no
-/// byte so still counts, and the byte cap bounds the memory a window takes
-/// however small the fragments a worker sends are.
-pub const FRAGMENT_OVERHEAD: usize = 128;
+/// What a fragment costs the window beyond its bytes: 1 KiB, an upper bound
+/// of what the window allocates for one fragment in the worst case, a
+/// fragment that is its own part and its own segment (every fragment
+/// independent under a zero segment target). On the 64-bit targets:
+///
+/// - its handle, a `Bytes` of 32 bytes, in its part's slices: a `Vec`
+///   allocates room for 4 elements at its first push (`RawVec`'s minimum
+///   non-zero capacity for elements of up to 1 KiB) and doubles when full,
+///   so 4 handles, 128 bytes;
+/// - its part, 56 bytes, in its segment's parts, 4 likewise: 224 bytes;
+/// - its segment, 120 bytes, in the listed queue and, delisted, 136 bytes in
+///   the delisted queue, each twice over: a `VecDeque` doubles when full
+///   and never shrinks, so it holds up to twice the most segments it held,
+///   which the cap bounds: 512 bytes;
+/// - the shared header a `Bytes` of a `Vec` allocates when cloned (3 words,
+///   24 bytes), and an allocator's header of 16 bytes on each of the 4
+///   allocations it costs alone (its buffer, that header, its part's slices
+///   and its segment's parts): 88 bytes.
+///
+/// 952 bytes in all (a test checks the sum against the types' sizes),
+/// rounded up. A fragment of no byte so still counts, and the byte cap
+/// bounds the memory a window takes however small the fragments a worker
+/// sends are.
+pub const FRAGMENT_OVERHEAD: usize = 1024;
 
 /// What a part's duration may exceed its target by before it closes a frame
 /// early, and a segment's may fall short of its target by and still be at
