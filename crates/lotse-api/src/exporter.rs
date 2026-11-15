@@ -154,15 +154,21 @@ impl Format {
     /// The response's `Content-Type` ("Content-Type Response": the media
     /// type, its version and, for a text format from 1.0.0 on, the
     /// escaping scheme).
-    pub fn content_type(self) -> String {
+    pub const fn content_type(self) -> &'static str {
         match self {
-            Self::OpenMetrics(escaping) => format!(
-                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping={}",
-                escaping.as_str()
-            ),
-            Self::PrometheusText => {
-                prometheus_client::encoding::prometheus_text::CONTENT_TYPE.to_owned()
+            Self::OpenMetrics(Escaping::AllowUtf8) => {
+                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=allow-utf-8"
             }
+            Self::OpenMetrics(Escaping::Underscores) => {
+                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores"
+            }
+            Self::OpenMetrics(Escaping::Dots) => {
+                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=dots"
+            }
+            Self::OpenMetrics(Escaping::Values) => {
+                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=values"
+            }
+            Self::PrometheusText => prometheus_client::encoding::prometheus_text::CONTENT_TYPE,
         }
     }
 }
@@ -581,13 +587,16 @@ fn single(
     let Some(number) = number else {
         return Ok(());
     };
-    let metric = encoder.encode_descriptor(
+    // The `?` on a line that runs: alone on a line of its own, the error
+    // path it stands for, which writing to a `String` never takes, would
+    // count as a line no test reaches.
+    let described = encoder.encode_descriptor(
         family.name,
         family.help,
         family.base.unit(),
         family.kind.metric_type(),
-    )?;
-    sample(metric, family.kind, number)
+    );
+    sample(described?, family.kind, number)
 }
 
 /// `family` with one sample per `(label value, number)`, labelled `label`;
@@ -602,12 +611,13 @@ fn labelled<'v>(
     if samples.peek().is_none() {
         return Ok(());
     }
-    let mut metric = encoder.encode_descriptor(
+    let described = encoder.encode_descriptor(
         family.name,
         family.help,
         family.base.unit(),
         family.kind.metric_type(),
-    )?;
+    );
+    let mut metric = described?;
     for (value, number) in samples {
         let labels = [(label, value)];
         sample(metric.encode_family(&labels)?, family.kind, number)?;
@@ -673,11 +683,8 @@ impl Collector for Exposition {
             single(&mut encoder, &family, field(&supervisor.process))?;
         }
         for (family, field) in DEMUX_FAMILIES {
-            single(
-                &mut encoder,
-                &family,
-                supervisor.demux.as_ref().and_then(field),
-            )?;
+            let number = supervisor.demux.as_ref().and_then(field);
+            single(&mut encoder, &family, number)?;
         }
         let count = |value: usize| Number::Count(u64::try_from(value).unwrap_or(u64::MAX));
         let totals = [
@@ -742,12 +749,13 @@ pub(crate) fn render(metrics: &Metrics, format: Format) -> Result<(String, LeftO
     let mut registry = Registry::with_prefix(PREFIX);
     registry.register_collector(Box::new(exposition));
     let mut text = String::new();
-    match format {
+    let encoded = match format {
         Format::OpenMetrics(_) => prometheus_client::encoding::text::encode(&mut text, &registry),
         Format::PrometheusText => {
             prometheus_client::encoding::prometheus_text::encode(&mut text, &registry)
         }
-    }?;
+    };
+    encoded?;
     Ok((text, left_out))
 }
 
@@ -795,8 +803,7 @@ fn answer(
             "metrics exposition capped: streams or workers beyond the cap are left out"
         );
     }
-    let content_type = HeaderValue::from_str(&format.content_type())
-        .unwrap_or_else(|_| HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"));
+    let content_type = HeaderValue::from_static(format.content_type());
     closing((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], text).into_response())
 }
 
@@ -1337,10 +1344,7 @@ lotse_supervisor_uptime_seconds 1.5
         ] {
             let (status, headers, body) = body_of(respond(Some(full()), format, &lines)).await;
             assert_eq!(status, 200);
-            assert_eq!(
-                headers[header::CONTENT_TYPE],
-                format.content_type().as_str()
-            );
+            assert_eq!(headers[header::CONTENT_TYPE], format.content_type());
             assert_eq!(headers[header::CONNECTION], "close");
             assert_eq!(body, text(&full(), format));
         }
@@ -1382,5 +1386,46 @@ lotse_supervisor_uptime_seconds 1.5
         assert_eq!(status, 405);
         assert_eq!(headers[header::ALLOW], "GET, HEAD");
         assert!(body.contains("invalid_request"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_tls_client_removed_since_its_handshake_is_refused_rfc9110_15_5_4() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        use lotse_core::fingerprint::Fingerprint;
+
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let dir = std::env::temp_dir().join(format!("lotse-exporter-{}", std::process::id()));
+        let _gone = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let runtime = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
+        let scraper = Fingerprint::of(b"scraper");
+        let store = ClientStore::open(
+            &std::fs::File::open(&dir).unwrap(),
+            &dir,
+            &[(scraper, lotse_api_types::clients::ClientRole::Metrics)],
+            runtime,
+        )
+        .unwrap();
+        let tls = |pin| PeerInfo::Tls {
+            pin,
+            addr: "192.0.2.1:1".parse().unwrap(),
+        };
+        let none = HeaderMap::new();
+        assert!(refusal(&tls(scraper), &none, false, Some(&store)).is_none());
+        let removed = refusal(&tls(Fingerprint::of(b"gone")), &none, false, Some(&store));
+        let (status, headers, body) = body_of(removed.unwrap()).await;
+        assert_eq!(status, 403);
+        assert_eq!(headers[header::CONNECTION], "close");
+        assert!(body.contains("not_permitted"), "{body}");
+        assert!(
+            logs.text()
+                .contains("metrics refused: its client was removed")
+        );
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
