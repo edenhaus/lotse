@@ -987,6 +987,10 @@ function startLlhls(marks) {
         session = await create(false);
         llhls.mime = session.mime;
         llhls.playlist_url = session.playlist;
+        // What the element reported of the first attempt (its `error` can
+        // come before hls.js's fatal one, or as hls.js lets go of it) goes
+        // with the refusal: only the retry's errors are the page's.
+        llhls.refused_by_hlsjs.element_errors = llhls.errors.splice(0);
         await Promise.race([playWithHlsJs(Hls, session.playlist), timeout(15000, "the first LL-HLS frame without audio")]);
       }
     }

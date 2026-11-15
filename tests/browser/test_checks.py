@@ -899,15 +899,22 @@ def test_an_opus_session_s_type_counts_even_when_hls_js_or_the_browser_refused_i
     page = llhls_page()
     page["llhls"]["mime"] = opus
     assert check(page, OPUS, player="llhls").failures == []
-    # hls.js failed on it before a frame and the page asked again without the audio.
+    # hls.js failed on it before a frame and the page asked again without the audio; the
+    # element's error of that first attempt is kept with the refusal, not as the page's.
+    element_error = "the element: 4 MEDIA_ERR_SRC_NOT_SUPPORTED"
     page["llhls"] |= {
         "mime": video_only,
-        "refused_by_hlsjs": {"mime": opus, "error": "hls.js fatal: mediaError bufferAddCodecError"},
+        "refused_by_hlsjs": {
+            "mime": opus,
+            "error": "hls.js fatal: mediaError bufferAddCodecError",
+            "element_errors": [element_error],
+        },
     }
     verdict = check(page, OPUS, player="llhls")
     assert verdict.failures == []
     assert verdict.llhls is not None
     assert verdict.llhls["refused_by_hlsjs"]["mime"] == opus
+    assert verdict.llhls["refused_by_hlsjs"]["element_errors"] == [element_error]
     assert verdict.llhls["audio"]["in_output"] is False
     # Refused by `isTypeSupported` first.
     page["llhls"] |= {"refused_by_hlsjs": None, "refused_mime": opus}
