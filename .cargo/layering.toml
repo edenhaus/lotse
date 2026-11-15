@@ -17,6 +17,7 @@ lotse-tls = ["lotse-rtsp", "lotse-http", "lotse-supervisor"] # the sources' TLS 
 lotse-rtsp = ["lotse"]
 lotse-http = ["lotse"] # M6, the factory behind `source-http`
 lotse-mux = ["lotse"] # M6, the recording container behind `output-recording`
+lotse-hls = ["lotse-supervisor"] # the LL-HLS window of a live output, in the supervisor that serves it
 lotse-webrtc = ["lotse", "lotse-testing"] # lotse: the factories behind `output-webrtc` and `source-webrtc`; lotse-testing: dev-only, its reproduction test of an open str0m issue (Safari's ICE)
 lotse-snapshot = ["lotse-supervisor", "lotse"] # M5
 lotse-supervisor = ["lotse"]
