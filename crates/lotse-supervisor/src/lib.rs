@@ -242,16 +242,20 @@ pub fn bind(settings: &Settings) -> Result<Listeners, BindError> {
         owners: settings.owners,
         allow_uid: settings.allow_uid,
         max_connections: settings.limits.max_connections,
-        // One per session, one `stream/subscribe` and one
-        // `signaling/subscribe` per stream and one of each for every
-        // stream: the cap never refuses what the other limits allow.
-        max_subscriptions: settings.limits.max_sessions.saturating_add(
-            settings
-                .limits
-                .max_streams
-                .saturating_add(1)
-                .saturating_mul(2),
-        ),
+        // One per session, one per live output, one `stream/subscribe`
+        // and one `signaling/subscribe` per stream and one of each for
+        // every stream: the cap never refuses what the other limits allow.
+        max_subscriptions: settings
+            .limits
+            .max_sessions
+            .saturating_add(settings.limits.live.max_live)
+            .saturating_add(
+                settings
+                    .limits
+                    .max_streams
+                    .saturating_add(1)
+                    .saturating_mul(2),
+            ),
         tls: settings.control_tls.clone(),
     })?;
     Ok(Listeners { api, udp, tcp })

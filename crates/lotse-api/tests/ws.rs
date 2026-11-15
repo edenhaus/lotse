@@ -44,6 +44,8 @@ struct FakeHandler {
     flood: Option<Arc<Notify>>,
     /// The subscriptions `webrtc/offer` opened, which end with `closed`.
     sessions: Mutex<Vec<(u64, mpsc::Sender<Event>)>>,
+    /// The `live/create` commands the handler began.
+    lives: AtomicU64,
 }
 
 impl FakeHandler {
@@ -53,6 +55,25 @@ impl FakeHandler {
                 stream_id: stream_id.to_owned(),
             },
             payload: json!({ "type": "stream", "stream_id": stream_id, "state": state, "last_error": null }),
+        }
+    }
+}
+
+impl FakeHandler {
+    /// `live/create` `id`: the output's result, then its `closed`, which
+    /// ends the subscription.
+    fn live_create(&self, id: u64) -> Outcome {
+        self.lives.fetch_add(1, Ordering::AcqRel);
+        let (tx, rx) = mpsc::channel(8);
+        let _queued = tx.try_send(Event {
+            class: EventClass::Signaling,
+            payload: json!({ "type": "closed", "reason": "closed" }),
+        });
+        let live_id = format!("l{id}");
+        Outcome::SubscribedWith {
+            result: json!({ "live_id": live_id, "url": format!("/v0/live/{live_id}"),
+                            "mime": "video/mp4; codecs=\"avc1.640028\"" }),
+            events: rx,
         }
     }
 }
@@ -134,6 +155,7 @@ impl Handler for FakeHandler {
                     events: rx,
                 }
             }
+            Command::LiveCreate(create) => self.live_create(create.id),
             // A refusal at a limit, as the supervisor's busy connection.
             Command::BackchannelRelease(_) => Outcome::Error(
                 ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
@@ -154,7 +176,6 @@ impl Handler for FakeHandler {
             | Command::SignalingAnswer(_)
             | Command::SignalingCandidate(_)
             | Command::SignalingError(_)
-            | Command::LiveCreate(_)
             | Command::LiveClose(_) => Outcome::Result(json!({})),
             Command::Ping(_)
             | Command::Schema(_)
@@ -582,6 +603,7 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
             json!({ "type": "recording/create", "stream_id": "a", "duration_ms": 1_000 }),
         ),
         (7, json!({ "type": "signaling/subscribe" })),
+        (8, json!({ "type": "live/create", "stream_id": "a" })),
     ] {
         let mut frame = frame;
         frame["id"] = json!(id);
@@ -592,7 +614,8 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
     }
     assert_eq!(running.handler.subscribers.lock().unwrap().len(), 1);
     assert_eq!(running.handler.sessions.lock().unwrap().len(), 1);
-    // The first refusal is a warning, the four after it within the
+    assert_eq!(running.handler.lives.load(Ordering::Acquire), 0);
+    // The first refusal is a warning, the five after it within the
     // interval are counted for the next.
     let refusals = warned_limits(&logs);
     assert_eq!(refusals.len(), 1, "{refusals:?}");
@@ -606,22 +629,66 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
         assert!(refusals[0].contains(part), "{part}: {refusals:?}");
     }
     // Other commands are not affected.
-    send(&mut ws, json!({ "id": 8, "type": "info" })).await;
+    send(&mut ws, json!({ "id": 9, "type": "info" })).await;
     assert_eq!(recv(&mut ws).await["result"]["version"], "0.0.0-test");
 
     // The session's channel closes: its subscription ended and frees a slot.
     running.handler.sessions.lock().unwrap().clear();
-    send(&mut ws, json!({ "id": 9, "type": "ping" })).await;
+    send(&mut ws, json!({ "id": 10, "type": "ping" })).await;
     assert_eq!(recv(&mut ws).await["type"], "pong");
-    send(&mut ws, json!({ "id": 10, "type": "stream/subscribe" })).await;
+    send(&mut ws, json!({ "id": 11, "type": "stream/subscribe" })).await;
     assert_eq!(recv(&mut ws).await["success"], true);
     running.clock.advance(SUMMARY_INTERVAL);
-    send(&mut ws, json!({ "id": 11, "type": "stream/subscribe" })).await;
+    send(&mut ws, json!({ "id": 12, "type": "stream/subscribe" })).await;
     assert_eq!(recv(&mut ws).await["error"]["code"], "limit_reached");
     let refusals = warned_limits(&logs);
     assert_eq!(refusals.len(), 2, "{refusals:?}");
-    assert!(refusals[1].contains("id=11"), "{refusals:?}");
-    assert!(refusals[1].contains("refused=5"), "{refusals:?}");
+    assert!(refusals[1].contains("id=12"), "{refusals:?}");
+    assert!(refusals[1].contains("refused=6"), "{refusals:?}");
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `live/create` holds a subscription slot like every command that opens
+/// one: at the cap it is refused before the handler sees it, and an output
+/// that ended (`closed`) gives its slot back, its finished forwarder
+/// forgotten when the next command that opens a subscription is admitted.
+#[tokio::test]
+async fn a_live_output_holds_a_subscription_slot_until_it_ends() {
+    let running = start_limited("live-cap", FakeHandler::default(), 8, 1);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    for id in [1, 3] {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "live/create", "stream_id": "a" }),
+        )
+        .await;
+        let created = recv(&mut ws).await;
+        assert_eq!(created["id"], id, "{created}");
+        assert_eq!(created["result"]["url"], format!("/v0/live/l{id}"));
+        assert_eq!(
+            recv(&mut ws).await,
+            json!({ "id": id, "type": "event", "event": { "type": "closed", "reason": "closed" } })
+        );
+        send(&mut ws, json!({ "id": id + 1, "type": "ping" })).await;
+        assert_eq!(recv(&mut ws).await["type"], "pong");
+    }
+    send(&mut ws, json!({ "id": 5, "type": "stream/subscribe" })).await;
+    assert_eq!(recv(&mut ws).await["success"], true);
+    send(
+        &mut ws,
+        json!({ "id": 6, "type": "live/create", "stream_id": "a" }),
+    )
+    .await;
+    let refused = recv(&mut ws).await;
+    assert_eq!(refused["id"], 6, "{refused}");
+    assert_eq!(refused["error"]["code"], "limit_reached", "{refused}");
+    assert_eq!(
+        refused["error"]["details"]["limit"], "max_subscriptions",
+        "{refused}"
+    );
+    assert_eq!(running.handler.lives.load(Ordering::Acquire), 2);
     ws.close(None).await.unwrap();
     running.finish().await;
 }

@@ -281,7 +281,7 @@ pub struct Config {
     /// Control connections at once.
     pub max_connections: u32,
     /// Open subscriptions per connection (`stream/subscribe`,
-    /// `webrtc/offer`, `session/adopt`, `recording/create`,
+    /// `webrtc/offer`, `session/adopt`, `recording/create`, `live/create`,
     /// `signaling/subscribe`); one more is answered
     /// `limit_reached` before the handler sees it. Ended ones do not count.
     pub max_subscriptions: u32,
