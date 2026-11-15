@@ -290,6 +290,158 @@ fn a_fragment_of_audio_alone_joins_the_open_part_and_closes_none() {
     );
 }
 
+/// Five 200 ms frames, then audio alone, then the keyframe that completes
+/// the segment: the audio is no part of its own lasting nothing (§4.4.4.9:
+/// `DURATION`) but goes, ahead of the keyframe, into the next segment's
+/// first part, which is independent: it contains the keyframe.
+#[test]
+fn rfc8216bis_4_4_4_9_audio_alone_when_a_segment_completes_goes_into_the_next_segment_s_first_part()
+{
+    let mut window = five_part_segments(Config::default(), 5);
+    assert_eq!(window.push(fragment(100, 10, false, 0)), Ok(Pushed::Held));
+    assert_eq!(window.push(fragment(101, 20, false, 0)), Ok(Pushed::Held));
+    assert_eq!(
+        window.push(fragment(5, 72, true, 200 * MS)),
+        Ok(Pushed::Published)
+    );
+    assert_eq!(
+        tags(window.get(Resource::Segment { msn: 0 })),
+        [0, 1, 2, 3, 4]
+    );
+    assert_eq!(
+        window.get(Resource::Part { msn: 0, index: 5 }),
+        Lookup::NotFound
+    );
+    assert_eq!(
+        tags(window.get(Resource::Part { msn: 1, index: 0 })),
+        [100, 101, 5]
+    );
+    let playlist = window.playlist().unwrap();
+    assert!(!playlist.contains("DURATION=0.000000"), "{playlist}");
+    assert!(
+        playlist.contains("#EXTINF:1.000000,\nseg0.m4s\n"),
+        "{playlist}"
+    );
+    assert!(
+        playlist.contains("#EXT-X-PART:DURATION=0.200000,INDEPENDENT=YES,URI=\"part1.0.m4s\"\n"),
+        "{playlist}"
+    );
+    // The audio's cost went with it: segment 0 costs its five frames.
+    let audio = 10 + 20 + 2 * FRAGMENT_OVERHEAD;
+    assert_eq!(window.listed[0].cost, 5 * EACH);
+    assert_eq!(window.open.as_ref().unwrap().segment.cost, audio + EACH);
+    assert_eq!(window.bytes(), INIT.len() + 6 * EACH + audio);
+    push_frames(&mut window, 6, 5, 200, 5);
+    assert_eq!(
+        tags(window.get(Resource::Segment { msn: 1 })),
+        [100, 101, 5, 6, 7, 8, 9]
+    );
+    assert_eq!(window.listed[1].cost, audio + 5 * EACH);
+}
+
+/// A segment that lasts nothing yet, an independent fragment of no
+/// duration, does not complete at the next independent fragment, even
+/// under a zero segment target: it would be a segment and a part that last
+/// nothing (§4.4.3.1, §4.4.4.9), and its part would set a Part Target
+/// Duration of a millisecond.
+#[test]
+fn rfc8216bis_4_4_4_9_a_segment_that_lasts_nothing_completes_at_no_independent_fragment() {
+    let mut window = window(Config {
+        segment_target: Duration::ZERO,
+        ..Config::default()
+    });
+    assert_eq!(window.push(fragment(0, 10, true, 0)), Ok(Pushed::Held));
+    assert_eq!(window.push(fragment(1, 10, true, 0)), Ok(Pushed::Held));
+    assert_eq!(
+        window.push(fragment(2, 10, true, 300 * MS)),
+        Ok(Pushed::Published)
+    );
+    assert_eq!(window.playlist(), None);
+    assert_eq!(
+        window.push(fragment(3, 10, true, 300 * MS)),
+        Ok(Pushed::Published)
+    );
+    assert_eq!(tags(window.get(Resource::Segment { msn: 0 })), [0, 1, 2]);
+    assert_eq!(
+        tags(window.get(Resource::Part { msn: 0, index: 0 })),
+        [0, 1, 2]
+    );
+    let playlist = window.playlist().unwrap();
+    assert!(
+        playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.301000\n"),
+        "{playlist}"
+    );
+}
+
+/// Asserts what every push keeps: each closed part and each complete
+/// segment lasts something (§4.4.4.9, §4.4.3.1), a segment lasts its parts
+/// and costs its fragments, its open part's included, and the window holds
+/// what its segments cost.
+fn assert_parts_last_and_cost_their_fragments(window: &Window) {
+    let open = window.open.as_ref();
+    let complete = window
+        .delisted
+        .iter()
+        .map(|delisted| &delisted.segment)
+        .chain(&window.listed);
+    for segment in complete.clone() {
+        assert!(!segment.duration.is_zero(), "segment {}", segment.msn);
+    }
+    let mut held = 0;
+    for (segment, pending) in complete
+        .map(|segment| (segment, None))
+        .chain(open.map(|open| (&open.segment, Some(&open.pending))))
+    {
+        let mut duration = Duration::ZERO;
+        let mut cost = pending.map_or(0, Part::cost);
+        for (index, part) in segment.parts.iter().enumerate() {
+            assert!(!part.duration.is_zero(), "part {}.{index}", segment.msn);
+            duration += part.duration;
+            cost += part.cost();
+        }
+        assert_eq!(segment.duration, duration, "segment {}", segment.msn);
+        assert_eq!(segment.cost, cost, "segment {}", segment.msn);
+        held += cost;
+    }
+    assert_eq!(window.held, held);
+}
+
+/// Video of 40 and 200 ms, keyframes of those and of no duration, and audio
+/// alone, mixed, under segment targets of zero, 200 ms and 1 s: no push
+/// publishes a part or a segment that lasts nothing, and every byte is
+/// accounted to the segment that holds it.
+#[test]
+fn rfc8216bis_4_4_4_9_no_part_or_segment_published_lasts_nothing() {
+    for segment_target in [0, 200, 1000] {
+        let mut window = window(Config {
+            segment_target: Duration::from_millis(segment_target),
+            max_bytes: 40 * EACH,
+            ..Config::default()
+        });
+        let mut state = 7_u32;
+        for n in 0..600_u32 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let (independent, ms) = match (state >> 16) % 8 {
+                0 | 1 => (false, 0),
+                2 => (true, 0),
+                3 => (true, 40),
+                4 => (true, 200),
+                5 => (false, 200),
+                _ => (false, 40),
+            };
+            window
+                .push(fragment(n.to_le_bytes()[0], 72, independent, ms * MS))
+                .unwrap();
+            assert_parts_last_and_cost_their_fragments(&window);
+            if let Some(playlist) = window.playlist() {
+                assert!(!playlist.contains("DURATION=0.000000"), "{playlist}");
+                assert!(!playlist.contains("#EXTINF:0.000000"), "{playlist}");
+            }
+        }
+        assert!(window.completed > 20, "{segment_target}");
+    }
+}
+
 #[test]
 fn rfc8216bis_4_4_2_1_a_segment_starts_at_the_first_independent_fragment_once_it_lasts_the_target()
 {
@@ -821,6 +973,46 @@ fn an_open_segment_past_the_byte_cap_ends_the_window() {
     assert_eq!(window.push(fragment(6, 72, true, 200 * MS)), overflow);
     assert_eq!(window.bytes(), 5 * EACH + INIT.len());
     assert_eq!(tags(window.get(Resource::Part { msn: 0, index: 4 })), [4]);
+}
+
+/// A new segment holds the audio alone it takes from the one before and its
+/// keyframe: past the cap together, they end the window. An open part that
+/// lasts something closes in its segment and costs the new one nothing.
+#[test]
+fn the_byte_cap_counts_the_audio_alone_a_new_segment_takes() {
+    let config = Config {
+        segment_target: Duration::ZERO,
+        max_bytes: 2 * FRAGMENT_OVERHEAD + 10,
+        ..Config::default()
+    };
+    let mut window = window(config);
+    // A part of its own: the audio is alone in the open part.
+    assert_eq!(
+        window.push(fragment(0, 0, true, 200 * MS)),
+        Ok(Pushed::Published)
+    );
+    assert_eq!(window.push(fragment(1, 0, false, 0)), Ok(Pushed::Held));
+    assert_eq!(
+        window.push(fragment(2, 72, true, 40 * MS)),
+        Err(PushError::Overflow {
+            max_bytes: config.max_bytes
+        })
+    );
+
+    let mut window = self::window(Config {
+        max_bytes: EACH,
+        ..config
+    });
+    assert_eq!(window.push(fragment(0, 0, true, 40 * MS)), Ok(Pushed::Held));
+    assert_eq!(
+        window.push(fragment(1, 72, true, 40 * MS)),
+        Ok(Pushed::Published)
+    );
+    // Segment 0 went for the cap, as it would have with the audio: the new
+    // segment alone fits.
+    assert_eq!(window.get(Resource::Segment { msn: 0 }), Lookup::NotFound);
+    assert_eq!(tags(window.get(Resource::Part { msn: 1, index: 0 })), [1]);
+    assert_eq!(window.bytes(), INIT.len() + EACH);
 }
 
 #[test]
