@@ -7531,6 +7531,57 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A live output of a stream whose first source moves to another
+    /// connection, the old one kept as a later source, is asked to stop at
+    /// once and ends `stream_changed` with its worker's `Closed`.
+    #[tokio::test]
+    async fn a_live_output_of_a_stream_whose_first_source_moved_ends_stream_changed() {
+        let dir = private_dir("live-moved-first");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let connection = s.shared.lock().streams["front"].sources[0]
+            .connection
+            .clone();
+        let (tx, mut commands) = mpsc::channel(16);
+        s.shared
+            .lock()
+            .connections
+            .get_mut(&connection)
+            .unwrap()
+            .commands = tx;
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        s.shared
+            .lock()
+            .live_report(&connection, &live_id, live_started());
+        let (_answer, mut events) = started(within(create).await.unwrap());
+        let failover = json!({ "id": 3, "type": "stream/put", "stream_id": "front",
+                               "sources": [{ "protocol": "fake", "url": "fake://127.0.0.1:9/" },
+                                           { "protocol": "fake", "url": "fake://127.0.0.1:1/" }] });
+        result(call(&s, &failover.to_string()).await);
+        assert_eq!(
+            s.shared.lock().streams["front"].sources[1].connection,
+            connection,
+            "the old connection stays, as the second source's"
+        );
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        s.shared.lock().live_report(
+            &connection,
+            &live_id,
+            live_closed(lotse_ipc::STOPPED_AS_ASKED),
+        );
+        assert_eq!(next(&mut events).await["reason"], "stream_changed");
+        assert!(!s.shared.lock().lives.contains_key(&live_id));
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Why an output that ended before its init segment refuses its
     /// `live/create`.
     #[test]
