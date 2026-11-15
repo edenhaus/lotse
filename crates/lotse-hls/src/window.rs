@@ -75,29 +75,67 @@
 //!
 //! # What the window holds
 //!
-//! The playlist lists the last [`Config::segments`] complete segments; the
-//! one before them, delisted last, is still served (not listed) until the
-//! next one is delisted: §6.2.2 keeps a removed segment downloadable for
-//! its Availability Duration, its own duration past the playlist's, about
-//! one segment. The parts of a segment are served as long as the segment is
-//! (§6.2.2: "at least three Target Durations after the EXT-X-PART tag is
-//! removed"; see [`DEFAULT_SEGMENTS`] for why the default holds that long).
-//! Media past [`Config::max_bytes`] drops the oldest segments first,
-//! the delisted one, then the listed ones; the open segment is never
-//! dropped, and a fragment that would make it hold more than the cap
-//! alone ends the window ([`PushError::Overflow`]): a stream whose
-//! keyframes are that far apart cannot be served as segments that start
-//! with one.
+//! The window has no wall clock: its clock is the media it took, the sum of
+//! its fragments' durations, read after each push. A live writer sends a
+//! fragment once the next frame tells how long it lasts, so at its end, and
+//! the clock so runs with the camera's.
+//!
+//! The playlist lists the last [`Config::segments`] complete segments. A
+//! complete segment's `EXT-X-PART` tags are listed, all of them, while its
+//! end is within three Target Durations of the playlist's (its last closed
+//! part's), and leave together at the push that takes it further, or with
+//! the segment when it is delisted first. §6.2.2: "EXT-X-PART tags SHOULD
+//! be removed from the Playlist after they are greater than three Target
+//! Durations from the end of the Playlist". A client knows a part's Part
+//! Index (§3.2: "the position of the Partial Segment within its Parent
+//! Segment. The first Partial Segment has a Part Index of zero") only by
+//! counting its parent's tags: hls.js 1.7.4 (`src/loader/m3u8-parser.ts`,
+//! read 2026-11-15) numbers the `EXT-X-PART` tags after a segment's URI from
+//! 0 and places the first at its parent's start, so a parent listed without
+//! its first parts would have the rest misnumbered and mistimed.
+//! SPEC-DEVIATION (§6.2.2, the SHOULD): a parent's first parts so keep their
+//! tags up to one segment longer than three Target Durations from the end.
+//! The open segment's parts are always listed.
+//!
+//! A delisted segment is still served (not listed) until the later of two
+//! deadlines, both of §6.2.2, and then retired at the first push that takes
+//! the clock to it:
+//!
+//! - "clients MUST be able to download the segment until the time at which
+//!   it first appeared in the Playlist plus the segment's Availability
+//!   Duration", which is "the duration of the segment plus the duration of
+//!   the longest-duration Playlist distributed by the server containing that
+//!   segment": the clock when it completed, plus its duration, plus the
+//!   longest sum of the segments' durations (§4.1: "The duration of a Media
+//!   Playlist is the sum of the durations of the Media Segments within it")
+//!   of a playlist that listed it;
+//! - "Clients MUST be able to download the Partial Segment for at least
+//!   three Target Durations after the EXT-X-PART tag is removed from the
+//!   Playlist": the clock when its part tags left, plus three Target
+//!   Durations. A part is served as long as its segment.
+//!
+//! Segments of one Target Duration each are so served about one segment
+//! past their delisting; segments of differing durations, or shorter than
+//! the Target Duration, longer.
+//!
+//! Media past [`Config::max_bytes`] drops the oldest segments first, the
+//! delisted ones, then the listed ones; the open segment is never dropped,
+//! and a fragment that would make it hold more than the cap alone ends the
+//! window ([`PushError::Overflow`]): a stream whose keyframes are that far
+//! apart cannot be served as segments that start with one.
 //!
 //! SPEC-DEVIATION (§6.2.2, "MUST NOT remove a Media Segment ... if that
 //! would produce a Playlist whose duration is less than three times the
-//! Target Duration"): the segment count and the byte cap are hard bounds on
-//! the supervisor's memory and drop a segment however short the playlist
-//! then is. The defaults keep about six Target Durations when segments
-//! last one each, which they do when the keyframe interval is the segment
-//! target or longer.
+//! Target Duration", and the deadlines above): the segment count and the
+//! byte cap are hard bounds on the supervisor's memory; the count delists
+//! a segment however short the playlist then is, and the cap drops one
+//! before its deadline. The defaults keep about six Target Durations when
+//! segments last one each, which they do when the keyframe interval is the
+//! segment target or longer. And the deadlines are wall-clock times that
+//! the window reads off its media: a source that sends media faster than
+//! real time retires segments early by as much.
 //!
-//! The window is sans-IO and has no clock: a blocked request
+//! The window is sans-IO and has no other clock: a blocked request
 //! ([`Window::reload`], [`Window::get`]) is the caller's to hold, to wake
 //! when [`Window::push`] publishes ([`Pushed::Published`]) and to time out.
 
@@ -136,17 +174,19 @@ pub const DEFAULT_PART_TARGET: Duration = Duration::from_millis(200);
 /// 1s`, read 2026-11-15).
 pub const DEFAULT_SEGMENT_TARGET: Duration = Duration::from_secs(1);
 
-/// The complete segments a playlist lists by default: 6. With the one
-/// delisted segment still served, the window holds 7 segments and the open
-/// one, so with segments of one Target Duration each: a playlist of 6, at
-/// least the 3 Target Durations §6.2.2 asks of one, and a part served 3
-/// Target Durations past the 3 its tag is listed for (§6.2.2). MediaMTX
-/// 1.21.3 keeps 7 (`hlsSegmentCount: 7`, read 2026-11-15).
+/// The complete segments a playlist lists by default: 6. With segments of
+/// one Target Duration each, a playlist of 6 Target Durations, at least the
+/// 3 §6.2.2 asks of one, and one delisted segment still served (see the
+/// module docs), so the window holds 7 segments and the open one; a part's
+/// tag is listed for about 3 Target Durations and the part served for 3
+/// more (§6.2.2) within those 7. MediaMTX 1.21.3 keeps 7 (`hlsSegmentCount:
+/// 7`, read 2026-11-15).
 pub const DEFAULT_SEGMENTS: usize = 6;
 
 /// The media a window holds at most by default, accounted as
 /// [`Window::bytes`] counts it: 32 MiB, the default window of 2 s segments
-/// (7 and the open one) of a stream of up to about 16 Mbit/s.
+/// (7 and the open one, see [`DEFAULT_SEGMENTS`]) of a stream of up to
+/// about 16 Mbit/s.
 pub const DEFAULT_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// What a fragment costs the window beyond its bytes: its handle, and its
@@ -171,6 +211,18 @@ const ONE_SECOND: Duration = Duration::from_secs(1);
 /// second or more, in seconds of parts below (draft-pantos-hls-rfc8216bis-22
 /// §6.2.5.2).
 const ADVANCE_PART_LIMIT: u64 = 3;
+
+/// How far from the playlist's end, in Target Durations, a complete
+/// segment's end is while its part tags are listed: "EXT-X-PART tags SHOULD
+/// be removed from the Playlist after they are greater than three Target
+/// Durations from the end of the Playlist" (draft-pantos-hls-rfc8216bis-22
+/// §6.2.2).
+const PART_TAG_TARGET_DURATIONS: u32 = 3;
+
+/// How long, in Target Durations, a part is served after its tag left the
+/// playlist: "at least three Target Durations after the EXT-X-PART tag is
+/// removed from the Playlist" (draft-pantos-hls-rfc8216bis-22 §6.2.2).
+const PART_SERVED_TARGET_DURATIONS: u32 = 3;
 
 /// One fragment of a live output: its bytes, opaque here, and what a playlist
 /// says of it.
@@ -370,9 +422,27 @@ struct Segment {
     /// What it costs the window ([`FRAGMENT_OVERHEAD`]), its open part's
     /// fragments included.
     cost: usize,
+    /// Where it starts on the window's clock: the clock before its first
+    /// fragment.
+    start: Duration,
+    /// The window's clock when it completed and first appeared in the
+    /// playlist; zero while open.
+    appeared: Duration,
+    /// The duration of the longest playlist that listed it, the sum of its
+    /// segments' durations (draft-pantos-hls-rfc8216bis-22 §4.1); zero while
+    /// open.
+    longest: Duration,
+    /// The window's clock when its part tags left the playlist; `None` while
+    /// they are listed, and always for the open segment.
+    untagged: Option<Duration>,
 }
 
 impl Segment {
+    /// Where it ends on the window's clock: its start plus its closed parts.
+    fn end(&self) -> Duration {
+        self.start.saturating_add(self.duration)
+    }
+
     /// The segment's bytes: its parts', in order.
     fn chunks(&self) -> Chunks {
         let mut chunks = Chunks::default();
@@ -393,14 +463,19 @@ struct Open {
 }
 
 impl Open {
-    /// An empty segment of `msn`.
-    fn new(msn: u64) -> Self {
+    /// An empty segment of `msn` that starts at `start` on the window's
+    /// clock.
+    fn new(msn: u64, start: Duration) -> Self {
         Self {
             segment: Segment {
                 msn,
                 parts: Vec::new(),
                 duration: Duration::ZERO,
                 cost: 0,
+                start,
+                appeared: Duration::ZERO,
+                longest: Duration::ZERO,
+                untagged: None,
             },
             pending: Part::default(),
         }
@@ -425,6 +500,16 @@ impl Open {
     }
 }
 
+/// A segment delisted and still served (see the module docs).
+#[derive(Debug)]
+struct Delisted {
+    /// The segment.
+    segment: Segment,
+    /// The window's clock at which it is retired (draft-pantos-hls-rfc8216bis-22
+    /// §6.2.2): served while the clock is before it.
+    until: Duration,
+}
+
 /// The targets a published playlist holds to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Targets {
@@ -445,8 +530,11 @@ pub struct Window {
     /// The complete segments the playlist lists, oldest first, Media
     /// Sequence Numbers consecutive.
     listed: VecDeque<Segment>,
-    /// The segment delisted last, still served.
-    delisted: Option<Segment>,
+    /// The segments delisted and still served, in the order delisted.
+    delisted: VecDeque<Delisted>,
+    /// The window's clock: the durations of the fragments it took, summed
+    /// (see the module docs).
+    clock: Duration,
     /// The segment being built: `None` until an independent fragment starts
     /// the window, then always one.
     open: Option<Open>,
@@ -480,7 +568,8 @@ impl Window {
             config,
             init,
             listed: VecDeque::new(),
-            delisted: None,
+            delisted: VecDeque::new(),
+            clock: Duration::ZERO,
             open: None,
             completed: 0,
             previous_parts: 0,
@@ -518,6 +607,8 @@ impl Window {
             return Err(overflow);
         }
 
+        let start = self.clock;
+        self.clock = self.clock.saturating_add(fragment.duration);
         let completing = if starts { self.open.take() } else { None };
         let published = completing.is_some();
         if let Some(open) = completing {
@@ -525,7 +616,7 @@ impl Window {
         }
         let limit = self.part_limit();
         let msn = self.completed;
-        let open = self.open.get_or_insert_with(|| Open::new(msn));
+        let open = self.open.get_or_insert_with(|| Open::new(msn, start));
         // Close the part before a fragment that would take it past the limit;
         // one of only audio, which lasts nothing, keeps it.
         let before = if !open.pending.duration.is_zero()
@@ -544,16 +635,23 @@ impl Window {
         } else {
             None
         };
+        let end = open.segment.end();
         self.held = self.held.saturating_add(cost);
         // Only a part closed after its fragment can be longer than the limit:
         // the one fragment it holds is.
         if let Some(duration) = after {
             self.raise_part_target(duration);
         }
-        // Drop the oldest segments past the cap, the delisted one first; the
+        self.untag(end);
+        self.retire();
+        // Drop the oldest segments past the cap, the delisted ones first; the
         // open one alone is within it (checked above).
         while self.held > self.config.max_bytes
-            && let Some(gone) = self.delisted.take().or_else(|| self.listed.pop_front())
+            && let Some(gone) = self
+                .delisted
+                .pop_front()
+                .map(|delisted| delisted.segment)
+                .or_else(|| self.listed.pop_front())
         {
             self.held = self.held.saturating_sub(gone.cost);
         }
@@ -565,12 +663,14 @@ impl Window {
     }
 
     /// Completes the open segment: closes its open part, sets or raises the
-    /// targets, lists it and delists the oldest past the count.
+    /// targets, lists it, delists the oldest past the count, and records the
+    /// playlist's duration against every segment it lists.
     fn complete(&mut self, mut open: Open) {
         // The open part is within the limit: the last fragment would have
         // closed it otherwise.
         open.close_part();
-        let segment = open.segment;
+        let mut segment = open.segment;
+        segment.appeared = self.clock;
         self.completed = self.completed.saturating_add(1);
         self.previous_parts = u64::try_from(segment.parts.len()).unwrap_or(u64::MAX);
         let rounded = rounded_seconds(segment.duration);
@@ -591,10 +691,76 @@ impl Window {
         self.listed.push_back(segment);
         if self.listed.len() > self.config.segments
             && let Some(oldest) = self.listed.pop_front()
-            && let Some(gone) = self.delisted.replace(oldest)
         {
-            self.held = self.held.saturating_sub(gone.cost);
+            let until = self.deadline(&oldest);
+            self.delisted.push_back(Delisted {
+                segment: oldest,
+                until,
+            });
         }
+        let duration = self.listed.iter().fold(Duration::ZERO, |sum, segment| {
+            sum.saturating_add(segment.duration)
+        });
+        for segment in &mut self.listed {
+            segment.longest = segment.longest.max(duration);
+        }
+    }
+
+    /// The clock at which `segment`, delisted now, is retired
+    /// (draft-pantos-hls-rfc8216bis-22 §6.2.2, see the module docs): the
+    /// later of its Availability Duration past the time it appeared and
+    /// three Target Durations past the time its part tags left, now if they
+    /// leave with it.
+    fn deadline(&self, segment: &Segment) -> Duration {
+        let available = segment
+            .appeared
+            .saturating_add(segment.duration)
+            .saturating_add(segment.longest);
+        let parts = segment
+            .untagged
+            .unwrap_or(self.clock)
+            .saturating_add(self.target_durations(PART_SERVED_TARGET_DURATIONS));
+        available.max(parts)
+    }
+
+    /// `count` Target Durations; zero before the playlist is published.
+    fn target_durations(&self, count: u32) -> Duration {
+        self.target_duration()
+            .unwrap_or_default()
+            .saturating_mul(count)
+    }
+
+    /// Takes the part tags of the complete segments whose end is now more
+    /// than three Target Durations from the playlist's `end` (its last closed
+    /// part's) out of the playlist, all of a segment's together (see the
+    /// module docs), oldest first, and records when.
+    fn untag(&mut self, end: Duration) {
+        let reach = self.target_durations(PART_TAG_TARGET_DURATIONS);
+        let clock = self.clock;
+        for segment in self
+            .listed
+            .iter_mut()
+            .skip_while(|segment| segment.untagged.is_some())
+        {
+            if segment.end().saturating_add(reach) >= end {
+                break;
+            }
+            segment.untagged = Some(clock);
+        }
+    }
+
+    /// Retires the delisted segments whose deadline the clock reached.
+    fn retire(&mut self) {
+        let clock = self.clock;
+        let mut freed = 0_usize;
+        self.delisted.retain(|delisted| {
+            let served = delisted.until > clock;
+            if !served {
+                freed = freed.saturating_add(delisted.segment.cost);
+            }
+            served
+        });
+        self.held = self.held.saturating_sub(freed);
     }
 
     /// Raises the published Part Target Duration to fit a part of `duration`
@@ -740,8 +906,12 @@ impl Window {
 
     /// The complete segment `msn`, if held.
     fn segment(&self, msn: u64) -> Option<&Segment> {
-        if let Some(delisted) = self.delisted.as_ref().filter(|segment| segment.msn == msn) {
-            return Some(delisted);
+        if let Some(delisted) = self
+            .delisted
+            .iter()
+            .find(|delisted| delisted.segment.msn == msn)
+        {
+            return Some(&delisted.segment);
         }
         let first = self.listed.front()?.msn;
         self.listed
