@@ -226,25 +226,34 @@ impl ServerIdentity {
     /// leaves the file that uid can read. The pin changes, so every client
     /// pairs again; a running daemon serves the old certificate until it
     /// restarts. Asked for by the operator only, never on a start.
-    pub fn reissue(dir: &Path, owners: Owners) -> Result<Self, IdentityError> {
+    ///
+    /// The rename is the change, as for the enrolled clients: once it is
+    /// done the new certificate is the identity, and a failed sync of the
+    /// directory after it is no error but part of the result
+    /// ([`Reissued::notice`]), so the operator learns the new pin and does
+    /// not reissue again.
+    pub fn reissue(dir: &Path, owners: Owners) -> Result<Reissued, IdentityError> {
         Self::reissue_with(
             dir,
             owners,
             rustls::crypto::ring::default_provider().secure_random,
+            File::sync_all,
         )
     }
 
-    /// [`Self::reissue`] with the serial's randomness from `random`.
+    /// [`Self::reissue`] with the serial's randomness from `random` and the
+    /// directory synced by `sync_dir`.
     fn reissue_with(
         dir: &Path,
         owners: Owners,
         random: &dyn SecureRandom,
-    ) -> Result<Self, IdentityError> {
+        sync_dir: SyncDir,
+    ) -> Result<Reissued, IdentityError> {
         let locked = checked_directory(dir, owners, true)?;
         let old = Self::load_in(&locked, dir, owners)?;
         let key = KeyPair::try_from(&old.key).map_err(IdentityError::Generate)?;
         let pem = certify(&key, random)?;
-        write_new(&locked, dir, &pem, Some(old.owner))?;
+        let unsynced = write_new(&locked, dir, &pem, Some(old.owner), sync_dir)?;
         let identity = Self::load_in(&locked, dir, owners)?;
         tracing::info!(
             event = "control_identity_reissued",
@@ -253,7 +262,7 @@ impl ServerIdentity {
             server_pin = %identity.pin,
             "control identity reissued: every client must pair again"
         );
-        Ok(identity)
+        Ok(Reissued { identity, unsynced })
     }
 
     /// The identity in `dir`, made there first when there is none. `dir`
@@ -261,17 +270,33 @@ impl ServerIdentity {
     /// started as or, started as root, the uid it drops to.
     pub fn load_or_create(dir: &Path, owners: Owners) -> Result<Self, IdentityError> {
         let locked = checked_directory(dir, owners, true)?;
-        Self::load_or_create_in(&locked, dir, owners)
+        Self::load_or_create_in(&locked, dir, owners, File::sync_all)
     }
 
     /// [`Self::load_or_create`] in `handle`, `dir` opened, checked and
-    /// locked by [`checked_directory`]; `dir` only names it in messages.
-    fn load_or_create_in(handle: &File, dir: &Path, owners: Owners) -> Result<Self, IdentityError> {
+    /// locked by [`checked_directory`], the directory synced by
+    /// `sync_dir`; `dir` only names it in messages. Once the new file is
+    /// renamed into place it is the identity: a failed sync of the
+    /// directory after that is logged, as a crash could still lose it and
+    /// the next start make another.
+    fn load_or_create_in(
+        handle: &File,
+        dir: &Path,
+        owners: Owners,
+        sync_dir: SyncDir,
+    ) -> Result<Self, IdentityError> {
         match Self::load_in(handle, dir, owners) {
             Err(IdentityError::Missing(_)) => {
                 let random = rustls::crypto::ring::default_provider().secure_random;
                 let pem = generate(&rcgen::PKCS_ECDSA_P256_SHA256, random)?;
-                write_new(handle, dir, &pem, None)?;
+                let unsynced = write_new(handle, dir, &pem, None, sync_dir)?;
+                if let Some(err) = unsynced {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %err,
+                        "control identity generated, but syncing its directory failed: a crash may lose it"
+                    );
+                }
                 let identity = Self::load_in(handle, dir, owners)?;
                 tracing::info!(
                     event = "control_identity_created",
@@ -466,17 +491,53 @@ fn serial(random: &dyn SecureRandom) -> Result<SerialNumber, IdentityError> {
     Ok(SerialNumber::from(bytes.to_vec()))
 }
 
+/// Syncs the data directory after the rename: [`File::sync_all`], or a
+/// test's fault.
+type SyncDir = fn(&File) -> io::Result<()>;
+
+/// What [`ServerIdentity::reissue`] made.
+#[derive(Debug)]
+pub struct Reissued {
+    /// The new identity, in place.
+    pub identity: ServerIdentity,
+    /// Why the directory could not be synced after the rename, if it could
+    /// not: a crash before the system writes it may bring the old
+    /// certificate back.
+    unsynced: Option<io::Error>,
+}
+
+impl Reissued {
+    /// What the operator must know next, for `lotse identity --reissue` to
+    /// print beside the new pin: every client pairs again and the daemon
+    /// restarts to serve it, and, if the sync failed, that a crash may
+    /// still undo it.
+    pub fn notice(&self) -> String {
+        let unsynced = self.unsynced.as_ref().map_or_else(String::new, |err| {
+            format!(
+                " Syncing the data directory failed ({err}): a crash before the system writes it may bring back the old certificate; check it with `lotse identity` before pairing."
+            )
+        });
+        format!(
+            "the control identity has a new certificate from the same key, naming the DNS name `{SERVER_NAME}`, and the pin above replaces the old one: every client must pair again. Restart the daemon to serve it.{unsynced}"
+        )
+    }
+}
+
 /// Writes `pem` as [`IDENTITY_FILE`] in `handle`, the directory `dir`
 /// opened: to a new file created with mode 0600, given `owner` (a uid and
 /// gid) when there is one and else left the creator's, synced, renamed
-/// into place, and the directory synced. A partial file a crash left
-/// behind is replaced.
+/// into place, and the directory synced by `sync_dir`. A partial file a
+/// crash left behind is replaced. An error means [`IDENTITY_FILE`] is
+/// unchanged; once it is renamed into place the new file is the identity,
+/// and a failed sync of the directory is returned as its error, not as
+/// the result's.
 fn write_new(
     handle: &File,
     dir: &Path,
     pem: &str,
     owner: Option<(u32, u32)>,
-) -> Result<(), IdentityError> {
+    sync_dir: SyncDir,
+) -> Result<Option<io::Error>, IdentityError> {
     let text = dir.join(PARTIAL_FILE).display().to_string();
     let io = |source: io::Error| io_error(&text, source);
     let _stale = rustix::fs::unlinkat(handle, PARTIAL_FILE, AtFlags::empty());
@@ -493,7 +554,7 @@ fn write_new(
     rustix::fs::renameat(handle, PARTIAL_FILE, handle, IDENTITY_FILE)
         .map_err(io::Error::from)
         .map_err(io)?;
-    handle.sync_all().map_err(io)
+    Ok(sync_dir(handle).err())
 }
 
 #[cfg(test)]
@@ -587,7 +648,7 @@ mod tests {
         let _gone = std::fs::remove_dir_all(&checked);
         std::fs::rename(&dir, &checked).unwrap();
         std::fs::DirBuilder::new().mode(0o777).create(&dir).unwrap();
-        let made = ServerIdentity::load_or_create_in(&locked, &dir, me()).unwrap();
+        let made = ServerIdentity::load_or_create_in(&locked, &dir, me(), File::sync_all).unwrap();
         assert!(!dir.join(IDENTITY_FILE).exists(), "not written to the swap");
         let kept = ServerIdentity::load(&checked, me()).unwrap();
         assert_eq!(kept.pin(), made.pin(), "written where checked");
@@ -687,8 +748,15 @@ mod tests {
         assert!(err.to_string().contains("no randomness"), "{err}");
         let dir = data_dir("no-random", 0o700);
         let legacy = legacy_pem();
-        write_new(&open_directory(&dir).unwrap(), &dir, &legacy, None).unwrap();
-        let err = ServerIdentity::reissue_with(&dir, me(), no_random).unwrap_err();
+        write_new(
+            &open_directory(&dir).unwrap(),
+            &dir,
+            &legacy,
+            None,
+            File::sync_all,
+        )
+        .unwrap();
+        let err = ServerIdentity::reissue_with(&dir, me(), no_random, File::sync_all).unwrap_err();
         assert!(matches!(err, IdentityError::Random), "{err}");
         assert_eq!(
             std::fs::read_to_string(dir.join(IDENTITY_FILE)).unwrap(),
@@ -702,7 +770,14 @@ mod tests {
     fn an_identity_without_the_name_keeps_working_untouched() {
         let dir = data_dir("legacy", 0o700);
         let legacy = legacy_pem();
-        write_new(&open_directory(&dir).unwrap(), &dir, &legacy, None).unwrap();
+        write_new(
+            &open_directory(&dir).unwrap(),
+            &dir,
+            &legacy,
+            None,
+            File::sync_all,
+        )
+        .unwrap();
         let loaded = ServerIdentity::load_or_create(&dir, me()).unwrap();
         assert!(!loaded.names_server());
         assert_eq!(
@@ -726,9 +801,20 @@ mod tests {
         let err = ServerIdentity::reissue(&dir, someone_else()).unwrap_err();
         assert!(matches!(err, IdentityError::DirectoryOwner { .. }), "{err}");
         let legacy = legacy_pem();
-        write_new(&open_directory(&dir).unwrap(), &dir, &legacy, None).unwrap();
+        write_new(
+            &open_directory(&dir).unwrap(),
+            &dir,
+            &legacy,
+            None,
+            File::sync_all,
+        )
+        .unwrap();
         let old = ServerIdentity::load(&dir, me()).unwrap();
-        let new = ServerIdentity::reissue(&dir, me()).unwrap();
+        let reissued = ServerIdentity::reissue(&dir, me()).unwrap();
+        let notice = reissued.notice();
+        assert!(!notice.contains("Syncing"), "{notice}");
+        assert!(reissued.notice().contains("every client must pair again"));
+        let new = reissued.identity;
         assert!(new.names_server());
         assert_ne!(new.pin(), old.pin());
         let path = dir.join(IDENTITY_FILE);
@@ -740,7 +826,7 @@ mod tests {
         assert_eq!(new.owner, old.owner);
         assert_eq!(ServerIdentity::load(&dir, me()).unwrap().pin(), new.pin());
         // A second reissue of the same key: a serial of its own again.
-        let again = ServerIdentity::reissue(&dir, me()).unwrap();
+        let again = ServerIdentity::reissue(&dir, me()).unwrap().identity;
         let serials = [&old, &new, &again].map(|identity| serial_of(identity.certificate.as_ref()));
         assert_ne!(serials[0], serials[1]);
         assert_ne!(serials[1], serials[2]);
@@ -753,6 +839,33 @@ mod tests {
             "{text}"
         );
         assert!(!dir.join(PARTIAL_FILE).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_sync_after_the_rename_keeps_the_new_identity_and_says_so() {
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let disk = |_: &File| Err(io::Error::other("disk"));
+        let dir = data_dir("sync-fails", 0o700);
+        let locked = checked_directory(&dir, me(), true).unwrap();
+        let made = ServerIdentity::load_or_create_in(&locked, &dir, me(), disk).unwrap();
+        drop(locked);
+        let logged = logs.text();
+        assert!(logged.contains("syncing its directory failed"), "{logged}");
+        assert_eq!(ServerIdentity::load(&dir, me()).unwrap().pin(), made.pin());
+        let reissued = ServerIdentity::reissue_with(&dir, me(), random(), disk).unwrap();
+        assert_ne!(reissued.identity.pin(), made.pin());
+        assert_eq!(
+            ServerIdentity::load(&dir, me()).unwrap().pin(),
+            reissued.identity.pin(),
+            "the renamed file is the identity in force"
+        );
+        let notice = reissued.notice();
+        assert!(notice.contains("every client must pair again"), "{notice}");
+        assert!(
+            notice.contains("Syncing the data directory failed (disk)"),
+            "{notice}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -924,7 +1037,14 @@ mod tests {
         let (key, certificate) = made.split_at(made.find("-----BEGIN CERTIFICATE").unwrap());
         for (content, what) in [(certificate, "private key"), (key, "certificate")] {
             let _gone = std::fs::remove_file(&path);
-            write_new(&open_directory(&dir).unwrap(), &dir, content, None).unwrap();
+            write_new(
+                &open_directory(&dir).unwrap(),
+                &dir,
+                content,
+                None,
+                File::sync_all,
+            )
+            .unwrap();
             let err = ServerIdentity::load(&dir, me()).unwrap_err();
             assert!(
                 matches!(&err, IdentityError::Pem { what: w, .. } if w.starts_with(what)),
@@ -945,7 +1065,14 @@ mod tests {
         std::fs::DirBuilder::new()
             .create(dir.join(PARTIAL_FILE))
             .unwrap();
-        let err = write_new(&open_directory(&dir).unwrap(), &dir, &made, None).unwrap_err();
+        let err = write_new(
+            &open_directory(&dir).unwrap(),
+            &dir,
+            &made,
+            None,
+            File::sync_all,
+        )
+        .unwrap_err();
         assert!(matches!(err, IdentityError::Io { .. }), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
