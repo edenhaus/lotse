@@ -393,6 +393,9 @@ pub(crate) struct HlsSession {
     serial: u64,
     /// Its output: the live output's id.
     output: String,
+    /// Its output's window: the session ends with its output, so it never
+    /// outlives the window it serves.
+    feed: Arc<Feed>,
     /// The stream it plays.
     stream_id: String,
     /// The subscription that gets its events.
@@ -553,7 +556,7 @@ impl State {
 
     /// The open output of `stream_id` and `audio` a session joins: not one
     /// whose live output is being stopped.
-    fn hls_output_of(&self, stream_id: &str, audio: bool) -> Option<String> {
+    fn hls_output_of(&self, stream_id: &str, audio: bool) -> Option<Joined> {
         self.hls
             .outputs
             .iter()
@@ -565,7 +568,7 @@ impl State {
                         .get(*live_id)
                         .is_some_and(|live| live.ending.is_none())
             })
-            .map(|(live_id, _)| live_id.clone())
+            .map(|(live_id, output)| Joined::of(live_id, output))
     }
 
     /// Refuses a session on `stream_id` past the sessions' limits.
@@ -766,6 +769,30 @@ struct Registered {
     start: watch::Receiver<Start>,
 }
 
+/// What a new session takes of the output it joins or starts.
+struct Joined {
+    /// The live output.
+    live_id: String,
+    /// Its window.
+    feed: Arc<Feed>,
+    /// The worker's warning so far, which the session gets at once.
+    warning: Option<(LiveWarningCode, String)>,
+    /// Its start.
+    start: watch::Receiver<Start>,
+}
+
+impl Joined {
+    /// What a session takes of `live_id`'s `output`.
+    fn of(live_id: &str, output: &HlsOutput) -> Self {
+        Self {
+            live_id: live_id.to_owned(),
+            feed: Arc::clone(&output.feed),
+            warning: output.warning.clone(),
+            start: output.start.subscribe(),
+        }
+    }
+}
+
 /// `hls/create`: validates against the limits, joins the stream's output
 /// of that audio choice or starts one, registers the session, and waits for
 /// the output's start for at most `limits.live_start_timeout_ms` and the
@@ -864,18 +891,25 @@ fn register(
         ApiError::new(ErrorCode::LimitReached, "no LL-HLS in this build")
             .with_detail("limit", Cap::Outputs.as_str())
     })?;
-    if !state.streams.contains_key(stream_id.as_str()) {
+    let Some(stream) = state.streams.get(stream_id.as_str()) else {
         return Err(ApiError::new(ErrorCode::StreamNotFound, "no such stream")
             .with_detail("stream_id", stream_id.as_str()));
-    }
+    };
+    let source = session_connection(state, stream)?;
     state.check_hls_sessions(stream_id.as_str(), limits)?;
-    let (live_id, joined) = match state.hls_output_of(stream_id.as_str(), create.audio) {
-        Some(live_id) => (live_id, true),
+    let (output, joined) = match state.hls_output_of(stream_id.as_str(), create.audio) {
+        Some(output) => (output, true),
         None => (
-            start_output(shared, state, stream_id, create.audio, limits)?,
+            start_output(shared, state, stream_id, source, create.audio, limits)?,
             false,
         ),
     };
+    let Joined {
+        live_id,
+        feed,
+        warning,
+        start,
+    } = output;
     let (events, rx) = mpsc::channel(LIVE_QUEUE);
     let serial = state.hls.last.wrapping_add(1);
     state.hls.last = serial;
@@ -884,6 +918,7 @@ fn register(
     let session = HlsSession {
         serial,
         output: live_id.clone(),
+        feed,
         stream_id: stream_id.as_str().to_owned(),
         owner: LiveOwner {
             connection,
@@ -900,21 +935,9 @@ fn register(
         gone,
         _idle: idle_timer(shared, hls_id.as_str(), serial, limits.idle_timeout),
     };
-    let output = state
-        .hls
-        .outputs
-        .get(&live_id)
-        .ok_or_else(|| internal("the LL-HLS output is gone"))?;
-    if let Some((code, message)) = &output.warning {
-        session.deliver(
-            hls_id.as_str(),
-            &HlsEvent::Warning {
-                code: *code,
-                message: message.clone(),
-            },
-        );
+    if let Some((code, message)) = warning {
+        session.deliver(hls_id.as_str(), &HlsEvent::Warning { code, message });
     }
-    let start = output.start.subscribe();
     state
         .hls
         .sessions
@@ -935,15 +958,17 @@ fn register(
     })
 }
 
-/// Starts an LL-HLS output of `stream_id`: a framed live output whose pipe
-/// the supervisor reads itself; its live output's id.
+/// Starts an LL-HLS output of `stream_id` on its `source` connection: a
+/// framed live output whose pipe the supervisor reads itself; what a
+/// session joins of it.
 fn start_output(
     shared: &Arc<Shared>,
     state: &mut State,
     stream_id: &StreamId,
+    source: SessionConnection,
     audio: bool,
     limits: HlsLimits,
-) -> Result<String, ApiError> {
+) -> Result<Joined, ApiError> {
     if state.hls.outputs.len() >= usize::try_from(limits.max_outputs).unwrap_or(usize::MAX) {
         return Err(state.hls_refused(Cap::Outputs, stream_id.as_str()));
     }
@@ -953,11 +978,7 @@ fn start_output(
         id: connection_id,
         commands,
         ..
-    } = state
-        .streams
-        .get(stream_id.as_str())
-        .ok_or_else(|| internal("the stream is gone"))
-        .and_then(|stream| session_connection(state, stream))?;
+    } = source;
     let live_id = ulid(shared.clock.wall_now()).map_err(internal)?;
     let (reader, writer) = std::io::pipe().map_err(internal)?;
     let reader = pipe::Receiver::from_owned_fd(reader.into()).map_err(internal)?;
@@ -993,22 +1014,21 @@ fn start_output(
         read(
             Arc::clone(shared),
             live_id.clone(),
-            reader,
+            Box::new(reader),
             Arc::clone(&feed),
             limits.window(),
         ),
     );
-    state.hls.outputs.insert(
-        live_id.clone(),
-        HlsOutput {
-            stream_id: stream_id.as_str().to_owned(),
-            audio,
-            feed,
-            start: watch::Sender::new(Start::Starting),
-            warning: None,
-            _reader: RecordingTimer(reader.abort_handle()),
-        },
-    );
+    let output = HlsOutput {
+        stream_id: stream_id.as_str().to_owned(),
+        audio,
+        feed,
+        start: watch::Sender::new(Start::Starting),
+        warning: None,
+        _reader: RecordingTimer(reader.abort_handle()),
+    };
+    let joined = Joined::of(&live_id, &output);
+    state.hls.outputs.insert(live_id.clone(), output);
     state.refresh_connection(&connection_id);
     tracing::info!(
         event = "hls_output_opened",
@@ -1018,7 +1038,7 @@ fn start_output(
         audio,
         "LL-HLS output opened; waiting for its init segment"
     );
-    Ok(live_id)
+    Ok(joined)
 }
 
 /// The idle timer of session `serial`, `hls_id`: it ends the session
@@ -1047,11 +1067,13 @@ fn idle_timer(
 }
 
 /// Reads LL-HLS output `live_id`'s pipe into `feed` until it ends; a
-/// record that breaks the format or the window ends the output.
+/// record that breaks the format or the window ends the output. The pipe
+/// is a trait object, not a generic, so the one function serves the pipe
+/// and a test's failing reader alike.
 async fn read(
     shared: Arc<Shared>,
     live_id: String,
-    mut pipe: impl AsyncRead + Unpin,
+    mut pipe: Box<dyn AsyncRead + Unpin + Send>,
     feed: Arc<Feed>,
     config: Config,
 ) {
@@ -1131,18 +1153,11 @@ impl State {
             .get_mut(hls_id.as_str())
             .ok_or(HlsError::NotFound)?;
         session.touched = now;
-        let (session, gone) = (Arc::clone(&session.blocked), session.gone.clone());
-        let output = self
-            .hls
-            .sessions
-            .get(hls_id.as_str())
-            .and_then(|session| self.hls.outputs.get(&session.output))
-            .ok_or(HlsError::NotFound)?;
         Ok(Asked {
-            feed: Arc::clone(&output.feed),
-            session,
+            feed: Arc::clone(&session.feed),
+            session: Arc::clone(&session.blocked),
             all,
-            gone,
+            gone: session.gone.clone(),
             before,
         })
     }
