@@ -17,6 +17,8 @@ bytes = { workspace = true }
 hmac = { workspace = true } # MESSAGE-INTEGRITY of the fake TURN server (RFC 8489 §14.5) and of the Safari ICE test's hand-made STUN requests
 md-5 = { workspace = true } # the fake TURN server's long-term key (RFC 8489 §9.2.2)
 futures-util = { workspace = true } # the dev viewer's relay halves
+hyper = { workspace = true, features = ["client"] } # the dev viewer's GET of a live output's bytes from the daemon's control socket (`client::conn::http1`), streamed to the browser
+hyper-util = { workspace = true } # `TokioIo` between that request's Unix stream and hyper
 rcgen = { workspace = true } # the fake camera's self-signed certificate in TLS mode
 rtsp-types = { workspace = true }
 rustls = { workspace = true } # the fake camera's TLS server configuration
