@@ -230,8 +230,8 @@ fn answer(
             request.body.set(BodyState::Taken);
             let content_type = HeaderValue::from_str(&live.mime)
                 .unwrap_or_else(|_| HeaderValue::from_static(FALLBACK_MIME));
-            let header = HeaderValue::from_str(live_id.as_str())
-                .unwrap_or_else(|_| HeaderValue::from_static(""));
+            // A live id is a header value as it is (`LiveId`'s pattern).
+            let id_header = HeaderValue::from_str(live_id.as_str()).ok();
             let body = body_stream(Sending {
                 chunks: ReaderStream::with_capacity(live.reader, CHUNK_BYTES),
                 sent: 0,
@@ -243,7 +243,7 @@ fn answer(
             headers.insert(header::CONTENT_TYPE, content_type);
             headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
-            headers.insert(X_LIVE_ID, header);
+            headers.extend(id_header.map(|id| (X_LIVE_ID, id)));
             response
         }
     }
