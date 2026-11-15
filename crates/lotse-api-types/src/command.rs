@@ -371,8 +371,12 @@ const fn with_audio() -> bool {
 /// The command waits for the stream's worker to write the init segment,
 /// which needs the video's parameter sets, for at most
 /// `limits.live_start_timeout_ms`, so the result can carry the MIME type
-/// with its `codecs`. A running live output keeps the source connected, as
-/// a viewer does.
+/// with its `codecs`. Meanwhile the connection reads and answers further
+/// commands, so the result may follow theirs: a signaled source's
+/// `signaling/answer`, which its output may be waiting for, is never held up
+/// behind it. It holds its subscription's place under the connection's cap
+/// from the start. A running live output keeps the source connected, as a
+/// viewer does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]

@@ -397,7 +397,10 @@ async fn a_container_that_fails_ends_the_output_internal_error() {
         rig.video_frame(0, true, 1);
         let _reader = rig.start_with(
             spec(false, 1 << 20),
-            FakeLiveMuxerFactory { fail: Some(fail) },
+            FakeLiveMuxerFactory {
+                fail: Some(fail),
+                ..FakeLiveMuxerFactory::default()
+            },
         );
         if fetch {
             rig.started().await;
@@ -418,6 +421,7 @@ async fn a_container_that_fails_at_a_hole_ends_the_output_internal_error() {
         spec(false, 1 << 20),
         FakeLiveMuxerFactory {
             fail: Some(FakeLiveFailure::Skip),
+            ..FakeLiveMuxerFactory::default()
         },
     );
     rig.started().await;
@@ -434,9 +438,13 @@ async fn a_container_that_fails_at_a_hole_ends_the_output_internal_error() {
 #[tokio::test]
 async fn after_the_fetch_an_output_without_a_keyframe_in_time_ends() {
     let (logs, _guard) = Logs::capture();
-    let mut rig = Rig::new(None);
-    let _reader = rig.fetched().await;
+    let mut rig = Rig::new(Some(fake_aac()));
+    let _reader = rig.start(spec(true, 1 << 20));
+    rig.started().await;
+    assert!(rig.lives.fetch("l1"));
+    settle().await;
     rig.video_frame(0, false, 1);
+    rig.audio_frame(0);
     settle().await;
     rig.clock.advance(DEFAULT_LIVE_START_TIMEOUT);
     assert_eq!(rig.closed().await.0, "source_not_live");
@@ -465,6 +473,92 @@ async fn a_gop_the_cache_cut_short_is_not_sent_and_the_next_keyframe_starts_the_
     );
     rig.lives.stop("l1", LiveEnd::Stopped);
     rig.closed().await;
+}
+
+/// The GOP lost a frame over `max_frame_bytes` before the fetch, which the
+/// output's subscription, taken at the fetch, never saw: the frames after
+/// the hole may reference it, so the GOP is not sent.
+#[tokio::test]
+async fn a_gop_that_lost_a_frame_before_the_fetch_is_not_sent_and_the_next_keyframe_starts_the_media()
+ {
+    let limits = TrackLimits {
+        max_frame_bytes: 100,
+        ..TrackLimits::default()
+    };
+    let mut rig = Rig::with(Some(h264()), None, true, limits, 8);
+    rig.video_frame(0, true, 1);
+    assert!(!rig.video_frame(1, false, 101), "lost");
+    rig.video_frame(2, false, 2);
+    let reader = rig.fetched().await;
+    rig.video_frame(3, false, 3);
+    rig.video_frame(4, true, 4);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h264", "frame v 0 14400 k 4"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    rig.closed().await;
+}
+
+/// An output started after a codec family change, before the new
+/// family's first keyframe, writes the new family's init segment: the old
+/// family's GOP is not sent under it.
+#[tokio::test]
+async fn an_output_started_after_a_codec_family_change_joins_at_the_new_family_s_first_keyframe() {
+    let mut rig = Rig::new(None);
+    rig.video_frame(0, true, 1);
+    rig.video_frame(1, false, 2);
+    rig.video().set_codec(h265());
+    let reader = rig.fetched().await;
+    rig.video_frame(2, false, 3);
+    rig.video_frame(3, true, 4);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h265", "frame v 0 10800 k 4"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    rig.closed().await;
+}
+
+/// The video track closes while the output waits for a codec it carries:
+/// the output ends `stream_deleted` at once, not at the start timeout,
+/// and does not spin on the closed subscription meanwhile.
+#[tokio::test]
+async fn a_video_track_closed_before_its_codec_is_carried_ends_the_output_stream_deleted() {
+    let (logs, _guard) = Logs::capture();
+    let mut rig = Rig::with(Some(Codec::Mjpeg), None, true, TrackLimits::default(), 8);
+    let _reader = rig.start(spec(false, 1 << 20));
+    settle().await;
+    rig.video().close();
+    assert_eq!(rig.closed().await.0, "stream_deleted");
+    assert_eq!(
+        logs.count(
+            Level::INFO,
+            "live: the video track closed before the output started"
+        ),
+        1
+    );
+}
+
+/// The real container holds a keyframe until the next frame gives its
+/// duration (the fake holds a frame without a payload): a keyframe taken
+/// before the start timeout ends the wait for one, even when its fragment
+/// comes after it.
+#[tokio::test]
+async fn a_keyframe_the_container_holds_across_the_start_timeout_keeps_the_output() {
+    let mut rig = Rig::new(None);
+    let reader = rig.fetched().await;
+    rig.video_frame(249, true, 0);
+    settle().await;
+    rig.clock.advance(Duration::from_millis(80));
+    settle().await;
+    rig.video_frame(251, false, 1);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h264", "frame v 0 903600 - 1"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    assert_eq!(rig.closed().await.0, "stopped");
 }
 
 #[tokio::test]
@@ -567,6 +661,64 @@ async fn a_reader_that_keeps_up_costs_no_frame_even_without_a_buffer() {
     rig.lives.stop("l1", LiveEnd::Stopped);
     let (_, _, dropped, drops) = rig.closed().await;
     assert_eq!((dropped, drops), (0, 0));
+}
+
+/// A frame the subscription lost while the queue drains keeps the drain:
+/// a keyframe that comes while the queue is below the buffer but not yet in
+/// the pipe is left out, as it would go out behind the backlog, and the
+/// media starts again at the first keyframe after the queue emptied.
+#[tokio::test]
+async fn a_frame_lost_while_the_queue_drains_keeps_the_drain_until_the_queue_empties() {
+    let limits = TrackLimits {
+        max_frame_bytes: 48 * 1024,
+        ..TrackLimits::default()
+    };
+    let mut rig = Rig::with(Some(h264()), None, true, limits, 8);
+    let reader = rig.start(spec(false, 100 * 1024));
+    rig.started().await;
+    assert!(rig.lives.fetch("l1"));
+    settle().await;
+    // The pipe takes 64 KiB: frame 3 finds some 80 KiB queued, frame 4
+    // some 128 KiB, over the buffer, and starts the drain; frame 5 is left
+    // out.
+    for index in 0..6 {
+        assert!(rig.video_frame(index, index == 0, 48 * 1024));
+        settle().await;
+    }
+    // One pipe's worth read and the pipe filled again: some 64 KiB queued,
+    // below the buffer but not in the pipe.
+    let mut all = available(&reader).await;
+    settle().await;
+    assert!(
+        !rig.video_frame(6, false, 48 * 1024 + 1),
+        "over max_frame_bytes: lost"
+    );
+    settle().await;
+    rig.video_frame(7, true, 10);
+    settle().await;
+    // The rest of the queue, then a delta frame on an empty queue and the
+    // next keyframe.
+    loop {
+        let read = available(&reader).await;
+        if read.is_empty() {
+            break;
+        }
+        all.extend(read);
+    }
+    rig.video_frame(8, false, 10);
+    rig.video_frame(9, true, 10);
+    all.extend(available(&reader).await);
+    let seen = lines(&all);
+    let skip = seen.iter().position(|line| line == "skip").expect("a drop");
+    assert_eq!(seen[skip - 1], "frame v 0 10800 - 49152", "{seen:?}");
+    assert_eq!(seen[skip + 1..], ["frame v 0 32400 k 10"], "{seen:?}");
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    let (_, _, dropped, drops) = rig.closed().await;
+    assert_eq!(
+        (dropped, drops),
+        (5, 2),
+        "frames 4 to 8: the drain's two, the lost one, the keyframe, the one after"
+    );
 }
 
 #[tokio::test]
@@ -817,6 +969,68 @@ async fn a_framed_output_writes_each_record_behind_its_header() {
     assert_eq!(&records[0].bytes[..], b"init video=h264\n");
     rig.lives.stop("l1", LiveEnd::Stopped);
     rig.closed().await;
+}
+
+/// A frame's fragment that lasts over what a record header may say (a
+/// camera whose timestamps jumped): a framed output ends rather than tell
+/// the LL-HLS window a duration the media does not have, with a warning
+/// carrying the duration; an output that is not framed writes no header
+/// and goes on.
+#[tokio::test]
+async fn a_frame_over_the_framing_s_duration_ends_a_framed_output_and_not_another() {
+    let (logs, _guard) = Logs::capture();
+    let over = Duration::from_micros(u64::from(fragments::MAX_DURATION_US) + 1);
+    let long = FakeLiveMuxerFactory {
+        duration: over,
+        ..FakeLiveMuxerFactory::default()
+    };
+    let mut rig = Rig::new(None);
+    let _reader = rig.start_with(
+        LiveSpec {
+            framed: true,
+            ..spec(false, 1 << 20)
+        },
+        long,
+    );
+    rig.started().await;
+    rig.lives.fetch("l1");
+    settle().await;
+    rig.video_frame(0, true, 3);
+    assert_eq!(rig.closed().await.0, "internal_error");
+    let warning = "live: a record's length or its video's duration is over the framing's bound";
+    let warned = logs.lines(Level::WARN, warning);
+    assert_eq!(warned.len(), 1);
+    assert!(
+        warned[0].fields.contains(" len=")
+            && warned[0].fields.contains(" duration=Some(60.000001s)"),
+        "{warned:?}"
+    );
+
+    let mut rig = Rig::new(None);
+    let reader = rig.start_with(spec(false, 1 << 20), long);
+    rig.started().await;
+    rig.lives.fetch("l1");
+    settle().await;
+    rig.video_frame(0, true, 3);
+    rig.video_frame(1, false, 2);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h264", "frame v 0 0 k 3", "frame v 0 3600 - 2"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    assert_eq!(rig.closed().await.0, "stopped");
+    assert_eq!(logs.count(Level::WARN, warning), 1, "no second warning");
+}
+
+#[test]
+fn a_record_s_video_duration_is_its_fragment_s_and_none_for_the_init_segment() {
+    let duration = Duration::from_millis(40);
+    let fragment = RecordKind::Fragment {
+        independent: false,
+        duration,
+    };
+    assert_eq!(video_duration(fragment), Some(duration));
+    assert_eq!(video_duration(RecordKind::Init), None);
 }
 
 #[tokio::test]

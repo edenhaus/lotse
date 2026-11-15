@@ -641,6 +641,11 @@ def latency(page: Json, stream: Stream, player: Player = MSE) -> dict[str, Json]
     the live edge, a part that came late, would put a flash a second or more late at the next
     second's WebRTC flash and report a second too little. The browser's own HLS knows no edge and
     keeps the buffer's.
+    For MSE, the flash's display time less `behind_ms` is when its bytes reached the buffer, so
+    the pairing holds while those bytes arrive within `MSE_PAIR_WITHIN_MS` of one frame after the
+    WebRTC flash; bytes a second late are paired with the next second's, which nothing on the page
+    tells apart from the identical flash of that second. Only a marker that names its second, or a
+    source time both outputs carry, would remove that; latency is a report, so it is left.
     """
     clock = page.get("clock") or {}
     origin = (clock.get("time_origin") or 0.0) + (clock.get("t0") or 0.0)

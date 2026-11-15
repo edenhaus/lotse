@@ -32,7 +32,9 @@
 //! they come, the chunked body streamed through, never cached (RFC 9111
 //! §5.2.2.5). Like the relay, it answers only a request whose `Host` names
 //! the machine by address or as `localhost`, and with an `Origin` only the
-//! page's own.
+//! page's own. Any other method, `HEAD` included, is a `405` that never
+//! reaches the daemon, whose output has one body to give (RFC 9110
+//! §15.5.6).
 //!
 //! `GET /v0/hls/{hls_id}/{name}` is proxied the same way, as a client proxies
 //! an LL-HLS session's playlist and media (draft-pantos-hls-rfc8216bis-22) to
@@ -45,7 +47,8 @@
 //! `Content-Length`, `Cache-Control` and body come back as they come. A
 //! Blocking Playlist Reload (§6.2.5.2) or a hinted part's request (§6.2.6) is
 //! held by the daemon, up to three Target Durations, and the proxy holds the
-//! browser's with it. A development tool, never part of the daemon.
+//! browser's with it; `HEAD` and any other method are a `405` there too. A
+//! development tool, never part of the daemon.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -179,7 +182,12 @@ fn host_is_literal(host: &str) -> bool {
 /// one `Host` names the machine ([`host_is_literal`]), and an `Origin`, which
 /// a same-origin `fetch()` of a `GET` leaves out (WHATWG Fetch §3.1), is the
 /// page's own; a page of another origin, or one reached by DNS rebinding,
-/// gets nothing.
+/// gets nothing. A cross-origin request can leave `Origin` out too (a
+/// `no-cors` fetch, a media element's load), so one the browser marks as
+/// coming from another site (`Sec-Fetch-Site: cross-site` or `same-site`,
+/// W3C Fetch Metadata §2.1.2) is refused whatever its `Origin`; the page's
+/// own requests say `same-origin`, and a client that sends no fetch metadata
+/// is no browser page.
 fn may_fetch(headers: &HeaderMap) -> bool {
     let Some(host) = single(headers, header::HOST) else {
         return false;
@@ -187,8 +195,16 @@ fn may_fetch(headers: &HeaderMap) -> bool {
     if !host_is_literal(host) {
         return false;
     }
-    headers.get(header::ORIGIN).is_none() || same_origin(headers)
+    let other_site = headers
+        .get_all(SEC_FETCH_SITE)
+        .iter()
+        .any(|site| site != "same-origin" && site != "none");
+    !other_site && (headers.get(header::ORIGIN).is_none() || same_origin(headers))
 }
+
+/// The fetch metadata header saying which site a browser's request comes
+/// from (W3C Fetch Metadata Request Headers §2.1.2).
+const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 
 /// The live output `path` names, `/v0/live/{live_id}`, checked against the
 /// identifier pattern as the daemon checks it; `None` for anything else.
@@ -254,15 +270,22 @@ fn same_origin(headers: &HeaderMap) -> bool {
 }
 
 /// The routes: the page, the browser test's page, the relay, the live
-/// outputs' bytes and the LL-HLS sessions' playlists and media; anything else is `404` (axum answers a wrong method on a
-/// route `405`, and a malformed request or upgrade `400`).
+/// outputs' bytes and the LL-HLS sessions' playlists and media; anything
+/// else is `404` (axum answers a malformed request or upgrade `400`). The
+/// proxied paths answer only `GET`: axum's `get` would answer `HEAD` with
+/// the `GET` handler, whose `GET` to the daemon takes a live output's one
+/// body (and holds an LL-HLS session's blocking reload for nothing), so
+/// `HEAD` and every other method are [`not_allowed`] instead.
 fn router(socket: PathBuf, cancel: CancellationToken) -> Router {
     Router::new()
         .route("/", get(|| async { page(PAGE, PAGE_POLICY.as_str()) }))
         .route(crate::browser::PAGE_PATH, get(test_page))
         .route(RELAY_PATH, get(upgrade))
-        .route(LIVE_ROUTE, get(live))
-        .route(HLS_ROUTE, get(hls))
+        .route(
+            LIVE_ROUTE,
+            get(live).head(not_allowed).fallback(not_allowed),
+        )
+        .route(HLS_ROUTE, get(hls).head(not_allowed).fallback(not_allowed))
         .fallback(|| async { refuse(StatusCode::NOT_FOUND, "not found\n".to_owned()) })
         .with_state(Shared {
             socket: socket.into(),
@@ -459,6 +482,20 @@ async fn live(State(shared): State<Shared>, headers: HeaderMap, uri: Uri) -> Res
             refuse(StatusCode::BAD_GATEWAY, format!("{reason}\n"))
         }
     }
+}
+
+/// Any other method on a proxied path, `HEAD` included: `405` with
+/// `Allow: GET` (RFC 9110 §15.5.6), as the daemon's own routes answer it,
+/// without asking the daemon, whose live output has one body to give.
+async fn not_allowed() -> Response {
+    let mut response = refuse(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "only GET is proxied here\n".to_owned(),
+    );
+    response
+        .headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static("GET"));
+    response
 }
 
 /// The daemon's answer to `GET /v0/live/{live_id}` on a connection of its
@@ -1870,6 +1907,54 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A `HEAD` (which axum's `get` would answer with the `GET` handler)
+    /// or any other method is a `405` with `Allow: GET` (RFC 9110
+    /// §15.5.6) that never asks the daemon: its `GET` would take the live
+    /// output's one body, which the browser's `GET` after it could then
+    /// no longer play.
+    #[tokio::test]
+    async fn rfc9110_s15_5_6_head_is_refused_without_taking_the_live_body() {
+        let (dir, socket, mut asked, go) = fake_live_daemon(
+            "live-head",
+            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            vec!["5\r\nfirst\r\n0\r\n\r\n"],
+        );
+        let (addr, cancel) = start(socket).await;
+        for method in ["HEAD", "POST", "PUT", "DELETE"] {
+            let refused = raw(
+                addr,
+                &format!("{method} /v0/live/01JL HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(
+                refused.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+                "{method}: {refused}"
+            );
+            let lower = refused.to_ascii_lowercase();
+            assert!(lower.contains("\r\nallow: get\r\n"), "{method}: {refused}");
+            assert!(
+                asked.try_recv().is_err(),
+                "{method} reached the daemon: {refused}"
+            );
+        }
+        // The daemon's one body is still there for the browser's GET.
+        go.send(()).unwrap();
+        go.send(()).unwrap();
+        let response = get(addr, "/v0/live/01JL").await;
+        assert!(
+            asked
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("GET /v0/live/01JL HTTP/1.1\r\n")
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("first"), "{response}");
+        cancel.cancel();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_live_id_is_the_path_s_one_segment_checked_against_the_identifier_pattern() {
         assert_eq!(live_id_of("/v0/live/01JL").unwrap().as_str(), "01JL");
@@ -1897,6 +1982,20 @@ mod tests {
             ("host", "127.0.0.1:8080"),
             ("origin", "http://evil.example")
         ]));
+        // W3C Fetch Metadata §2.1.2: a request of another site is refused
+        // even without an Origin (a no-cors fetch, a media element's load).
+        for site in ["cross-site", "same-site"] {
+            assert!(
+                !with(&[("host", "127.0.0.1:8080"), ("sec-fetch-site", site)]),
+                "{site}"
+            );
+        }
+        for site in ["same-origin", "none"] {
+            assert!(
+                with(&[("host", "127.0.0.1:8080"), ("sec-fetch-site", site)]),
+                "{site}"
+            );
+        }
     }
 
     /// A client's proxy of an LL-HLS session: the playlist's Blocking
@@ -2103,6 +2202,18 @@ mod tests {
         )
         .await;
         assert!(post.starts_with("HTTP/1.1 405"), "{post}");
+        // RFC 9110 §15.5.6: HEAD is refused here too, without the daemon: with
+        // no daemon behind the socket, asking it would be a 502.
+        let head = raw(
+            addr,
+            "HEAD /v0/hls/01JH/index.m3u8 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 405"), "{head}");
+        assert!(
+            head.to_ascii_lowercase().contains("\r\nallow: get\r\n"),
+            "{head}"
+        );
         // Good requests, the longest query among them, with no daemon behind
         // the socket.
         let longest = format!("v={}", "1".repeat(MAX_HLS_QUERY_BYTES - 2));

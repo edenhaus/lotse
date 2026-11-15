@@ -19,9 +19,10 @@
 //! first frame a player gets is so the GOP's keyframe, as old as the GOP
 //! (at most the camera's keyframe interval, and what `limits.gop_cache_*`
 //! keeps); the player plays the burst and jumps to the live edge. A GOP
-//! the cache cut short (only its keyframe kept) is not sent: the frames after
-//! it would miss their references, and the output starts at the next
-//! keyframe instead.
+//! the cache cut short (only its keyframe kept: it outgrew the cache, or
+//! lost a frame over `max_frame_bytes` before the output's subscription) is
+//! not sent: the frames after it would miss their references, and the
+//! output starts at the next keyframe instead.
 //!
 //! Back-pressure: the media path never waits for a reader. The bytes the
 //! container completed go to the pipe as it takes them, without blocking,
@@ -379,7 +380,9 @@ async fn run(
 enum Dropping {
     /// Not dropping: every frame goes to the container.
     No,
-    /// Every frame is left out until the queue went into the pipe.
+    /// Every frame is left out until the queue went into the pipe, then the
+    /// container leaves them out until the next keyframe; a frame lost
+    /// meanwhile keeps it.
     Draining,
     /// The container leaves frames out until the next keyframe; those count
     /// as dropped.
@@ -421,7 +424,8 @@ struct Output {
     dropped_frames: u64,
     /// Rate-limits the drop warnings.
     drop_lines: Throttle,
-    /// Whether the container wrote a fragment yet.
+    /// Whether the container took a video keyframe yet: the wait for one
+    /// after the fetch is over, though the container may still hold it.
     begun: bool,
     /// The injected clock.
     clock: Arc<dyn Clock>,
@@ -442,13 +446,15 @@ impl Output {
     ) -> Result<Media, LiveEnd> {
         let mut ready = tracks.ready();
         while !*ready.borrow_and_update() {
-            self.wait(
-                ready.changed(),
-                asked,
-                deadline,
-                "the source did not go live",
-            )
-            .await?;
+            // Never an error: `tracks`, held here, holds the sender.
+            let _changed = self
+                .wait(
+                    ready.changed(),
+                    asked,
+                    deadline,
+                    "the source did not go live",
+                )
+                .await?;
         }
         let natives = tracks.tracks();
         let video = natives
@@ -463,16 +469,19 @@ impl Output {
         // first keyframe: the codec changes then.
         let mut changes = video.subscribe(Unit::Frames);
         while !factory.accepts(&video.codec()) {
-            let next = async {
-                let _event = changes.next().await;
-            };
-            self.wait(
-                next,
-                asked,
-                deadline,
-                "no video codec the container carries",
-            )
-            .await?;
+            let event = self
+                .wait(
+                    changes.next(),
+                    asked,
+                    deadline,
+                    "no video codec the container carries",
+                )
+                .await?;
+            // A closed track's subscription ends at once, on every call.
+            if event.is_none() {
+                tracing::info!(live.id = %self.id, "live: the video track closed before the output started");
+                return Err(LiveEnd::StreamDeleted);
+            }
         }
         drop(changes);
         let video_entry = entry(&video);
@@ -526,17 +535,17 @@ impl Output {
 
     /// Waits for `event`, unless the output ends first: the worker's end,
     /// the reader gone, or `deadline` passed (`source_not_live`, logged
-    /// with `why`).
-    async fn wait(
+    /// with `why`); what `event` gave.
+    async fn wait<T>(
         &self,
-        event: impl Future<Output = impl Sized>,
+        event: impl Future<Output = T>,
         asked: &mut watch::Receiver<Asked>,
         deadline: Instant,
         why: &str,
-    ) -> Result<(), LiveEnd> {
+    ) -> Result<T, LiveEnd> {
         let left = deadline.saturating_duration_since(self.clock.now());
         tokio::select! {
-            _ = event => Ok(()),
+            out = event => Ok(out),
             reason = asked_end(asked) => Err(reason),
             () = hangup(&self.pipe) => Err(self.gone()),
             () = self.clock.sleep(left) => {
@@ -732,34 +741,49 @@ impl Output {
             self.drop = Dropping::Draining;
             return Ok(());
         }
-        match self.muxer.push(kind, frame) {
-            Ok(LiveStep::Fragment(fragment)) => {
+        let keyframe = kind == Kind::Video && frame.keyframe;
+        let step = self
+            .muxer
+            .push(kind, frame)
+            .map_err(|err| self.failed(&err))?;
+        // A video keyframe always starts the container (`LiveStep::Dropped`
+        // is for the frames before one), which may hold it until the next
+        // frame gives its duration: the output has begun, its fragment to
+        // come.
+        if keyframe && !self.begun {
+            self.begun = true;
+            tracing::debug!(live.id = %self.id, "live: the container took the first keyframe");
+        }
+        match step {
+            LiveStep::Fragment(fragment) => {
                 if fragment.independent {
                     self.drop = Dropping::No;
                 }
-                self.begun = true;
-                self.queue_fragment(fragment)
+                self.queue_fragment(fragment)?;
             }
-            Ok(LiveStep::Dropped) => {
+            LiveStep::Dropped => {
                 if self.drop != Dropping::No {
                     self.dropped_frames = self.dropped_frames.saturating_add(1);
                 }
-                Ok(())
             }
-            Ok(LiveStep::Held) => Ok(()),
-            Err(err) => Err(self.failed(&err)),
+            LiveStep::Held => {}
         }
+        Ok(())
     }
 
     /// Drops to the next keyframe for `why`, `skipped` frames lost already:
     /// the container finishes the frames it holds and leaves out the rest
-    /// until then.
+    /// until then. A drain under way stays one, as it already goes on at
+    /// the next keyframe once the queue went into the pipe: a keyframe
+    /// before that would go out behind the backlog.
     fn drop_to_keyframe(&mut self, skipped: u64, why: &'static str) -> Result<(), LiveEnd> {
         let finished = self.muxer.skip().map_err(|err| self.failed(&err))?;
         if let Some(fragment) = finished {
             self.queue_fragment(fragment)?;
         }
-        self.drop = Dropping::ToKeyframe;
+        if self.drop != Dropping::Draining {
+            self.drop = Dropping::ToKeyframe;
+        }
         self.drops = self.drops.saturating_add(1);
         self.dropped_frames = self.dropped_frames.saturating_add(skipped);
         if let Some(count) = self.drop_lines.hit(self.clock.now()) {
@@ -790,20 +814,24 @@ impl Output {
     }
 
     /// Queues `fragment`'s bytes for the pipe, behind its record header in a
-    /// framed output, its duration held to the longest a header says (a
-    /// minute: a camera whose timestamps jumped).
+    /// framed output, which says the fragment's real duration: one over
+    /// what a header may say (a minute: a camera whose timestamps jumped)
+    /// ends a framed output rather than tell the LL-HLS window a duration
+    /// the media it serves does not have ([`Self::queue_record`]). An
+    /// output that is not framed writes no header and goes on.
     fn queue_fragment(&mut self, fragment: LiveFragment) -> Result<(), LiveEnd> {
-        let longest = Duration::from_micros(u64::from(fragments::MAX_DURATION_US));
         let kind = RecordKind::Fragment {
             independent: fragment.independent,
-            duration: fragment.duration.min(longest),
+            duration: fragment.duration,
         };
         self.queue_record(kind, fragment.bytes)
     }
 
     /// Queues `bytes` for the pipe, in a framed output behind the header of
     /// a record of `kind` ([`lotse_ipc::fragments`]); one the header cannot
-    /// describe (over its bounds, far above any frame) ends the output.
+    /// describe (its length or its video's duration over the framing's
+    /// bounds, far above any frame of a working camera) ends the output
+    /// `internal_error`, logged with both.
     fn queue_record(&mut self, kind: RecordKind, bytes: Vec<Bytes>) -> Result<(), LiveEnd> {
         if self.framed {
             let len = bytes
@@ -811,7 +839,12 @@ impl Output {
                 .map(Bytes::len)
                 .fold(0_usize, usize::saturating_add);
             let Some(header) = fragments::header(kind, len) else {
-                tracing::warn!(live.id = %self.id, len, "live: a record over the framing's bounds");
+                tracing::warn!(
+                    live.id = %self.id,
+                    len,
+                    duration = ?video_duration(kind),
+                    "live: a record's length or its video's duration is over the framing's bound"
+                );
                 return Err(LiveEnd::InternalError);
             };
             self.queue(vec![Bytes::copy_from_slice(&header)]);
@@ -920,6 +953,15 @@ fn entry(track: &Arc<Track>) -> RecordingTrack {
     RecordingTrack {
         codec: (*track.codec()).clone(),
         clock_rate: track.clock_rate(),
+    }
+}
+
+/// How long the video of a record of `kind` lasts, for the log: `None` for
+/// the init segment.
+const fn video_duration(kind: RecordKind) -> Option<Duration> {
+    match kind {
+        RecordKind::Fragment { duration, .. } => Some(duration),
+        RecordKind::Init => None,
     }
 }
 

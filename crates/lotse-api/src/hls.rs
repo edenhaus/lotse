@@ -14,7 +14,11 @@
 //! by its own limits.
 //!
 //! A response carries its `Content-Length`, so it needs no chunked transfer
-//! coding and any HTTP/1.x request is served. Once the handler is asked, the
+//! coding and any HTTP/1.x request is served. Its body holds the handler's
+//! [`InFlight`] until it is sent or dropped: the handler's limits on the
+//! requests in flight bound the responses a client takes slowly too, and
+//! with them the media they keep after the window let it go. Once the
+//! handler is asked, the
 //! connection leaves the pending upgrades and their deadline, as a live
 //! output's body does (`crate::live`): a blocked request may wait longer
 //! than the upgrade deadline, and requests blocked at once must not take
@@ -39,13 +43,18 @@
 //! holds nor hints (§6.2.6: "SHOULD respond with "Not Found""), 400
 //! `invalid_request` for a malformed directive or one asking too far ahead
 //! (§6.2.5.2: "MUST return Bad Request, such as HTTP 400"), 429
-//! `limit_reached` (RFC 6585 §4) for a blocking request over the blocked
-//! requests' limits, 503 `source_timeout` for one not answered within three
+//! `limit_reached` (RFC 6585 §4) for a request over the limits on requests
+//! in flight or a blocking one over the blocked requests' limits, 503
+//! `source_timeout` for one not answered within three
 //! Target Durations (§6.2.5.2: "SHOULD return Service Unavailable, such as
 //! HTTP 503"), and 405 with `Allow: GET` (RFC 9110 §15.5.6) for any other
 //! method.
 //!
 //! [`Handler::hls`]: crate::Handler::hls
+
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use axum::Extension;
 use axum::body::{Body, Bytes};
@@ -57,6 +66,7 @@ use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::hls::PLAYLIST_NAME;
 use lotse_core::id::HlsId;
 use lotse_hls::{Blocking, Chunks, DirectiveError, Resource};
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::connection::refuse;
 use crate::listener::PeerInfo;
@@ -99,6 +109,24 @@ pub enum HlsReply {
     Media(Chunks),
 }
 
+/// What a request's response holds until it is sent or dropped: the
+/// handler's places among the requests in flight, so a client taking a
+/// response slowly keeps its place, and a limit on them bounds the
+/// connections and the bytes the responses hold.
+#[derive(Debug, Default)]
+pub struct InFlight {
+    /// The places, given back as they are dropped.
+    _permits: Vec<OwnedSemaphorePermit>,
+}
+
+impl InFlight {
+    /// Holds `permits` until the response is sent or dropped.
+    #[must_use]
+    pub const fn new(permits: Vec<OwnedSemaphorePermit>) -> Self {
+        Self { _permits: permits }
+    }
+}
+
 /// Why the handler answers a request with no playlist or resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HlsError {
@@ -119,6 +147,13 @@ pub enum HlsError {
     #[error("too many blocked requests ({limit})")]
     TooManyBlocked {
         /// The limit: `max_hls_blocked_per_session` or `max_hls_blocked`.
+        limit: &'static str,
+    },
+    /// The request would be in flight past a limit on requests in flight,
+    /// which it names: 429 `limit_reached` (RFC 6585 §4).
+    #[error("too many requests in flight ({limit})")]
+    TooManyRequests {
+        /// The limit: `max_hls_requests_per_session` or `max_hls_requests`.
         limit: &'static str,
     },
     /// The request blocked for three Target Durations without what it waits
@@ -273,26 +308,25 @@ fn admit(request: &Request<'_>) -> Result<(HlsId, HlsRequest), Box<Response>> {
 }
 
 /// The response to the handler's `answer` for session `hls_id`; every one
-/// closes its connection (see the module docs).
-fn reply(peer: &PeerInfo, hls_id: &HlsId, answer: Result<HlsReply, HlsError>) -> Response {
+/// closes its connection (see the module docs), and a `200`'s body holds
+/// the answer's [`InFlight`] until it is sent or dropped.
+fn reply(
+    peer: &PeerInfo,
+    hls_id: &HlsId,
+    answer: Result<(HlsReply, InFlight), HlsError>,
+) -> Response {
     let mut response = match answer {
-        Ok(HlsReply::Playlist(text)) => {
+        Ok((HlsReply::Playlist(text), in_flight)) => {
             tracing::trace!(%peer, hls.id = %hls_id, bytes = text.len(), "LL-HLS playlist sent");
-            ok(PLAYLIST_MIME, PLAYLIST_CACHE, text.len(), Body::from(text))
+            let len = text.len();
+            let body = Sending::new(vec![Bytes::from(text)], in_flight);
+            ok(PLAYLIST_MIME, PLAYLIST_CACHE, len, body)
         }
-        Ok(HlsReply::Media(chunks)) => {
+        Ok((HlsReply::Media(chunks), in_flight)) => {
             tracing::trace!(%peer, hls.id = %hls_id, bytes = chunks.len(), "LL-HLS resource sent");
             let len = chunks.len();
-            let parts = chunks
-                .into_vec()
-                .into_iter()
-                .map(Ok::<Bytes, std::io::Error>);
-            ok(
-                MEDIA_MIME,
-                MEDIA_CACHE,
-                len,
-                Body::from_stream(futures_util::stream::iter(parts)),
-            )
+            let body = Sending::new(chunks.into_vec(), in_flight);
+            ok(MEDIA_MIME, MEDIA_CACHE, len, body)
         }
         Err(error) => {
             tracing::debug!(%peer, hls.id = %hls_id, %error, "LL-HLS request refused");
@@ -305,9 +339,43 @@ fn reply(peer: &PeerInfo, hls_id: &HlsId, answer: Result<HlsReply, HlsError>) ->
     response
 }
 
-/// A `200` of `len` bytes of `mime`, cached as `cache` says.
-fn ok(mime: &'static str, cache: &'static str, len: usize, body: Body) -> Response {
-    let mut response = body.into_response();
+/// A response's body: its parts, in order, and the [`InFlight`] it holds
+/// until the last part is taken or the body is dropped unsent (the client
+/// gone, its socket stalled, shutdown).
+#[derive(Debug)]
+struct Sending {
+    /// The parts not yet taken.
+    parts: std::vec::IntoIter<Bytes>,
+    /// Released once the last part is taken.
+    in_flight: Option<InFlight>,
+}
+
+impl Sending {
+    /// A body of `parts` holding `in_flight`.
+    fn new(parts: Vec<Bytes>, in_flight: InFlight) -> Self {
+        Self {
+            parts: parts.into_iter(),
+            in_flight: Some(in_flight),
+        }
+    }
+}
+
+impl futures_util::Stream for Sending {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let part = self.parts.next();
+        if part.is_none() {
+            self.in_flight = None;
+        }
+        Poll::Ready(part.map(Ok))
+    }
+}
+
+/// A `200` of `len` bytes of `mime`, cached as `cache` says, its body
+/// `sending`.
+fn ok(mime: &'static str, cache: &'static str, len: usize, sending: Sending) -> Response {
+    let mut response = Body::from_stream(sending).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
@@ -325,23 +393,26 @@ fn refused(error: HlsError) -> Response {
             ErrorCode::InvalidRequest,
             "the request asks for a segment or part too far ahead",
         ),
-        HlsError::TooManyBlocked { limit } => {
-            let error = ApiError::new(ErrorCode::LimitReached, "too many blocked requests")
-                .with_detail("limit", limit);
-            let body = serde_json::to_string(&error).unwrap_or_default();
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(header::CONTENT_TYPE, "application/json")],
-                body,
-            )
-                .into_response()
-        }
+        HlsError::TooManyBlocked { limit } => too_many("too many blocked requests", limit),
+        HlsError::TooManyRequests { limit } => too_many("too many requests in flight", limit),
         HlsError::Timeout => refuse(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::SourceTimeout,
             "nothing to answer within three Target Durations",
         ),
     }
+}
+
+/// 429 `limit_reached` (RFC 6585 §4) for a request past `limit`.
+fn too_many(message: &str, limit: &'static str) -> Response {
+    let error = ApiError::new(ErrorCode::LimitReached, message).with_detail("limit", limit);
+    let body = serde_json::to_string(&error).unwrap_or_default();
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 /// 404 `hls_not_found`.

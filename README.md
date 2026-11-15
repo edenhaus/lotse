@@ -188,7 +188,12 @@ bytes once, in the chunked transfer coding: the init segment, then one
 cached keyframe on. The client proxies it to the browser; the daemon refuses
 a request that carries `Origin`. The command waits for the worker's init
 segment, at most `limits.live_start_timeout_ms` (10 s), since the MIME type
-needs the camera's parameter sets.
+needs the camera's parameter sets. The connection goes on reading and
+answering other commands meanwhile, so the result may come after theirs: an
+on-demand WebRTC camera starts for the output and sends its offer to the
+`signaling/subscribe` subscription, and the client's `signaling/answer` on
+the same connection is what lets the create finish. A waiting create counts
+against the connection's subscription cap from the start.
 
 - **Join.** The output starts at the stream's cached GOP and sends it at
   once, so its first frame is as old as that GOP: up to the camera's
@@ -260,6 +265,13 @@ the player; the daemon refuses a request that carries `Origin`.
   (4: the reload and the part a player holds, twice) and
   `limits.max_hls_blocked` (128) bound how many wait at once, past which a
   request is 429 `limit_reached`. A directive asking too far ahead is 400.
+- **Requests in flight.** A request counts from its arrival until its
+  response is sent or its client goes, a held one included:
+  `limits.max_hls_requests_per_session` (8: the two held, a download and
+  the init segment, twice) and `limits.max_hls_requests` (256) bound how
+  many are in flight at once, past which a request is 429 `limit_reached`.
+  A client taking a response slowly keeps its place, so these bound the
+  connections LL-HLS keeps open and the media its responses hold.
 - **Answers.** The playlist is `application/vnd.apple.mpegurl` with
   `Cache-Control: no-cache`, a segment or part `video/mp4` with
   `max-age=60`; each has its `Content-Length`, and each response closes its
@@ -269,14 +281,16 @@ the player; the daemon refuses a request that carries `Origin`.
 - **The end.** A session ends on `hls/close` (`closed`), when the control
   connection that created it closes or unsubscribes (`session_closed`),
   without a request for `limits.hls_idle_timeout_ms` (30 s: a player asks
-  several times a second; `idle`), or with its output, whose `closed`
+  several times a second; `idle`), counted from the `hls/create`'s answer,
+  so a slow start does not end it, or with its output, whose `closed`
   carries the live output's reasons, or `window_full` when the stream sends
   no keyframe within `limits.hls_window_bytes`. The output ends when its
   last session leaves.
 - **Limits.** `limits.max_hls_outputs` (8, each also a live output under
   `limits.max_live`) windows of at most `limits.hls_window_bytes` (32 MiB:
   seven 2 s segments of a 16 Mbit/s stream) each, so at most 256 MiB of
-  media in the daemon; `limits.max_hls_sessions` (32) and
+  media in the windows, and one segment or part more for each request in
+  flight; `limits.max_hls_sessions` (32) and
   `limits.max_hls_sessions_per_stream` (8) sessions; one more is
   `limit_reached` naming the limit.
 - **Deviations from the draft.** The Target Duration and Part Target

@@ -331,6 +331,15 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "LOTSE_MAX_HLS_BLOCKED", value_name = "N")]
     pub(crate) max_hls_blocked: Option<u32>,
 
+    /// LL-HLS requests of one session in flight at once, until their
+    /// response is sent.
+    #[arg(long, env = "LOTSE_MAX_HLS_REQUESTS_PER_SESSION", value_name = "N")]
+    pub(crate) max_hls_requests_per_session: Option<u32>,
+
+    /// LL-HLS requests in flight at once, over every session.
+    #[arg(long, env = "LOTSE_MAX_HLS_REQUESTS", value_name = "N")]
+    pub(crate) max_hls_requests: Option<u32>,
+
     /// Source connection attempts at once, across every camera; at least 1.
     #[arg(long, env = "LOTSE_CONNECT_CONCURRENCY", value_name = "N")]
     pub(crate) connect_concurrency: Option<NonZeroUsize>,
