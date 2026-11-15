@@ -576,6 +576,20 @@ fn a_codec_change_continues_the_output_only_while_the_init_segment_describes_it(
         "no entry to write"
     );
     assert!(!writer.continues(Kind::Audio, &opus_track(1)));
+    // RFC 6381 §3.3: the same `mp4a.40.2` at the same rate, but another
+    // configuration than the `esds` carries.
+    let stereo = RecordingTrack {
+        codec: Codec::AacLc {
+            sample_rate: 16_000,
+            channels: 2,
+            config: Bytes::from_static(&[0x14, 0x10]),
+        },
+        clock_rate: 16_000,
+    };
+    assert!(
+        !writer.continues(Kind::Audio, &stereo),
+        "another AAC configuration"
+    );
     assert!(
         !writer.continues(Kind::Audio, &h264_track()),
         "video where the audio was"
