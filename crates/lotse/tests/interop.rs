@@ -1694,15 +1694,21 @@ mod recording {
             assert!(!sound.frames.is_empty(), "audio frames");
             assert_eq!(sound.holes(), [], "the audio runs without a hole");
             // The audio covers the video's take at both ends: `holes` only
-            // sees between frames. Each end is allowed an audio frame (the
-            // first starts at or after the keyframe, and `-t` cuts each
-            // track at a frame of its own) plus EBU R37's 40 ms.
+            // sees between frames. Each end is allowed an audio frame (`-t`
+            // cuts each track at a frame of its own) plus EBU R37's 40 ms.
+            // The start is allowed a GOP more (the camera's keyframe every
+            // `FPS` frames, 1 s): the output joins at the cached keyframe,
+            // and the GOP cache holds no audio, so the audio begins where
+            // the output joined (observed 0.48 to 0.62 s after the keyframe,
+            // 2026-11-15, MediaMTX 1.21.3, ffmpeg 9.0.2).
             let slack_us = (sound.ms(sound.frames[0].duration) + AV_SYNC_MS) * 1_000;
+            let gop_us = 1_000_000;
             let (video_start, audio_start) = (video.start_us(), sound.start_us());
             let video_end = video_start + video.span_ms() * 1_000;
             let audio_end = audio_start + sound.span_ms() * 1_000;
             assert!(
-                audio_start.abs_diff(video_start) <= slack_us
+                audio_start + slack_us >= video_start
+                    && audio_start <= video_start + gop_us + slack_us
                     && audio_end.abs_diff(video_end) <= slack_us,
                 "audio from {audio_start} to {audio_end} us, video from {video_start} to {video_end} us"
             );
