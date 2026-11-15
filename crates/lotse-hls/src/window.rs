@@ -20,7 +20,9 @@
 //!   frames it lasts as many whole frames as fit, which keeps it above 85 %
 //!   of the limit (§4.4.4.9) for any frame interval below 15 % of it.
 //! - A segment ends before an independent fragment once it lasts the
-//!   segment target or longer: every segment starts with a keyframe
+//!   segment target or longer, or falls short of it by no more than
+//!   [`JITTER`] (a second of 30 frames of 90 kHz ticks sums to 10 ns short
+//!   of one): every segment starts with a keyframe
 //!   (§4.4.2.1, `EXT-X-INDEPENDENT-SEGMENTS`; §6.2.1: "divide the source
 //!   media at points that support effective decode"), its last part closes
 //!   with it (exempt from the 85 %, §4.4.4.9), and it lasts the target or
@@ -154,7 +156,8 @@ pub const DEFAULT_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const FRAGMENT_OVERHEAD: usize = 128;
 
 /// What a part's duration may exceed its target by before it closes a frame
-/// early: frame durations differ by rounding and a camera's clock.
+/// early, and a segment's may fall short of its target by and still be at
+/// it: frame durations differ by rounding and a camera's clock.
 pub const JITTER: Duration = Duration::from_millis(1);
 
 /// The nanoseconds of a millisecond.
@@ -498,7 +501,12 @@ impl Window {
         let starts = match &self.open {
             None if !fragment.independent => return Ok(Pushed::Dropped),
             None => true,
-            Some(open) => fragment.independent && open.duration() >= self.config.segment_target,
+            // A segment as long as its frames' rounded durations sum to:
+            // within JITTER of the target is at it.
+            Some(open) => {
+                fragment.independent
+                    && open.duration().saturating_add(JITTER) >= self.config.segment_target
+            }
         };
         let cost = fragment.bytes.len().saturating_add(FRAGMENT_OVERHEAD);
         let joins = match &self.open {
