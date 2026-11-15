@@ -364,16 +364,15 @@ enum OutputReport {
 }
 
 /// The next report of the recordings or the live outputs, whichever comes
-/// first; `None` once both channels ended, which they never do while the
-/// worker holds their senders.
+/// first; `None` once a channel ended, which none does while the worker
+/// holds their senders.
 async fn output_report(
     recordings: &mut mpsc::Receiver<(String, RecordingReport)>,
     lives: &mut mpsc::Receiver<(String, LiveReport)>,
 ) -> Option<OutputReport> {
     tokio::select! {
-        Some((id, event)) = recordings.recv() => Some(OutputReport::Recording(id, event)),
-        Some((id, event)) = lives.recv() => Some(OutputReport::Live(id, event)),
-        else => None,
+        report = recordings.recv() => report.map(|(id, event)| OutputReport::Recording(id, event)),
+        report = lives.recv() => report.map(|(id, event)| OutputReport::Live(id, event)),
     }
 }
 
