@@ -20,16 +20,29 @@
 //! - The audio of a stream whose video stops goes out alone once it spans
 //!   [`AUDIO_FRAGMENT_SPAN`] or holds [`AUDIO_FRAGMENT_BYTES`], so it is
 //!   held for no longer and no more than that.
-//! - The decode times run on without a hole: after a hole the caller made
-//!   ([`LiveMuxer::skip`]) or a reconnect (a video keyframe of another
-//!   epoch), the next video keyframe starts a new epoch where the video so
-//!   far ends, and the output's media time 0 moves on by the time left
-//!   out, so the audio after it keeps its place beside the video by
-//!   capture time. A player so never meets a gap in what it buffers. The
-//!   last video frame before the hole lasts the frame before it's
-//!   duration, as a recording's last frame does. Until the video
-//!   started again, the audio is left out: after a skip, and for audio of
-//!   a new epoch that comes before the video's first keyframe of it.
+//! - The decode and the presentation times run on without a hole: after a
+//!   hole the caller made ([`LiveMuxer::skip`]) or a reconnect (a video
+//!   keyframe of another epoch), the next video keyframe starts a new
+//!   epoch where the output so far ends, and the output's media time 0
+//!   moves to the capture time that puts the keyframe there (on by the
+//!   time left out, or back when the keyframe was captured before that),
+//!   so the audio after it keeps its place beside the video by capture
+//!   time. A player so never meets a gap in what it buffers. The output
+//!   ends where the video's presentation ends: the last video frame
+//!   before the hole lasts the frame before it's duration, as a
+//!   recording's last frame does, or until the audio ends if that is
+//!   later (audio that went out alone while the video stalled), the
+//!   frame on screen while that audio plays. Reordered video is decoded
+//!   past where it is presented: the keyframe is decoded where that
+//!   decode ends, ahead of its presentation by a negative composition
+//!   offset (ISO/IEC 14496-12 §8.8.8), as a recording's epoch is.
+//! - Until the video started again, the audio is left out: after a skip,
+//!   and for audio of a new epoch until the video's first keyframe after
+//!   that epoch's first audio frame, whether the audio before was taken
+//!   or left out. The audio's first epoch is the stream's own, whatever
+//!   keyframe it comes after: a writer that saw no audio before cannot
+//!   tell a reconnect's from it. Placed by the origin of then, it is
+//!   still followed by the video, whose last frame lasts until it ends.
 //!
 //! Sans-IO and pure, as the recording muxer: no I/O, no clock (the frames'
 //! capture times are the only time), no logging (the caller logs).
@@ -91,7 +104,8 @@ struct Live {
     /// The audio track, when the output has one.
     audio: Option<TrackWriter>,
     /// The output's media time 0 as a capture time: the first keyframe's,
-    /// moved on by every hole left out since; `None` before the first.
+    /// moved at every start of the video after it ([`Live::start_at`]);
+    /// `None` before the first.
     origin: Option<Instant>,
     /// Whether the output waits for a video keyframe: before the first,
     /// and after a skip.
@@ -99,14 +113,17 @@ struct Live {
     /// The epoch of the video's frames since its latest keyframe started
     /// it.
     video_epoch: Option<u32>,
-    /// The epoch of the audio's frames since it started.
+    /// The epoch of the latest audio frame, taken or left out; `None`
+    /// before the first.
     audio_epoch: Option<u32>,
     /// How often the video started: at the first keyframe and after each
     /// hole.
     starts: u64,
-    /// [`Live::starts`] when the audio's epoch started: audio of a new
-    /// epoch waits until the video started after it did.
-    audio_start: u64,
+    /// [`Live::starts`] when the audio's epoch began, 0 for its first: the
+    /// audio is taken once the video started after that. Before, audio of
+    /// a new epoch would be placed by an origin the video's next start
+    /// moves.
+    audio_since: u64,
     /// The sequence number of the latest fragment (ISO/IEC 14496-12
     /// §8.8.5): 0 before the first.
     sequence: u32,
@@ -123,17 +140,21 @@ impl Live {
             video_epoch: None,
             audio_epoch: None,
             starts: 0,
-            audio_start: 0,
+            audio_since: 0,
             sequence: 0,
         }
     }
 
-    /// Ends both tracks' epochs here (see [`TrackWriter::break_epoch`]).
+    /// Ends both tracks' epochs here (see [`TrackWriter::break_epoch`]):
+    /// the audio's, then the video's, whose last frame is presented until
+    /// the audio ends, if that is later. The video's presentation so ends
+    /// where the output does.
     fn break_epochs(&mut self) {
-        self.video.break_epoch();
-        if let Some(audio) = &mut self.audio {
-            audio.break_epoch();
-        }
+        let until = self.audio.as_mut().map_or(Duration::ZERO, |audio| {
+            audio.break_epoch(Duration::ZERO);
+            audio.presented_end()
+        });
+        self.video.break_epoch(until);
     }
 
     /// Takes a video frame.
@@ -167,16 +188,20 @@ impl Live {
 
     /// The output's media time 0 for a keyframe that starts the video
     /// (again) at `frame`: its own capture time for the first; else the
-    /// origin moved on so that the keyframe is captured where the video so
-    /// far ends, if it was captured later, which leaves the hole out of the
-    /// timeline.
+    /// capture time that puts the keyframe where the output so far ends,
+    /// the video's presentation after [`Live::break_epochs`]. That leaves
+    /// the hole out of the timeline, or moves the origin back when the
+    /// keyframe was captured before that end, so the audio captured after
+    /// the keyframe follows it by as much. The video's decode may end
+    /// later (reordered video), which its track's epoch takes up.
     fn start_at(&mut self, frame: &MediaFrame) -> Instant {
         let origin = match self.origin {
             None => frame.wallclock,
             Some(origin) => {
-                let since = frame.wallclock.saturating_duration_since(origin);
-                let hole = since.saturating_sub(self.video.decode_end());
-                origin.checked_add(hole).unwrap_or(origin)
+                let end = self.video.presented_end();
+                // Only a capture time before the clock's own start has
+                // none: the origin stays.
+                frame.wallclock.checked_sub(end).unwrap_or(origin)
             }
         };
         self.origin = Some(origin);
@@ -195,19 +220,18 @@ impl Live {
                 "an audio frame for a live output without audio".into(),
             ));
         };
-        let Some(origin) = self.origin.filter(|_| !self.waiting) else {
+        if self.audio_epoch != Some(frame.epoch) {
+            // The first epoch is the stream's own; a later one is a
+            // reconnect's, whose video starts again after it.
+            self.audio_since = self.audio_epoch.map_or(0, |_| self.starts);
+            self.audio_epoch = Some(frame.epoch);
+        }
+        // The video's starts break the audio's epoch too: the audio after
+        // one starts a new epoch on its track.
+        let started = !self.waiting && self.audio_since < self.starts;
+        let Some(origin) = self.origin.filter(|_| started) else {
             return Ok(LiveStep::Dropped);
         };
-        if self.audio_epoch != Some(frame.epoch) {
-            if self.audio_epoch.is_some() && self.audio_start == self.starts {
-                // Audio of a new epoch before the video's first keyframe of
-                // it: it would be placed by the old origin.
-                return Ok(LiveStep::Dropped);
-            }
-            audio.break_epoch();
-            self.audio_epoch = Some(frame.epoch);
-            self.audio_start = self.starts;
-        }
         audio.push(frame, origin)?;
         let full = audio.ready_bytes() >= limits.audio_bytes
             || audio
