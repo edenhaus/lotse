@@ -410,7 +410,8 @@ struct Output {
     dropped_frames: u64,
     /// Rate-limits the drop warnings.
     drop_lines: Throttle,
-    /// Whether the container wrote a fragment yet.
+    /// Whether the container took a video keyframe yet: the wait for one
+    /// after the fetch is over, though the container may still hold it.
     begun: bool,
     /// The injected clock.
     clock: Arc<dyn Clock>,
@@ -431,13 +432,15 @@ impl Output {
     ) -> Result<Media, LiveEnd> {
         let mut ready = tracks.ready();
         while !*ready.borrow_and_update() {
-            self.wait(
-                ready.changed(),
-                asked,
-                deadline,
-                "the source did not go live",
-            )
-            .await?;
+            // Never an error: `tracks`, held here, holds the sender.
+            let _changed = self
+                .wait(
+                    ready.changed(),
+                    asked,
+                    deadline,
+                    "the source did not go live",
+                )
+                .await?;
         }
         let natives = tracks.tracks();
         let video = natives
@@ -452,16 +455,19 @@ impl Output {
         // first keyframe: the codec changes then.
         let mut changes = video.subscribe(Unit::Frames);
         while !factory.accepts(&video.codec()) {
-            let next = async {
-                let _event = changes.next().await;
-            };
-            self.wait(
-                next,
-                asked,
-                deadline,
-                "no video codec the container carries",
-            )
-            .await?;
+            let event = self
+                .wait(
+                    changes.next(),
+                    asked,
+                    deadline,
+                    "no video codec the container carries",
+                )
+                .await?;
+            // A closed track's subscription ends at once, on every call.
+            if event.is_none() {
+                tracing::info!(live.id = %self.id, "live: the video track closed before the output started");
+                return Err(LiveEnd::StreamDeleted);
+            }
         }
         drop(changes);
         let video_entry = entry(&video);
@@ -515,17 +521,17 @@ impl Output {
 
     /// Waits for `event`, unless the output ends first: the worker's end,
     /// the reader gone, or `deadline` passed (`source_not_live`, logged
-    /// with `why`).
-    async fn wait(
+    /// with `why`); what `event` gave.
+    async fn wait<T>(
         &self,
-        event: impl Future<Output = impl Sized>,
+        event: impl Future<Output = T>,
         asked: &mut watch::Receiver<Asked>,
         deadline: Instant,
         why: &str,
-    ) -> Result<(), LiveEnd> {
+    ) -> Result<T, LiveEnd> {
         let left = deadline.saturating_duration_since(self.clock.now());
         tokio::select! {
-            _ = event => Ok(()),
+            out = event => Ok(out),
             reason = asked_end(asked) => Err(reason),
             () = hangup(&self.pipe) => Err(self.gone()),
             () = self.clock.sleep(left) => {
@@ -721,24 +727,34 @@ impl Output {
             self.dropping = true;
             return Ok(());
         }
-        match self.muxer.push(kind, frame) {
-            Ok(LiveStep::Fragment(fragment)) => {
+        let keyframe = kind == Kind::Video && frame.keyframe;
+        let step = self
+            .muxer
+            .push(kind, frame)
+            .map_err(|err| self.failed(&err))?;
+        // A video keyframe always starts the container (`LiveStep::Dropped`
+        // is for the frames before one), which may hold it until the next
+        // frame gives its duration: the output has begun, its fragment to
+        // come.
+        if keyframe && !self.begun {
+            self.begun = true;
+            tracing::debug!(live.id = %self.id, "live: the container took the first keyframe");
+        }
+        match step {
+            LiveStep::Fragment(fragment) => {
                 if fragment.independent {
                     self.after_drop = false;
                 }
-                self.begun = true;
                 self.queue(fragment.bytes);
-                Ok(())
             }
-            Ok(LiveStep::Dropped) => {
+            LiveStep::Dropped => {
                 if self.after_drop {
                     self.dropped_frames = self.dropped_frames.saturating_add(1);
                 }
-                Ok(())
             }
-            Ok(LiveStep::Held) => Ok(()),
-            Err(err) => Err(self.failed(&err)),
+            LiveStep::Held => {}
         }
+        Ok(())
     }
 
     /// Drops to the next keyframe for `why`, `skipped` frames lost already:

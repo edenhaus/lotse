@@ -433,9 +433,13 @@ async fn a_container_that_fails_at_a_hole_ends_the_output_internal_error() {
 #[tokio::test]
 async fn after_the_fetch_an_output_without_a_keyframe_in_time_ends() {
     let (logs, _guard) = Logs::capture();
-    let mut rig = Rig::new(None);
-    let _reader = rig.fetched().await;
+    let mut rig = Rig::new(Some(fake_aac()));
+    let _reader = rig.start(spec(true, 1 << 20));
+    rig.started().await;
+    assert!(rig.lives.fetch("l1"));
+    settle().await;
     rig.video_frame(0, false, 1);
+    rig.audio_frame(0);
     settle().await;
     rig.clock.advance(DEFAULT_LIVE_START_TIMEOUT);
     assert_eq!(rig.closed().await.0, "source_not_live");
@@ -509,6 +513,47 @@ async fn an_output_started_after_a_codec_family_change_joins_at_the_new_family_s
     );
     rig.lives.stop("l1", LiveEnd::Stopped);
     rig.closed().await;
+}
+
+/// The video track closes while the output waits for a codec it carries:
+/// the output ends `stream_deleted` at once, not at the start timeout,
+/// and does not spin on the closed subscription meanwhile.
+#[tokio::test]
+async fn a_video_track_closed_before_its_codec_is_carried_ends_the_output_stream_deleted() {
+    let (logs, _guard) = Logs::capture();
+    let mut rig = Rig::with(Some(Codec::Mjpeg), None, true, TrackLimits::default(), 8);
+    let _reader = rig.start(spec(false, 1 << 20));
+    settle().await;
+    rig.video().close();
+    assert_eq!(rig.closed().await.0, "stream_deleted");
+    assert_eq!(
+        logs.count(
+            Level::INFO,
+            "live: the video track closed before the output started"
+        ),
+        1
+    );
+}
+
+/// The real container holds a keyframe until the next frame gives its
+/// duration (the fake holds a frame without a payload): a keyframe taken
+/// before the start timeout ends the wait for one, even when its fragment
+/// comes after it.
+#[tokio::test]
+async fn a_keyframe_the_container_holds_across_the_start_timeout_keeps_the_output() {
+    let mut rig = Rig::new(None);
+    let reader = rig.fetched().await;
+    rig.video_frame(249, true, 0);
+    settle().await;
+    rig.clock.advance(Duration::from_millis(80));
+    settle().await;
+    rig.video_frame(251, false, 1);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h264", "frame v 0 903600 - 1"]
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    assert_eq!(rig.closed().await.0, "stopped");
 }
 
 #[tokio::test]
