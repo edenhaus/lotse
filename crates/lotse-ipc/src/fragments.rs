@@ -65,7 +65,7 @@ pub struct Record {
 }
 
 /// Why a stream of records is broken.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
     /// The header does not start with the magic and the version.
     #[error("not a live record header")]
@@ -156,6 +156,9 @@ pub struct Decoder {
     buffer: BytesMut,
     /// The header of the record whose bytes are coming, once read.
     pending: Option<(RecordKind, usize)>,
+    /// The broken header that ended the stream: every later push returns
+    /// it.
+    broken: Option<RecordError>,
 }
 
 impl Decoder {
@@ -174,7 +177,14 @@ impl Decoder {
 
     /// Takes `bytes` from the stream and returns the records they complete,
     /// in order; the first broken header ends the stream with its error.
+    /// The records before it are returned first whatever the reads' sizes:
+    /// a push that completes records and then meets a broken header returns
+    /// the records, and the next push (an empty one too) the error, as does
+    /// every push after it.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Record>, RecordError> {
+        if let Some(err) = self.broken {
+            return Err(err);
+        }
         self.buffer.extend_from_slice(bytes);
         let mut records = Vec::new();
         loop {
@@ -185,7 +195,17 @@ impl Decoder {
                     };
                     let mut header = [0; HEADER_BYTES];
                     header.copy_from_slice(head);
-                    let (kind, len) = parse(header)?;
+                    let (kind, len) = match parse(header) {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            self.broken = Some(err);
+                            return if records.is_empty() {
+                                Err(err)
+                            } else {
+                                Ok(records)
+                            };
+                        }
+                    };
                     self.buffer.advance(HEADER_BYTES);
                     self.pending = Some((kind, usize::try_from(len).unwrap_or(usize::MAX)));
                 }
@@ -338,6 +358,36 @@ mod tests {
             RecordError::TooLarge.to_string(),
             "a live record over its bound"
         );
+    }
+
+    /// Found by the `live_records` fuzz target: a record and a broken
+    /// header after it in one read gave the error alone, while smaller
+    /// reads gave the record first.
+    #[test]
+    fn the_records_before_a_broken_header_come_first_whatever_the_reads() {
+        let mut stream = framed(fragment(false, 0), b"");
+        let mut broken = header(fragment(true, 40), 4).unwrap();
+        broken[0] = b'X';
+        stream.extend_from_slice(&broken);
+        let mut decoder = Decoder::new();
+        assert_eq!(
+            decoder.push(&stream).unwrap(),
+            [Record {
+                kind: fragment(false, 0),
+                bytes: Bytes::new()
+            }]
+        );
+        assert_eq!(decoder.push(&[]).unwrap_err(), RecordError::Header);
+        assert_eq!(
+            decoder
+                .push(&framed(fragment(true, 40), b"more"))
+                .unwrap_err(),
+            RecordError::Header,
+            "the stream stays ended"
+        );
+        let mut alone = Decoder::new();
+        assert_eq!(alone.push(&broken).unwrap_err(), RecordError::Header);
+        assert_eq!(alone.push(&[]).unwrap_err(), RecordError::Header);
     }
 
     #[test]

@@ -23,7 +23,15 @@ fn read(stream: &[u8], step: usize) -> (Vec<Record>, Option<RecordError>) {
             Err(err) => return (records, Some(err)),
         }
     }
-    (records, None)
+    // A broken header met after records in the last read ends the stream
+    // with the next push.
+    match decoder.push(&[]) {
+        Ok(more) => {
+            assert!(more.is_empty(), "an empty push completes nothing");
+            (records, None)
+        }
+        Err(err) => (records, Some(err)),
+    }
 }
 
 fuzz_target!(|data: &[u8]| {

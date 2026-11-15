@@ -261,6 +261,23 @@ impl AsyncRead for Failing {
     }
 }
 
+/// A live body is read in chunks of up to a pipe's 64 KiB (pipe(7)).
+#[tokio::test(flavor = "current_thread")]
+async fn a_live_body_is_read_in_chunks_of_a_pipe_s_capacity() {
+    static BYTES: [u8; 100 * 1024] = [7; 100 * 1024];
+    let sending = Sending {
+        chunks: ReaderStream::with_capacity(Box::new(&BYTES[..]), CHUNK_BYTES),
+        sent: 0,
+        live_id: LiveId::new("01JL").unwrap(),
+        peer: peer(),
+    };
+    let sizes: Vec<usize> = body_stream(sending)
+        .map(|chunk| chunk.unwrap().len())
+        .collect()
+        .await;
+    assert_eq!(sizes, [64 * 1024, 36 * 1024]);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn rfc9112_8_a_live_body_whose_read_fails_is_cut() {
     let (logs, _guard) = capture();
