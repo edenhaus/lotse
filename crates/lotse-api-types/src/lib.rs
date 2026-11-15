@@ -10,8 +10,9 @@
 //! ignored by clients, so additive changes need no version bump.
 //!
 //! Standards: JSON Schema 2020-12, RFC 3339, ULID, Semantic Versioning
-//! 2.0.0; the recording DTOs describe fragmented MP4 files (ISO/IEC 14496-12)
-//! whose bytes are chunked HTTP bodies (RFC 9112 §7.1).
+//! 2.0.0; the recording and live DTOs describe fragmented MP4 (ISO/IEC 14496-12)
+//! whose bytes are chunked HTTP bodies (RFC 9112 §7.1), the live output's
+//! MIME type with its RFC 6381 `codecs` parameter.
 
 pub mod clients;
 pub mod command;
@@ -19,6 +20,7 @@ pub mod error;
 pub mod frame;
 pub mod info;
 pub mod limits;
+pub mod live;
 pub mod pairing;
 pub mod recording;
 pub mod schema;
@@ -34,4 +36,4 @@ pub use error::{ApiError, ErrorCode};
 pub use frame::{EventFrame, Failure, Hello, Pong, Shutdown, Success};
 pub use info::{InfoResult, Metrics};
 pub use stream::{Stream, StreamEvent, StreamState};
-pub use version::{API_VERSION, ApiVersion, PAIR_PATH, RECORDING_PATH, WS_PATH};
+pub use version::{API_VERSION, ApiVersion, LIVE_PATH, PAIR_PATH, RECORDING_PATH, WS_PATH};

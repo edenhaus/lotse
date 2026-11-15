@@ -19,7 +19,7 @@ use clap::parser::ValueSource;
 use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::{Mode, SandboxConfig};
 use lotse_supervisor::{
-    AdvertisedAddress, ControlTls, DEFAULT_CONNECT_CONCURRENCY, Limits, MAX_ADVERTISED,
+    AdvertisedAddress, ControlTls, DEFAULT_CONNECT_CONCURRENCY, Limits, LiveLimits, MAX_ADVERTISED,
     RecordingLimits, SHUTDOWN_BUDGET,
 };
 use serde::Deserialize;
@@ -381,6 +381,16 @@ struct LimitsFile {
     max_recordings: Option<u32>,
     /// `limits.max_recordings_per_stream`.
     max_recordings_per_stream: Option<u32>,
+    /// `limits.live_buffer_bytes`.
+    live_buffer_bytes: Option<u32>,
+    /// `limits.live_fetch_timeout_ms`.
+    live_fetch_timeout_ms: Option<u64>,
+    /// `limits.live_start_timeout_ms`.
+    live_start_timeout_ms: Option<u64>,
+    /// `limits.max_live`.
+    max_live: Option<u32>,
+    /// `limits.max_live_per_stream`.
+    max_live_per_stream: Option<u32>,
 }
 
 /// `[stream]` in the file.
@@ -546,10 +556,56 @@ impl Resolver<'_> {
                 lotse_sandbox::DEFAULT_WORKER_ADDRESS_SPACE,
             ),
             recordings: RecordingLimits::NONE,
+            live: LiveLimits::NONE,
         };
         Limits {
             recordings: self.recording_limits(args, file, limits.worker_address_space),
+            live: self.live_limits(args, file),
             ..limits
+        }
+    }
+
+    /// The live output limits of the `[limits]` group, defaults
+    /// [`LiveLimits::DEFAULT`]; the supervisor holds them when the build has
+    /// a live container, and passes the worker's share to every worker.
+    fn live_limits(&mut self, args: &ServeArgs, file: &LimitsFile) -> LiveLimits {
+        let default = LiveLimits::DEFAULT;
+        LiveLimits {
+            buffer_bytes: self.pick(
+                "limits.live_buffer_bytes",
+                "live_buffer_bytes",
+                args.live_buffer_bytes,
+                file.live_buffer_bytes,
+                default.buffer_bytes,
+            ),
+            fetch_timeout: Duration::from_millis(self.pick(
+                "limits.live_fetch_timeout_ms",
+                "live_fetch_timeout_ms",
+                args.live_fetch_timeout_ms,
+                file.live_fetch_timeout_ms,
+                millis(default.fetch_timeout),
+            )),
+            start_timeout: Duration::from_millis(self.pick(
+                "limits.live_start_timeout_ms",
+                "live_start_timeout_ms",
+                args.live_start_timeout_ms,
+                file.live_start_timeout_ms,
+                millis(default.start_timeout),
+            )),
+            max_live: self.pick(
+                "limits.max_live",
+                "max_live",
+                args.max_live,
+                file.max_live,
+                default.max_live,
+            ),
+            max_live_per_stream: self.pick(
+                "limits.max_live_per_stream",
+                "max_live_per_stream",
+                args.max_live_per_stream,
+                file.max_live_per_stream,
+                default.max_live_per_stream,
+            ),
         }
     }
 
@@ -1090,6 +1146,74 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(settings.supervisor.advertise.len(), MAX_ADVERTISED);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_live_limits_come_from_flags_over_the_file_over_the_defaults() {
+        let (settings, provenance) = resolve(&["lotse", "serve", "--socket", "/s"]).unwrap();
+        assert_eq!(settings.supervisor.limits.live, LiveLimits::DEFAULT);
+        assert_eq!(
+            source_of(&provenance, "limits.live_fetch_timeout_ms"),
+            ("10000".into(), Source::Default)
+        );
+        let dir = std::env::temp_dir().join(format!("lotse-config-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lotse.toml");
+        std::fs::write(
+            &path,
+            "socket = \"/s\"\n[limits]\nlive_buffer_bytes = 65536\nlive_fetch_timeout_ms = 3000\n\
+             live_start_timeout_ms = 4000\nmax_live = 5\nmax_live_per_stream = 2\n",
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+        let (settings, provenance) = resolve(&["lotse", "serve", "--config", config]).unwrap();
+        assert_eq!(
+            settings.supervisor.limits.live,
+            LiveLimits {
+                buffer_bytes: 1 << 16,
+                fetch_timeout: Duration::from_secs(3),
+                start_timeout: Duration::from_secs(4),
+                max_live: 5,
+                max_live_per_stream: 2,
+            }
+        );
+        for (name, value) in [
+            ("limits.live_buffer_bytes", "65536"),
+            ("limits.live_fetch_timeout_ms", "3000"),
+            ("limits.live_start_timeout_ms", "4000"),
+            ("limits.max_live", "5"),
+            ("limits.max_live_per_stream", "2"),
+        ] {
+            assert_eq!(
+                source_of(&provenance, name),
+                (value.into(), Source::File),
+                "{name}"
+            );
+        }
+        let (flagged, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--config",
+            config,
+            "--live-buffer-bytes",
+            "1024",
+            "--max-live-per-stream",
+            "1",
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                flagged.supervisor.limits.live.buffer_bytes,
+                flagged.supervisor.limits.live.max_live_per_stream,
+                flagged.supervisor.limits.live.max_live
+            ),
+            (1024, 1, 5)
+        );
+        assert_eq!(
+            source_of(&provenance, "limits.live_buffer_bytes"),
+            ("1024".into(), Source::Flag)
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

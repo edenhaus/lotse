@@ -110,8 +110,8 @@ use lotse_core::source::SourceError;
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::Throttle;
 use lotse_ipc::{
-    RecordingReport, RecordingSpec, STOPPED_AS_ASKED, SessionSpec, SignalCommand, SignalReport,
-    SourceSpec, SourceTarget,
+    LiveReport, LiveSpec, RecordingReport, RecordingSpec, STOPPED_AS_ASKED, SessionSpec,
+    SignalCommand, SignalReport, SourceSpec, SourceTarget,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -123,8 +123,6 @@ use crate::signaling::{
     LIMIT_REACHED, MAX_ENDED_SIGNALS, MAX_PENDING_OPENS, OPEN_EXPIRY, SIGNAL_WAIT, SignalFrom,
 };
 use crate::worker::{Worker, WorkerEvent};
-use crate::worker_text::MAX_NAME_BYTES;
-use lotse_core::text::plain;
 
 /// Session messages a driver holds, queued or in flight, besides the
 /// close each open session reserves (`SessionEntry::close_slot`): a
@@ -204,6 +202,24 @@ pub(crate) enum DriverCommand {
     StopRecording {
         /// The recording.
         recording_id: String,
+    },
+    /// Start this live output, writing into `pipe`; held until there is a
+    /// worker.
+    StartLive {
+        /// The live output.
+        spec: LiveSpec,
+        /// The write end of its pipe, which goes to the worker.
+        pipe: OwnedFd,
+    },
+    /// A reader took this live output's body: its media may go.
+    FetchLive {
+        /// The live output.
+        live_id: String,
+    },
+    /// End this live output.
+    StopLive {
+        /// The live output.
+        live_id: String,
     },
     /// Open this session.
     OpenSession(SessionSpec),
@@ -312,6 +328,9 @@ impl DriverCommand {
             | Self::Prerecord { .. }
             | Self::StartRecording { .. }
             | Self::StopRecording { .. }
+            | Self::StartLive { .. }
+            | Self::FetchLive { .. }
+            | Self::StopLive { .. }
             | Self::ReleaseBackchannel { .. }
             | Self::Signal { .. } => None,
         }
@@ -1038,15 +1057,11 @@ impl Driver {
             .recording_report(&self.spec.connection_id, recording_id, event, at);
     }
 
-    /// A worker's report of live output `live_id`. No live output runs on
-    /// a worker yet: the supervisor sends no `StartLive`, so a report names
-    /// none it holds, and it is dropped.
-    fn on_live_report(&self, live_id: &str) {
-        tracing::debug!(
-            live.id = %plain(live_id, MAX_NAME_BYTES),
-            connection.id = %self.spec.connection_id,
-            "report for a live output the supervisor does not hold; dropped"
-        );
+    /// A worker's report on one of its live outputs.
+    fn on_live_report(&self, live_id: &str, event: LiveReport) {
+        self.shared
+            .lock()
+            .live_report(&self.spec.connection_id, live_id, event);
     }
 
     /// The worker said something or exited.
@@ -1124,7 +1139,7 @@ impl Driver {
                 recording_id,
                 event,
             } => self.on_recording_report(&recording_id, event),
-            WorkerEvent::Live { live_id, .. } => self.on_live_report(&live_id),
+            WorkerEvent::Live { live_id, event } => self.on_live_report(&live_id, event),
             WorkerEvent::Signal(report) => self.on_signal_report(report),
             WorkerEvent::Talker {
                 session_id,
@@ -1516,6 +1531,7 @@ impl Driver {
         );
         // The pipes' write ends died with it: the bodies are cut.
         state.recordings_worker_gone(&connection);
+        state.lives_worker_gone(&connection);
         drop(state);
         let crashes = self.machine.crashes();
         self.feed(Input::WorkerExited);
@@ -1577,9 +1593,12 @@ impl Driver {
                     // was finishing hold their ids no longer. No recording it
                     // got runs: a recording is demand, and it is stopped for
                     // want of any.
-                    self.shared
-                        .lock()
-                        .forget_stopping_recordings(&self.spec.connection_id);
+                    let mut state = self.shared.lock();
+                    state.forget_stopping_recordings(&self.spec.connection_id);
+                    // A live output is demand too: one still here was
+                    // stopped, and its report reaches no one now.
+                    state.lives_worker_gone(&self.spec.connection_id);
+                    drop(state);
                     let shared = Arc::clone(&self.shared);
                     let stop = async move {
                         let _status = worker.stop(shared.shutdown_budget).await;
@@ -1694,6 +1713,12 @@ impl Driver {
                 tracing::debug!(%peer, "ice-tcp connection without a worker; closed");
             }
             DriverCommand::StopRecording { recording_id } => self.unqueue_recording(&recording_id),
+            DriverCommand::StopLive { live_id } => self.unqueue_live(&live_id),
+            // A live output's fetch comes after its start reached a worker:
+            // that worker is gone, and the output ended with it.
+            DriverCommand::FetchLive { live_id } => {
+                tracing::debug!(live.id = %live_id, "live fetch without a worker; dropped");
+            }
             // Without a worker no session talks.
             DriverCommand::ReleaseBackchannel { session_id } => {
                 tracing::debug!(
@@ -1725,6 +1750,28 @@ impl Driver {
             "recording stopped before a worker got it; ended here"
         );
         self.end_unqueued(recording_id, STOPPED_AS_ASKED);
+    }
+
+    /// A live output stopped while its start waits for a worker: the start
+    /// leaves the queue with its pipe and the output ends here, as its worker
+    /// would have ended it; one not queued went with the worker that had it.
+    fn unqueue_live(&mut self, live_id: &str) {
+        let before = self.queued.len();
+        self.queued.retain(|queued| {
+            !matches!(queued, DriverCommand::StartLive { spec, .. } if spec.live_id == live_id)
+        });
+        if self.queued.len() == before {
+            tracing::debug!(
+                live.id = live_id,
+                "live stop without a worker for a start none holds; dropped"
+            );
+            return;
+        }
+        tracing::debug!(
+            live.id = live_id,
+            "live output stopped before a worker got it; ended here"
+        );
+        self.shared.lock().live_unqueued(live_id);
     }
 
     /// How long a recording's start waits in the queue for a worker: the
@@ -1901,6 +1948,9 @@ impl Driver {
             DriverCommand::StopRecording { recording_id } => {
                 worker.stop_recording(&recording_id).await
             }
+            DriverCommand::StartLive { spec, pipe } => worker.start_live(&spec, pipe).await,
+            DriverCommand::FetchLive { live_id } => worker.fetch_live(&live_id).await,
+            DriverCommand::StopLive { live_id } => worker.stop_live(&live_id).await,
             DriverCommand::OpenSession(spec) => {
                 let sink = Arc::new(SessionSink {
                     local_ufrag: spec.ice_ufrag.clone(),
@@ -3446,7 +3496,7 @@ mod tests {
         let lines = captured.lines("report for a recording the supervisor does not hold");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("recording.id=k x"), "{lines:?}");
-        let cap = MAX_NAME_BYTES;
+        let cap = crate::worker_text::MAX_NAME_BYTES;
         assert!(!lines[0].contains(&"x".repeat(cap)), "{lines:?}");
     }
 
@@ -6114,5 +6164,96 @@ mod tests {
         worker.kill("test over");
         while !matches!(worker.next_event().await, WorkerEvent::Exited(_)) {}
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn live_spec(live_id: &str) -> LiveSpec {
+        LiveSpec {
+            live_id: live_id.into(),
+            audio: true,
+            buffer_bytes: 1 << 20,
+        }
+    }
+
+    /// Live messages go to a running worker as recordings' do (to a dead
+    /// one they are logged as not sent); without a worker the start waits
+    /// in the queue, a stop takes it out and ends the output there, a stop
+    /// for a start none holds and a fetch are dropped.
+    #[tokio::test]
+    async fn live_messages_reach_the_worker_or_wait_and_a_stop_ends_a_waiting_start_here() {
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        driver.worker = Some(dead_worker(&shared).await);
+        let (commands, _rx) = mpsc::channel(1);
+        let worker = driver.worker.as_mut().unwrap();
+        let (_reader, writer) = std::io::pipe().unwrap();
+        for command in [
+            DriverCommand::StartLive {
+                spec: live_spec("l1"),
+                pipe: writer.into(),
+            },
+            DriverCommand::FetchLive {
+                live_id: "l1".into(),
+            },
+            DriverCommand::StopLive {
+                live_id: "l1".into(),
+            },
+        ] {
+            assert!(command.session_id().is_none());
+            Driver::send(worker, &shared, &commands, command).await;
+        }
+        assert_eq!(captured.lines("session message could not be sent").len(), 3);
+        driver.worker = None;
+        // An output whose start waits for a worker.
+        let (events_tx, mut events) = mpsc::channel(4);
+        shared.lock().lives.insert(
+            "l2".into(),
+            crate::live::LiveEntry {
+                serial: 1,
+                stream_id: "front".into(),
+                connection: "c1".into(),
+                owner: Some(crate::live::LiveOwner {
+                    connection: ConnectionId(1),
+                    subscription: 1,
+                    events: events_tx,
+                }),
+                waiting: None,
+                mime: None,
+                body: None,
+                fetch_slot: None,
+                stop_slot: None,
+                ending: Some(lotse_api_types::live::LiveCloseReason::Closed),
+                warned: false,
+                timer: None,
+            },
+        );
+        driver.queue(DriverCommand::StartLive {
+            spec: live_spec("l2"),
+            pipe: fd(),
+        });
+        assert_eq!(driver.queued.len(), 1);
+        driver.queue(DriverCommand::FetchLive {
+            live_id: "l2".into(),
+        });
+        driver.queue(DriverCommand::StopLive {
+            live_id: "l9".into(),
+        });
+        assert_eq!(driver.queued.len(), 1, "neither touches the start");
+        driver.queue(DriverCommand::StopLive {
+            live_id: "l2".into(),
+        });
+        assert!(driver.queued.is_empty());
+        drop(driver);
+        let closed = events.recv().await.unwrap().payload;
+        assert_eq!(closed["reason"], "closed");
+        for line in [
+            "live fetch without a worker; dropped",
+            "live stop without a worker for a start none holds; dropped",
+            "live output stopped before a worker got it; ended here",
+        ] {
+            assert_eq!(captured.lines(line).len(), 1, "{line}");
+        }
     }
 }

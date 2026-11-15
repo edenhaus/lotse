@@ -15,8 +15,10 @@
 //! queue that sheds low-value traffic and disconnects a client that still
 //! overflows it, and a deadline on the closing handshake, so a peer that
 //! stops reading cannot hold a connection or its slot. Beside the upgrade
-//! it serves event recordings' bytes, `GET /v0/recording/{recording_id}`, as chunked
-//! response bodies the handler hands over ([`Handler::recording_body`]),
+//! it serves event recordings' bytes, `GET /v0/recording/{recording_id}`, and
+//! live outputs' bytes, `GET /v0/live/{live_id}`, as chunked
+//! response bodies the handler hands over ([`Handler::recording_body`],
+//! [`Handler::live_body`]),
 //! bounded by the client taking them and, over TLS, by its client staying
 //! enrolled.
 //!
@@ -42,7 +44,7 @@ use lotse_api_types::command::Command;
 use lotse_api_types::error::ApiError;
 use lotse_api_types::frame::Hello;
 use lotse_core::clock::Clock;
-use lotse_core::id::RecordingId;
+use lotse_core::id::{LiveId, RecordingId};
 use lotse_core::task::{BoxFuture, spawn_named};
 use lotse_core::throttle::CallSites;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -55,6 +57,7 @@ mod clients;
 mod connection;
 pub mod identity;
 mod listener;
+mod live;
 mod outbox;
 mod owners;
 pub mod pairing;
@@ -65,6 +68,7 @@ pub mod tls;
 
 pub use clients::ClientsError;
 pub use listener::{BindError, PeerInfo};
+pub use live::{LiveBody, LiveBodyError, live_id_of};
 pub use owners::Owners;
 pub use recording::{RecordingBody, RecordingBodyError};
 pub use tls::TlsConfig;
@@ -248,6 +252,17 @@ pub trait Handler: Send + Sync + 'static {
     ) -> Result<RecordingBody, RecordingBodyError> {
         let _ = recording_id;
         Err(RecordingBodyError::NotFound)
+    }
+
+    /// `GET /v0/live/{live_id}` in HTTP/1.1, from any peer either listener
+    /// admits (over TLS, one whose client is still allowed): the bytes of
+    /// live output `live_id` and their MIME type, handed over once, so a
+    /// second request is [`LiveBodyError::AlreadyFetched`]. The server sends
+    /// them as the response body until the reader ends. Never waits.
+    /// Without live outputs, every id is [`LiveBodyError::NotFound`].
+    fn live_body(&self, live_id: &LiveId) -> Result<LiveBody, LiveBodyError> {
+        let _ = live_id;
+        Err(LiveBodyError::NotFound)
     }
 }
 
@@ -519,6 +534,12 @@ impl Admission {
                 get(recording::fetch::<H>)
                     .head(recording::not_allowed)
                     .fallback(recording::not_allowed),
+            )
+            .route(
+                &format!("{}/{{live_id}}", lotse_api_types::LIVE_PATH),
+                get(live::fetch::<H>)
+                    .head(live::not_allowed)
+                    .fallback(live::not_allowed),
             )
             .with_state(state);
         let mut http = http1::Builder::new();
@@ -1076,7 +1097,6 @@ mod tests {
         clock: &Arc<lotse_core::clock::FakeClock>,
         recording: RecordingBody,
     ) -> (Admission, Arc<Semaphore>) {
-        let state = state(1, false);
         let handler = OneRecording(std::sync::Mutex::new(Some(recording)));
         assert_eq!(handler.hello(), Minimal.hello());
         let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
@@ -1084,6 +1104,16 @@ mod tests {
             handler.handle(ConnectionId(1), info).await,
             Outcome::Result(serde_json::Value::Null)
         ));
+        admission_with(clock, handler)
+    }
+
+    /// The admission both listeners use, for `handler`, on `clock`, and its
+    /// pending upgrades.
+    fn admission_with<H: Handler>(
+        clock: &Arc<lotse_core::clock::FakeClock>,
+        handler: H,
+    ) -> (Admission, Arc<Semaphore>) {
+        let state = state(1, false);
         let state = AppState {
             handler: Arc::new(handler),
             config: state.config,
@@ -1112,6 +1142,102 @@ mod tests {
         let (client, server) = tokio::io::duplex(SOCKET_BYTES);
         admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
         (client, admission)
+    }
+
+    /// A handler with one live output, whatever its id, whose body it hands
+    /// out once; it answers commands as [`Minimal`] does.
+    struct OneLive(std::sync::Mutex<Option<LiveBody>>);
+
+    impl Handler for OneLive {
+        fn hello(&self) -> Hello {
+            Minimal.hello()
+        }
+
+        fn handle(
+            &self,
+            connection: ConnectionId,
+            command: Command,
+        ) -> impl Future<Output = Outcome> + Send {
+            Minimal.handle(connection, command)
+        }
+
+        fn live_body(&self, live_id: &LiveId) -> Result<LiveBody, LiveBodyError> {
+            let _ = live_id;
+            let body = self.0.lock().unwrap().take();
+            body.ok_or(LiveBodyError::AlreadyFetched)
+        }
+    }
+
+    /// A live output's body goes through the router as a chunked `200` of
+    /// its MIME type, ends with its last chunk once its producer ends, and
+    /// any other method is 405; the default handler has no live output.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rfc9112_7_1_a_live_body_is_routed_and_ends_with_its_last_chunk() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let (reader, mut producer) = tokio::io::duplex(64 * 1024);
+        let live = LiveBody {
+            reader: Box::new(reader),
+            mime: "video/mp4; codecs=\"avc1.42c028\"".into(),
+        };
+        let handler = OneLive(std::sync::Mutex::new(Some(live)));
+        assert_eq!(handler.hello(), Minimal.hello());
+        let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
+        assert!(matches!(
+            handler.handle(ConnectionId(1), info).await,
+            Outcome::Result(serde_json::Value::Null)
+        ));
+        let (admission, _pending) = admission_with(&clock, handler);
+        let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+        admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+        client
+            .write_all(b"GET /v0/live/01JL HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .await
+            .unwrap();
+        producer.write_all(b"ftyp-and-moov").await.unwrap();
+        settle().await;
+        drop(producer);
+        let seen = finish(&mut client).await;
+        let text = String::from_utf8_lossy(&seen);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(
+            text.contains("content-type: video/mp4; codecs=\"avc1.42c028\"\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("transfer-encoding: chunked\r\n"), "{text}");
+        assert!(text.contains("x-live-id: 01JL\r\n"), "{text}");
+        assert!(text.contains("ftyp-and-moov"), "{text}");
+        assert!(text.ends_with("0\r\n\r\n"), "the last chunk: {text}");
+
+        for (handler, request, status) in [
+            (
+                OneLive(std::sync::Mutex::new(None)),
+                &b"HEAD /v0/live/01JL HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "405",
+            ),
+            (
+                OneLive(std::sync::Mutex::new(None)),
+                &b"GET /v0/live/01JL HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "409",
+            ),
+        ] {
+            let (admission, _pending) = admission_with(&clock, handler);
+            let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client.write_all(request).await.unwrap();
+            let head = String::from_utf8_lossy(&take(&mut client, 12).await).into_owned();
+            assert_eq!(head, format!("HTTP/1.1 {status}"));
+        }
+        let (admission, _pending) = admission_with(&clock, Minimal);
+        let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+        admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+        client
+            .write_all(b"GET /v0/live/01JL HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .await
+            .unwrap();
+        let head = String::from_utf8_lossy(&take(&mut client, 12).await).into_owned();
+        assert_eq!(head, "HTTP/1.1 404", "no live output without a handler's");
     }
 
     /// The socket here is a pipe the client empties 4 KiB a second, so the

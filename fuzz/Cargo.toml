@@ -259,3 +259,10 @@ path = "fuzz_targets/fmp4_live.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "live_path"
+path = "fuzz_targets/live_path.rs"
+test = false
+doc = false
+bench = false

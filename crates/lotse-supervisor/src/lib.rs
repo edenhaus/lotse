@@ -48,6 +48,7 @@ mod driver;
 mod gather;
 mod handler;
 mod host_cache;
+mod live;
 pub mod memory;
 pub mod net;
 mod recording;
@@ -61,6 +62,7 @@ mod worker_text;
 pub use advertise::{AdvertiseError, AdvertisedAddress, MAX_ADVERTISED};
 pub use handler::{Environment, FrontDoor, Identity, Supervisor};
 pub use host_cache::HostScan;
+pub use live::LiveLimits;
 pub use lotse_api::Owners;
 pub use lotse_api::Server as ApiServer;
 pub use lotse_api::TlsConfig as ControlTls;
@@ -109,6 +111,10 @@ pub struct Limits {
     /// event recordings. Without a recording output the supervisor holds
     /// [`RecordingLimits::NONE`] instead.
     pub recordings: RecordingLimits,
+    /// `limits.live_*`, `limits.max_live` and `limits.max_live_per_stream`:
+    /// the live outputs. Without a live container the supervisor holds
+    /// [`LiveLimits::NONE`] instead.
+    pub live: LiveLimits,
 }
 
 /// The supervisor's effective settings, resolved by the binary.
@@ -521,6 +527,7 @@ pub(crate) mod test_support {
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
                 recordings: RecordingLimits::DEFAULT,
+                live: LiveLimits::DEFAULT,
             },
             linger: Duration::from_secs(5),
             connect_concurrency: DEFAULT_CONNECT_CONCURRENCY,
@@ -625,6 +632,7 @@ pub(crate) mod test_support {
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
                 recordings: RecordingLimits::DEFAULT,
+                live: LiveLimits::DEFAULT,
             },
             udp: None,
             front_door: None,
