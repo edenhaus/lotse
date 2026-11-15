@@ -621,6 +621,35 @@ fn audio_goes_out_alone_once_it_spans_the_bound_while_the_video_waits() {
     assert_eq!(AUDIO_FRAGMENT_SPAN, Duration::from_millis(500));
 }
 
+/// Audio that goes out alone while the video waits is placed where the
+/// video's decode ends (ISO/IEC 14496-12 §8.8.12: its `tfdt` is the track's
+/// next decode time), not at the start of the media.
+#[test]
+fn iso14496_12_8_8_12_audio_out_alone_is_placed_where_the_video_s_decode_ends() {
+    let base = base();
+    let mut out = Output::with(LiveWriter::new(), &h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Video, video(base, 40, 3_600, false, 0, 1));
+    assert_eq!(out.fragments.len(), 1, "the keyframe, finished by the next");
+    let mut alone = None;
+    for i in 0..12 {
+        let n = u64::try_from(i).unwrap();
+        let ts = i64::try_from(i).unwrap() * AAC_FRAME;
+        if is_fragment(&out.push(Kind::Audio, aac(base, n * 64, ts, 0, i))) {
+            alone = out.fragments.last().cloned();
+            break;
+        }
+    }
+    let alone = alone.expect("the audio went out alone");
+    assert!(!alone.independent);
+    assert_eq!(alone.duration, Duration::ZERO, "no video in it");
+    assert_eq!(
+        alone.decode_time,
+        Duration::from_millis(40),
+        "where the video's decode ends"
+    );
+}
+
 #[test]
 fn audio_goes_out_alone_once_it_holds_the_bound() {
     // What a finished AAC frame holds: its payload, the one slice of it
