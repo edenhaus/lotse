@@ -870,7 +870,9 @@ function startLlhls(marks) {
   };
 
   // Its frames, as the MSE element's: each flash with how far behind the
-  // end of the buffer it was shown.
+  // end of the buffer it was shown and, through hls.js, how far behind the
+  // live edge (`hls.latency`: the playlist's edge aged by the time since it
+  // loaded, so a part that reaches the buffer late does not move it).
   const canvas = $("llhls-canvas").getContext("2d", { willReadFrequently: true });
   let wasWhite, first;
   const shown = new Promise((resolve) => { first = resolve; });
@@ -886,7 +888,8 @@ function startLlhls(marks) {
       const media = meta?.mediaTime ?? video.currentTime;
       const buffered = video.buffered;
       const edge = buffered.length ? buffered.end(buffered.length - 1) : undefined;
-      llhls.video.flashes.push({ at, media_time: media, behind_ms: edge === undefined ? null : (edge - media) * 1000 });
+      const live = Number.isFinite(hls?.latency) ? hls.latency * 1000 : null;
+      llhls.video.flashes.push({ at, media_time: media, behind_ms: edge === undefined ? null : (edge - media) * 1000, live_ms: live });
     }
     wasWhite = white;
   });
@@ -984,7 +987,7 @@ function startLlhls(marks) {
         session = await create(false);
         llhls.mime = session.mime;
         llhls.playlist_url = session.playlist;
-        await playWithHlsJs(Hls, session.playlist);
+        await Promise.race([playWithHlsJs(Hls, session.playlist), timeout(15000, "the first LL-HLS frame without audio")]);
       }
     }
     llhls.timings.first_frame = await Promise.race([shown, timeout(15000, "the first LL-HLS frame")]);

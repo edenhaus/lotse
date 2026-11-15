@@ -813,6 +813,28 @@ def test_an_llhls_flash_over_a_second_behind_pairs_by_its_buffer_distance() -> N
     assert latency_summary(found).startswith("WebRTC none, LL-HLS none, LL-HLS minus WebRTC 900")
 
 
+def test_an_llhls_flash_is_placed_by_the_live_edge_when_its_buffer_lags_it() -> None:
+    # 3 s behind WebRTC with the buffer's end lagging the live edge by 1 s (a part that came
+    # late): by the buffer the flash is the next second's, 2 s; by hls.js's latency, 3 s.
+    page = llhls_page(lag_ms=3_000.0)
+    for flash in page["llhls"]["video"]["flashes"]:
+        flash["behind_ms"] = 1_930.0
+    assert latency(page, AAC, checks.LLHLS)["llhls_minus_webrtc_ms"]["median"] == pytest.approx(
+        2_000.0
+    )
+    for flash in page["llhls"]["video"]["flashes"]:
+        flash["live_ms"] = 2_930.0
+    found = latency(page, AAC, checks.LLHLS)
+    assert found["llhls_minus_webrtc_ms"]["median"] == pytest.approx(3_000.0)
+    assert found["llhls_ms"]["median"] == pytest.approx(3_040.0)
+    # A flash without the edge (the browser's own HLS) keeps the buffer's distance.
+    for flash in page["llhls"]["video"]["flashes"]:
+        flash["live_ms"] = None
+    assert latency(page, AAC, checks.LLHLS)["llhls_minus_webrtc_ms"]["median"] == pytest.approx(
+        2_000.0
+    )
+
+
 @pytest.mark.parametrize(
     ("path", "value", "failure"),
     [

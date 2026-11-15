@@ -636,6 +636,11 @@ def latency(page: Json, stream: Stream, player: Player = MSE) -> dict[str, Json]
     after its first frame, and the buffer's end is then that part's end, so the two cancel. Its
     latency is that WebRTC flash's capture to render plus how much later the player's flash was
     shown. Without `captureTimestamp` (Firefox and Safari do not report it), only the difference.
+    Where the player knows the live edge (`live_ms`, hls.js's `latency`: the playlist's edge aged
+    by the time since it loaded), that distance places the flash instead: a buffer whose end lags
+    the live edge, a part that came late, would put a flash a second or more late at the next
+    second's WebRTC flash and report a second too little. The browser's own HLS knows no edge and
+    keeps the buffer's.
     """
     clock = page.get("clock") or {}
     origin = (clock.get("time_origin") or 0.0) + (clock.get("t0") or 0.0)
@@ -652,7 +657,8 @@ def latency(page: Json, stream: Stream, player: Player = MSE) -> dict[str, Json]
     held_ms = 1000 / stream.fps
     differences, delays = [], []
     for flash in _player_flashes(page, player):
-        behind = flash.get("behind_ms")
+        live = flash.get("live_ms")
+        behind = live if isinstance(live, int | float) else flash.get("behind_ms")
         expected = flash["at"] - (behind if isinstance(behind, int | float) else 0.0) - held_ms
         near = [w for w in webrtc_flashes if abs(w - expected) <= MSE_PAIR_WITHIN_MS]
         if not near:
