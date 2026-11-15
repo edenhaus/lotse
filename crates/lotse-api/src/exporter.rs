@@ -34,12 +34,16 @@
 //! which "Selection of Format" makes the last resort a target MUST use. A
 //! wildcard (`*/*`, as curl sends) gets the text format too: it names no
 //! protocol. Prometheus' default `Accept` weighs OpenMetrics 1.0.0 highest,
-//! so it gets OpenMetrics. Every metric name is in the legacy character
-//! set, so the exposition is the same under every escaping scheme
-//! (`allow-utf-8`, `underscores`, `dots`, `values`): the one asked for is
-//! named in the response, as "Content-Type Response" requires of a text
-//! format from 1.0.0 on, `underscores` when none was; an unknown scheme is
-//! not offered. Not offered: the Prometheus text format 1.0.0 and
+//! so it gets OpenMetrics. Every metric and label name is in the legacy
+//! character set, which `allow-utf-8` and `underscores` leave as it is
+//! (`docs/instrumenting/escaping_schemes.md`), so the exposition is the
+//! same under both: the one asked for is named in the response, as
+//! "Content-Type Response" requires of a text format from 1.0.0 on,
+//! `underscores` when none was ("Default Behavior"). `dots` and `values`
+//! are not offered: `dots` turns every `_` of a legacy name into `__`,
+//! and `values` reads as prefixing every name with `U__`, rewritings of
+//! the names the client's encoders do not write; a scraper naming only
+//! those, or a scheme it made up, gets the last resort. Not offered: the Prometheus text format 1.0.0 and
 //! OpenMetrics 0.0.1, which the client does not write, and the protobuf
 //! formats, which both specifications make optional; nor `gzip`, an
 //! optional content coding.
@@ -108,21 +112,18 @@ pub const MAX_EXPORTED_WORKERS: usize = 1024;
 /// (single-word) application prefix").
 const PREFIX: &str = "lotse";
 
-/// An escaping scheme of metric and label names a scraper may ask for with
-/// a text format from version 1.0.0 on (`content_negotiation.md`,
-/// "Escaping Scheme"). Every name here is in the legacy character set, so
-/// none changes the exposition.
+/// An escaping scheme of metric and label names the route offers with
+/// OpenMetrics 1.0.0 (`content_negotiation.md`, "Escaping Scheme";
+/// `escaping_schemes.md`): the two that leave a name in the legacy
+/// character set, as every name here is, as it is, so neither changes the
+/// exposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Escaping {
     /// `allow-utf-8`: names as they are.
     AllowUtf8,
-    /// `underscores`: other characters as `_`; named when the scraper
-    /// named none.
+    /// `underscores`: characters outside the legacy set as `_`; named when
+    /// the scraper named none.
     Underscores,
-    /// `dots`: `.` as `_dot_`, other characters as `__`.
-    Dots,
-    /// `values`: other characters as their code point values.
-    Values,
 }
 
 impl Escaping {
@@ -131,8 +132,6 @@ impl Escaping {
         match self {
             Self::AllowUtf8 => "allow-utf-8",
             Self::Underscores => "underscores",
-            Self::Dots => "dots",
-            Self::Values => "values",
         }
     }
 }
@@ -160,12 +159,6 @@ impl Format {
             Self::OpenMetrics(Escaping::Underscores) => {
                 "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores"
             }
-            Self::OpenMetrics(Escaping::Dots) => {
-                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=dots"
-            }
-            Self::OpenMetrics(Escaping::Values) => {
-                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=values"
-            }
             Self::PrometheusText => prometheus_client::encoding::prometheus_text::CONTENT_TYPE,
         }
     }
@@ -189,7 +182,7 @@ struct Representation {
 /// 0.0.4 first, the last resort a wildcard gets too, then OpenMetrics 1.0.0
 /// under each escaping scheme, `underscores` first, which a range naming
 /// none gets.
-const REPRESENTATIONS: [Representation; 5] = [
+const REPRESENTATIONS: [Representation; 3] = [
     Representation {
         format: Format::PrometheusText,
         ty: "text",
@@ -214,26 +207,6 @@ const REPRESENTATIONS: [Representation; 5] = [
             ("version", "1.0.0"),
             ("charset", "utf-8"),
             ("escaping", "allow-utf-8"),
-        ],
-    },
-    Representation {
-        format: Format::OpenMetrics(Escaping::Dots),
-        ty: "application",
-        subty: "openmetrics-text",
-        params: &[
-            ("version", "1.0.0"),
-            ("charset", "utf-8"),
-            ("escaping", "dots"),
-        ],
-    },
-    Representation {
-        format: Format::OpenMetrics(Escaping::Values),
-        ty: "application",
-        subty: "openmetrics-text",
-        params: &[
-            ("version", "1.0.0"),
-            ("charset", "utf-8"),
-            ("escaping", "values"),
         ],
     },
 ];
@@ -315,13 +288,15 @@ impl Range {
             })
     }
 
-    /// How specific the range is: a named type, a named subtype, then each
-    /// parameter outranks the range without it (RFC 9110 §12.5.1: "the
-    /// most specific reference has precedence").
-    fn specificity(&self) -> usize {
-        usize::from(self.ty != "*")
-            .saturating_add(usize::from(self.subty != "*"))
-            .saturating_add(self.params.len())
+    /// How specific the range is, compared in order: a named type, then a
+    /// named subtype, then the number of parameters (RFC 9110 §12.5.1: "the
+    /// most specific reference has precedence", its example ranking
+    /// `text/plain;format=flowed` over `text/plain` over `text/*` over
+    /// `*/*`). A parameter never lifts a wildcard over a named type or
+    /// subtype: `application/*;version=1.0.0` ranks below
+    /// `application/openmetrics-text`.
+    fn specificity(&self) -> (bool, bool, usize) {
+        (self.ty != "*", self.subty != "*", self.params.len())
     }
 }
 
@@ -1150,20 +1125,18 @@ mod tests {
             negotiated(&[PROMETHEUS_DEFAULT]),
             Format::OpenMetrics(Escaping::AllowUtf8)
         );
-        for (scheme, escaping) in [
-            ("allow-utf-8", Escaping::AllowUtf8),
-            ("underscores", Escaping::Underscores),
-            ("dots", Escaping::Dots),
-            ("values", Escaping::Values),
+        // `dots` and `values` are not offered: a scraper naming only them
+        // gets the last resort (`escaping_schemes.md`).
+        for (scheme, expected) in [
+            ("allow-utf-8", Format::OpenMetrics(Escaping::AllowUtf8)),
+            ("underscores", Format::OpenMetrics(Escaping::Underscores)),
+            ("dots", Format::PrometheusText),
+            ("values", Format::PrometheusText),
         ] {
             let accept = format!(
                 "application/openmetrics-text;version=1.0.0;escaping={scheme};q=0.5,text/plain;version=0.0.4;q=0.2"
             );
-            assert_eq!(
-                negotiated(&[&accept]),
-                Format::OpenMetrics(escaping),
-                "{scheme}"
-            );
+            assert_eq!(negotiated(&[&accept]), expected, "{scheme}");
         }
         // OpenMetrics without a version is its oldest, 1.0.0 (OpenMetrics
         // 1.0, "Protocol Negotiation"); with one and no escaping, as asked.
@@ -1229,12 +1202,12 @@ mod tests {
                 Format::OpenMetrics(Escaping::Underscores),
             ),
             (
-                "application/openmetrics-text;charset=UTF-8;escaping=dots",
-                Format::OpenMetrics(Escaping::Dots),
+                "application/openmetrics-text;charset=UTF-8;escaping=allow-utf-8",
+                Format::OpenMetrics(Escaping::AllowUtf8),
             ),
             (
-                "application/openmetrics-text;version=1.0.0;charset=\"utf-8\";escaping=values;q=0.7",
-                Format::OpenMetrics(Escaping::Values),
+                "application/openmetrics-text;version=1.0.0;charset=\"utf-8\";escaping=underscores;q=0.7",
+                Format::OpenMetrics(Escaping::Underscores),
             ),
             (
                 "text/plain;charset=utf-8;q=0.9,application/openmetrics-text;q=0.5",
@@ -1274,10 +1247,25 @@ mod tests {
         // An escaping scheme narrows the range to its representation.
         assert_eq!(
             negotiated(&[
-                "application/openmetrics-text;q=0.2,application/openmetrics-text;escaping=dots;q=0.9"
+                "application/openmetrics-text;q=0.2,application/openmetrics-text;escaping=allow-utf-8;q=0.9"
             ]),
-            Format::OpenMetrics(Escaping::Dots)
+            Format::OpenMetrics(Escaping::AllowUtf8)
         );
+    }
+
+    #[test]
+    fn parameters_never_lift_a_wildcard_over_a_named_type_or_subtype_rfc9110_12_5_1() {
+        // The named subtype's exclusion holds against a wildcard subtype
+        // with more parameters.
+        let subtype = ranges(
+            "application/openmetrics-text;q=0,application/*;version=1.0.0;charset=utf-8;q=1,text/plain;q=0.5",
+        )
+        .unwrap();
+        assert_eq!(chosen(&subtype), Some(Format::PrometheusText));
+        // And the named type's against a wildcard type with more: nothing
+        // is acceptable.
+        let ty = ranges("text/plain;q=0,*/*;version=0.0.4;charset=utf-8").unwrap();
+        assert_eq!(chosen(&ty), None);
     }
 
     #[test]
@@ -1353,8 +1341,6 @@ mod tests {
         for (escaping, name) in [
             (Escaping::AllowUtf8, "allow-utf-8"),
             (Escaping::Underscores, "underscores"),
-            (Escaping::Dots, "dots"),
-            (Escaping::Values, "values"),
         ] {
             assert_eq!(escaping.as_str(), name);
             assert_eq!(
@@ -1417,8 +1403,8 @@ lotse_supervisor_uptime_seconds 1.5
         assert_eq!(types.iter().collect::<HashSet<_>>().len(), 37);
         assert_eq!(
             text,
-            self::text(&full(), Format::OpenMetrics(Escaping::Dots)),
-            "every scheme alike"
+            self::text(&full(), Format::OpenMetrics(Escaping::Underscores)),
+            "both schemes alike"
         );
     }
 
@@ -1615,7 +1601,7 @@ lotse_supervisor_uptime_seconds 1.5
         let lines = LimitLines::new(clock);
         for format in [
             Format::PrometheusText,
-            Format::OpenMetrics(Escaping::Values),
+            Format::OpenMetrics(Escaping::Underscores),
         ] {
             let (status, headers, body) = body_of(respond(Some(full()), format, &lines)).await;
             assert_eq!(status, 200);
