@@ -379,7 +379,9 @@ async fn run(
 enum Dropping {
     /// Not dropping: every frame goes to the container.
     No,
-    /// Every frame is left out until the queue went into the pipe.
+    /// Every frame is left out until the queue went into the pipe, then the
+    /// container leaves them out until the next keyframe; a frame lost
+    /// meanwhile keeps it.
     Draining,
     /// The container leaves frames out until the next keyframe; those count
     /// as dropped.
@@ -753,13 +755,17 @@ impl Output {
 
     /// Drops to the next keyframe for `why`, `skipped` frames lost already:
     /// the container finishes the frames it holds and leaves out the rest
-    /// until then.
+    /// until then. A drain under way stays one, as it already goes on at
+    /// the next keyframe once the queue went into the pipe: a keyframe
+    /// before that would go out behind the backlog.
     fn drop_to_keyframe(&mut self, skipped: u64, why: &'static str) -> Result<(), LiveEnd> {
         let finished = self.muxer.skip().map_err(|err| self.failed(&err))?;
         if let Some(fragment) = finished {
             self.queue_fragment(fragment)?;
         }
-        self.drop = Dropping::ToKeyframe;
+        if self.drop != Dropping::Draining {
+            self.drop = Dropping::ToKeyframe;
+        }
         self.drops = self.drops.saturating_add(1);
         self.dropped_frames = self.dropped_frames.saturating_add(skipped);
         if let Some(count) = self.drop_lines.hit(self.clock.now()) {

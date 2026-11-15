@@ -569,6 +569,64 @@ async fn a_reader_that_keeps_up_costs_no_frame_even_without_a_buffer() {
     assert_eq!((dropped, drops), (0, 0));
 }
 
+/// A frame the subscription lost while the queue drains keeps the drain:
+/// a keyframe that comes while the queue is below the buffer but not yet in
+/// the pipe is left out, as it would go out behind the backlog, and the
+/// media starts again at the first keyframe after the queue emptied.
+#[tokio::test]
+async fn a_frame_lost_while_the_queue_drains_keeps_the_drain_until_the_queue_empties() {
+    let limits = TrackLimits {
+        max_frame_bytes: 48 * 1024,
+        ..TrackLimits::default()
+    };
+    let mut rig = Rig::with(Some(h264()), None, true, limits, 8);
+    let reader = rig.start(spec(false, 100 * 1024));
+    rig.started().await;
+    assert!(rig.lives.fetch("l1"));
+    settle().await;
+    // The pipe takes 64 KiB: frame 3 finds some 80 KiB queued, frame 4
+    // some 128 KiB, over the buffer, and starts the drain; frame 5 is left
+    // out.
+    for index in 0..6 {
+        assert!(rig.video_frame(index, index == 0, 48 * 1024));
+        settle().await;
+    }
+    // One pipe's worth read and the pipe filled again: some 64 KiB queued,
+    // below the buffer but not in the pipe.
+    let mut all = available(&reader).await;
+    settle().await;
+    assert!(
+        !rig.video_frame(6, false, 48 * 1024 + 1),
+        "over max_frame_bytes: lost"
+    );
+    settle().await;
+    rig.video_frame(7, true, 10);
+    settle().await;
+    // The rest of the queue, then a delta frame on an empty queue and the
+    // next keyframe.
+    loop {
+        let read = available(&reader).await;
+        if read.is_empty() {
+            break;
+        }
+        all.extend(read);
+    }
+    rig.video_frame(8, false, 10);
+    rig.video_frame(9, true, 10);
+    all.extend(available(&reader).await);
+    let seen = lines(&all);
+    let skip = seen.iter().position(|line| line == "skip").expect("a drop");
+    assert_eq!(seen[skip - 1], "frame v 0 10800 - 49152", "{seen:?}");
+    assert_eq!(seen[skip + 1..], ["frame v 0 32400 k 10"], "{seen:?}");
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    let (_, _, dropped, drops) = rig.closed().await;
+    assert_eq!(
+        (dropped, drops),
+        (5, 2),
+        "frames 4 to 8: the drain's two, the lost one, the keyframe, the one after"
+    );
+}
+
 #[tokio::test]
 async fn a_frame_the_subscription_lost_drops_to_the_next_keyframe() {
     let limits = TrackLimits {
