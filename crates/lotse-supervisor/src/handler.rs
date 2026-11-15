@@ -1505,10 +1505,14 @@ impl Supervisor {
     /// viewer), and waits for the worker's init segment, whose MIME type the
     /// result carries, for at most `limits.live_start_timeout_ms` and
     /// [`LIVE_CREATE_SLACK`]: the one command that waits on the camera,
-    /// bounded, as `webrtc/reoffer` waits on a worker. Then the fetch
-    /// deadline runs until the body is taken. The command's future may be
-    /// dropped at its wait (the client removed, shutdown): the output stays
-    /// registered with its owner, whose connection's close ends it.
+    /// bounded, as `webrtc/reoffer` waits on a worker. The control
+    /// connection reads and answers its further commands meanwhile, so an
+    /// on-demand signaled source this output starts can be answered on the
+    /// same connection (its `signaling/answer`) and send the init segment.
+    /// Then the fetch deadline runs until the body is taken. The command's
+    /// future may be dropped at its wait (the client removed, shutdown, the
+    /// connection closed): the output stays registered with its owner,
+    /// whose connection's close ends it.
     async fn live_create(
         &self,
         connection: ConnectionId,

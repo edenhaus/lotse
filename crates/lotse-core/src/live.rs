@@ -9,9 +9,10 @@
 //! is complete the moment its frame's duration is known. After a hole (the
 //! reader fell behind and the frames up to the next keyframe were dropped,
 //! [`LiveMuxer::skip`], or the camera reconnected) it starts again at the next
-//! video keyframe, which it places where the video so far ends, so the decode
-//! times run on without a hole and a player buffers no gap; the audio keeps
-//! its place beside the video by capture time. Core knows no container: the
+//! video keyframe, which it places where the output so far ends (the video's
+//! last frame lasting until the audio sent ends, if that is later), so the
+//! decode and presentation times run on without a hole and a player buffers
+//! no gap; the audio keeps its place beside the video by capture time. Core knows no container: the
 //! factory is registered by the binary ([`Registries::live`]), and a worker
 //! without one runs no live output.
 //!
@@ -118,9 +119,10 @@ pub trait LiveMuxer: Send + Sync {
     fn continues(&self, track: Kind, entry: &RecordingTrack) -> bool;
 
     /// A hole: the caller left frames out. The frames held are finished
-    /// as they are and returned, if any, and every frame from here on is
+    /// as they are and returned, if any (the video's last lasting until the
+    /// audio ends, if that is later), and every frame from here on is
     /// [`LiveStep::Dropped`] until the next video keyframe, which starts
-    /// the output again where its video ends.
+    /// the output again where it ends.
     fn skip(&mut self) -> Result<Option<LiveFragment>, RecordingError>;
 }
 

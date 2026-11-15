@@ -32,7 +32,9 @@
 //! they come, the chunked body streamed through, never cached (RFC 9111
 //! §5.2.2.5). Like the relay, it answers only a request whose `Host` names
 //! the machine by address or as `localhost`, and with an `Origin` only the
-//! page's own. A development tool, never part of the daemon.
+//! page's own. Any other method, `HEAD` included, is a `405` that never
+//! reaches the daemon, whose output has one body to give (RFC 9110
+//! §15.5.6). A development tool, never part of the daemon.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -186,13 +188,19 @@ fn same_origin(headers: &HeaderMap) -> bool {
 
 /// The routes: the page, the browser test's page, the relay and the live
 /// outputs' bytes; anything else is `404` (axum answers a wrong method on a
-/// route `405`, and a malformed request or upgrade `400`).
+/// route `405`, and a malformed request or upgrade `400`). A live output's
+/// path answers only `GET`: axum's `get` would answer `HEAD` with [`live`],
+/// whose `GET` to the daemon takes the output's one body, so `HEAD` and
+/// every other method are [`not_allowed`] instead.
 fn router(socket: PathBuf, cancel: CancellationToken) -> Router {
     Router::new()
         .route("/", get(|| async { page(PAGE, PAGE_POLICY.as_str()) }))
         .route(crate::browser::PAGE_PATH, get(test_page))
         .route(RELAY_PATH, get(upgrade))
-        .route(LIVE_ROUTE, get(live))
+        .route(
+            LIVE_ROUTE,
+            get(live).head(not_allowed).fallback(not_allowed),
+        )
         .fallback(|| async { refuse(StatusCode::NOT_FOUND, "not found\n".to_owned()) })
         .with_state(Shared {
             socket: socket.into(),
@@ -389,6 +397,20 @@ async fn live(State(shared): State<Shared>, headers: HeaderMap, uri: Uri) -> Res
             refuse(StatusCode::BAD_GATEWAY, format!("{reason}\n"))
         }
     }
+}
+
+/// Any other method on a live output's path, `HEAD` included: `405` with
+/// `Allow: GET` (RFC 9110 §15.5.6), as the daemon's own route answers it,
+/// without asking the daemon, whose output has one body to give.
+async fn not_allowed() -> Response {
+    let mut response = refuse(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "a live output's bytes are fetched with GET\n".to_owned(),
+    );
+    response
+        .headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static("GET"));
+    response
 }
 
 /// The daemon's answer to `GET /v0/live/{live_id}` on a connection of its
@@ -1737,6 +1759,54 @@ mod tests {
         let response = String::from_utf8_lossy(&response);
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
         drop(go);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `HEAD` (which axum's `get` would answer with the `GET` handler)
+    /// or any other method is a `405` with `Allow: GET` (RFC 9110
+    /// §15.5.6) that never asks the daemon: its `GET` would take the live
+    /// output's one body, which the browser's `GET` after it could then
+    /// no longer play.
+    #[tokio::test]
+    async fn rfc9110_s15_5_6_head_is_refused_without_taking_the_live_body() {
+        let (dir, socket, mut asked, go) = fake_live_daemon(
+            "live-head",
+            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            vec!["5\r\nfirst\r\n0\r\n\r\n"],
+        );
+        let (addr, cancel) = start(socket).await;
+        for method in ["HEAD", "POST", "PUT", "DELETE"] {
+            let refused = raw(
+                addr,
+                &format!("{method} /v0/live/01JL HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(
+                refused.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+                "{method}: {refused}"
+            );
+            let lower = refused.to_ascii_lowercase();
+            assert!(lower.contains("\r\nallow: get\r\n"), "{method}: {refused}");
+            assert!(
+                asked.try_recv().is_err(),
+                "{method} reached the daemon: {refused}"
+            );
+        }
+        // The daemon's one body is still there for the browser's GET.
+        go.send(()).unwrap();
+        go.send(()).unwrap();
+        let response = get(addr, "/v0/live/01JL").await;
+        assert!(
+            asked
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("GET /v0/live/01JL HTTP/1.1\r\n")
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("first"), "{response}");
+        cancel.cancel();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

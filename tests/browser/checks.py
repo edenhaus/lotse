@@ -601,6 +601,11 @@ def latency(page: Json, stream: Stream) -> dict[str, Json]:
     are a second apart and the MSE picture is later than WebRTC's by some fraction of one. Its
     latency is that WebRTC flash's capture to render plus how much later the MSE flash was shown.
     Without `captureTimestamp` (Firefox and Safari do not report it), only the difference.
+    The flash's display time less `behind_ms` is when its bytes reached the buffer, so the pairing
+    holds while those bytes arrive within `MSE_PAIR_WITHIN_MS` of one frame after the WebRTC
+    flash; bytes a second late are paired with the next second's, which nothing on the page
+    tells apart from the identical flash of that second. Only a marker that names its second, or
+    a source time both outputs carry, would remove that; latency is a report, so it is left.
     """
     clock = page.get("clock") or {}
     origin = (clock.get("time_origin") or 0.0) + (clock.get("t0") or 0.0)

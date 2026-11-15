@@ -6,11 +6,12 @@
 //! `EXT-X-PART-INF` (§4.4.3.7), `EXT-X-MEDIA-SEQUENCE` (§4.4.3.2, before the
 //! first segment), `EXT-X-INDEPENDENT-SEGMENTS` (§4.4.2.1), `EXT-X-MAP`
 //! (§4.4.4.5, before every part, as §4.4.4.9 requires of a tag that applies
-//! to a Parent Segment), then each complete segment as its recent
-//! `EXT-X-PART` tags (§4.4.4.9), its `EXTINF` (§4.4.4.1) and its URI, the
-//! open segment's parts, and the `EXT-X-PRELOAD-HINT` of the next part
-//! (§4.4.5.3; the Low-Latency profile, Appendix B.1, has a playlist with
-//! parts carry one).
+//! to a Parent Segment), then each complete segment as its `EXT-X-PART`
+//! tags (§4.4.4.9) while they are listed, all of them or none (the window's
+//! module docs say for how long, and why all), its `EXTINF` (§4.4.4.1) and
+//! its URI, the open segment's parts, and the `EXT-X-PRELOAD-HINT` of the
+//! next part (§4.4.5.3; the Low-Latency profile, Appendix B.1, has a
+//! playlist with parts carry one).
 //!
 //! Durations are decimal-floating-point seconds (§4.2) to the microsecond,
 //! truncated: monotone, so a part no longer than the Part Target Duration
@@ -47,13 +48,6 @@ const VERSION: u8 = 6;
 /// (draft-pantos-hls-rfc8216bis-22 §4.4.3.8). Three: the SHOULD, the
 /// lowest latency it allows.
 const PART_HOLD_BACK_PARTS: u32 = 3;
-
-/// How far from the playlist's end, in Target Durations, a part's tag is
-/// listed: "EXT-X-PART tags SHOULD be removed from the Playlist after they
-/// are greater than three Target Durations from the end of the Playlist"
-/// (draft-pantos-hls-rfc8216bis-22 §6.2.2). A part is that far once its end
-/// is.
-const PART_TAG_TARGET_DURATIONS: u32 = 3;
 
 impl Window {
     /// The Media Playlist as it is now, once the first segment completed;
@@ -101,31 +95,27 @@ impl fmt::Display for Render<'_> {
         writeln!(f, "#EXT-X-MAP:URI=\"{}\"", Resource::Init)?;
 
         let open = window.open.as_ref().map(|open| &open.segment);
-        let segments = || window.listed.iter().chain(open);
-        let end = segments().fold(Duration::ZERO, |end, segment| {
-            end.saturating_add(segment.duration)
-        });
-        let tags_from = end.saturating_sub(
-            Duration::from_secs(target_duration).saturating_mul(PART_TAG_TARGET_DURATIONS),
-        );
-        let mut at = Duration::ZERO;
-        for segment in segments() {
-            for (index, part) in (0_u64..).zip(&segment.parts) {
-                at = at.saturating_add(part.duration);
-                if at >= tags_from {
-                    let uri = Resource::Part {
-                        msn: segment.msn,
-                        index,
-                    };
-                    let independent = if part.independent {
-                        "INDEPENDENT=YES,"
-                    } else {
-                        ""
-                    };
-                    let duration = Seconds(part.duration);
-                    write!(f, "#EXT-X-PART:DURATION={duration},{independent}")?;
-                    writeln!(f, "URI=\"{uri}\"")?;
-                }
+        for segment in window.listed.iter().chain(open) {
+            // A segment's part tags are listed all or none (see the window's
+            // module docs): a client numbers them from 0 (§3.2).
+            let parts = if segment.untagged.is_none() {
+                segment.parts.as_slice()
+            } else {
+                &[]
+            };
+            for (index, part) in (0_u64..).zip(parts) {
+                let uri = Resource::Part {
+                    msn: segment.msn,
+                    index,
+                };
+                let independent = if part.independent {
+                    "INDEPENDENT=YES,"
+                } else {
+                    ""
+                };
+                let duration = Seconds(part.duration);
+                write!(f, "#EXT-X-PART:DURATION={duration},{independent}")?;
+                writeln!(f, "URI=\"{uri}\"")?;
             }
             if Some(segment.msn) != open.map(|open| open.msn) {
                 writeln!(f, "#EXTINF:{},", Seconds(segment.duration))?;

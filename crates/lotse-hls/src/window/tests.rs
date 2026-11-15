@@ -23,7 +23,11 @@ fn fragment(tag: u8, len: usize, independent: bool, nanos: u64) -> Fragment {
     }
 }
 
-/// Pushes `count` fragments of `ms` each and 72 bytes (200 with the
+/// What a fragment of [`push_frames`] and [`push_200_ms`] costs the window:
+/// its 72 bytes and the overhead.
+const EACH: usize = 72 + FRAGMENT_OVERHEAD;
+
+/// Pushes `count` fragments of `ms` each and 72 bytes ([`EACH`] with the
 /// overhead), the `n`th tagged `n` and independent when `n % gop == 0`;
 /// returns what the last became.
 fn push_frames(window: &mut Window, from: usize, count: usize, ms: u64, gop: usize) -> Pushed {
@@ -47,6 +51,63 @@ fn five_part_segments(config: Config, count: usize) -> Window {
     let mut window = window(config);
     push_frames(&mut window, 0, count, 200, 5);
     window
+}
+
+/// Pushes fragments `from` to `to` (excluded) of 200 ms and 72 bytes
+/// ([`EACH`] with the overhead), the `n`th tagged `n` (wrapping) and independent when
+/// `independent(n)`: one fragment a part. The window's clock is then `to`
+/// × 200 ms.
+fn push_200_ms(window: &mut Window, from: usize, to: usize, independent: fn(usize) -> bool) {
+    for n in from..to {
+        window
+            .push(fragment(
+                u8::try_from(n % 256).unwrap(),
+                72,
+                independent(n),
+                200 * MS,
+            ))
+            .unwrap();
+    }
+}
+
+/// A first segment of 1.4 s (7 fragments), then segments of 1 s (5): the
+/// Target Duration is 1.
+fn first_1400_ms(n: usize) -> bool {
+    n == 0 || (n >= 7 && (n - 7).is_multiple_of(5))
+}
+
+/// A first segment of 2 s (10 fragments), then segments of 1 s (5): the
+/// Target Duration is 2, and a playlist of 6 segments lasts 6 or 7 s.
+fn first_2_s(n: usize) -> bool {
+    n == 0 || (n >= 10 && n.is_multiple_of(5))
+}
+
+/// Whether the window serves segment `msn` and its part 0.
+fn serves(window: &Window, msn: u64) -> bool {
+    let segment = matches!(window.get(Resource::Segment { msn }), Lookup::Ready(_));
+    let part = matches!(
+        window.get(Resource::Part { msn, index: 0 }),
+        Lookup::Ready(_)
+    );
+    assert_eq!(segment, part, "segment {msn} and its part 0");
+    segment
+}
+
+/// Asserts that every parent in `playlist` lists its part tags from Part
+/// Index 0 on, consecutively: a client numbers them by their position after
+/// the previous segment's URI (§3.2).
+fn assert_part_tags_start_at_0(playlist: &str) {
+    let mut position = 0;
+    for line in playlist.lines() {
+        if let Some(part) = line.strip_prefix("#EXT-X-PART:") {
+            let uri = part.split("URI=\"").nth(1).unwrap();
+            let index = uri.split('.').nth(1).unwrap();
+            assert_eq!(index, position.to_string(), "{line} in\n{playlist}");
+            position += 1;
+        } else if !line.starts_with('#') {
+            position = 0;
+        }
+    }
 }
 
 fn chunks_of(lookup: Lookup) -> Vec<Bytes> {
@@ -333,6 +394,7 @@ fn rfc8216bis_4_golden_playlist() {
 #EXT-X-MAP:URI=\"init.mp4\"
 #EXTINF:1.000000,
 seg0.m4s
+#EXT-X-PART:DURATION=0.200000,INDEPENDENT=YES,URI=\"part1.0.m4s\"
 #EXT-X-PART:DURATION=0.200000,URI=\"part1.1.m4s\"
 #EXT-X-PART:DURATION=0.200000,URI=\"part1.2.m4s\"
 #EXT-X-PART:DURATION=0.200000,URI=\"part1.3.m4s\"
@@ -361,21 +423,131 @@ seg3.m4s
 }
 
 #[test]
-fn rfc8216bis_6_2_2_part_tags_go_once_their_end_is_more_than_three_target_durations_from_the_end() {
-    // 4.4 s of media, a Target Duration of 1: tags from 1.4 s on. Part 1.1
-    // ends at 1.4 s exactly and keeps its tag; part 1.0, ending at 1.2 s,
-    // has none.
+fn rfc8216bis_6_2_2_a_segment_s_part_tags_go_together_once_its_end_is_more_than_three_target_durations_from_the_end()
+ {
+    // 4.4 s of media, a Target Duration of 1: segment 0 ends at 1 s, more
+    // than 3 s from the end, and lists no part tag; segment 1 ends at 2 s
+    // and lists all of its, part 1.0 too, which ends at 1.2 s.
     let playlist = five_part_segments(Config::default(), 22)
         .playlist()
         .unwrap();
-    assert!(!playlist.contains("part1.0.m4s"));
-    assert!(playlist.contains("part1.1.m4s"));
-    // One part more: 4.6 s, tags from 1.6 s.
-    let playlist = five_part_segments(Config::default(), 23)
+    assert!(!playlist.contains("part0."));
+    for index in 0..5 {
+        assert!(playlist.contains(&format!("part1.{index}.m4s")), "{index}");
+    }
+    // 5 s: segment 1 ends exactly 3 s from the end and keeps its tags.
+    let playlist = five_part_segments(Config::default(), 25)
         .playlist()
         .unwrap();
-    assert!(!playlist.contains("part1.1.m4s"));
-    assert!(playlist.contains("part1.2.m4s"));
+    assert!(playlist.contains("URI=\"part1.0.m4s\""));
+    assert!(playlist.contains("URI=\"part1.4.m4s\""));
+    // One part more: 5.2 s, and all go together.
+    let playlist = five_part_segments(Config::default(), 26)
+        .playlist()
+        .unwrap();
+    assert!(!playlist.contains("part1."));
+    assert!(playlist.contains("#EXTINF:1.000000,\nseg1.m4s\n"));
+    assert!(playlist.contains("URI=\"part2.0.m4s\""));
+}
+
+/// Part Indexes are positions: a client counts the `EXT-X-PART` tags after
+/// the previous segment's URI from 0 (§3.2: "the position of the Partial
+/// Segment within its Parent Segment"; hls.js 1.7.4 `m3u8-parser.ts`, read
+/// 2026-11-15, numbers them so and places the first at its parent's start),
+/// so no playlist lists a parent's later parts without its first.
+#[test]
+fn rfc8216bis_3_2_every_listed_parent_s_part_tags_start_at_part_index_0() {
+    let patterns: [fn(usize) -> bool; 3] = [|n| n.is_multiple_of(5), first_1400_ms, first_2_s];
+    for independent in patterns {
+        let mut window = window(Config::default());
+        for n in 0..90 {
+            push_200_ms(&mut window, n, n + 1, independent);
+            if let Some(playlist) = window.playlist() {
+                assert_part_tags_start_at_0(&playlist);
+            }
+        }
+    }
+}
+
+/// A first segment of 1.4 s and segments of 1 s after, 6 listed: segment 0
+/// appeared at 1.6 s (completed by the 200 ms fragment that starts segment
+/// 1), and the longest playlist listing it, segments 0 to 5, lasts 6.4 s, so
+/// it is served until 1.6 + 1.4 + 6.4 = 9.4 s; its part tags left at 4.6 s,
+/// and 3 Target Durations after is earlier. It was delisted at 7.6 s, and a
+/// window that served one delisted segment dropped it at 8.6 s.
+#[test]
+fn rfc8216bis_6_2_2_a_delisted_segment_is_served_its_availability_duration_past_its_first_appearance()
+ {
+    let mut window = window(Config::default());
+    push_200_ms(&mut window, 0, 38, first_1400_ms);
+    assert!(
+        window
+            .playlist()
+            .unwrap()
+            .contains("#EXT-X-MEDIA-SEQUENCE:1\n")
+    );
+    push_200_ms(&mut window, 38, 43, first_1400_ms);
+    assert!(serves(&window, 0), "8.6 s");
+    push_200_ms(&mut window, 43, 46, first_1400_ms);
+    assert!(serves(&window, 0), "9.2 s");
+    assert_eq!(window.bytes(), 46 * EACH + INIT.len());
+    push_200_ms(&mut window, 46, 47, first_1400_ms);
+    assert!(!serves(&window, 0), "9.4 s");
+    assert_eq!(window.bytes(), (47 - 7) * EACH + INIT.len());
+    // Segment 1 appeared at 2.6 s and was listed in the 6.4 s playlist too,
+    // not only in the 6 s ones of segments of 1 s: served until 10 s.
+    assert!(serves(&window, 1));
+    push_200_ms(&mut window, 47, 49, first_1400_ms);
+    assert!(serves(&window, 1), "9.8 s");
+    push_200_ms(&mut window, 49, 50, first_1400_ms);
+    assert!(!serves(&window, 1), "10 s");
+}
+
+/// A first segment of 2 s and segments of 1 s after (the Target Duration is
+/// 2), 6 listed: segment 0's part tags left with it at 8.2 s, so its parts,
+/// and so it, are served until 3 Target Durations later, 14.2 s, past its
+/// Availability Duration (2.2 + 2 + 7 = 11.2 s). A window that served one
+/// delisted segment dropped it at 9.2 s.
+#[test]
+fn rfc8216bis_6_2_2_a_part_is_served_three_target_durations_past_its_tag() {
+    let mut window = window(Config::default());
+    push_200_ms(&mut window, 0, 40, first_2_s);
+    assert!(window.playlist().unwrap().contains("part0.0.m4s"));
+    push_200_ms(&mut window, 40, 41, first_2_s);
+    let playlist = window.playlist().unwrap();
+    assert!(!playlist.contains("seg0.m4s"));
+    assert!(!playlist.contains("part0."));
+    push_200_ms(&mut window, 41, 46, first_2_s);
+    assert!(serves(&window, 0), "9.2 s");
+    push_200_ms(&mut window, 46, 70, first_2_s);
+    assert!(serves(&window, 0), "14 s");
+    push_200_ms(&mut window, 70, 71, first_2_s);
+    assert!(!serves(&window, 0), "14.2 s");
+}
+
+/// As above, 8 listed: segment 2 ends at 4 s, so its part tags leave once
+/// the playlist's end passes 4 + 6 = 10 s, at 10.2 s, while it is still
+/// listed; it is served until 10.2 + 6 = 16.2 s, not 6 s past its
+/// delisting at 12.2 s, and past its Availability Duration (4.2 + 1 + 9 =
+/// 14.2 s).
+#[test]
+fn rfc8216bis_6_2_2_a_part_is_served_three_target_durations_past_the_time_its_tag_left() {
+    let mut window = window(Config {
+        segments: 8,
+        ..Config::default()
+    });
+    push_200_ms(&mut window, 0, 50, first_2_s);
+    assert!(window.playlist().unwrap().contains("part2.0.m4s"));
+    push_200_ms(&mut window, 50, 51, first_2_s);
+    let playlist = window.playlist().unwrap();
+    assert!(playlist.contains("#EXTINF:1.000000,\nseg2.m4s\n"));
+    assert!(!playlist.contains("part2."));
+    push_200_ms(&mut window, 51, 61, first_2_s);
+    assert!(!window.playlist().unwrap().contains("seg2.m4s"), "12.2 s");
+    push_200_ms(&mut window, 61, 80, first_2_s);
+    assert!(serves(&window, 2), "16 s");
+    push_200_ms(&mut window, 80, 81, first_2_s);
+    assert!(!serves(&window, 2), "16.2 s");
 }
 
 #[test]
@@ -384,25 +556,29 @@ fn rfc8216bis_6_2_2_the_media_sequence_advances_as_segments_are_delisted() {
         segments: 2,
         ..Config::default()
     };
-    let window = five_part_segments(config, 22);
+    let mut window = five_part_segments(config, 22);
     let playlist = window.playlist().unwrap();
     assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:2\n"));
     assert!(!playlist.contains("seg1.m4s"));
     assert!(playlist.contains("#EXTINF:1.000000,\nseg2.m4s\n"));
-    // The segment delisted last is still served, with its parts; the one
-    // before it is gone.
+    // The delisted segments are still served, with their parts: their part
+    // tags left with them, at 3.2 and 4.2 s, and are served 3 Target
+    // Durations more.
     assert_eq!(
         tags(window.get(Resource::Segment { msn: 1 })),
         [5, 6, 7, 8, 9]
     );
     assert_eq!(tags(window.get(Resource::Part { msn: 1, index: 4 })), [9]);
-    assert_eq!(window.get(Resource::Segment { msn: 0 }), Lookup::NotFound);
-    assert_eq!(
-        window.get(Resource::Part { msn: 0, index: 0 }),
-        Lookup::NotFound
-    );
-    // Segments 1 to 3 of 5 fragments and the open one of 2, 200 bytes each.
-    assert_eq!(window.bytes(), 17 * 200 + INIT.len());
+    assert!(serves(&window, 0));
+    // Segments 0 to 3 of 5 fragments and the open one of 2, EACH each.
+    assert_eq!(window.bytes(), 22 * EACH + INIT.len());
+    // 6.2 s: segment 0 is retired.
+    push_frames(&mut window, 22, 8, 200, 5);
+    assert!(serves(&window, 0));
+    push_frames(&mut window, 30, 1, 200, 5);
+    assert!(!serves(&window, 0));
+    assert!(serves(&window, 1));
+    assert_eq!(window.bytes(), (31 - 5) * EACH + INIT.len());
 }
 
 #[test]
@@ -583,24 +759,24 @@ fn rfc8216bis_4_4_4_9_the_part_target_rises_to_a_part_of_one_longer_fragment() {
 
 #[test]
 fn the_byte_cap_drops_the_delisted_segment_first_and_holds_up_to_the_cap() {
-    // 200 bytes a fragment, 1000 a segment; one segment listed.
+    // EACH a fragment, 5 × EACH a segment; one segment listed.
     let mut window = window(Config {
         segments: 1,
-        max_bytes: 2_400,
+        max_bytes: 12 * EACH,
         ..Config::default()
     });
     push_frames(&mut window, 0, 11, 200, 5);
-    assert_eq!(window.bytes(), 2_200 + INIT.len());
-    // 2400: at the cap, nothing drops.
+    assert_eq!(window.bytes(), 11 * EACH + INIT.len());
+    // 12 fragments: at the cap, nothing drops.
     push_frames(&mut window, 11, 1, 200, 5);
-    assert_eq!(window.bytes(), 2_400 + INIT.len());
+    assert_eq!(window.bytes(), 12 * EACH + INIT.len());
     assert!(matches!(
         window.get(Resource::Segment { msn: 0 }),
         Lookup::Ready(_)
     ));
-    // 2600: the delisted segment drops first.
+    // 13: the delisted segment drops first.
     push_frames(&mut window, 12, 1, 200, 5);
-    assert_eq!(window.bytes(), 1_600 + INIT.len());
+    assert_eq!(window.bytes(), 8 * EACH + INIT.len());
     assert_eq!(window.get(Resource::Segment { msn: 0 }), Lookup::NotFound);
     assert!(matches!(
         window.get(Resource::Segment { msn: 1 }),
@@ -611,14 +787,14 @@ fn the_byte_cap_drops_the_delisted_segment_first_and_holds_up_to_the_cap() {
 #[test]
 fn the_byte_cap_drops_listed_segments_down_to_the_open_one() {
     let mut window = window(Config {
-        max_bytes: 1_000,
+        max_bytes: 5 * EACH,
         ..Config::default()
     });
     // Segment 0 holds the cap exactly; the keyframe that starts segment 1
     // joins no segment, and segment 0 drops for it.
     push_frames(&mut window, 0, 5, 200, 5);
     assert_eq!(push_frames(&mut window, 5, 1, 200, 5), Pushed::Published);
-    assert_eq!(window.bytes(), 200 + INIT.len());
+    assert_eq!(window.bytes(), EACH + INIT.len());
     assert_eq!(window.get(Resource::Segment { msn: 0 }), Lookup::NotFound);
     let playlist = window.playlist().unwrap();
     assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:1\n"));
@@ -633,15 +809,17 @@ fn the_byte_cap_drops_listed_segments_down_to_the_open_one() {
 #[test]
 fn an_open_segment_past_the_byte_cap_ends_the_window() {
     let mut window = window(Config {
-        max_bytes: 1_000,
+        max_bytes: 5 * EACH,
         ..Config::default()
     });
     push_frames(&mut window, 0, 5, 200, 100);
-    let overflow = Err(PushError::Overflow { max_bytes: 1_000 });
+    let overflow = Err(PushError::Overflow {
+        max_bytes: 5 * EACH,
+    });
     assert_eq!(window.push(fragment(5, 72, false, 200 * MS)), overflow);
     // It takes nothing more, a keyframe neither, and serves what it holds.
     assert_eq!(window.push(fragment(6, 72, true, 200 * MS)), overflow);
-    assert_eq!(window.bytes(), 1_000 + INIT.len());
+    assert_eq!(window.bytes(), 5 * EACH + INIT.len());
     assert_eq!(tags(window.get(Resource::Part { msn: 0, index: 4 })), [4]);
 }
 
@@ -654,6 +832,77 @@ fn a_first_fragment_past_the_byte_cap_ends_the_window() {
     assert_eq!(
         window.push(fragment(0, 1_000, true, 200 * MS)),
         Err(PushError::Overflow { max_bytes: 1_000 })
+    );
+    assert_eq!(window.bytes(), INIT.len());
+}
+
+/// The most the window allocates for a fragment that is its own part and
+/// its own segment, on the target the test runs on, as
+/// [`FRAGMENT_OVERHEAD`]'s docs count it: 4 handles and 4 parts (a `Vec`'s
+/// first capacity), a segment and a delisted one twice over (a
+/// `VecDeque`'s doubling), the 3 words of a `Bytes`' shared header, and an
+/// allocator's header on its buffer, that header and the two vectors.
+fn worst_case_fragment_footprint() -> usize {
+    /// An allocator's header, rounded up: glibc's and musl's are at most 16
+    /// bytes on the 64-bit targets.
+    const ALLOCATION_HEADER: usize = 16;
+    4 * size_of::<Bytes>()
+        + 4 * size_of::<Part>()
+        + 2 * size_of::<Segment>()
+        + 2 * size_of::<Delisted>()
+        + 3 * size_of::<usize>()
+        + 4 * ALLOCATION_HEADER
+}
+
+#[test]
+fn the_fragment_overhead_covers_a_one_fragment_segment_s_allocations() {
+    assert!(
+        worst_case_fragment_footprint() <= FRAGMENT_OVERHEAD,
+        "{} bytes",
+        worst_case_fragment_footprint()
+    );
+}
+
+/// Fragments of no byte, each its own segment: each costs the overhead, at
+/// least its footprint, so a cap of 10 overheads holds 10 of them (the open
+/// segment and 9 listed) and drops the oldest for the 11th; a cap below one
+/// overhead takes none.
+#[test]
+fn fragments_of_no_byte_are_charged_their_worst_case_footprint() {
+    let config = Config {
+        segment_target: Duration::ZERO,
+        segments: 100,
+        max_bytes: 10 * FRAGMENT_OVERHEAD,
+        ..Config::default()
+    };
+    let mut window = window(config);
+    for n in 1..=10 {
+        window.push(fragment(0, 0, true, 40 * MS)).unwrap();
+        assert_eq!(window.bytes(), n * FRAGMENT_OVERHEAD + INIT.len());
+        assert!(window.bytes() >= n * worst_case_fragment_footprint() + INIT.len());
+    }
+    assert!(matches!(
+        window.get(Resource::Segment { msn: 0 }),
+        Lookup::Ready(_)
+    ));
+    window.push(fragment(0, 0, true, 40 * MS)).unwrap();
+    assert_eq!(window.bytes(), 10 * FRAGMENT_OVERHEAD + INIT.len());
+    assert_eq!(window.listed.len(), 9);
+    assert_eq!(window.get(Resource::Segment { msn: 0 }), Lookup::NotFound);
+    assert!(matches!(
+        window.get(Resource::Segment { msn: 1 }),
+        Lookup::Ready(_)
+    ));
+
+    let mut window = self::window(Config {
+        max_bytes: FRAGMENT_OVERHEAD - 1,
+        ..config
+    });
+    assert_eq!(
+        window.push(fragment(0, 0, true, 40 * MS)),
+        Err(PushError::Overflow {
+            max_bytes: FRAGMENT_OVERHEAD - 1
+        })
     );
     assert_eq!(window.bytes(), INIT.len());
 }

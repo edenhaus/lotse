@@ -221,10 +221,16 @@ pub trait Handler: Send + Sync + 'static {
     /// The `hello` frame's content.
     fn hello(&self) -> Hello;
 
-    /// Handles one command of `connection`. Never waits on a camera. The
+    /// Handles one command of `connection`. Never waits on a camera but
+    /// for `live/create`, bounded, which the connection answers while it
+    /// reads and answers its further commands, so one that releases the
+    /// wait (a signaled source's `signaling/answer`) is not held up behind
+    /// it; every other command is answered before the next is read. The
     /// future is dropped at an await point when the connection's client is
-    /// removed or the daemon shuts down before it ends, so what it changes
-    /// it changes between two awaits, never across one.
+    /// removed or the daemon shuts down before it ends, or, for
+    /// `live/create`, when the connection closes, always before
+    /// [`Self::connection_closed`]; so what it changes it changes between
+    /// two awaits, never across one.
     fn handle(
         &self,
         connection: ConnectionId,
@@ -305,8 +311,8 @@ pub struct Config {
     /// Control connections at once.
     pub max_connections: u32,
     /// Open subscriptions per connection (`stream/subscribe`,
-    /// `webrtc/offer`, `session/adopt`, `recording/create`, `hls/create`,
-    /// `signaling/subscribe`); one more is answered
+    /// `webrtc/offer`, `session/adopt`, `recording/create`, `live/create`,
+    /// `hls/create`, `signaling/subscribe`); one more is answered
     /// `limit_reached` before the handler sees it. Ended ones do not count.
     pub max_subscriptions: u32,
     /// The mutual-TLS listener, if one is configured.

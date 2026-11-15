@@ -446,7 +446,7 @@ impl TrackWriter {
                 let anchored = previous.is_some();
                 let since = frame.wallclock.saturating_duration_since(origin);
                 let at = i128::from(ticks(since, self.clock_rate));
-                self.close_before(Some(at));
+                self.close_before(Some(at), 0);
                 let anchor = at.max(self.shown);
                 let lead = self.end.saturating_sub(anchor).max(0);
                 let epoch = Epoch::new(frame.epoch, ts, anchor, lead);
@@ -480,6 +480,13 @@ impl TrackWriter {
             .as_ref()
             .and_then(Epoch::shown)
             .map_or(self.shown, |shown| self.shown.max(shown))
+    }
+
+    /// [`Self::presented`] from the media time 0: after
+    /// [`break_epoch`](Self::break_epoch), where the next epoch is
+    /// presented at the earliest.
+    pub(crate) fn presented_end(&self) -> Duration {
+        duration_of(self.presented(), self.clock_rate)
     }
 
     /// The presentation time of the latest frame taken, from the recording's
@@ -523,7 +530,7 @@ impl TrackWriter {
     /// otherwise end early), else the duration of the one before it
     /// (video), else a frame at [`FALLBACK_FRAME_RATE`].
     pub(crate) fn close(&mut self) {
-        self.close_before(None);
+        self.close_before(None, 0);
     }
 
     /// [`close`](Self::close), with the held video sample lasting until
@@ -611,8 +618,9 @@ impl TrackWriter {
     /// frame's: the duration the next epoch's last sample inherits is the
     /// uncut one. The epoch so ends: where its presentation ends, the
     /// sample's end or the ones' before it ([`Epoch::shown`]), goes into
-    /// [`Self::shown`].
-    fn close_before(&mut self, next: Option<i128>) {
+    /// [`Self::shown`]. A sample presented before `until` lasts until
+    /// then, longer than its frame: the hole's too, as the cut is.
+    fn close_before(&mut self, next: Option<i128>, until: i128) {
         let Some(held) = self.held.take() else {
             return;
         };
@@ -625,7 +633,11 @@ impl TrackWriter {
             .map(|next| next.max(shown).saturating_sub(held.pts()))
             .and_then(|cut| u32::try_from(cut).ok())
             .filter(|cut| (1..duration).contains(cut));
-        let length = cut.unwrap_or(duration);
+        // A duration past its field's lasts the longest it holds.
+        let stretch = until.saturating_sub(held.pts()).min(i128::from(u32::MAX));
+        let length = cut
+            .unwrap_or(duration)
+            .max(u32::try_from(stretch).unwrap_or_default());
         self.finish(&held, length);
         self.shown = shown.max(held.pts().saturating_add(i128::from(length)));
         self.last_duration = Some(duration);
@@ -756,15 +768,18 @@ impl TrackWriter {
     }
 
     /// Ends the current epoch here, as a reconnect would: the held sample
-    /// is finished as [`close`](Self::close) finishes it, and the next frame
-    /// starts a new epoch, anchored at its capture time and no earlier than
-    /// where the track's decode and presentation so far end, whatever its
-    /// epoch number. A live output's hole: the frames between were left
-    /// out.
-    pub(crate) fn break_epoch(&mut self) {
+    /// is finished as [`close`](Self::close) finishes it, but presented
+    /// until `until` at least (a live output's other track reaching
+    /// further: the frame stays on screen while it plays), and the next
+    /// frame starts a new epoch, anchored at its capture time and no
+    /// earlier than where the track's decode and presentation so far end,
+    /// whatever its epoch number. A live output's hole: the frames between
+    /// were left out.
+    pub(crate) fn break_epoch(&mut self, until: Duration) {
         // Closing the held sample settles where the epoch's presentation
         // ends (`close_before`); an epoch without one was closed before.
-        self.close();
+        let until = i128::from(ticks(until, self.clock_rate));
+        self.close_before(None, until);
         self.epoch = None;
     }
 
