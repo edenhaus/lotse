@@ -32,7 +32,21 @@
 //!   (§4.4.4.9: "if the Partial Segment contains an independent frame"); the
 //!   first part of every segment does.
 //! - A fragment of audio alone lasts zero and joins the open part: it never
-//!   closes one.
+//!   closes one. When a segment completes while its open part holds audio
+//!   alone, that part is not published on its own, lasting nothing
+//!   (§4.4.4.9: its `DURATION`), nor added to the part before, which was
+//!   published and never changes: it becomes the start of the next
+//!   segment's first part, ahead of the keyframe, in the order pushed. That
+//!   part is still `INDEPENDENT=YES`: it contains the keyframe. And the
+//!   segment is still independent (§4.4.2.1: `EXT-X-INDEPENDENT-SEGMENTS`
+//!   "indicates that all media samples in a Media Segment can be decoded
+//!   without information from other segments"): every AAC-LC and Opus
+//!   frame, the audio a live output carries, decodes on its own, and the
+//!   init segment says so (its audio `trex` makes every audio sample a sync
+//!   sample, ISO/IEC 14496-12 §8.8.3); the video still starts at the
+//!   keyframe. Likewise a segment that lasts nothing yet completes at no
+//!   independent fragment. So every part and every segment lasts
+//!   something.
 //!
 //! The decode times of the fragments run on without a hole, so the playlist
 //! needs no `EXT-X-DISCONTINUITY` (§6.2.1: timing and encoding changes are
@@ -420,11 +434,19 @@ struct Part {
 }
 
 impl Part {
-    /// Appends a fragment.
+    /// Appends a fragment, as one slice.
     fn push(&mut self, fragment: Fragment) {
         self.chunks.push(fragment.bytes);
         self.duration = self.duration.saturating_add(fragment.duration);
         self.independent |= fragment.independent;
+    }
+
+    /// What its fragments cost the window: [`fragment_cost`] of each
+    /// slice, one a fragment.
+    fn cost(&self) -> usize {
+        self.chunks.as_slice().iter().fold(0_usize, |sum, chunk| {
+            sum.saturating_add(fragment_cost(chunk))
+        })
     }
 }
 
@@ -482,21 +504,22 @@ struct Open {
 }
 
 impl Open {
-    /// An empty segment of `msn` that starts at `start` on the window's
-    /// clock.
-    fn new(msn: u64, start: Duration) -> Self {
+    /// A segment of `msn` that starts at `start` on the window's clock, its
+    /// open part `pending`: empty, or the audio alone the segment before
+    /// carried (see [`Window::complete`]).
+    fn new(msn: u64, start: Duration, pending: Part) -> Self {
         Self {
             segment: Segment {
                 msn,
                 parts: Vec::new(),
                 duration: Duration::ZERO,
-                cost: 0,
+                cost: pending.cost(),
                 start,
                 appeared: Duration::ZERO,
                 longest: Duration::ZERO,
                 untagged: None,
             },
-            pending: Part::default(),
+            pending,
         }
     }
 
@@ -505,17 +528,14 @@ impl Open {
         self.segment.duration.saturating_add(self.pending.duration)
     }
 
-    /// Closes the open part, if it holds a fragment, and returns its
-    /// duration.
-    fn close_part(&mut self) -> Option<Duration> {
-        if self.pending.chunks.as_slice().is_empty() {
-            return None;
-        }
+    /// Closes the open part, which lasts something (so holds a fragment),
+    /// and returns its duration.
+    fn close_part(&mut self) -> Duration {
         let part = std::mem::take(&mut self.pending);
         let duration = part.duration;
         self.segment.duration = self.segment.duration.saturating_add(duration);
         self.segment.parts.push(part);
-        Some(duration)
+        duration
     }
 }
 
@@ -610,15 +630,20 @@ impl Window {
             None if !fragment.independent => return Ok(Pushed::Dropped),
             None => true,
             // A segment as long as its frames' rounded durations sum to:
-            // within JITTER of the target is at it.
+            // within JITTER of the target is at it. One that lasts nothing
+            // yet (an independent fragment of no duration, and audio) would
+            // be a segment and a part of no duration: it takes the fragment.
             Some(open) => {
                 fragment.independent
+                    && !open.duration().is_zero()
                     && open.duration().saturating_add(JITTER) >= self.config.segment_target
             }
         };
-        let cost = fragment.bytes.len().saturating_add(FRAGMENT_OVERHEAD);
+        let cost = fragment_cost(&fragment.bytes);
         let joins = match &self.open {
             Some(open) if !starts => open.segment.cost,
+            // The open part, of audio alone, that the new segment takes.
+            Some(open) if open.pending.duration.is_zero() => open.pending.cost(),
             _ => 0,
         };
         if joins.saturating_add(cost) > self.config.max_bytes {
@@ -630,18 +655,20 @@ impl Window {
         self.clock = self.clock.saturating_add(fragment.duration);
         let completing = if starts { self.open.take() } else { None };
         let published = completing.is_some();
-        if let Some(open) = completing {
-            self.complete(open);
-        }
+        let carried = completing.map(|open| self.complete(open));
         let limit = self.part_limit();
         let msn = self.completed;
-        let open = self.open.get_or_insert_with(|| Open::new(msn, start));
+        // A fragment of audio alone lasts nothing: the new segment starts on
+        // the clock where the audio it carries does.
+        let open = self
+            .open
+            .get_or_insert_with(|| Open::new(msn, start, carried.unwrap_or_default()));
         // Close the part before a fragment that would take it past the limit;
         // one of only audio, which lasts nothing, keeps it.
         let before = if !open.pending.duration.is_zero()
             && open.pending.duration.saturating_add(fragment.duration) > limit
         {
-            open.close_part()
+            Some(open.close_part())
         } else {
             None
         };
@@ -650,7 +677,7 @@ impl Window {
         open.segment.cost = open.segment.cost.saturating_add(cost);
         // Close it now if one more fragment as long would.
         let after = if open.pending.duration.saturating_add(duration) > limit {
-            open.close_part()
+            Some(open.close_part())
         } else {
             None
         };
@@ -683,12 +710,22 @@ impl Window {
 
     /// Completes the open segment: closes its open part, sets or raises the
     /// targets, lists it, delists the oldest past the count, and records the
-    /// playlist's duration against every segment it lists.
-    fn complete(&mut self, mut open: Open) {
+    /// playlist's duration against every segment it lists. Returns the open
+    /// part instead when it lasts nothing, audio alone (or nothing), for the
+    /// next segment's first part (see the module docs), its cost taken off
+    /// the segment's.
+    fn complete(&mut self, mut open: Open) -> Part {
         // The open part is within the limit: the last fragment would have
-        // closed it otherwise.
-        open.close_part();
+        // closed it otherwise. The segment lasts something (see `push`):
+        // when its open part lasts nothing and goes, its closed parts do.
+        let carried = if open.pending.duration.is_zero() {
+            std::mem::take(&mut open.pending)
+        } else {
+            open.close_part();
+            Part::default()
+        };
         let mut segment = open.segment;
+        segment.cost = segment.cost.saturating_sub(carried.cost());
         segment.appeared = self.clock;
         self.completed = self.completed.saturating_add(1);
         self.previous_parts = u64::try_from(segment.parts.len()).unwrap_or(u64::MAX);
@@ -723,6 +760,7 @@ impl Window {
         for segment in &mut self.listed {
             segment.longest = segment.longest.max(duration);
         }
+        carried
     }
 
     /// The clock at which `segment`, delisted now, is retired
@@ -945,6 +983,12 @@ impl Window {
         };
         parts.get(usize::try_from(index).ok()?)
     }
+}
+
+/// What a fragment of `bytes` costs the window: its bytes and
+/// [`FRAGMENT_OVERHEAD`].
+fn fragment_cost(bytes: &Bytes) -> usize {
+    bytes.len().saturating_add(FRAGMENT_OVERHEAD)
 }
 
 /// The Part Target Duration for a longest part of `longest`: plus [`JITTER`],
