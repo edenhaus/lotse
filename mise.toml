@@ -38,6 +38,10 @@ uv = "0.13.8" # the browser test's Python, Selenium and pytest, and its checks (
 # and HLS; ffmpeg alone serves raw MPEG-TS over HTTP.
 # Third-party tools on purpose, so the stream is not our own reading of the specs.
 "github:bluenviron/mediamtx" = "1.21.3"
+# The scraper of the metrics test (`mise run interop`, the ignored `prometheus_` test): a real
+# Prometheus scraping the daemon over mutual TLS, so the exposition and Go's TLS path (the server
+# certificate's DNS name, `server_name`, the client certificate) are a third party's reading.
+"github:prometheus/prometheus" = "3.16.0"
 # FFmpeg 9.0.2, static GPL builds (libx264, libopus; the native aac and pcm_mulaw encoders). Linux:
 # BtbN/FFmpeg-Builds, the build ffmpeg.org links, a month-end autobuild (kept for years, the daily
 # ones only for weeks) from the release/9.0 branch. macOS arm64 (the Safari browser test): Martin
@@ -160,8 +164,8 @@ description = "The TURN client against a real coturn in Docker (UDP and TCP, lon
 run = "scripts/turn-e2e.sh"
 
 [tasks.interop]
-description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (the ignored `mediamtx_iso14496_12_recording_` tests); and ffprobe reading the recording muxer's fixtures (the ignored `ffprobe_` tests)"
-run = "scripts/nextest.sh -E 'binary_id(lotse::interop) | binary_id(lotse-mux::fixtures)' --run-ignored only --no-tests=fail mediamtx_ ffmpeg_ ffprobe_"
+description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (the ignored `mediamtx_iso14496_12_recording_` tests); and ffprobe reading the recording muxer's fixtures (the ignored `ffprobe_` tests); and a real Prometheus scraping `GET /v0/metrics` over mutual TLS with an openssl-made P-256 client certificate, a second one never enrolled refused (the ignored `prometheus_` test)"
+run = "scripts/nextest.sh -E 'binary_id(lotse::interop) | binary_id(lotse::metrics) | binary_id(lotse-mux::fixtures)' --run-ignored only --no-tests=fail mediamtx_ ffmpeg_ ffprobe_ prometheus_"
 
 [tasks.load]
 description = "The load generator: N fake cameras x M headless viewers against a release daemon; report in target/load-report.json"

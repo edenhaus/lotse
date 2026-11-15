@@ -98,6 +98,18 @@ impl Handler for Minimal {
         }
     }
 
+    /// One stream, `front`, with nine packets lost.
+    fn metrics_snapshot(&self) -> impl Future<Output = Option<lotse_api_types::Metrics>> + Send {
+        let snapshot = serde_json::json!({
+            "supervisor": { "pid": 1, "uptime_ms": 2000, "rss_bytes": null, "pss_bytes": null, "tasks": null, "demux": null },
+            "workers": {},
+            "worker_restarts": 0,
+            "sessions": 0,
+            "streams": { "front": { "packets_lost": 9 } },
+        });
+        std::future::ready(serde_json::from_value(snapshot).ok())
+    }
+
     fn recording_body(
         &self,
         recording_id: &lotse_core::id::RecordingId,
@@ -1842,4 +1854,80 @@ fn a_pin_fixed_with_both_roles_or_enrolled_with_the_other_stops_the_start() {
     // The same role in both places is no conflict.
     drop(Server::bind(config_with(&dir, &data, vec![], vec![pin])).unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// One request with `Connection: close`, and the whole answer's text.
+async fn answer_once<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    connected: io::Result<S>,
+    method: &str,
+    path: &str,
+) -> String {
+    let mut stream = connected.unwrap();
+    let head = format!("{method} {path} HTTP/1.1\r\nHost: lotse\r\nConnection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    within_5_s(stream.read_to_end(&mut answer)).await.unwrap();
+    String::from_utf8(answer).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn either_role_and_the_socket_read_the_metrics_in_the_prometheus_text_format() {
+    let control = ClientIdentity::generate().unwrap();
+    let metrics = ClientIdentity::generate().unwrap();
+    let (dir, data) = dirs("metrics-route");
+    let running = start_with(dir, data, vec![control.pin], vec![metrics.pin]);
+    let socket = || tokio::net::UnixStream::connect(running.dir.join("lotse.sock"));
+    let as_metrics = || connect(running.addr, running.config(ClientCert::Own(&metrics)));
+    let as_control = || connect(running.addr, running.config(ClientCert::Own(&control)));
+    for answer in [
+        answer_once(as_metrics().await, "GET", lotse_api_types::METRICS_PATH).await,
+        answer_once(as_control().await, "GET", lotse_api_types::METRICS_PATH).await,
+        answer_once(socket().await, "GET", lotse_api_types::METRICS_PATH).await,
+    ] {
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        let head = head.to_ascii_lowercase();
+        assert!(
+            head.contains("content-type: text/plain; version=0.0.4; charset=utf-8\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("connection: close"), "{head}");
+        assert!(
+            body.contains("lotse_supervisor_uptime_seconds 2.000\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("lotse_stream_packets_lost_total{stream=\"front\"} 9\n"),
+            "{body}"
+        );
+    }
+    // HEAD as GET without the body; any other method 405.
+    let answer = answer_once(as_metrics().await, "HEAD", lotse_api_types::METRICS_PATH).await;
+    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+    assert!(answer.ends_with("\r\n\r\n"), "no body: {answer}");
+    let (status, body) =
+        request_once(as_metrics().await, "POST", lotse_api_types::METRICS_PATH).await;
+    assert_eq!((status, code_of(&body)), (405, "invalid_request".into()));
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9110_15_5_4_a_metrics_client_removed_after_its_handshake_reads_no_more() {
+    let (logs, _guard) = capture();
+    let scraper = ClientIdentity::generate().unwrap();
+    let running = start("metrics-removed", vec![]);
+    let mut admin = local(&running).await;
+    let answer = call(&mut admin, add(1, scraper.pin, "metrics")).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    let connected = connect(running.addr, running.config(ClientCert::Own(&scraper))).await;
+    let answer = call(&mut admin, remove(2, scraper.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    let (status, body) = request_once(connected, "GET", lotse_api_types::METRICS_PATH).await;
+    assert_eq!((status, code_of(&body)), (403, "not_permitted".into()));
+    assert!(
+        logs.text()
+            .contains("metrics refused: its client was removed")
+    );
+    drop(admin);
+    running.finish().await;
 }
