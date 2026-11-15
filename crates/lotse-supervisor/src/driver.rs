@@ -6171,6 +6171,7 @@ mod tests {
             live_id: live_id.into(),
             audio: true,
             buffer_bytes: 1 << 20,
+            framed: false,
         }
     }
 

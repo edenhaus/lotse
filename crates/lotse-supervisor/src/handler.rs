@@ -1523,6 +1523,7 @@ impl Supervisor {
                 live_id: live_id.as_str().to_owned(),
                 audio: create.audio,
                 buffer_bytes: limits.buffer_bytes,
+                framed: false,
             };
             let (fetch_slot, stop_slot) = hand_over_live(&commands, spec, writer.into())?;
             let serial = state.last_live.saturating_add(1);

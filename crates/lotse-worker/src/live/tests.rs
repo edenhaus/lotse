@@ -56,6 +56,7 @@ fn spec(audio: bool, buffer_bytes: u32) -> LiveSpec {
         live_id: "l1".into(),
         audio,
         buffer_bytes,
+        framed: false,
     }
 }
 
@@ -697,4 +698,60 @@ async fn an_audio_codec_change_past_the_init_segment_ends_the_output() {
         .unwrap()
         .set_codec(Codec::Opus { channels: 2 });
     assert_eq!(rig.closed().await.0, "codec_changed");
+}
+
+#[tokio::test]
+async fn a_framed_output_writes_each_record_behind_its_header() {
+    use lotse_ipc::fragments::{Decoder, RecordKind};
+
+    let mut rig = Rig::new(None);
+    rig.video_frame(0, true, 3);
+    let reader = rig.start(LiveSpec {
+        framed: true,
+        ..spec(false, 1 << 20)
+    });
+    rig.started().await;
+    rig.lives.fetch("l1");
+    settle().await;
+    rig.video_frame(1, false, 2);
+    let bytes = available(&reader).await;
+    let records = Decoder::new().push(&bytes).unwrap();
+    let kinds: Vec<RecordKind> = records.iter().map(|record| record.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            RecordKind::Init,
+            RecordKind::Fragment {
+                independent: true,
+                duration: Duration::ZERO
+            },
+            RecordKind::Fragment {
+                independent: false,
+                duration: Duration::ZERO
+            },
+        ]
+    );
+    assert_eq!(&records[0].bytes[..], b"init video=h264\n");
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    rig.closed().await;
+}
+
+#[tokio::test]
+async fn a_record_over_the_framing_s_bound_ends_the_output_internal_error() {
+    let limits = TrackLimits {
+        max_frame_bytes: usize::MAX,
+        gop_cache_bytes: usize::MAX,
+        ..TrackLimits::default()
+    };
+    let mut rig = Rig::with(Some(h264()), None, true, limits, 8);
+    let len = usize::try_from(fragments::MAX_RECORD_BYTES).unwrap();
+    let _reader = rig.start(LiveSpec {
+        framed: true,
+        ..spec(false, u32::MAX)
+    });
+    rig.started().await;
+    rig.lives.fetch("l1");
+    settle().await;
+    rig.video_frame(0, true, len);
+    assert_eq!(rig.closed().await.0, "internal_error");
 }

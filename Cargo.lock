@@ -1697,6 +1697,7 @@ dependencies = [
 name = "lotse-ipc"
 version = "0.0.0-dev"
 dependencies = [
+ "bytes",
  "postcard",
  "rustix",
  "serde",

@@ -266,3 +266,10 @@ path = "fuzz_targets/live_path.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "live_records"
+path = "fuzz_targets/live_records.rs"
+test = false
+doc = false
+bench = false
