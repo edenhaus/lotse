@@ -48,11 +48,13 @@ struct FakeHandler {
     hls: Mutex<Vec<mpsc::Sender<Event>>>,
     /// The `live/create` commands the handler began.
     lives: AtomicU64,
-    /// The `live/create` commands of stream `door` still waiting.
+    /// The `live/create` and `hls/create` commands of stream `door` still
+    /// waiting.
     creating: AtomicU64,
     /// [`Self::creating`] when the connection closed.
     creating_at_close: AtomicU64,
-    /// `signaling/answer`: releases one `live/create` of stream `door`.
+    /// `signaling/answer`: releases one `live/create` or `hls/create` of
+    /// stream `door`.
     answered: Notify,
     /// Notified once `webrtc/reoffer` began.
     reoffering: Notify,
@@ -60,7 +62,7 @@ struct FakeHandler {
     reoffered: Notify,
 }
 
-/// Counts a waiting `live/create` in [`FakeHandler::creating`] until
+/// Counts a waiting create in [`FakeHandler::creating`] until
 /// dropped, its future with it.
 struct Creating<'a>(&'a AtomicU64);
 
@@ -87,9 +89,16 @@ impl FakeHandler {
         }
     }
 
-    /// `hls/create` `id`: a result with content, then the session's events
-    /// until the test ends them.
-    fn hls_create(&self, id: u64) -> Outcome {
+    /// `hls/create` `id` of `stream_id`: a result with content, then the
+    /// session's events until the test ends them. On stream `door`, a
+    /// signaled source's, it waits for a `signaling/answer`, as the
+    /// supervisor's waits for the output's start a source gives only once
+    /// the camera's answer is relayed.
+    async fn hls_create(&self, id: u64, stream_id: &str) -> Outcome {
+        if stream_id == "door" {
+            let _creating = Creating::new(&self.creating);
+            self.answered.notified().await;
+        }
         let (tx, rx) = mpsc::channel(8);
         self.hls.lock().unwrap().push(tx);
         Outcome::SubscribedWith {
@@ -197,7 +206,7 @@ impl Handler for FakeHandler {
                 self.sessions.lock().unwrap().push((offer.id, tx));
                 Outcome::Subscribed(rx)
             }
-            Command::HlsCreate(create) => self.hls_create(create.id),
+            Command::HlsCreate(create) => self.hls_create(create.id, &create.stream_id).await,
             Command::RecordingCreate(start) => {
                 // A result with content, then the recording's events.
                 let (tx, rx) = mpsc::channel(8);
@@ -835,6 +844,46 @@ async fn a_waiting_live_create_leaves_its_connection_answering_the_commands_that
         );
     }
     assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `hls/create` waits for its output's start as `live/create` does for its
+/// init segment, which a signaled source gives only once the client relayed
+/// the camera's answer, on the same connection as like as not: the
+/// connection reads and answers further commands while it waits, answers it
+/// once the handler does, and a waiting create holds its subscription slot
+/// from the start.
+#[tokio::test]
+async fn a_waiting_hls_create_leaves_its_connection_answering_the_commands_that_release_it() {
+    let running = start_limited("hls-waits", FakeHandler::default(), 8, 1);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    for id in 1..=2 {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "hls/create", "stream_id": "door" }),
+        )
+        .await;
+    }
+    let refused = recv(&mut ws).await;
+    assert_eq!(refused["id"], 2, "{refused}");
+    assert_eq!(refused["error"]["code"], "limit_reached", "{refused}");
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 1);
+    send(
+        &mut ws,
+        json!({ "id": 3, "type": "signaling/answer", "signal_id": "s", "sdp": "v=0" }),
+    )
+    .await;
+    let answered = recv(&mut ws).await;
+    assert_eq!(answered["id"], 3, "{answered}");
+    assert_eq!(answered["success"], true, "{answered}");
+    assert_eq!(
+        recv(&mut ws).await,
+        json!({ "id": 1, "type": "result", "success": true, "result": { "hls_id": "h1" } })
+    );
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
+    assert_eq!(running.handler.hls.lock().unwrap().len(), 1);
     ws.close(None).await.unwrap();
     running.finish().await;
 }

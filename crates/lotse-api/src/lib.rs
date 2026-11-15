@@ -222,15 +222,15 @@ pub trait Handler: Send + Sync + 'static {
     fn hello(&self) -> Hello;
 
     /// Handles one command of `connection`. Never waits on a camera but
-    /// for `live/create`, bounded, which the connection answers while it
-    /// reads and answers its further commands, so one that releases the
-    /// wait (a signaled source's `signaling/answer`) is not held up behind
-    /// it; every other command is answered before the next is read. The
-    /// future is dropped at an await point when the connection's client is
-    /// removed or the daemon shuts down before it ends, or, for
-    /// `live/create`, when the connection closes, always before
-    /// [`Self::connection_closed`]; so what it changes it changes between
-    /// two awaits, never across one.
+    /// for `live/create` and `hls/create`, bounded, which the connection
+    /// answers while it reads and answers its further commands, so one that
+    /// releases the wait (a signaled source's `signaling/answer`) is not
+    /// held up behind it; every other command is answered before the next
+    /// is read. The future is dropped at an await point when the
+    /// connection's client is removed or the daemon shuts down before it
+    /// ends, or, for `live/create` and `hls/create`, when the connection
+    /// closes, always before [`Self::connection_closed`]; so what it changes
+    /// it changes between two awaits, never across one.
     fn handle(
         &self,
         connection: ConnectionId,

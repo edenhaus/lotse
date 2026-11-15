@@ -8,10 +8,10 @@
 //! not for web pages) and the RFC 6455 §7.4.1 close codes: `1001` going
 //! away on shutdown, `1003` for a binary frame, `1008` policy violation on
 //! an overflowed outbound queue or a removed client. Commands are processed
-//! one at a time per connection, but for the one that waits on a camera,
-//! `live/create`: the connection reads and answers further commands while
-//! it waits (a signaled source's `signaling/answer` may be what releases
-//! it), holding its subscription slot from the start, so
+//! one at a time per connection, but for the ones that wait on a camera,
+//! `live/create` and `hls/create`: the connection reads and answers further
+//! commands while one waits (a signaled source's `signaling/answer` may be
+//! what releases it), each holding its subscription slot from the start, so
 //! `max_subscriptions` bounds them. One the handler is still awaiting when
 //! the connection's client is removed or the daemon shuts down is dropped
 //! and refused, so it never holds up the close; one still waiting when the
@@ -819,15 +819,16 @@ const fn opens_subscription(command: &Command) -> bool {
 /// Whether the handler's answer to `command` waits on a camera, so the
 /// connection reads and answers further commands meanwhile
 /// ([`Connection::wait_for`]): `live/create` waits for the worker's init
-/// segment, which a signaled source sends only once its client relayed the
-/// camera's answer, on this connection as like as not. Each opens a
-/// subscription ([`opens_subscription`]), whose slot it holds while it
-/// waits. Every other command is answered before the next is read:
-/// `webrtc/reoffer` waits too, but on the session's worker alone and for a
-/// bounded time, and the candidates of its new offer that follow it must
-/// reach the handler after it.
+/// segment and `hls/create` for its output's start, which a signaled source
+/// gives only once its client relayed the camera's answer, on this
+/// connection as like as not. Each opens a subscription
+/// ([`opens_subscription`]), whose slot it holds while it waits. Every
+/// other command is answered before the next is read: `webrtc/reoffer`
+/// waits too, but on the session's worker alone and for a bounded time,
+/// and the candidates of its new offer that follow it must reach the
+/// handler after it.
 const fn waits(command: &Command) -> bool {
-    matches!(command, Command::LiveCreate(_))
+    matches!(command, Command::LiveCreate(_) | Command::HlsCreate(_))
 }
 
 /// Forwards a subscription's events as frames until it ends or the queue
@@ -875,10 +876,15 @@ mod tests {
     }
 
     #[test]
-    fn only_live_create_waits_and_it_holds_a_subscription_slot_meanwhile() {
-        let live = command(r#"{"id":1,"type":"live/create","stream_id":"a"}"#);
-        assert!(waits(&live));
-        assert!(opens_subscription(&live));
+    fn only_live_and_hls_create_wait_and_each_holds_a_subscription_slot_meanwhile() {
+        for text in [
+            r#"{"id":1,"type":"live/create","stream_id":"a"}"#,
+            r#"{"id":1,"type":"hls/create","stream_id":"a"}"#,
+        ] {
+            let create = command(text);
+            assert!(waits(&create), "{text}");
+            assert!(opens_subscription(&create), "{text}");
+        }
         let reoffer = command(r#"{"id":1,"type":"webrtc/reoffer","session_id":"s","sdp":"v=0"}"#);
         assert!(!waits(&reoffer));
     }
