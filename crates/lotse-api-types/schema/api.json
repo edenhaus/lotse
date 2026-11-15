@@ -910,6 +910,67 @@
         },
         {
           "additionalProperties": false,
+          "description": "`live/create`: a live output of a stream; its bytes are fetched\nwith `GET /v0/live/{live_id}`.",
+          "properties": {
+            "audio": {
+              "default": true,
+              "description": "Take the stream's audio, when the live container carries it as it\nis (AAC-LC, Opus); any other codec is left out with an\n`audio_omitted` warning and nothing is transcoded. `false` makes a\nvideo-only output, for a player that cannot play the stream's\naudio.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "The command id, which becomes the subscription id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "description": "The stream to play.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "live/create",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "stream_id"
+          ],
+          "title": "LiveCreateCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`live/close`: ends a live output.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "live_id": {
+              "description": "The live output.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "live/close",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "live_id"
+          ],
+          "title": "LiveCloseCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "`signaling/subscribe`: a subscription to the offers of one\nstream's signaled sources, or of every stream's. Its end\n(`unsubscribe`, the connection's close, a supersede) ends every\nsignal it holds at once, live ones included, without `closed`:\ntheir sources connect again after their backoff.",
           "properties": {
             "id": {
@@ -1359,8 +1420,48 @@
           "const": "signal_not_found",
           "description": "`signaling/answer`, `signaling/candidate` or `signaling/error` of a\nsignal that is not open, or that another control connection owns.",
           "type": "string"
+        },
+        {
+          "const": "live_not_found",
+          "description": "`GET /v0/live/{live_id}` (HTTP 404) or `live/close` of a live output\nthat is not open: never created, already ended, or an id that is no\nlive output's.",
+          "type": "string"
+        },
+        {
+          "const": "live_already_fetched",
+          "description": "`GET /v0/live/{live_id}` (HTTP 409) of a live output whose bytes\nanother request already took: a live output has one body.",
+          "type": "string"
+        },
+        {
+          "const": "source_not_live",
+          "description": "`live/create` on a stream whose source showed no video the live\ncontainer carries within `limits.live_start_timeout_ms`.",
+          "type": "string"
         }
       ]
+    },
+    "EventFrame_for_LiveEvent": {
+      "description": "An `event` of a subscription; `id` is the subscribing command's.",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/LiveEvent",
+          "description": "The event."
+        },
+        "id": {
+          "description": "The subscription's command id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/EventTag",
+          "description": "`\"event\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "event"
+      ],
+      "type": "object"
     },
     "EventFrame_for_RecordingEvent": {
       "description": "An `event` of a subscription; `id` is the subscribing command's.",
@@ -1777,6 +1878,178 @@
         "session_grace_ms"
       ],
       "type": "object"
+    },
+    "LiveCloseReason": {
+      "description": "Why a live output ended: the `reason` of `closed`.",
+      "oneOf": [
+        {
+          "const": "closed",
+          "description": "`live/close`.",
+          "type": "string"
+        },
+        {
+          "const": "client_gone",
+          "description": "The body's connection closed, or stopped taking bytes.",
+          "type": "string"
+        },
+        {
+          "const": "session_closed",
+          "description": "The control connection that created it closed, or unsubscribed.",
+          "type": "string"
+        },
+        {
+          "const": "not_fetched",
+          "description": "Nobody fetched the body within `limits.live_fetch_timeout_ms`.",
+          "type": "string"
+        },
+        {
+          "const": "stream_deleted",
+          "description": "The stream was deleted, or its video track closed.",
+          "type": "string"
+        },
+        {
+          "const": "stream_changed",
+          "description": "The stream moved to another source connection, or the codec of what\nfollows is not known.",
+          "type": "string"
+        },
+        {
+          "const": "codec_changed",
+          "description": "A codec changed past what the init segment describes (another\ncodec, profile, level or picture size): a new output needs a new\ninit segment, so the client creates one.",
+          "type": "string"
+        },
+        {
+          "const": "no_video_track",
+          "description": "The stream has no video track.",
+          "type": "string"
+        },
+        {
+          "const": "source_not_live",
+          "description": "No keyframe came within `limits.live_start_timeout_ms` of the fetch.",
+          "type": "string"
+        },
+        {
+          "const": "worker_crashed",
+          "description": "The stream's worker process exited.",
+          "type": "string"
+        },
+        {
+          "const": "shutting_down",
+          "description": "The daemon is stopping.",
+          "type": "string"
+        },
+        {
+          "const": "internal_error",
+          "description": "The container failed, or the worker broke the contract.",
+          "type": "string"
+        }
+      ]
+    },
+    "LiveCreateResult": {
+      "description": "`live/create`'s result: the live output, its MIME type, and where its\nbytes are fetched.",
+      "properties": {
+        "live_id": {
+          "description": "The live output: a ULID.",
+          "type": "string"
+        },
+        "mime": {
+          "description": "The MIME type of its bytes with the RFC 6381 `codecs` parameter of\nwhat the container writes, `video/mp4; codecs=\"avc1.640028,mp4a.40.2\"`:\nthe video's entry, then the audio's when the output has audio. What\n`MediaSource.isTypeSupported` takes.",
+          "type": "string"
+        },
+        "url": {
+          "description": "The path to `GET` its bytes from on the socket this command came\nover: `/v0/live/{live_id}`. One request takes them; a live output\nnot fetched within `limits.live_fetch_timeout_ms` ends `not_fetched`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "live_id",
+        "mime",
+        "url"
+      ],
+      "type": "object"
+    },
+    "LiveEvent": {
+      "description": "An event of `live/create`: warnings, then `closed` always last.\nEach variant's schema title names the Python client's class for it.",
+      "oneOf": [
+        {
+          "description": "Non-fatal: the output goes on.",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/LiveWarningCode",
+              "description": "The stable code."
+            },
+            "message": {
+              "description": "For humans.",
+              "type": "string"
+            },
+            "type": {
+              "const": "warning",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "message"
+          ],
+          "title": "LiveEventWarning",
+          "type": "object"
+        },
+        {
+          "description": "The last event; the subscription ends with it, and the body ends,\nwith its last chunk, once the bytes before it are read.",
+          "properties": {
+            "bytes": {
+              "description": "The bytes its worker wrote for the body; 0 when it ended without\nits worker's last word (`worker_crashed`, `shutting_down`).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "dropped_frames": {
+              "description": "The frames left out because the body was read slower than the\ncamera sends: each time the output fell behind, every frame up\nto the next keyframe.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "drops": {
+              "description": "How often it fell behind and dropped to the next keyframe.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "live_id": {
+              "description": "The live output.",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/LiveCloseReason",
+              "description": "Why."
+            },
+            "type": {
+              "const": "closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "live_id",
+            "reason",
+            "bytes",
+            "dropped_frames",
+            "drops"
+          ],
+          "title": "LiveEventClosed",
+          "type": "object"
+        }
+      ]
+    },
+    "LiveWarningCode": {
+      "description": "The code of a live output's `warning`.",
+      "oneOf": [
+        {
+          "const": "audio_omitted",
+          "description": "The stream's audio does not fit the live container (G.711, G.722,\nanything but AAC-LC and Opus) and is not transcoded: the output has\nno audio, its `mime` names none, and the message names the codec.",
+          "type": "string"
+        }
+      ]
     },
     "Metrics": {
       "description": "`metrics/get`'s result.",
@@ -3546,6 +3819,36 @@
       ],
       "type": "object"
     },
+    "Success_for_LiveCreateResult": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/LiveCreateResult",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
     "Success_for_Metrics": {
       "description": "A successful `result`: exactly one per command.",
       "properties": {
@@ -4282,6 +4585,9 @@
     "$ref": "#/$defs/Command"
   },
   "events": {
+    "live/create": {
+      "$ref": "#/$defs/EventFrame_for_LiveEvent"
+    },
     "recording/create": {
       "$ref": "#/$defs/EventFrame_for_RecordingEvent"
     },
@@ -4316,6 +4622,12 @@
     },
     "info": {
       "$ref": "#/$defs/Success_for_InfoResult"
+    },
+    "live/close": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "live/create": {
+      "$ref": "#/$defs/Success_for_LiveCreateResult"
     },
     "metrics/get": {
       "$ref": "#/$defs/Success_for_Metrics"

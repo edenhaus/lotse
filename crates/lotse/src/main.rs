@@ -97,6 +97,11 @@ fn registries() -> Registries {
     {
         registries.recording = Some(Arc::new(lotse_mux::Factory));
     }
+    // The live outputs' container: one fragment of fragmented MP4 per frame.
+    #[cfg(feature = "output-live")]
+    {
+        registries.live = Some(Arc::new(lotse_mux::LiveFactory));
+    }
     #[cfg(feature = "source-rtsp")]
     registered(
         "rtsp source",
@@ -183,7 +188,7 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
     let profile = Profile::Worker { connect_ports };
     let _report = lotse_sandbox::apply(&profile, &sandbox).context("sandbox")?;
     let settings = lotse_worker::Settings {
-        live: lotse_worker::LiveSettings::default(),
+        live: live_settings(args),
         worker_threads: args.worker_threads,
         limits: track_limits(args),
         runner: RunnerConfig::default(),
@@ -205,6 +210,15 @@ fn track_limits(args: &WorkerArgs) -> TrackLimits {
     TrackLimits {
         prerecord_bytes: args.max_prerecord_bytes,
         ..TrackLimits::default()
+    }
+}
+
+/// The worker's live output limits from the flags its supervisor passed,
+/// the values the supervisor checks live outputs against.
+const fn live_settings(args: &WorkerArgs) -> lotse_worker::LiveSettings {
+    lotse_worker::LiveSettings {
+        start_timeout: Duration::from_millis(args.live_start_timeout_ms),
+        max_outputs: args.max_live,
     }
 }
 
@@ -275,6 +289,7 @@ fn serve(args: &ServeArgs, matches: &ArgMatches) -> anyhow::Result<()> {
             worker_address_space: limits.worker_address_space,
             max_sessions: limits.max_sessions,
             recordings: limits.recordings,
+            live: limits.live,
         },
         udp: None,
         front_door: None,
@@ -351,6 +366,33 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_runs_its_live_outputs_under_the_limits_its_flags_pass() {
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "lotse",
+                "worker",
+                "--live-start-timeout-ms",
+                "2500",
+                "--max-live",
+                "3",
+            ])
+            .unwrap();
+        let args = WorkerArgs::from_arg_matches(
+            matches
+                .subcommand_matches("worker")
+                .expect("the worker subcommand"),
+        )
+        .unwrap();
+        assert_eq!(
+            live_settings(&args),
+            lotse_worker::LiveSettings {
+                start_timeout: Duration::from_millis(2_500),
+                max_outputs: 3,
+            }
+        );
+    }
+
+    #[test]
     fn a_worker_runs_its_recordings_under_the_limits_its_flags_pass() {
         let matches = Cli::command()
             .try_get_matches_from([
@@ -383,6 +425,19 @@ mod tests {
             }
         );
         assert_eq!(track_limits(&args).prerecord_bytes, 1 << 20);
+    }
+
+    /// The registries of a build with every feature hold the live container.
+    #[cfg(feature = "output-live")]
+    #[test]
+    fn the_live_output_is_registered_behind_its_feature() {
+        let registries = registries();
+        let live = registries.live.expect("a live output");
+        assert!(live.accepts(&lotse_core::codec::Codec::Opus { channels: 2 }));
+        assert!(
+            !live.accepts(&lotse_core::codec::Codec::Pcmu),
+            "no G.711 in MP4"
+        );
     }
 
     /// The registries of a build with every feature hold the recording container.

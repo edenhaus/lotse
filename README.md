@@ -3,7 +3,8 @@
 A small, fast, memory-safe media daemon built for Home Assistant. It takes
 camera streams (RTSP, HLS or MPEG-TS over HTTP, and WebRTC cameras such as
 Nest, Ring and Matter ones, whose signaling its client relays) and serves them to
-browsers over WebRTC, with two-way audio designed in from the start, and
+browsers over WebRTC, with two-way audio designed in from the start, as
+live fMP4 over HTTP where WebRTC cannot connect, and
 as event recordings: fragmented MP4 that starts before the event, from the
 seconds it keeps in memory, for its client to store. It does nothing
 else.
@@ -161,6 +162,59 @@ With no host address found, or without a subscribed client, the source
 reports `source_unreachable`.
 The dev viewer does not relay signaling, so such a source needs a client
 that does.
+
+## Live fMP4 over HTTP
+
+WebRTC is the main path to a browser. Where it cannot connect (UDP
+blocked, no TURN server), a client falls back to live fMP4 over HTTP, which
+a browser plays through Media Source Extensions about half a second behind
+the camera:
+
+```json
+{ "id": 7, "type": "live/create", "stream_id": "front", "audio": true }
+```
+
+The result names the output, its MIME type with the RFC 6381 `codecs`
+parameter, for the client's `MediaSource.isTypeSupported`, and where its
+bytes are:
+
+```json
+{ "live_id": "01JD…", "mime": "video/mp4; codecs=\"avc1.640028,mp4a.40.2\"", "url": "/v0/live/01JD…" }
+```
+
+`GET /v0/live/{live_id}` on the same socket (or the mTLS listener) takes the
+bytes once, in the chunked transfer coding: the init segment, then one
+`moof`+`mdat` per video frame with the audio up to it, from the stream's
+cached keyframe on. The client proxies it to the browser; the daemon refuses
+a request that carries `Origin`. The command waits for the worker's init
+segment, at most `limits.live_start_timeout_ms` (10 s), since the MIME type
+needs the camera's parameter sets.
+
+- **Join.** The output starts at the stream's cached GOP and sends it at
+  once, so its first frame is as old as that GOP: up to the camera's
+  keyframe interval behind live. A player appends the burst and jumps to the
+  end of what it buffered.
+- **A slow reader.** A frame is out one frame interval after it arrived
+  (each waits for the next to know its duration). When the body is read
+  slower than the camera sends and more than `limits.live_buffer_bytes`
+  (1 MiB) wait in the worker, the output drops every frame up to the next
+  keyframe and goes on from where its video ended, so the player's timeline
+  has no hole; `closed` counts the drops. A client that reads nothing for
+  10 s is dropped.
+- **Audio.** AAC-LC and Opus go in as the camera sends them; anything else
+  (G.711, G.722) is left out with an `audio_omitted` warning, never
+  transcoded: `"audio": false` asks for video alone, for a player that
+  cannot play the stream's audio.
+- **The end.** `closed` names why: `closed` (`live/close`), `client_gone`,
+  `session_closed` (the control connection that created it closed or
+  unsubscribed), `not_fetched` (no `GET` within
+  `limits.live_fetch_timeout_ms`, 10 s), `stream_deleted`, `stream_changed`,
+  `codec_changed` (another codec, profile, level or picture size: create a
+  new output, whose init segment describes it), `no_video_track`,
+  `source_not_live`, `worker_crashed`, `shutting_down`, `internal_error`.
+  The body ends with its last chunk when the output ends.
+- **Limits.** `limits.max_live` (16) outputs at once and
+  `limits.max_live_per_stream` (8) per stream; one more is `limit_reached`.
 
 ## Running in a container
 

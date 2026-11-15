@@ -81,6 +81,16 @@ pub enum ErrorCode {
     /// `signaling/answer`, `signaling/candidate` or `signaling/error` of a
     /// signal that is not open, or that another control connection owns.
     SignalNotFound,
+    /// `GET /v0/live/{live_id}` (HTTP 404) or `live/close` of a live output
+    /// that is not open: never created, already ended, or an id that is no
+    /// live output's.
+    LiveNotFound,
+    /// `GET /v0/live/{live_id}` (HTTP 409) of a live output whose bytes
+    /// another request already took: a live output has one body.
+    LiveAlreadyFetched,
+    /// `live/create` on a stream whose source showed no video the live
+    /// container carries within `limits.live_start_timeout_ms`.
+    SourceNotLive,
 }
 
 impl ErrorCode {
@@ -115,6 +125,9 @@ impl ErrorCode {
             Self::RecordingIdInUse => "recording_id_in_use",
             Self::RecordingAlreadyFetched => "recording_already_fetched",
             Self::SignalNotFound => "signal_not_found",
+            Self::LiveNotFound => "live_not_found",
+            Self::LiveAlreadyFetched => "live_already_fetched",
+            Self::SourceNotLive => "source_not_live",
         }
     }
 
@@ -209,6 +222,9 @@ mod tests {
             ErrorCode::RecordingIdInUse,
             ErrorCode::RecordingAlreadyFetched,
             ErrorCode::SignalNotFound,
+            ErrorCode::LiveNotFound,
+            ErrorCode::LiveAlreadyFetched,
+            ErrorCode::SourceNotLive,
         ];
         for code in all {
             let json = serde_json::to_value(code).unwrap();
