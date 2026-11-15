@@ -86,6 +86,9 @@ struct Limits {
 /// One live output's tracks and where its timeline is.
 #[derive(Debug)]
 struct Live {
+    /// The tracks as the init segment describes them: the video's, and the
+    /// audio's when the output has one.
+    entries: (RecordingTrack, Option<RecordingTrack>),
     /// The video track.
     video: TrackWriter,
     /// The audio track, when the output has one.
@@ -116,6 +119,7 @@ impl Live {
     /// An output of `video` and `audio` before its first keyframe.
     fn new(video: &RecordingTrack, audio: Option<&RecordingTrack>) -> Self {
         Self {
+            entries: (video.clone(), audio.cloned()),
             video: TrackWriter::new(VIDEO_TRACK_ID, Kind::Video, video),
             audio: audio.map(|audio| TrackWriter::new(AUDIO_TRACK_ID, Kind::Audio, audio)),
             origin: None,
@@ -312,6 +316,19 @@ impl LiveMuxer for LiveWriter {
             Kind::Video => live.push_video(frame),
             Kind::Audio => live.push_audio(frame, &self.limits),
         }
+    }
+
+    fn continues(&self, track: Kind, entry: &RecordingTrack) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let written = match track {
+            Kind::Video => Some(&live.entries.0),
+            Kind::Audio => live.entries.1.as_ref(),
+        };
+        written.is_some_and(|written| {
+            written.clock_rate == entry.clock_rate && init::describes(&written.codec, &entry.codec)
+        })
     }
 
     fn skip(&mut self) -> Result<Option<LiveFragment>, RecordingError> {

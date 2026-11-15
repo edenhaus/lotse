@@ -483,3 +483,20 @@ fn audio_codecs(codec: &Codec) -> Result<String, RecordingError> {
         other => Err(RecordingError::Unsupported(other.family())),
     }
 }
+
+/// Whether a sample entry written for `written` still describes the
+/// frames of `now`: the same `codecs` entry (RFC 6381 §3.3: the profile,
+/// level and constraints of the video, the audio's object type) and, for
+/// video, the same picture size; for audio, the same configuration, which
+/// the sample entry carries whole (the `esds`, the `dOps` channels). A
+/// video SPS that changes nothing of that keeps its own parameter sets in
+/// band ([`crate::fragment`]).
+pub(crate) fn describes(written: &Codec, now: &Codec) -> bool {
+    match (video_entry(written), video_entry(now)) {
+        (Ok((_, written_size)), Ok((_, now_size))) => {
+            written_size == now_size && video_codecs(written).ok() == video_codecs(now).ok()
+        }
+        (Err(_), Err(_)) => carries(now) && written == now,
+        _ => false,
+    }
+}

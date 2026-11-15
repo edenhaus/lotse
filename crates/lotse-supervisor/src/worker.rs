@@ -38,8 +38,8 @@ use lotse_core::task::spawn_named;
 use lotse_core::text::plain;
 use lotse_ipc::{Channel, IpcError, Receiver, Sender, SourceState, ToSupervisor, ToWorker};
 pub use lotse_ipc::{
-    RecordingReport, RecordingSpec, SessionEvent, SessionSpec, SignalCommand, SignalReport,
-    SourceSpec, TrackInfo, WorkerStats,
+    LiveReport, LiveSpec, RecordingReport, RecordingSpec, SessionEvent, SessionSpec, SignalCommand,
+    SignalReport, SourceSpec, TrackInfo, WorkerStats,
 };
 use tokio::process::Child;
 use tokio::sync::mpsc;
@@ -158,6 +158,13 @@ pub enum WorkerEvent {
         recording_id: String,
         /// What happened.
         event: RecordingReport,
+    },
+    /// A live output reported something, as the worker wrote it.
+    Live {
+        /// The live output.
+        live_id: String,
+        /// What happened.
+        event: LiveReport,
     },
     /// The worker closed its channel cleanly.
     ChannelClosed,
@@ -417,6 +424,7 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
             recording_id,
             event,
         },
+        ToSupervisor::Live { live_id, event } => WorkerEvent::Live { live_id, event },
         ToSupervisor::ProbeConnecting { probe } => WorkerEvent::ProbeConnecting(probe),
         ToSupervisor::ProbeEnded { probe } => WorkerEvent::ProbeEnded(probe),
         ToSupervisor::Talker(change) => match TalkerReason::parse(&change.reason) {
@@ -1476,6 +1484,29 @@ mod tests {
             ),
             WorkerEvent::Recording {
                 recording_id: "k1".into(),
+                event
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_report_is_passed_on_as_the_worker_wrote_it() {
+        let event = LiveReport::Closed {
+            reason: "client_gone".into(),
+            bytes: 10,
+            dropped_frames: 0,
+            drops: 0,
+        };
+        assert_eq!(
+            mapped(
+                ToSupervisor::Live {
+                    live_id: "l1".into(),
+                    event: event.clone(),
+                },
+                None
+            ),
+            WorkerEvent::Live {
+                live_id: "l1".into(),
                 event
             }
         );

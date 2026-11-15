@@ -1535,6 +1535,29 @@ impl Track {
         (subscription, snapshot, codec, clock_rate, source)
     }
 
+    /// A frame subscription, the GOP cache, the codec descriptor and the
+    /// clock rate, taken together under the ring's lock, as
+    /// [`Self::subscribe_from_prerecord`] takes its snapshot: every frame
+    /// reaches the GOP cache and the broadcast under that lock, so the GOP
+    /// holds the frames published before the subscription from its keyframe
+    /// on, the subscription yields every frame published after, and none is
+    /// in both or in neither. A live output's join: the GOP is a decodable
+    /// start, and the descriptor is the one of its frames and of those the
+    /// subscription yields up to its first `TrackChanged`. The GOP is
+    /// `None` before the first keyframe. The lock is held for the
+    /// subscribe and the loads only.
+    pub fn subscribe_from_gop(
+        self: &Arc<Self>,
+    ) -> (TrackSubscription, Option<Arc<GopSnapshot>>, Arc<Codec>, u32) {
+        let fed = self.lock_prerecord();
+        let subscription = self.subscribe(Unit::Frames);
+        let gop = self.gop();
+        let codec = self.codec();
+        let clock_rate = self.clock_rate();
+        drop(fed);
+        (subscription, gop, codec, clock_rate)
+    }
+
     /// Frees the pre-record ring and its window, for a closed track.
     fn free_prerecord(&self) {
         let _previous = self.lock_prerecord().ring.set_window(None);
@@ -2235,6 +2258,24 @@ mod tests {
             ..frame(true, 1)
         }));
         assert_eq!(track.gop().unwrap().age(now), Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_join_from_the_gop_takes_every_frame_once_with_the_codec() {
+        let track = Arc::new(video_track(TrackLimits::default()));
+        let (mut sub, gop, codec, rate) = track.subscribe_from_gop();
+        assert!(gop.is_none(), "no keyframe yet");
+        assert_eq!((codec, rate), (track.codec(), 90_000));
+        assert!(track.publish_frame(frame(true, 10)));
+        assert!(track.publish_frame(frame(false, 20)));
+        let (mut joined, gop, ..) = track.subscribe_from_gop();
+        assert!(track.publish_frame(frame(false, 30)));
+        let held: Vec<usize> = gop.unwrap().frames().map(|f| f.payload.len()).collect();
+        assert_eq!(held, [10, 20], "the GOP holds what came before");
+        crate::let_assert!(Some(TrackEvent::Frame(next)) = joined.next().await);
+        assert_eq!(next.payload.len(), 30, "the subscription what came after");
+        crate::let_assert!(Some(TrackEvent::Frame(first)) = sub.next().await);
+        assert_eq!(first.payload.len(), 10);
     }
 
     #[tokio::test]

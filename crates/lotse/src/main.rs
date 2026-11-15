@@ -183,6 +183,7 @@ fn worker(args: &WorkerArgs) -> anyhow::Result<()> {
     let profile = Profile::Worker { connect_ports };
     let _report = lotse_sandbox::apply(&profile, &sandbox).context("sandbox")?;
     let settings = lotse_worker::Settings {
+        live: lotse_worker::LiveSettings::default(),
         worker_threads: args.worker_threads,
         limits: track_limits(args),
         runner: RunnerConfig::default(),
