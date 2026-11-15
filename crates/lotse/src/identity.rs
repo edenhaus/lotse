@@ -29,12 +29,10 @@ pub(crate) fn run(args: &IdentityArgs) -> anyhow::Result<ExitCode> {
         drop_to: args.user.unwrap_or(lotse_sandbox::DEFAULT_UID),
     };
     if args.reissue {
-        let identity = ServerIdentity::reissue(&args.data_dir, owners)
+        let reissued = ServerIdentity::reissue(&args.data_dir, owners)
             .context("reissuing the control identity")?;
-        println!("{}", identity.pin());
-        eprintln!(
-            "lotse: the control identity has a new certificate from the same key, naming the DNS name `{CONTROL_SERVER_NAME}`, and the pin above replaces the old one: every client must pair again. Restart the daemon to serve it."
-        );
+        println!("{}", reissued.identity.pin());
+        eprintln!("lotse: {}", reissued.notice());
         return Ok(ExitCode::SUCCESS);
     }
     let identity = ServerIdentity::load(&args.data_dir, owners).context("control identity")?;
