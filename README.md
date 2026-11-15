@@ -276,7 +276,8 @@ the player; the daemon refuses a request that carries `Origin`.
 - **The end.** A session ends on `hls/close` (`closed`), when the control
   connection that created it closes or unsubscribes (`session_closed`),
   without a request for `limits.hls_idle_timeout_ms` (30 s: a player asks
-  several times a second; `idle`), or with its output, whose `closed`
+  several times a second; `idle`), counted from the `hls/create`'s answer,
+  so a slow start does not end it, or with its output, whose `closed`
   carries the live output's reasons, or `window_full` when the stream sends
   no keyframe within `limits.hls_window_bytes`. The output ends when its
   last session leaves.

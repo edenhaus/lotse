@@ -630,6 +630,46 @@ async fn a_session_without_a_request_within_the_idle_timeout_ends_idle() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A session's idle clock starts with its create's answer: a start that
+/// takes longer than the idle timeout, within the start timeout, keeps the
+/// session, which then lives the idle timeout from the answer.
+#[tokio::test]
+async fn a_session_s_idle_clock_starts_once_its_create_is_answered() {
+    let dir = private_dir("hls-idle-start");
+    let clock = Arc::new(FakeClock::from_system());
+    let idle = Duration::from_secs(1);
+    let just_under = Duration::from_millis(999);
+    let limits = HlsLimits {
+        idle_timeout: idle,
+        ..HlsLimits::DEFAULT
+    };
+    let (s, mut commands) = rig(&dir, limits, clock.clone()).await;
+    s.shared.lock().live_limits.start_timeout = Duration::from_secs(5);
+    let create = spawn_create(&s, 2, true);
+    let (spec, _pipe) = output_start(&mut commands).await;
+    settle().await;
+    clock.advance(2 * idle);
+    settle().await;
+    assert_eq!(
+        s.shared.lock().hls.sessions.len(),
+        1,
+        "no idle while waiting"
+    );
+    live_report(&s, &spec.live_id, live_started());
+    let (answer, mut events) = started(within(create).await.unwrap());
+    let id = hls_id(&answer);
+    clock.advance(just_under);
+    settle().await;
+    assert!(events.try_recv().is_err(), "idle counts from the answer");
+    clock.advance(Duration::from_millis(1));
+    assert_eq!(
+        next(&mut events).await,
+        json!({ "type": "closed", "hls_id": id.as_str(), "reason": "idle" })
+    );
+    stop(&s, &clock).await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Blocked requests are bounded at once, per session and in all (429), and
 /// in time: three Target Durations once the window publishes, the start
 /// timeout before (503); a request whose session ends while it waits is

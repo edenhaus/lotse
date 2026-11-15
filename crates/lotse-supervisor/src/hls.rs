@@ -21,7 +21,9 @@
 //! first `hls/create` starts it, those that come while it starts wait for
 //! the same start (`limits.live_start_timeout_ms` and the slack of
 //! `live/create`), later ones join it. Each session has its own id, a ULID,
-//! its own subscription and its own idle clock. A session ends on
+//! its own subscription and its own idle clock, which runs from its
+//! create's answer: a start slower than the idle timeout keeps it. A
+//! session ends on
 //! `hls/close` (`closed`), its subscription or control connection gone
 //! (`session_closed`), no request within `limits.hls_idle_timeout_ms`
 //! (`idle`), or its output's end; the output ends when its last session
@@ -452,8 +454,10 @@ pub(crate) struct HlsSession {
     gone: CancellationToken,
     /// Cancels [`Self::gone`] when the session is dropped.
     _gone: DropGuard,
-    /// Its idle timer, aborted when the session ends.
-    _idle: RecordingTimer,
+    /// Its idle timer, armed once its create is answered, so a start
+    /// slower than the idle timeout keeps it; aborted when the session
+    /// ends.
+    idle: Option<RecordingTimer>,
 }
 
 impl HlsSession {
@@ -817,6 +821,8 @@ struct Registered {
     events: mpsc::Receiver<Event>,
     /// The output's start.
     start: watch::Receiver<Start>,
+    /// The session's idle timeout, its timer armed once it starts.
+    idle_timeout: Duration,
 }
 
 /// What a new session takes of the output it joins or starts.
@@ -846,9 +852,10 @@ impl Joined {
 /// `hls/create`: validates against the limits, joins the stream's output
 /// of that audio choice or starts one, registers the session, and waits for
 /// the output's start for at most `limits.live_start_timeout_ms` and the
-/// slack of `live/create`. The command's future may be dropped at its wait:
-/// the session stays registered with its owner, whose connection's close,
-/// or the idle timeout, ends it.
+/// slack of `live/create`. The command's future may be dropped at its wait,
+/// only as its control connection closes or the daemon shuts down: the
+/// session stays registered with its owner, whose connection's close ends
+/// it; its idle timer is armed only once the create answers.
 pub(crate) async fn create(
     shared: &Arc<Shared>,
     connection: ConnectionId,
@@ -864,6 +871,7 @@ pub(crate) async fn create(
         live_id,
         events,
         mut start,
+        idle_timeout,
     } = registered?;
     let outcome = tokio::select! {
         started = start.wait_for(|start| start.outcome().is_some()) => started
@@ -872,8 +880,9 @@ pub(crate) async fn create(
             }),
         () = shared.clock.sleep(wait) => Err(HlsCloseReason::SourceNotLive),
     };
-    let now = shared.clock.now();
-    let mime = shared.lock().hls_started(&hls_id, &live_id, outcome, now)?;
+    let mime = shared
+        .lock()
+        .hls_started(shared, &hls_id, &live_id, outcome, idle_timeout)?;
     let result = HlsCreateResult {
         playlist: hls_playlist_path(hls_id.as_str()),
         hls_id: hls_id.as_str().to_owned(),
@@ -884,14 +893,16 @@ pub(crate) async fn create(
 
 impl State {
     /// The start session `hls_id` of output `live_id` waited for came out
-    /// as `outcome` at `now`: its MIME type, its idle clock running from
-    /// here; or the refusal, the output ended for its reason.
+    /// as `outcome`: its MIME type, its idle timer of `idle_timeout` armed
+    /// from here, as the client learns its id only now; or the refusal, the
+    /// output ended for its reason.
     fn hls_started(
         &mut self,
+        shared: &Arc<Shared>,
         hls_id: &HlsId,
         live_id: &str,
         outcome: Result<String, HlsCloseReason>,
-        now: Instant,
+        idle_timeout: Duration,
     ) -> Result<String, ApiError> {
         let mime = outcome.map_err(|reason| {
             self.close_hls_output(live_id, reason);
@@ -903,7 +914,17 @@ impl State {
             .sessions
             .get_mut(hls_id.as_str())
             .ok_or_else(|| not_found(hls_id.as_str()))?;
-        session.touched = now;
+        session.idle = Some(idle_timer(
+            shared,
+            hls_id.as_str(),
+            session.serial,
+            idle_timeout,
+        ));
+        tracing::debug!(
+            hls.id = %hls_id,
+            timeout_ms = idle_timeout.as_millis(),
+            "LL-HLS session started; its idle timer armed"
+        );
         Ok(mime)
     }
 }
@@ -928,7 +949,8 @@ fn register_locked(
 }
 
 /// Registers session `hls_id` of `create` on `state`: the checks, the
-/// output joined or started, the session and its idle timer.
+/// output joined or started, and the session, its idle timer left to its
+/// start.
 fn register(
     shared: &Arc<Shared>,
     state: &mut State,
@@ -980,7 +1002,7 @@ fn register(
         requests: places(limits.max_requests_per_session),
         _gone: gone.clone().drop_guard(),
         gone,
-        _idle: idle_timer(shared, hls_id.as_str(), serial, limits.idle_timeout),
+        idle: None,
     };
     if let Some((code, message)) = warning {
         session.deliver(hls_id.as_str(), &HlsEvent::Warning { code, message });
@@ -1002,6 +1024,7 @@ fn register(
         live_id,
         events: rx,
         start,
+        idle_timeout: limits.idle_timeout,
     })
 }
 
@@ -1089,7 +1112,8 @@ fn start_output(
 }
 
 /// The idle timer of session `serial`, `hls_id`: it ends the session
-/// `idle` once no request reached it for `timeout` on the injected clock.
+/// `idle` once no request reached it for `timeout` on the injected clock,
+/// the first `timeout` counted from now.
 fn idle_timer(
     shared: &Arc<Shared>,
     hls_id: &str,
