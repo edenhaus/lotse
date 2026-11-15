@@ -171,4 +171,8 @@ exclude_re = [
     # An empty host let through goes on to `Url::set_username`, which refuses a URL whose host
     # is empty (url 2): the same `MissingHost`.
     "source_url.rs:.*replace match guard !host.is_empty\\(\\) with true in SourceUrl::parse$",
+    # A pipe takes at least one byte of a write of non-empty slices or refuses it with
+    # EWOULDBLOCK (pipe(7)), and the queue holds no empty slice: `Ok(0)` never comes.
+    "lotse-worker/src/live.rs:.*replace match guard written > 0 with true in Output::write$",
+    "lotse-worker/src/live.rs:.*replace > with >= in Output::write$",
 ]
