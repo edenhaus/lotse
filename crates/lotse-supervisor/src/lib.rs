@@ -242,19 +242,22 @@ pub fn bind(settings: &Settings) -> Result<Listeners, BindError> {
         owners: settings.owners,
         allow_uid: settings.allow_uid,
         max_connections: settings.limits.max_connections,
-        // One per session, one `stream/subscribe` and one
-        // `signaling/subscribe` per stream and one of each for every
-        // stream: the cap never refuses what the other limits allow.
-        max_subscriptions: settings.limits.max_sessions.saturating_add(
-            settings
-                .limits
-                .max_streams
-                .saturating_add(1)
-                .saturating_mul(2),
-        ),
+        max_subscriptions: max_subscriptions(&settings.limits),
         tls: settings.control_tls.clone(),
     })?;
     Ok(Listeners { api, udp, tcp })
+}
+
+/// The control API's `max_subscriptions`, the subscriptions one control
+/// connection may hold: one per session, one per live output, one
+/// `stream/subscribe` and one `signaling/subscribe` per stream and one of
+/// each for every stream, so the cap never refuses what the other limits
+/// allow.
+fn max_subscriptions(limits: &Limits) -> u32 {
+    limits
+        .max_sessions
+        .saturating_add(limits.live.max_live)
+        .saturating_add(limits.max_streams.saturating_add(1).saturating_mul(2))
 }
 
 /// Serves until `shutdown` resolves, then tears down in order (stop
@@ -677,6 +680,18 @@ mod tests {
     /// instantiation of `serve` runs every path the tests take.
     fn requested() -> std::future::Ready<ShutdownReason> {
         std::future::ready(ShutdownReason::Requested)
+    }
+
+    #[test]
+    fn the_subscription_cap_holds_every_session_live_output_and_stream_subscription() {
+        let limits = settings(PathBuf::from("/nonexistent")).limits;
+        // 256 sessions, 16 live outputs, 2 × (2 streams + every stream).
+        assert_eq!(max_subscriptions(&limits), 256 + 16 + 2 * 3);
+        let saturated = Limits {
+            max_sessions: u32::MAX,
+            ..limits
+        };
+        assert_eq!(max_subscriptions(&saturated), u32::MAX);
     }
 
     #[tokio::test]
