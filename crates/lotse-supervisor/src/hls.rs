@@ -29,6 +29,14 @@
 //! its live output's ([`hls_reason`]). An output counts against the live
 //! outputs' limits too, being one.
 //!
+//! A request is in flight from its arrival until its response is sent or
+//! dropped, its places held by the response's body (`lotse_api::InFlight`):
+//! at most [`HlsLimits::max_requests_per_session`] and
+//! [`HlsLimits::max_requests`] at once (over is 429, RFC 6585 §4). A client
+//! taking a response slowly keeps its place, so these bound the
+//! connections the requests keep open and the media their responses hold
+//! after the window let it go.
+//!
 //! Requests are answered from the window (draft-pantos-hls-rfc8216bis-22):
 //! a Blocking Playlist Reload (§6.2.5.2) or a request for the part a Preload
 //! Hint names (§4.4.5.3) waits for a push to publish what it asks for, as
@@ -41,13 +49,14 @@
 //!
 //! The windows hold at most [`HlsLimits::max_outputs`] times
 //! [`HlsLimits::window_bytes`] of media in the supervisor, the init segments
-//! besides.
+//! besides; the responses in flight hold at most
+//! [`HlsLimits::max_requests`] resources more, each one a window held.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use lotse_api::{ConnectionId, Event, EventClass, HlsError, HlsReply, HlsRequest};
+use lotse_api::{ConnectionId, Event, EventClass, HlsError, HlsReply, HlsRequest, InFlight};
 use lotse_api_types::command::HlsCreate;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::hls::{HlsCloseReason, HlsCreateResult, HlsEvent, hls_playlist_path};
@@ -114,6 +123,13 @@ pub struct HlsLimits {
     /// `limits.max_hls_blocked`: requests blocked at once over every
     /// session.
     pub max_blocked: u32,
+    /// `limits.max_hls_requests_per_session`: requests of one session in
+    /// flight at once, from their arrival until their response is sent or
+    /// dropped, blocked ones included.
+    pub max_requests_per_session: u32,
+    /// `limits.max_hls_requests`: requests in flight at once over every
+    /// session.
+    pub max_requests: u32,
 }
 
 impl HlsLimits {
@@ -134,6 +150,9 @@ impl HlsLimits {
     /// - 4 blocked requests a session: a player holds two, the playlist
     ///   reload and the hinted part (§6.2.5.2, §4.4.5.3), twice that leaves
     ///   room for a retry; 128 in all, four for each of 32 sessions.
+    /// - 8 requests in flight a session: the two blocked, the part or
+    ///   segment a player downloads meanwhile and the init segment, twice;
+    ///   256 in all, eight for each of 32 sessions.
     pub const DEFAULT: Self = Self {
         max_outputs: 8,
         max_sessions: 32,
@@ -144,6 +163,8 @@ impl HlsLimits {
         idle_timeout: Duration::from_secs(30),
         max_blocked_per_session: 4,
         max_blocked: 128,
+        max_requests_per_session: 8,
+        max_requests: 256,
     };
 
     /// The window an output of these limits builds.
@@ -171,6 +192,10 @@ enum Cap {
     BlockedPerSession,
     /// [`HlsLimits::max_blocked`].
     Blocked,
+    /// [`HlsLimits::max_requests_per_session`].
+    RequestsPerSession,
+    /// [`HlsLimits::max_requests`].
+    Requests,
 }
 
 impl Cap {
@@ -182,6 +207,8 @@ impl Cap {
             Self::SessionsPerStream => "max_hls_sessions_per_stream",
             Self::BlockedPerSession => "max_hls_blocked_per_session",
             Self::Blocked => "max_hls_blocked",
+            Self::RequestsPerSession => "max_hls_requests_per_session",
+            Self::Requests => "max_hls_requests",
         }
     }
 }
@@ -199,6 +226,10 @@ struct Caps {
     blocked_per_session: Throttle,
     /// [`Cap::Blocked`].
     blocked: Throttle,
+    /// [`Cap::RequestsPerSession`].
+    requests_per_session: Throttle,
+    /// [`Cap::Requests`].
+    requests: Throttle,
 }
 
 impl Caps {
@@ -210,6 +241,8 @@ impl Caps {
             Cap::SessionsPerStream => &mut self.sessions_per_stream,
             Cap::BlockedPerSession => &mut self.blocked_per_session,
             Cap::Blocked => &mut self.blocked,
+            Cap::RequestsPerSession => &mut self.requests_per_session,
+            Cap::Requests => &mut self.requests,
         }
     }
 }
@@ -410,6 +443,11 @@ pub(crate) struct HlsSession {
     /// Its requests blocked at once, against
     /// [`HlsLimits::max_blocked_per_session`].
     blocked: Arc<Semaphore>,
+    /// Its requests in flight at once, against
+    /// [`HlsLimits::max_requests_per_session`]; a response sent after the
+    /// session ended still holds its place, in a semaphore no request asks
+    /// any more.
+    requests: Arc<Semaphore>,
     /// Cancelled when the session ends: its blocked requests end.
     gone: CancellationToken,
     /// Cancels [`Self::gone`] when the session is dropped.
@@ -448,6 +486,9 @@ pub(crate) struct Hls {
     /// Requests blocked at once over every session, against
     /// [`HlsLimits::max_blocked`].
     blocked: Arc<Semaphore>,
+    /// Requests in flight at once over every session, against
+    /// [`HlsLimits::max_requests`].
+    requests: Arc<Semaphore>,
     /// The rate limits of the caps' warnings.
     caps: Caps,
 }
@@ -461,18 +502,22 @@ impl Default for Hls {
 impl Hls {
     /// No output and no session, under `limits`.
     pub(crate) fn new(limits: Option<HlsLimits>) -> Self {
-        let blocked = limits.map_or(0, |limits| {
-            usize::try_from(limits.max_blocked).unwrap_or(usize::MAX)
-        });
         Self {
             limits,
             outputs: BTreeMap::new(),
             sessions: BTreeMap::new(),
             last: 0,
-            blocked: Arc::new(Semaphore::new(blocked.min(Semaphore::MAX_PERMITS))),
+            blocked: places(limits.map_or(0, |limits| limits.max_blocked)),
+            requests: places(limits.map_or(0, |limits| limits.max_requests)),
             caps: Caps::default(),
         }
     }
+}
+
+/// A semaphore of `limit` places, as many as a semaphore holds at most.
+fn places(limit: u32) -> Arc<Semaphore> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS)))
 }
 
 /// The session's reason for its output's live output ending for `reason`:
@@ -931,11 +976,8 @@ fn register(
             events,
         },
         touched: now,
-        blocked: Arc::new(Semaphore::new(
-            usize::try_from(limits.max_blocked_per_session)
-                .unwrap_or(usize::MAX)
-                .min(Semaphore::MAX_PERMITS),
-        )),
+        blocked: places(limits.max_blocked_per_session),
+        requests: places(limits.max_requests_per_session),
         _gone: gone.clone().drop_guard(),
         gone,
         _idle: idle_timer(shared, hls_id.as_str(), serial, limits.idle_timeout),
@@ -1151,7 +1193,8 @@ impl State {
     /// what answering it needs.
     fn hls_asked(&mut self, hls_id: &HlsId, now: Instant) -> Result<Asked, HlsError> {
         let before = self.live_limits.start_timeout;
-        let all = Arc::clone(&self.hls.blocked);
+        let blocked = Arc::clone(&self.hls.blocked);
+        let requests = Arc::clone(&self.hls.requests);
         let session = self
             .hls
             .sessions
@@ -1160,55 +1203,89 @@ impl State {
         session.touched = now;
         Ok(Asked {
             feed: Arc::clone(&session.feed),
-            session: Arc::clone(&session.blocked),
-            all,
+            in_flight: Places {
+                session: Arc::clone(&session.requests),
+                all: requests,
+                caps: (Cap::RequestsPerSession, Cap::Requests),
+            },
+            blocked: Places {
+                session: Arc::clone(&session.blocked),
+                all: blocked,
+                caps: (Cap::BlockedPerSession, Cap::Blocked),
+            },
             gone: session.gone.clone(),
             before,
         })
     }
 
-    /// The refusal of a request of `hls_id` that would block past `cap`,
-    /// its warning rate-limited.
-    fn hls_blocked_refused(&mut self, cap: Cap, hls_id: &HlsId) -> HlsError {
+    /// The refusal of a request of `hls_id` that would be in flight or
+    /// block past `cap`, its warning rate-limited.
+    fn hls_request_refused(&mut self, cap: Cap, hls_id: &HlsId) -> HlsError {
         let now = self.signaling.clock.now();
+        let limit = cap.as_str();
         if let Some(count) = self.hls.caps.of(cap).hit(now) {
-            tracing::warn!(hls.id = %hls_id, limit = cap.as_str(), count, "LL-HLS blocked request refused at its limit");
+            tracing::warn!(hls.id = %hls_id, limit, count, "LL-HLS request refused at its limit");
         }
-        HlsError::TooManyBlocked {
-            limit: cap.as_str(),
+        match cap {
+            Cap::RequestsPerSession | Cap::Requests => HlsError::TooManyRequests { limit },
+            _ => HlsError::TooManyBlocked { limit },
         }
     }
+}
+
+/// One kind of a request's places: the session's and every session's, and
+/// the caps they stand for.
+struct Places {
+    /// The session's.
+    session: Arc<Semaphore>,
+    /// Every session's.
+    all: Arc<Semaphore>,
+    /// The caps of `session` and of `all`.
+    caps: (Cap, Cap),
 }
 
 /// What a request of a session needs, taken under the lock.
 struct Asked {
     /// The session's window.
     feed: Arc<Feed>,
-    /// The session's blocked requests.
-    session: Arc<Semaphore>,
-    /// Every session's blocked requests.
-    all: Arc<Semaphore>,
+    /// The session's and every session's requests in flight.
+    in_flight: Places,
+    /// The session's and every session's blocked requests.
+    blocked: Places,
     /// Cancelled when the session ends.
     gone: CancellationToken,
     /// How long a request waits before the window publishes.
     before: Duration,
 }
 
-/// `GET /v0/hls/{hls_id}/{name}`: touches the session's idle clock and
-/// answers from its window, waiting, bounded, for what it does not hold
-/// yet. See the module docs.
+/// `GET /v0/hls/{hls_id}/{name}`: touches the session's idle clock, takes
+/// the request's places in flight, which its response holds, and answers
+/// from its window, waiting, bounded, for what it does not hold yet. See
+/// the module docs.
 pub(crate) async fn serve(
     shared: &Arc<Shared>,
     hls_id: &HlsId,
     request: HlsRequest,
-) -> Result<HlsReply, HlsError> {
+) -> Result<(HlsReply, InFlight), HlsError> {
     let now = shared.clock.now();
     let asked = shared.lock().hls_asked(hls_id, now)?;
+    let in_flight = InFlight::new(take(shared, hls_id, &asked.in_flight)?);
+    let reply = answer(shared, hls_id, request, &asked).await?;
+    Ok((reply, in_flight))
+}
+
+/// The answer to `request` from the window `asked` names, once it has one.
+async fn answer(
+    shared: &Arc<Shared>,
+    hls_id: &HlsId,
+    request: HlsRequest,
+    asked: &Asked,
+) -> Result<HlsReply, HlsError> {
     let mut published = asked.feed.published.subscribe();
     if let Answer::Done(answer) = asked.feed.answer(request) {
         return answer;
     }
-    let _permits = block(shared, hls_id, &asked)?;
+    let _blocked = take(shared, hls_id, &asked.blocked)?;
     let deadline = shared.clock.sleep(asked.feed.block_bound(asked.before));
     tokio::pin!(deadline);
     loop {
@@ -1228,27 +1305,22 @@ pub(crate) async fn serve(
     }
 }
 
-/// A place among the blocked requests of the session and of all, or the
-/// refusal of a request over either, its warning rate-limited.
-fn block(
+/// A place among `places` of the session and of all, or the refusal of a
+/// request over either, its warning rate-limited.
+fn take(
     shared: &Arc<Shared>,
     hls_id: &HlsId,
-    asked: &Asked,
-) -> Result<
-    (
-        tokio::sync::OwnedSemaphorePermit,
-        tokio::sync::OwnedSemaphorePermit,
-    ),
-    HlsError,
-> {
-    let refused = |cap: Cap| shared.lock().hls_blocked_refused(cap, hls_id);
-    let session = Arc::clone(&asked.session)
+    places: &Places,
+) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>, HlsError> {
+    let (session_cap, all_cap) = places.caps;
+    let refused = |cap: Cap| shared.lock().hls_request_refused(cap, hls_id);
+    let session = Arc::clone(&places.session)
         .try_acquire_owned()
-        .map_err(|_| refused(Cap::BlockedPerSession))?;
-    let all = Arc::clone(&asked.all)
+        .map_err(|_| refused(session_cap))?;
+    let all = Arc::clone(&places.all)
         .try_acquire_owned()
-        .map_err(|_| refused(Cap::Blocked))?;
-    Ok((session, all))
+        .map_err(|_| refused(all_cap))?;
+    Ok(vec![session, all])
 }
 
 #[cfg(test)]

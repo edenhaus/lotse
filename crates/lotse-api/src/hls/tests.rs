@@ -233,7 +233,8 @@ async fn rfc9110_15_5_a_request_the_route_refuses_gets_the_error_body() {
 async fn rfc8216bis_4_a_playlist_is_an_uncached_mpegurl_of_its_length_on_a_closing_connection() {
     let (logs, _guard) = capture();
     let text = "#EXTM3U\n".to_owned();
-    let response = reply(&peer(), &id("01JH"), Ok(HlsReply::Playlist(text.clone())));
+    let answer = (HlsReply::Playlist(text.clone()), InFlight::default());
+    let response = reply(&peer(), &id("01JH"), Ok(answer));
     assert_eq!(response.status(), StatusCode::OK);
     let headers = response.headers().clone();
     assert_eq!(
@@ -273,7 +274,8 @@ async fn rfc8216bis_3_1_2_a_resource_is_its_chunks_as_mp4_of_their_length() {
         panic!("the first segment is complete");
     };
     assert!(segment.as_slice().len() > 1, "{segment:?}");
-    let response = reply(&peer(), &id("01JH"), Ok(HlsReply::Media(segment)));
+    let answer = (HlsReply::Media(segment), InFlight::default());
+    let response = reply(&peer(), &id("01JH"), Ok(answer));
     let headers = response.headers().clone();
     assert_eq!(headers[header::CONTENT_TYPE], "video/mp4");
     assert_eq!(headers[header::CACHE_CONTROL], "max-age=60");
@@ -301,14 +303,25 @@ async fn rfc8216bis_6_2_5_2_the_handler_s_refusals_map_to_their_status_and_code(
             429,
             "limit_reached",
         ),
+        (
+            HlsError::TooManyRequests {
+                limit: "max_hls_requests",
+            },
+            429,
+            "limit_reached",
+        ),
         (HlsError::Timeout, 503, "source_timeout"),
     ] {
         let response = reply(&peer(), &id("01JH"), Err(error));
         assert_eq!(response.headers()[header::CONNECTION], "close");
         let (got, body) = status_and_error(response).await;
         assert_eq!((got, body["code"].as_str().unwrap()), (status, code));
-        if status == 429 {
-            assert_eq!(body["details"]["limit"], "max_hls_blocked");
+        if let HlsError::TooManyBlocked { limit } | HlsError::TooManyRequests { limit } = error {
+            assert_eq!(body["details"]["limit"], limit);
+            assert_eq!(
+                body["message"],
+                error.to_string().split(" (").next().unwrap()
+            );
         }
     }
     assert!(logs.text().contains("LL-HLS request refused"));
@@ -319,4 +332,59 @@ async fn rfc8216bis_6_2_5_2_the_handler_s_refusals_map_to_their_status_and_code(
         .to_string(),
         "too many blocked requests (max_hls_blocked_per_session)"
     );
+    assert_eq!(
+        HlsError::TooManyRequests {
+            limit: "max_hls_requests_per_session"
+        }
+        .to_string(),
+        "too many requests in flight (max_hls_requests_per_session)"
+    );
+}
+
+/// An [`InFlight`] of one place of a one-place semaphore, and the
+/// semaphore.
+fn one_place() -> (InFlight, Arc<tokio::sync::Semaphore>) {
+    let places = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = Arc::clone(&places).try_acquire_owned().unwrap();
+    (InFlight::new(vec![permit]), places)
+}
+
+/// A response's body holds its place among the requests in flight while
+/// it has parts to send, and gives it back as its last part is taken,
+/// though the body is not dropped yet.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_holds_its_place_in_flight_until_its_last_part_is_taken() {
+    use futures_util::StreamExt as _;
+
+    let (in_flight, places) = one_place();
+    let parts = vec![Bytes::from_static(b"moof"), Bytes::from_static(b"mdat")];
+    let mut sending = Sending::new(parts, in_flight);
+    for part in [&b"moof"[..], b"mdat"] {
+        assert_eq!(places.available_permits(), 0, "parts left");
+        assert_eq!(sending.next().await.unwrap().unwrap(), part);
+    }
+    assert_eq!(places.available_permits(), 0, "the end not taken yet");
+    assert!(sending.next().await.is_none());
+    assert_eq!(places.available_permits(), 1, "sent");
+    assert!(sending.next().await.is_none());
+    assert_eq!(places.available_permits(), 1);
+}
+
+/// A response's body dropped before its end, as when its client goes,
+/// gives its place back; so does the response it is the body of.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_dropped_unsent_gives_its_place_in_flight_back() {
+    use futures_util::StreamExt as _;
+
+    let (in_flight, places) = one_place();
+    let mut sending = Sending::new(vec![Bytes::from_static(b"moof")], in_flight);
+    assert!(sending.next().await.is_some());
+    drop(sending);
+    assert_eq!(places.available_permits(), 1);
+    let (in_flight, places) = one_place();
+    let answer = (HlsReply::Playlist("#EXTM3U\n".to_owned()), in_flight);
+    let response = reply(&peer(), &id("01JH"), Ok(answer));
+    assert_eq!(places.available_permits(), 0, "the response holds it");
+    drop(response);
+    assert_eq!(places.available_permits(), 1);
 }

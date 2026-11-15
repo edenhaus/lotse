@@ -409,6 +409,10 @@ struct LimitsFile {
     max_hls_blocked_per_session: Option<u32>,
     /// `limits.max_hls_blocked`.
     max_hls_blocked: Option<u32>,
+    /// `limits.max_hls_requests_per_session`.
+    max_hls_requests_per_session: Option<u32>,
+    /// `limits.max_hls_requests`.
+    max_hls_requests: Option<u32>,
 }
 
 /// `[stream]` in the file.
@@ -665,6 +669,20 @@ impl Resolver<'_> {
                 args.max_hls_blocked,
                 file.max_hls_blocked,
                 default.max_blocked,
+            ),
+            max_requests_per_session: self.pick(
+                "limits.max_hls_requests_per_session",
+                "max_hls_requests_per_session",
+                args.max_hls_requests_per_session,
+                file.max_hls_requests_per_session,
+                default.max_requests_per_session,
+            ),
+            max_requests: self.pick(
+                "limits.max_hls_requests",
+                "max_hls_requests",
+                args.max_hls_requests,
+                file.max_hls_requests,
+                default.max_requests,
             ),
         }
     }
@@ -1340,7 +1358,8 @@ mod tests {
             "socket = \"/s\"\n[limits]\nmax_hls_outputs = 2\nmax_hls_sessions = 6\n\
              max_hls_sessions_per_stream = 3\nhls_window_bytes = 1048576\n\
              hls_part_target_ms = 300\nhls_segment_target_ms = 2000\n\
-             hls_idle_timeout_ms = 5000\nmax_hls_blocked_per_session = 2\nmax_hls_blocked = 12\n",
+             hls_idle_timeout_ms = 5000\nmax_hls_blocked_per_session = 2\nmax_hls_blocked = 12\n\
+             max_hls_requests_per_session = 3\nmax_hls_requests = 20\n",
         )
         .unwrap();
         let config = path.to_str().unwrap();
@@ -1355,6 +1374,8 @@ mod tests {
             idle_timeout: Duration::from_secs(5),
             max_blocked_per_session: 2,
             max_blocked: 12,
+            max_requests_per_session: 3,
+            max_requests: 20,
         };
         assert_eq!(
             settings.supervisor.limits.hls,
@@ -1370,6 +1391,8 @@ mod tests {
             ("limits.hls_idle_timeout_ms", "5000"),
             ("limits.max_hls_blocked_per_session", "2"),
             ("limits.max_hls_blocked", "12"),
+            ("limits.max_hls_requests_per_session", "3"),
+            ("limits.max_hls_requests", "20"),
         ] {
             assert_eq!(
                 source_of(&provenance, name),
@@ -1386,11 +1409,14 @@ mod tests {
             "100",
             "--max-hls-blocked",
             "1",
+            "--max-hls-requests",
+            "7",
         ])
         .unwrap();
         for (name, value) in [
             ("limits.hls_part_target_ms", "100"),
             ("limits.max_hls_blocked", "1"),
+            ("limits.max_hls_requests", "7"),
         ] {
             assert_eq!(
                 source_of(&provenance, name),

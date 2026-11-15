@@ -260,6 +260,13 @@ the player; the daemon refuses a request that carries `Origin`.
   (4: the reload and the part a player holds, twice) and
   `limits.max_hls_blocked` (128) bound how many wait at once, past which a
   request is 429 `limit_reached`. A directive asking too far ahead is 400.
+- **Requests in flight.** A request counts from its arrival until its
+  response is sent or its client goes, a held one included:
+  `limits.max_hls_requests_per_session` (8: the two held, a download and
+  the init segment, twice) and `limits.max_hls_requests` (256) bound how
+  many are in flight at once, past which a request is 429 `limit_reached`.
+  A client taking a response slowly keeps its place, so these bound the
+  connections LL-HLS keeps open and the media its responses hold.
 - **Answers.** The playlist is `application/vnd.apple.mpegurl` with
   `Cache-Control: no-cache`, a segment or part `video/mp4` with
   `max-age=60`; each has its `Content-Length`, and each response closes its
@@ -276,7 +283,8 @@ the player; the daemon refuses a request that carries `Origin`.
 - **Limits.** `limits.max_hls_outputs` (8, each also a live output under
   `limits.max_live`) windows of at most `limits.hls_window_bytes` (32 MiB:
   seven 2 s segments of a 16 Mbit/s stream) each, so at most 256 MiB of
-  media in the daemon; `limits.max_hls_sessions` (32) and
+  media in the windows, and one segment or part more for each request in
+  flight; `limits.max_hls_sessions` (32) and
   `limits.max_hls_sessions_per_stream` (8) sessions; one more is
   `limit_reached` naming the limit.
 - **Deviations from the draft.** The Target Duration and Part Target

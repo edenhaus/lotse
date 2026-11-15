@@ -149,7 +149,7 @@ fn spawn_request(
     s: &Arc<Supervisor>,
     id: &HlsId,
     request: HlsRequest,
-) -> tokio::task::JoinHandle<Result<HlsReply, HlsError>> {
+) -> tokio::task::JoinHandle<Result<(HlsReply, InFlight), HlsError>> {
     let s = Arc::clone(s);
     let id = id.clone();
     spawn_named("test.hls_request", async move { s.hls(&id, request).await })
@@ -174,6 +174,8 @@ fn the_default_limits_are_the_documented_ones_and_make_the_window_s_config() {
             idle_timeout: Duration::from_secs(30),
             max_blocked_per_session: 4,
             max_blocked: 128,
+            max_requests_per_session: 8,
+            max_requests: 256,
         }
     );
     assert_eq!(HlsLimits::DEFAULT.window(), Config::default());
@@ -285,36 +287,43 @@ async fn rfc8216bis_6_2_5_2_an_hls_session_serves_its_output_s_window_until_it_c
     published(&s, &spec.live_id, 5).await;
     settle().await;
     assert!(!reload.is_finished(), "segment 1 is not complete");
-    let_assert!(Ok(HlsReply::Playlist(text)) = within(s.hls(&id, playlist(Blocking::None))).await);
+    let_assert!(
+        Ok((HlsReply::Playlist(text), _)) = within(s.hls(&id, playlist(Blocking::None))).await
+    );
     assert!(text.contains("#EXT-X-TARGETDURATION:1\n"), "{text}");
     let_assert!(
-        Ok(HlsReply::Media(init)) = within(s.hls(&id, HlsRequest::Media(Resource::Init))).await
+        Ok((HlsReply::Media(init), _)) =
+            within(s.hls(&id, HlsRequest::Media(Resource::Init))).await
     );
     assert_eq!(init.as_slice().concat(), b"init");
     let_assert!(
-        Ok(HlsReply::Media(part)) =
+        Ok((HlsReply::Media(part), _)) =
             within(s.hls(&id, HlsRequest::Media(Resource::Part { msn: 0, index: 1 }))).await
     );
     assert_eq!(part.len(), 8);
     let_assert!(
-        Ok(HlsReply::Media(segment)) =
+        Ok((HlsReply::Media(segment), _)) =
             within(s.hls(&id, HlsRequest::Media(Resource::Segment { msn: 0 }))).await
     );
     assert_eq!(segment.len(), 40);
     assert_eq!(
-        within(s.hls(&id, HlsRequest::Media(Resource::Segment { msn: 9 }))).await,
-        Err(HlsError::ResourceNotFound)
+        within(s.hls(&id, HlsRequest::Media(Resource::Segment { msn: 9 })))
+            .await
+            .err(),
+        Some(HlsError::ResourceNotFound)
     );
     assert_eq!(
-        within(s.hls(&id, playlist(Blocking::Segment { msn: 9 }))).await,
-        Err(HlsError::BadRequest)
+        within(s.hls(&id, playlist(Blocking::Segment { msn: 9 })))
+            .await
+            .err(),
+        Some(HlsError::BadRequest)
     );
     // Segment 1 completes: the blocked reload is answered.
     for frame in 0..10 {
         pipe.write_all(&record(fragment(frame == 9, 100), &[frame; 4]))
             .unwrap();
     }
-    let_assert!(Ok(Ok(HlsReply::Playlist(text))) = within(reload).await);
+    let_assert!(Ok(Ok((HlsReply::Playlist(text), _))) = within(reload).await);
     assert!(text.contains("seg1.m4s"), "{text}");
     let close = json!({ "id": 3, "type": "hls/close", "hls_id": id.as_str() });
     assert_eq!(result(call(&s, &close.to_string()).await), json!({}));
@@ -334,8 +343,8 @@ async fn rfc8216bis_6_2_5_2_an_hls_session_serves_its_output_s_window_until_it_c
         (ErrorCode::HlsNotFound, &json!(id.as_str()))
     );
     assert_eq!(
-        within(s.hls(&id, playlist(Blocking::None))).await,
-        Err(HlsError::NotFound)
+        within(s.hls(&id, playlist(Blocking::None))).await.err(),
+        Some(HlsError::NotFound)
     );
     s.shutdown().await;
     std::fs::remove_dir_all(dir).unwrap();
@@ -646,13 +655,13 @@ async fn rfc8216bis_6_2_5_2_blocked_requests_are_bounded_in_number_and_time() {
     let early = spawn_request(&s, &id, HlsRequest::Media(Resource::Init));
     settle().await;
     assert_eq!(
-        within(s.hls(&id, playlist(Blocking::None))).await,
-        Err(HlsError::TooManyBlocked {
+        within(s.hls(&id, playlist(Blocking::None))).await.err(),
+        Some(HlsError::TooManyBlocked {
             limit: "max_hls_blocked_per_session"
         })
     );
     clock.advance(start_timeout);
-    assert_eq!(within(early).await.unwrap(), Err(HlsError::Timeout));
+    assert_eq!(within(early).await.unwrap().err(), Some(HlsError::Timeout));
     pipe.write_all(&first_segment()).unwrap();
     published(&s, &live_id, 5).await;
     let hinted = HlsRequest::Media(Resource::Part { msn: 1, index: 0 });
@@ -666,33 +675,102 @@ async fn rfc8216bis_6_2_5_2_blocked_requests_are_bounded_in_number_and_time() {
     let third = hls_id(&third);
     for _ in 0..2 {
         assert_eq!(
-            within(s.hls(&third, hinted)).await,
-            Err(HlsError::TooManyBlocked {
+            within(s.hls(&third, hinted)).await.err(),
+            Some(HlsError::TooManyBlocked {
                 limit: "max_hls_blocked"
             })
         );
     }
     assert_eq!(
-        captured
-            .lines("LL-HLS blocked request refused at its limit")
-            .len(),
+        captured.lines("LL-HLS request refused at its limit").len(),
         2
     );
     // The hinted part completes; the other waits out three Target
     // Durations.
     pipe.write_all(&record(fragment(false, 100), &[11; 4]))
         .unwrap();
-    let_assert!(Ok(Ok(HlsReply::Media(part))) = within(blocked).await);
+    let_assert!(Ok(Ok((HlsReply::Media(part), _))) = within(blocked).await);
     assert_eq!(part.len(), 8);
     settle().await;
     assert!(!ahead.is_finished());
     clock.advance(Duration::from_secs(3));
-    assert_eq!(within(ahead).await.unwrap(), Err(HlsError::Timeout));
+    assert_eq!(within(ahead).await.unwrap().err(), Some(HlsError::Timeout));
     let gone = spawn_request(&s, &third, playlist(Blocking::Segment { msn: 2 }));
     settle().await;
     let close = json!({ "id": 7, "type": "hls/close", "hls_id": third.as_str() });
     result(call(&s, &close.to_string()).await);
-    assert_eq!(within(gone).await.unwrap(), Err(HlsError::NotFound));
+    assert_eq!(within(gone).await.unwrap().err(), Some(HlsError::NotFound));
+    stop(&s, &clock).await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Requests are bounded in flight, per session and in all (429), from
+/// their arrival until their response is dropped, blocked ones included,
+/// each cap warned once per interval; a response held past its session's
+/// end still holds its place in all.
+#[tokio::test]
+async fn requests_in_flight_are_bounded_until_their_responses_are_dropped() {
+    let captured = Captured::default();
+    let _logs = captured.install();
+    let dir = private_dir("hls-in-flight");
+    let clock = Arc::new(FakeClock::from_system());
+    let limits = HlsLimits {
+        max_requests_per_session: 2,
+        max_requests: 3,
+        idle_timeout: Duration::from_secs(3600),
+        ..HlsLimits::DEFAULT
+    };
+    let (s, mut commands) = rig(&dir, limits, clock.clone()).await;
+    let (live_id, mut pipe, id, _events) = first_session(&s, &mut commands).await;
+    pipe.write_all(&first_segment()).unwrap();
+    published(&s, &live_id, 5).await;
+    let init = HlsRequest::Media(Resource::Init);
+    let in_flight = || s.shared.lock().hls.requests.available_permits();
+    let first = within(s.hls(&id, init)).await.unwrap();
+    let blocked = spawn_request(&s, &id, playlist(Blocking::Segment { msn: 1 }));
+    while in_flight() != 1 {
+        settle().await;
+    }
+    let per_session = Some(HlsError::TooManyRequests {
+        limit: "max_hls_requests_per_session",
+    });
+    assert_eq!(within(s.hls(&id, init)).await.err(), per_session);
+    let create = json!({ "id": 5, "type": "hls/create", "stream_id": "front" });
+    let (second, _second_events) = started(within(call_on(&s, 1, &create)).await);
+    let second = hls_id(&second);
+    let held = within(s.hls(&second, init)).await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            within(s.hls(&second, init)).await.err(),
+            Some(HlsError::TooManyRequests {
+                limit: "max_hls_requests"
+            })
+        );
+    }
+    let refused = captured.lines("LL-HLS request refused at its limit");
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert!(
+        refused[0].contains("max_hls_requests_per_session"),
+        "{refused:?}"
+    );
+    // A sent or dropped response, and a blocked request that ends, give
+    // their places back.
+    drop(first);
+    blocked.abort();
+    while in_flight() != 2 {
+        settle().await;
+    }
+    let again = within(s.hls(&id, init)).await.unwrap();
+    assert_eq!(in_flight(), 1);
+    let close = json!({ "id": 6, "type": "hls/close", "hls_id": id.as_str() });
+    result(call(&s, &close.to_string()).await);
+    assert_eq!(
+        in_flight(),
+        1,
+        "the session's end leaves its response's place"
+    );
+    drop((again, held));
+    assert_eq!(in_flight(), 3);
     stop(&s, &clock).await;
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -713,7 +791,7 @@ async fn an_init_request_waiting_for_the_window_is_answered_as_the_window_is_mad
         settle().await;
     }
     pipe.write_all(&record(RecordKind::Init, b"init")).unwrap();
-    let_assert!(Ok(Ok(HlsReply::Media(init))) = within(early).await);
+    let_assert!(Ok(Ok((HlsReply::Media(init), _))) = within(early).await);
     assert_eq!(init.as_slice().concat(), b"init");
     assert_eq!(*feed(&s, &live_id).published.borrow(), 1, "no part yet");
     stop(&s, &clock).await;

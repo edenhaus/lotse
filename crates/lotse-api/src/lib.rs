@@ -72,7 +72,7 @@ pub mod test_util;
 pub mod tls;
 
 pub use clients::ClientsError;
-pub use hls::{HlsError, HlsReply, HlsRequest};
+pub use hls::{HlsError, HlsReply, HlsRequest, InFlight};
 pub use listener::{BindError, PeerInfo};
 pub use live::{LiveBody, LiveBodyError, live_id_of};
 pub use owners::Owners;
@@ -278,12 +278,13 @@ pub trait Handler: Send + Sync + 'static {
     /// the window can answer it (draft-pantos-hls-rfc8216bis-22 §6.2.5.2,
     /// §4.4.5.3), at most three Target Durations, then
     /// [`HlsError::Timeout`]. The future is dropped when the client goes.
-    /// Without LL-HLS, every id is [`HlsError::NotFound`].
+    /// The answer's [`InFlight`] is held until its response is sent or
+    /// dropped. Without LL-HLS, every id is [`HlsError::NotFound`].
     fn hls(
         &self,
         hls_id: &HlsId,
         request: HlsRequest,
-    ) -> impl Future<Output = Result<HlsReply, HlsError>> + Send {
+    ) -> impl Future<Output = Result<(HlsReply, InFlight), HlsError>> + Send {
         let _ = (hls_id, request);
         std::future::ready(Err(HlsError::NotFound))
     }
@@ -1292,18 +1293,19 @@ mod tests {
             &self,
             hls_id: &HlsId,
             request: HlsRequest,
-        ) -> impl Future<Output = Result<HlsReply, HlsError>> + Send {
+        ) -> impl Future<Output = Result<(HlsReply, InFlight), HlsError>> + Send {
             let release = Arc::clone(&self.release);
             let id = hls_id.clone();
             async move {
                 release.notified().await;
-                match request {
-                    HlsRequest::Playlist(_) => Ok(HlsReply::Playlist(format!("#EXTM3U\n#{id}\n"))),
-                    HlsRequest::Media(lotse_hls::Resource::Init) => Ok(HlsReply::Media(
+                let reply = match request {
+                    HlsRequest::Playlist(_) => HlsReply::Playlist(format!("#EXTM3U\n#{id}\n")),
+                    HlsRequest::Media(lotse_hls::Resource::Init) => HlsReply::Media(
                         lotse_hls::Chunks::from(axum::body::Bytes::from_static(b"init")),
-                    )),
-                    HlsRequest::Media(_) => Err(HlsError::ResourceNotFound),
-                }
+                    ),
+                    HlsRequest::Media(_) => return Err(HlsError::ResourceNotFound),
+                };
+                Ok((reply, InFlight::default()))
             }
         }
     }
@@ -1394,6 +1396,81 @@ mod tests {
         let text = String::from_utf8_lossy(&seen);
         assert!(text.starts_with("HTTP/1.1 404"), "{text}");
         assert!(text.contains("hls_not_found"), "{text}");
+    }
+
+    /// A handler with LL-HLS sessions of any id that answers every request
+    /// with 64 KiB of media, at once, holding one of `places`.
+    struct BigHls {
+        places: Arc<Semaphore>,
+    }
+
+    impl Handler for BigHls {
+        fn hello(&self) -> Hello {
+            Minimal.hello()
+        }
+
+        fn handle(
+            &self,
+            connection: ConnectionId,
+            command: Command,
+        ) -> impl Future<Output = Outcome> + Send {
+            Minimal.handle(connection, command)
+        }
+
+        fn hls(
+            &self,
+            _hls_id: &HlsId,
+            _request: HlsRequest,
+        ) -> impl Future<Output = Result<(HlsReply, InFlight), HlsError>> + Send {
+            let permit = Arc::clone(&self.places).try_acquire_owned().unwrap();
+            let media = axum::body::Bytes::from(vec![7_u8; 64 * 1024]);
+            let reply = HlsReply::Media(lotse_hls::Chunks::from(media));
+            std::future::ready(Ok((reply, InFlight::new(vec![permit]))))
+        }
+    }
+
+    /// An LL-HLS response holds the handler's place among the requests in
+    /// flight while its client takes it, past the handler's answer, and
+    /// gives it back once the client took it all, or once the client went
+    /// before it did.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_hls_response_holds_its_place_in_flight_until_it_is_sent_or_its_client_goes() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let places = Arc::new(Semaphore::new(1));
+        let handler = BigHls {
+            places: Arc::clone(&places),
+        };
+        assert_eq!(handler.hello(), Minimal.hello());
+        let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
+        assert!(matches!(
+            handler.handle(ConnectionId(1), info).await,
+            Outcome::Result(serde_json::Value::Null)
+        ));
+        let (admission, _pending) = admission_with(&clock, handler);
+        let request = b"GET /v0/hls/01JH/seg0.m4s HTTP/1.1\r\nHost: lotse\r\n\r\n";
+        for client_goes in [false, true] {
+            let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client.write_all(request).await.unwrap();
+            let head = String::from_utf8_lossy(&take(&mut client, 12).await).into_owned();
+            assert_eq!(head, "HTTP/1.1 200");
+            settle().await;
+            assert_eq!(places.available_permits(), 0, "64 KiB do not fit the pipe");
+            if client_goes {
+                drop(client);
+            } else {
+                let rest = finish(&mut client).await;
+                assert!(rest.ends_with(&[7_u8; 1024]), "the body to its end");
+            }
+            let mut tries = 0;
+            while places.available_permits() == 0 {
+                tries += 1;
+                assert!(tries < 100, "the place is given back");
+                settle().await;
+            }
+        }
     }
 
     /// The socket here is a pipe the client empties 4 KiB a second, so the
