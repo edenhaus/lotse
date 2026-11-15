@@ -44,6 +44,8 @@ struct FakeHandler {
     flood: Option<Arc<Notify>>,
     /// The subscriptions `webrtc/offer` opened, which end with `closed`.
     sessions: Mutex<Vec<(u64, mpsc::Sender<Event>)>>,
+    /// The subscriptions `hls/create` opened, which end with `closed`.
+    hls: Mutex<Vec<mpsc::Sender<Event>>>,
 }
 
 impl FakeHandler {
@@ -53,6 +55,17 @@ impl FakeHandler {
                 stream_id: stream_id.to_owned(),
             },
             payload: json!({ "type": "stream", "stream_id": stream_id, "state": state, "last_error": null }),
+        }
+    }
+
+    /// `hls/create` `id`: a result with content, then the session's events
+    /// until the test ends them.
+    fn hls_create(&self, id: u64) -> Outcome {
+        let (tx, rx) = mpsc::channel(8);
+        self.hls.lock().unwrap().push(tx);
+        Outcome::SubscribedWith {
+            result: json!({ "hls_id": format!("h{id}") }),
+            events: rx,
         }
     }
 }
@@ -121,6 +134,7 @@ impl Handler for FakeHandler {
                 self.sessions.lock().unwrap().push((offer.id, tx));
                 Outcome::Subscribed(rx)
             }
+            Command::HlsCreate(create) => self.hls_create(create.id),
             Command::RecordingCreate(start) => {
                 // A result with content, then the recording's events.
                 let (tx, rx) = mpsc::channel(8);
@@ -156,7 +170,6 @@ impl Handler for FakeHandler {
             | Command::SignalingError(_)
             | Command::LiveCreate(_)
             | Command::LiveClose(_)
-            | Command::HlsCreate(_)
             | Command::HlsClose(_) => Outcome::Result(json!({})),
             Command::Ping(_)
             | Command::Schema(_)
@@ -624,6 +637,46 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
     assert_eq!(refusals.len(), 2, "{refusals:?}");
     assert!(refusals[1].contains("id=11"), "{refusals:?}");
     assert!(refusals[1].contains("refused=5"), "{refusals:?}");
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `hls/create` opens a subscription, so it counts against
+/// `max_subscriptions` and is refused at it before the handler sees it; an
+/// LL-HLS session that ended (`closed`) frees its slot.
+#[tokio::test]
+async fn an_hls_session_counts_against_the_subscription_cap_until_it_closes() {
+    let running = start_limited("hls-subscription-cap", FakeHandler::default(), 8, 1);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    let create = |id: u64| json!({ "id": id, "type": "hls/create", "stream_id": "a" });
+    send(&mut ws, create(1)).await;
+    assert_eq!(
+        recv(&mut ws).await,
+        json!({ "id": 1, "type": "result", "success": true, "result": { "hls_id": "h1" } })
+    );
+    send(&mut ws, create(2)).await;
+    let refused = recv(&mut ws).await;
+    assert_eq!(
+        (&refused["id"], &refused["error"]["code"]),
+        (&json!(2), &json!("limit_reached")),
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["details"]["limit"], "max_subscriptions");
+    assert_eq!(running.handler.hls.lock().unwrap().len(), 1);
+    // The session closes: its subscription's last event, then its end.
+    let session = running.handler.hls.lock().unwrap().pop().unwrap();
+    let closed = Event {
+        class: EventClass::Signaling,
+        payload: json!({ "type": "closed", "hls_id": "h1", "reason": "closed" }),
+    };
+    session.send(closed).await.unwrap();
+    drop(session);
+    assert_eq!(recv(&mut ws).await["event"]["reason"], "closed");
+    send(&mut ws, json!({ "id": 3, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    send(&mut ws, create(4)).await;
+    assert_eq!(recv(&mut ws).await["result"]["hls_id"], "h4");
     ws.close(None).await.unwrap();
     running.finish().await;
 }
