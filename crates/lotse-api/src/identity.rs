@@ -7,10 +7,12 @@
 //! A generated certificate names [`SERVER_NAME`] as a DNS name in its
 //! subject alternative names, so a client whose TLS stack verifies by name
 //! can trust it as its own root and verify it by that name: Go's x509
-//! refuses a certificate that names its host only in the Common Name
-//! (observed with Go 1.15 and later: "certificate relies on legacy Common
-//! Name field, use SANs instead"), and Go accepts a leaf that is itself in
-//! the root pool as a chain of one, which amounts to pinning it. An
+//! never matches a name against the Common Name (from Go 1.15), so an
+//! identity without the name is refused (observed with Prometheus 3.16.0,
+//! `server_name: lotse`, on 2026-11-15: "x509: certificate is not valid
+//! for any names, but wanted to match lotse"), and Go accepts a leaf that
+//! is itself in the root pool as a chain of one, which amounts to pinning
+//! it (the same Prometheus scraped the reissued identity). An
 //! identity made before the name keeps working as it is: the pin is the
 //! SHA-256 of the whole certificate, so a new certificate is a new pin
 //! and every client pairs again. Only [`ServerIdentity::reissue`] makes
