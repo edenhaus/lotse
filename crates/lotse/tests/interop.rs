@@ -1654,7 +1654,8 @@ mod recording {
     /// What ffmpeg took of a session of a camera sending H.264 and `audio`,
     /// in `file`, as ffprobe decodes it: every frame, from a keyframe on,
     /// two seconds of the camera's frames or more, without a hole; the
-    /// camera's audio where the container carries it, without a hole.
+    /// camera's audio where the container carries it, without a hole and
+    /// over the video's span.
     #[cfg(feature = "output-hls")]
     fn check_hls_take(file: &Path, audio: Audio) {
         let (video, sound) = ffprobe(file);
@@ -1692,6 +1693,19 @@ mod recording {
         if let Some(sound) = sound {
             assert!(!sound.frames.is_empty(), "audio frames");
             assert_eq!(sound.holes(), [], "the audio runs without a hole");
+            // The audio covers the video's take at both ends: `holes` only
+            // sees between frames. Each end is allowed an audio frame (the
+            // first starts at or after the keyframe, and `-t` cuts each
+            // track at a frame of its own) plus EBU R37's 40 ms.
+            let slack_us = (sound.ms(sound.frames[0].duration) + AV_SYNC_MS) * 1_000;
+            let (video_start, audio_start) = (video.start_us(), sound.start_us());
+            let video_end = video_start + video.span_ms() * 1_000;
+            let audio_end = audio_start + sound.span_ms() * 1_000;
+            assert!(
+                audio_start.abs_diff(video_start) <= slack_us
+                    && audio_end.abs_diff(video_end) <= slack_us,
+                "audio from {audio_start} to {audio_end} us, video from {video_start} to {video_end} us"
+            );
         }
     }
 
