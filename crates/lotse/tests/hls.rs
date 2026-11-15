@@ -188,8 +188,12 @@ async fn rfc8216bis_6_2_5_2_an_hls_session_plays_the_camera_until_closed() {
     .await;
     assert_eq!(reload.status, 200);
     let reloaded = String::from_utf8(reload.bytes).unwrap();
+    // The hint alone names the part too: only a part tag shows that the reload waited for it.
     assert!(
-        reloaded.contains(&format!("URI=\"{hinted}\"")),
+        reloaded
+            .lines()
+            .any(|line| line.starts_with("#EXT-X-PART:")
+                && line.contains(&format!("URI=\"{hinted}\""))),
         "{reloaded}"
     );
     let part = get(&socket, &format!("{base}/{hinted}")).await;
