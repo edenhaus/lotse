@@ -1401,6 +1401,8 @@ pub enum FakeLiveFailure {
     Start,
     /// `push` fails on the first frame it takes.
     Push,
+    /// `skip` fails, as at a hole.
+    Skip,
 }
 
 /// A live container that writes lines a reader can parse instead of
@@ -1518,6 +1520,11 @@ impl LiveMuxer for FakeLiveMuxer {
     }
 
     fn skip(&mut self) -> Result<Option<LiveFragment>, RecordingError> {
+        if self.fail == Some(FakeLiveFailure::Skip) {
+            return Err(RecordingError::Failed(
+                "the fake live writer fails every skip".into(),
+            ));
+        }
         if self.waiting {
             return Ok(None);
         }
