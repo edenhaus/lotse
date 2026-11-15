@@ -1025,6 +1025,12 @@ mod tests {
         assert_eq!(answer["success"], true, "{answer}");
         assert!(!leaving);
         assert_eq!(store.role(&scraper), Some(ClientRole::Metrics));
+        assert!(
+            clients_add(clients, &unix, &text, ClientRole::Metrics)
+                .await
+                .is_ok(),
+            "idempotent"
+        );
         let refused = clients_add(clients, &unix, &text, ClientRole::Control)
             .await
             .unwrap_err();
@@ -1036,6 +1042,7 @@ mod tests {
             "clients/add refused: not on the control socket",
             "adding the control client failed",
             "clients/add refused: the pin has the other role",
+            "clients/add: the pin already has the role, nothing to add",
         ] {
             assert!(text.contains(line), "{line}: {text}");
         }
