@@ -46,6 +46,33 @@ struct FakeHandler {
     sessions: Mutex<Vec<(u64, mpsc::Sender<Event>)>>,
     /// The `live/create` commands the handler began.
     lives: AtomicU64,
+    /// The `live/create` commands of stream `door` still waiting.
+    creating: AtomicU64,
+    /// [`Self::creating`] when the connection closed.
+    creating_at_close: AtomicU64,
+    /// `signaling/answer`: releases one `live/create` of stream `door`.
+    answered: Notify,
+    /// Notified once `webrtc/reoffer` began.
+    reoffering: Notify,
+    /// Releases a `webrtc/reoffer`.
+    reoffered: Notify,
+}
+
+/// Counts a waiting `live/create` in [`FakeHandler::creating`] until
+/// dropped, its future with it.
+struct Creating<'a>(&'a AtomicU64);
+
+impl<'a> Creating<'a> {
+    fn new(creating: &'a AtomicU64) -> Self {
+        creating.fetch_add(1, Ordering::AcqRel);
+        Self(creating)
+    }
+}
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl FakeHandler {
@@ -60,10 +87,25 @@ impl FakeHandler {
 }
 
 impl FakeHandler {
-    /// `live/create` `id`: the output's result, then its `closed`, which
-    /// ends the subscription.
-    fn live_create(&self, id: u64) -> Outcome {
+    /// `webrtc/reoffer`: waits for the test, as the supervisor's for the
+    /// worker.
+    async fn reoffer(&self) -> Outcome {
+        self.reoffering.notify_one();
+        self.reoffered.notified().await;
+        Outcome::Result(json!({ "sdp": "v=0" }))
+    }
+
+    /// `live/create` `id` of `stream_id`: the output's result, then its
+    /// `closed`, which ends the subscription. On stream `door`, a
+    /// signaled source's, it waits for a `signaling/answer`, as the
+    /// supervisor's waits for the init segment a source sends only once
+    /// the camera's answer is relayed.
+    async fn live_create(&self, id: u64, stream_id: &str) -> Outcome {
         self.lives.fetch_add(1, Ordering::AcqRel);
+        if stream_id == "door" {
+            let _creating = Creating::new(&self.creating);
+            self.answered.notified().await;
+        }
         let (tx, rx) = mpsc::channel(8);
         let _queued = tx.try_send(Event {
             class: EventClass::Signaling,
@@ -155,7 +197,12 @@ impl Handler for FakeHandler {
                     events: rx,
                 }
             }
-            Command::LiveCreate(create) => self.live_create(create.id),
+            Command::LiveCreate(create) => self.live_create(create.id, &create.stream_id).await,
+            Command::SignalingAnswer(_) => {
+                self.answered.notify_one();
+                Outcome::Result(json!({}))
+            }
+            Command::WebrtcReoffer(_) => self.reoffer().await,
             // A refusal at a limit, as the supervisor's busy connection.
             Command::BackchannelRelease(_) => Outcome::Error(
                 ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
@@ -167,13 +214,11 @@ impl Handler for FakeHandler {
             Command::MetricsGet(_) => Outcome::Result(json!({ "pad": "x".repeat(2 << 20) })),
             Command::StreamDelete(_)
             | Command::WebrtcCandidate(_)
-            | Command::WebrtcReoffer(_)
             | Command::SessionGet(_)
             | Command::SessionList(_)
             | Command::SessionClose(_)
             | Command::SessionAdopt(_)
             | Command::SignalingSubscribe(_)
-            | Command::SignalingAnswer(_)
             | Command::SignalingCandidate(_)
             | Command::SignalingError(_)
             | Command::LiveClose(_) => Outcome::Result(json!({})),
@@ -202,6 +247,8 @@ impl Handler for FakeHandler {
     }
 
     fn connection_closed(&self, _connection: ConnectionId) {
+        self.creating_at_close
+            .store(self.creating.load(Ordering::Acquire), Ordering::Release);
         self.closed.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -690,6 +737,138 @@ async fn a_live_output_holds_a_subscription_slot_until_it_ends() {
     );
     assert_eq!(running.handler.lives.load(Ordering::Acquire), 2);
     ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `live/create` waits for the worker's init segment, which a signaled
+/// source sends only once the client relayed the camera's answer, on the
+/// same connection as like as not: the connection reads and answers further
+/// commands while a create waits, and answers it once the handler does.
+/// Each waiting create holds its subscription slot from the start, so
+/// creates at once cannot pass `max_subscriptions`.
+#[tokio::test]
+async fn a_waiting_live_create_leaves_its_connection_answering_the_commands_that_release_it() {
+    let running = start_limited("live-waits", FakeHandler::default(), 8, 2);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    for id in 1..=3 {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "live/create", "stream_id": "door" }),
+        )
+        .await;
+    }
+    let refused = recv(&mut ws).await;
+    assert_eq!(refused["id"], 3, "{refused}");
+    assert_eq!(refused["error"]["code"], "limit_reached", "{refused}");
+    assert_eq!(running.handler.lives.load(Ordering::Acquire), 2);
+    for (create, answer) in [(1, 4), (2, 5)] {
+        send(
+            &mut ws,
+            json!({ "id": answer, "type": "signaling/answer", "signal_id": "s", "sdp": "v=0" }),
+        )
+        .await;
+        let answered = recv(&mut ws).await;
+        assert_eq!(answered["id"], answer, "{answered}");
+        assert_eq!(answered["success"], true, "{answered}");
+        let created = recv(&mut ws).await;
+        assert_eq!(created["id"], create, "{created}");
+        assert_eq!(created["result"]["url"], format!("/v0/live/l{create}"));
+        assert_eq!(
+            recv(&mut ws).await,
+            json!({ "id": create, "type": "event", "event": { "type": "closed", "reason": "closed" } })
+        );
+    }
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// A command that does not wait on a camera, `webrtc/reoffer` here, is
+/// answered before the connection reads the next one, so what a client
+/// sends after it, the candidates of the new offer, reaches the handler
+/// after it.
+#[tokio::test]
+async fn a_command_that_does_not_wait_on_a_camera_is_answered_before_the_next_is_read() {
+    let running = start("reoffer-in-line", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    send(
+        &mut ws,
+        json!({ "id": 1, "type": "webrtc/reoffer", "session_id": "s1", "sdp": "v=0" }),
+    )
+    .await;
+    within_5_s(running.handler.reoffering.notified()).await;
+    send(&mut ws, json!({ "id": 2, "type": "ping" })).await;
+    // Every task here runs on this thread: yielding lets the connection
+    // read the ping, were it not held up.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    running.handler.reoffered.notify_one();
+    assert_eq!(recv(&mut ws).await["id"], 1);
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// A shutdown refuses a `live/create` still waiting, its future dropped,
+/// before the `shutdown` frame and the close.
+#[tokio::test]
+async fn shutdown_refuses_a_waiting_live_create_before_it_says_goodbye() {
+    let running = start("live-shutdown", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    send(
+        &mut ws,
+        json!({ "id": 1, "type": "live/create", "stream_id": "door" }),
+    )
+    .await;
+    send(&mut ws, json!({ "id": 2, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 1);
+    running.shutdown.cancel();
+    let refused = recv(&mut ws).await;
+    assert_eq!(refused["id"], 1, "{refused}");
+    assert_eq!(refused["error"]["code"], "shutting_down", "{refused}");
+    assert_eq!(recv(&mut ws).await["type"], "shutdown");
+    // RFC 6455 §7.4.1: 1001, going away.
+    assert_eq!(recv(&mut ws).await, json!({ "closed": 1001 }));
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
+    running.finish().await;
+}
+
+/// A `live/create` still waiting when its client leaves goes with the
+/// connection: its future is dropped before the handler hears the
+/// connection closed, which ends what the create opened.
+#[tokio::test]
+async fn a_waiting_live_create_is_dropped_before_its_connection_is_closed() {
+    let (logs, _guard) = capture(tracing::Level::INFO);
+    let running = start("live-left", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    send(
+        &mut ws,
+        json!({ "id": 1, "type": "live/create", "stream_id": "door" }),
+    )
+    .await;
+    send(&mut ws, json!({ "id": 2, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 1);
+    ws.close(None).await.unwrap();
+    within_5_s(async {
+        while running.handler.closed.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(running.handler.creating_at_close.load(Ordering::Acquire), 0);
+    let text = logs.text();
+    assert!(
+        text.contains("waiting=1")
+            && text.contains("commands still waiting dropped with the connection"),
+        "{text}"
+    );
     running.finish().await;
 }
 

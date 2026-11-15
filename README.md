@@ -188,7 +188,12 @@ bytes once, in the chunked transfer coding: the init segment, then one
 cached keyframe on. The client proxies it to the browser; the daemon refuses
 a request that carries `Origin`. The command waits for the worker's init
 segment, at most `limits.live_start_timeout_ms` (10 s), since the MIME type
-needs the camera's parameter sets.
+needs the camera's parameter sets. The connection goes on reading and
+answering other commands meanwhile, so the result may come after theirs: an
+on-demand WebRTC camera starts for the output and sends its offer to the
+`signaling/subscribe` subscription, and the client's `signaling/answer` on
+the same connection is what lets the create finish. A waiting create counts
+against the connection's subscription cap from the start.
 
 - **Join.** The output starts at the stream's cached GOP and sends it at
   once, so its first frame is as old as that GOP: up to the camera's
