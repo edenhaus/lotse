@@ -7558,6 +7558,22 @@ mod tests {
             .lock()
             .live_report(&connection, &live_id, live_started());
         let (_answer, mut events) = started(within(create).await.unwrap());
+        // Another stream's output, on a connection of its own, stays.
+        result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
+        let back = s.shared.lock().streams["back"].sources[0]
+            .connection
+            .clone();
+        let (tx, mut back_commands) = mpsc::channel(16);
+        s.shared.lock().connections.get_mut(&back).unwrap().commands = tx;
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(4, "back")).await }
+        });
+        let back_live = live_start(&mut back_commands).await;
+        s.shared
+            .lock()
+            .live_report(&back, &back_live, live_started());
+        let (_answer, _back_events) = started(within(create).await.unwrap());
         let failover = json!({ "id": 3, "type": "stream/put", "stream_id": "front",
                                "sources": [{ "protocol": "fake", "url": "fake://127.0.0.1:9/" },
                                            { "protocol": "fake", "url": "fake://127.0.0.1:1/" }] });
@@ -7578,6 +7594,8 @@ mod tests {
         );
         assert_eq!(next(&mut events).await["reason"], "stream_changed");
         assert!(!s.shared.lock().lives.contains_key(&live_id));
+        assert!(s.shared.lock().lives.contains_key(&back_live));
+        assert!(back_commands.try_recv().is_err(), "nothing asked of it");
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
