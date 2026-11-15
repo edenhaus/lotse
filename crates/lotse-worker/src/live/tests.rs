@@ -265,20 +265,23 @@ async fn an_output_writes_its_init_at_once_and_its_media_from_the_cached_keyfram
         ["init video=h264 audio=aac_lc"]
     );
     assert!(rig.lives.fetch("l1"));
-    assert!(rig.lives.fetch("l1"), "a second fetch changes nothing");
-    settle().await;
-    assert!(rig.video_frame(4, false, 7));
-    rig.audio_frame(0);
     assert_eq!(
         lines(&available(&reader).await),
         [
             "frame v 0 3600 k 5",
             "frame v 0 7200 - 4",
             "frame v 0 10800 - 6",
-            "frame v 0 14400 - 7",
-            "frame a 0 0 k 4",
         ],
-        "the GOP from its keyframe, the frames since the start included, then the live ones"
+        "at the fetch, the GOP from its keyframe, the frames since the start included"
+    );
+    assert!(rig.lives.fetch("l1"), "a second fetch changes nothing");
+    settle().await;
+    assert!(rig.video_frame(4, false, 7));
+    rig.audio_frame(0);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["frame v 0 14400 - 7", "frame a 0 0 k 4"],
+        "then the live ones"
     );
     assert!(rig.lives.stop("l1", LiveEnd::Stopped));
     let (reason, bytes, dropped, drops) = rig.closed().await;

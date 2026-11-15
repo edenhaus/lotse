@@ -11,7 +11,7 @@ import pytest
 from selenium import webdriver
 from selenium.webdriver.common.service import Service
 
-from harness import Settings, options
+from harness import CASES, Settings, options
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -84,3 +84,10 @@ def driver_port(request: pytest.FixtureRequest) -> Iterator[int]:
 def test_a_driver_without_a_shutdown_endpoint_stops_without_a_warning(driver_port: int) -> None:
     # Selenium drops the unclosed HTTPError; pyproject's filter keeps `error` from failing on it.
     _Driver(executable_path="driver", port=driver_port).send_remote_shutdown_command()
+
+
+def test_the_mse_cases_play_each_audio_the_live_output_meets() -> None:
+    mse = {name: case.audio for name, case in CASES.items() if case.mse}
+    assert mse == {"mse": "aac", "mse-pcmu": "pcmu", "mse-opus": "opus"}
+    assert all(CASES[name].disrupt is None for name in mse)
+    assert not any(case.mse for case in CASES.values() if case.name not in mse)

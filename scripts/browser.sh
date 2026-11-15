@@ -8,9 +8,10 @@
 #
 # Builds `lotse` and `lotse-browser` in release and runs the test with uv (the Python and the
 # packages pinned in tests/browser/uv.lock); the test starts the daemon, `lotse-browser` and the
-# browser once per case (`--case join|aac|pli|reconnect|crash|all`, repeatable, default all;
-# tests/browser/harness.py), and writes target/browser-<engine>/<case>/report.json with the
-# daemon's, the example's and the driver's logs. `mise run browser` calls it.
+# browser once per case (`--case join|aac|pli|reconnect|crash|mse|mse-pcmu|mse-opus|all`,
+# repeatable, default all; tests/browser/harness.py), and writes
+# target/browser-<engine>/<case>/report.json with the daemon's, the example's and the driver's
+# logs. `mise run browser` calls it.
 #
 # The browser is the installed one, its driver the one Selenium Manager resolves for it (on PATH
 # when it matches, else fetched); `--browser-version 142` (Chrome for Testing, Firefox) has
