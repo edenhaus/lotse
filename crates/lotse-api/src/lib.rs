@@ -18,7 +18,8 @@
 //! it serves event recordings' bytes, `GET /v0/recording/{recording_id}`, as chunked
 //! response bodies the handler hands over ([`Handler::recording_body`]),
 //! bounded by the client taking them and, over TLS, by its client staying
-//! enrolled.
+//! enrolled. A TLS client's role decides which routes it reaches
+//! (the `access` module): a `metrics` client none of these.
 //!
 //! Standards: RFC 6455 (WebSocket, close codes §7.4.1, `Origin` §10.2),
 //! RFC 9110 (HTTP), RFC 9112 (HTTP/1.1, the chunked transfer coding §7.1
@@ -51,6 +52,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
+mod access;
 mod clients;
 mod connection;
 pub mod identity;
@@ -63,7 +65,7 @@ mod recording;
 pub mod test_util;
 pub mod tls;
 
-pub use clients::ClientsError;
+pub use clients::{ClientsError, PinsError, RoleName, parse_pins, render_pins};
 pub use listener::{BindError, PeerInfo};
 pub use owners::Owners;
 pub use recording::{RecordingBody, RecordingBodyError};
@@ -122,6 +124,9 @@ pub const BODY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// wrote: 5 s, after which the body ends without its last chunk. A worker
 /// reports as it closes its pipe.
 pub const RECORDING_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The route of a recording's bytes, as the router has it.
+const RECORDING_ROUTE: &str = "/v0/recording/{recording_id}";
 
 /// Connections accepted and not yet upgraded, at once: 8. One more is
 /// closed at accept, without a response. A TLS connection takes its place
@@ -204,7 +209,7 @@ pub enum Outcome {
 }
 
 /// What the supervisor implements. `ping`, `schema`, `unsubscribe`,
-/// `pairing/create`, `clients/list` and `clients/remove` are answered by
+/// `pairing/create`, `clients/list`, `clients/remove` and `clients/add` are answered by
 /// the server itself; everything else goes here, and so do the requests
 /// for recordings' bytes.
 pub trait Handler: Send + Sync + 'static {
@@ -512,13 +517,30 @@ impl Admission {
         let serving = state.serving.clone();
         let clients = state.clients.clone();
         let next_id = Arc::clone(&state.next_id);
+        let lines = Arc::new(access::RefusalLines::new(Arc::clone(&clock)));
+        // A layer of each route's own, so every method of it, its
+        // fallback's too, is checked, and the log names the route.
+        let control_only = |route: &'static str| {
+            axum::middleware::from_fn_with_state(
+                access::ControlOnly {
+                    clients: clients.clone(),
+                    lines: Arc::clone(&lines),
+                    route,
+                },
+                access::control_only,
+            )
+        };
         let app = Router::new()
-            .route(lotse_api_types::WS_PATH, get(connection::upgrade::<H>))
             .route(
-                &format!("{}/{{recording_id}}", lotse_api_types::RECORDING_PATH),
+                lotse_api_types::WS_PATH,
+                get(connection::upgrade::<H>).layer(control_only(lotse_api_types::WS_PATH)),
+            )
+            .route(
+                RECORDING_ROUTE,
                 get(recording::fetch::<H>)
                     .head(recording::not_allowed)
-                    .fallback(recording::not_allowed),
+                    .fallback(recording::not_allowed)
+                    .layer(control_only(RECORDING_ROUTE)),
             )
             .with_state(state);
         let mut http = http1::Builder::new();
@@ -761,6 +783,14 @@ mod tests {
         ) -> impl Future<Output = Outcome> + Send {
             std::future::ready(Outcome::Result(serde_json::Value::Null))
         }
+    }
+
+    #[test]
+    fn the_recording_route_is_the_recording_path_and_its_id() {
+        assert_eq!(
+            RECORDING_ROUTE,
+            format!("{}/{{recording_id}}", lotse_api_types::RECORDING_PATH)
+        );
     }
 
     #[test]

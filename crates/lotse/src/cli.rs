@@ -178,6 +178,18 @@ pub(crate) struct ServeArgs {
     )]
     pub(crate) control_clients: Option<Vec<Fingerprint>>,
 
+    /// The client certificates allowed on the control TLS listener to read
+    /// `GET /v0/metrics` and nothing else (a Prometheus scraper), by their
+    /// SHA-256 as `--control-clients` takes them, comma-separated. A pin in
+    /// both lists stops the start.
+    #[arg(
+        long,
+        env = "LOTSE_METRICS_CLIENTS",
+        value_name = "PIN,...",
+        value_delimiter = ','
+    )]
+    pub(crate) metrics_clients: Option<Vec<Fingerprint>>,
+
     /// Where the daemon keeps what outlives a restart: the control TLS
     /// listener's key and certificate. Must exist, belong to the starting uid
     /// (or, started as root, to `--user`) and give the group and others no

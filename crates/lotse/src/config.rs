@@ -308,6 +308,9 @@ struct FileConfig {
     /// `[control]`.
     #[serde(default)]
     control: ControlFile,
+    /// `[metrics]`.
+    #[serde(default)]
+    metrics: MetricsFile,
     /// `sandbox`.
     sandbox: Option<Mode>,
     /// `[webrtc]`.
@@ -334,6 +337,14 @@ struct ControlFile {
     /// `control.listen`.
     listen: Option<SocketAddr>,
     /// `control.clients`.
+    clients: Option<Vec<Fingerprint>>,
+}
+
+/// `[metrics]` in the file.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsFile {
+    /// `metrics.clients`.
     clients: Option<Vec<Fingerprint>>,
 }
 
@@ -619,8 +630,8 @@ impl Resolver<'_> {
         }
     }
 
-    /// The control TLS listener, from `control.listen`, `control.clients`
-    /// and `data_dir`: none without a listen address, and an error without
+    /// The control TLS listener, from `control.listen`, `control.clients`,
+    /// `metrics.clients` and `data_dir`: none without a listen address, and an error without
     /// a data directory for its identity. No `control.clients` is no
     /// error: the listener then admits the clients enrolled by pairing,
     /// and until there is one, only a client that pairs.
@@ -629,6 +640,7 @@ impl Resolver<'_> {
         args: &ServeArgs,
         data_dir: Option<PathBuf>,
         file: ControlFile,
+        metrics: MetricsFile,
         state_owner: (u32, u32),
     ) -> Result<Option<ControlTls>, ConfigError> {
         let data_dir = self.pick_required(
@@ -652,9 +664,17 @@ impl Resolver<'_> {
             file.clients.map(Pins),
             Pins(Vec::new()),
         );
+        let metrics_clients = self.pick(
+            "metrics.clients",
+            "metrics_clients",
+            args.metrics_clients.clone().map(Pins),
+            metrics.clients.map(Pins),
+            Pins(Vec::new()),
+        );
         Ok(Some(ControlTls {
             listen,
             clients: clients.0,
+            metrics_clients: metrics_clients.0,
             data_dir: data_dir.ok_or(ConfigError::MissingDataDir)?.0,
             state_owner,
         }))
@@ -796,7 +816,7 @@ pub(crate) fn load(
     );
     let own_gid = rustix::process::getgid().as_raw();
     let state_owner = state_owner(starting_uid, (uid, gid), own_gid);
-    let control_tls = r.control(args, file.data_dir, file.control, state_owner)?;
+    let control_tls = r.control(args, file.data_dir, file.control, file.metrics, state_owner)?;
     let mode = r.pick("sandbox", "sandbox", args.sandbox, file.sandbox, SANDBOX);
     let udp_listen = r.pick(
         "webrtc.udp_listen",
@@ -1319,10 +1339,55 @@ mod tests {
         let control = settings.supervisor.control_tls.unwrap();
         assert_eq!(control.listen, "[::]:18557".parse().unwrap());
         assert_eq!(control.clients, [Fingerprint::of(b"abc")]);
+        assert_eq!(control.metrics_clients, []);
         assert_eq!(
             source_of(&provenance, "control.clients"),
             (PIN_ABC_PAIRS.into(), Source::File)
         );
+        assert_eq!(
+            source_of(&provenance, "metrics.clients"),
+            (String::new(), Source::Default)
+        );
+
+        // `[metrics] clients` from the file, `--metrics-clients` over it.
+        std::fs::write(
+            &path,
+            format!("data_dir = \"/data\"\n[control]\nlisten = \"[::]:18557\"\n[metrics]\nclients = [\"{PIN_ABC}\"]\n"),
+        )
+        .unwrap();
+        let (settings, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/z.sock",
+            "--config",
+            config,
+        ])
+        .unwrap();
+        let control = settings.supervisor.control_tls.unwrap();
+        assert_eq!(control.metrics_clients, [Fingerprint::of(b"abc")]);
+        assert_eq!(control.clients, []);
+        assert_eq!(
+            source_of(&provenance, "metrics.clients"),
+            (PIN_ABC_PAIRS.into(), Source::File)
+        );
+        let other = Fingerprint::of(b"other");
+        let (settings, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/z.sock",
+            "--config",
+            config,
+            "--metrics-clients",
+            &format!("{PIN_ABC},{}", other.to_hex()),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.supervisor.control_tls.unwrap().metrics_clients,
+            [Fingerprint::of(b"abc"), other]
+        );
+        assert_eq!(source_of(&provenance, "metrics.clients").1, Source::Flag);
 
         // Without pins the listener is configured, and refused when it binds.
         let (settings, _) = resolve(&[

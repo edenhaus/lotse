@@ -1,6 +1,12 @@
 //! The control TLS listener's allowed clients: the fixed pins of the
-//! configuration and the pins enrolled by pairing, which persist across
-//! restarts in `<data-dir>/clients/pins`.
+//! configuration and the pins enrolled by pairing or `clients/add`, which
+//! persist across restarts in `<data-dir>/clients/pins`, each with its
+//! [`ClientRole`]: `control` may use the whole API, `metrics` only
+//! `GET /v0/metrics`. The role is lotse's, kept with the pin, never read
+//! from the certificate, which the client made itself. A pin has one
+//! role: one fixed with both, or fixed with one and enrolled with the
+//! other, stops the start, and enrolling a pin that has the other role is
+//! refused, so a pin's role only changes by removing it first.
 //!
 //! Enrollment happens at runtime, after the privilege drop and under the
 //! sandbox, so the enrolled pins live in a directory of their own that the
@@ -13,7 +19,9 @@
 //! uid needs no access to the directories above it. The directory is
 //! held under an exclusive `flock` for the store's lifetime, so a second
 //! daemon on the same data directory is refused rather than overwriting
-//! the enrollments of the first. The pins file is one pin per line,
+//! the enrollments of the first. The pins file is one pin per line, then
+//! its role after blanks (`<pin> metrics`); a line with the pin alone, as
+//! files written before roles have, is `control` ([`parse_pins`]). It is
 //! replaced whole on every change: written to a new file with mode 0600,
 //! synced, renamed into place and the directory synced, so a crash leaves
 //! the old list or the new one. The rename is the change: once it is done
@@ -31,7 +39,7 @@
 //! connections are closed, so a new enrollment of the same pin waits and
 //! its fresh connection is never closed by the removal before it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
@@ -39,7 +47,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
 
-use lotse_api_types::clients::{ClientList, ControlClient};
+use lotse_api_types::clients::{ClientList, ClientRole, ControlClient};
 use lotse_core::fingerprint::Fingerprint;
 use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
@@ -50,7 +58,7 @@ use crate::ConnectionId;
 /// The enrolled clients' directory in the data directory.
 pub(crate) const CLIENTS_DIR: &str = "clients";
 
-/// The enrolled pins in [`CLIENTS_DIR`], one per line.
+/// The enrolled pins in [`CLIENTS_DIR`], one per line with its role.
 pub(crate) const PINS_FILE: &str = "pins";
 
 /// Where an update writes before the rename to [`PINS_FILE`].
@@ -94,17 +102,107 @@ pub enum ClientsError {
         /// The uid the daemon runs as after the privilege drop.
         expected: u32,
     },
-    /// A line is not a pin.
-    #[error("enrolled clients {path}, line {line}: not a certificate pin")]
+    /// A line is not a pin and a role.
+    #[error("enrolled clients {path}, line {line}: {what}")]
     Pin {
         /// The file.
         path: String,
         /// The line, from 1.
         line: usize,
+        /// What is wrong with it.
+        what: &'static str,
+    },
+    /// The configuration fixes a pin with both roles.
+    #[error(
+        "client pin {0} is configured both as a control and as a metrics client; keep it in one of `control.clients` and `metrics.clients`"
+    )]
+    FixedRoles(Fingerprint),
+    /// The configuration fixes a pin with one role and the file enrolls it
+    /// with the other.
+    #[error(
+        "client pin {pin} is configured as a {fixed} client but enrolled as a {enrolled} one in {path}; remove it from one of them"
+    )]
+    EnrolledRole {
+        /// The file.
+        path: String,
+        /// The pin.
+        pin: Fingerprint,
+        /// Its role in the configuration.
+        fixed: RoleName,
+        /// Its role in the file.
+        enrolled: RoleName,
     },
     /// Another daemon holds the directory.
     #[error("enrolled clients {0} are in use by another lotse daemon on the same data directory")]
     InUse(String),
+}
+
+/// A [`ClientRole`] as an error message names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleName(pub ClientRole);
+
+impl std::fmt::Display for RoleName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+
+/// Why a line of the enrolled pins file (`<data-dir>/clients/pins`) was
+/// refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("line {line}: {what}")]
+pub struct PinsError {
+    /// The line, from 1.
+    pub line: usize,
+    /// What is wrong with it.
+    pub what: &'static str,
+}
+
+/// The pins of the enrolled pins file's `text`, each with its role. Every line is
+/// a pin ([`Fingerprint::parse`]), then optionally blanks and a role
+/// (`control`, `metrics`), with blanks around them ignored; a pin alone
+/// is `control`, as every line of a file from before roles is. Blank lines
+/// are skipped; anything else, a pin given twice with different roles
+/// included, refuses the whole file. Runs on a file the daemon wrote, but
+/// never panics (fuzzed).
+pub fn parse_pins(text: &str) -> Result<BTreeMap<Fingerprint, ClientRole>, PinsError> {
+    let mut pins = BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index.saturating_add(1);
+        let refuse = |what| PinsError {
+            line: line_number,
+            what,
+        };
+        let mut tokens = line.split_ascii_whitespace();
+        let Some(pin) = tokens.next() else {
+            continue;
+        };
+        let pin = Fingerprint::parse(pin).map_err(|_| refuse("not a certificate pin"))?;
+        let role = match tokens.next() {
+            None => ClientRole::Control,
+            Some(role) => ClientRole::parse(role).ok_or_else(|| refuse("not a role"))?,
+        };
+        if tokens.next().is_some() {
+            return Err(refuse("more than a pin and a role"));
+        }
+        if pins.insert(pin, role).is_some_and(|before| before != role) {
+            return Err(refuse("the pin again, with another role"));
+        }
+    }
+    Ok(pins)
+}
+
+/// The text of the enrolled pins file for `pins`: one line each, the pin, a blank
+/// and its role, which [`parse_pins`] reads back as `pins`.
+pub fn render_pins(pins: &BTreeMap<Fingerprint, ClientRole>) -> String {
+    let mut content = String::new();
+    for (pin, role) in pins {
+        content.push_str(&pin.to_string());
+        content.push(' ');
+        content.push_str(role.as_str());
+        content.push('\n');
+    }
+    content
 }
 
 /// Syncs [`CLIENTS_DIR`] after a rename in it.
@@ -131,15 +229,27 @@ pub(crate) enum Removal {
     Fixed,
 }
 
-/// Who may connect: the fixed pins and the enrolled ones.
+/// What [`ClientStore::add`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Addition {
+    /// The pin is enrolled with the role now.
+    Added,
+    /// The pin already had the role, fixed or enrolled: nothing changed.
+    Already,
+    /// The pin has this other role: nothing changed.
+    OtherRole(ClientRole),
+}
+
+/// Who may connect, and with which role: the fixed pins and the enrolled
+/// ones.
 #[derive(Debug)]
 pub(crate) struct ClientStore {
     /// The configuration's pins, which no enrollment changes.
-    fixed: HashSet<Fingerprint>,
+    fixed: HashMap<Fingerprint, ClientRole>,
     /// The enrolled pins, as [`PINS_FILE`] holds them. Its lock is only
-    /// ever held to read or to replace the set, never across a write to
+    /// ever held to read or to replace the map, never across a write to
     /// disk: the TLS verifier reads it on the runtime's threads.
-    enrolled: RwLock<BTreeSet<Fingerprint>>,
+    enrolled: RwLock<BTreeMap<Fingerprint, ClientRole>>,
     /// Held across a whole change of [`PINS_FILE`], so changes are written
     /// one at a time and each starts from the set the last one left.
     writing: Mutex<()>,
@@ -161,7 +271,9 @@ impl ClientStore {
     /// checked by the caller; `data_dir` only names it) if it is missing,
     /// owned by `runtime` (the uid and gid the daemon runs as after the
     /// drop) and mode 0700, checks it, locks it, and reads the enrolled
-    /// pins. A start that is not root owns what it makes and chowns it to
+    /// pins. `fixed` are the configuration's pins with their roles; a pin
+    /// there twice with both roles, or enrolled with the role it is not
+    /// fixed with, is an error. A start that is not root owns what it makes and chowns it to
     /// its own uid and gid, so it needs no capability. Every step goes
     /// through a descriptor: [`CLIENTS_DIR`] is made
     /// and opened in `data`, [`PINS_FILE`] in [`CLIENTS_DIR`], neither
@@ -170,9 +282,18 @@ impl ClientStore {
     pub(crate) fn open(
         data: &File,
         data_dir: &Path,
-        fixed: &[Fingerprint],
+        fixed: &[(Fingerprint, ClientRole)],
         runtime: (u32, u32),
     ) -> Result<Self, ClientsError> {
+        let mut roles = HashMap::new();
+        for (pin, role) in fixed {
+            if roles
+                .insert(*pin, *role)
+                .is_some_and(|before| before != *role)
+            {
+                return Err(ClientsError::FixedRoles(*pin));
+            }
+        }
         let dir = data_dir.join(CLIENTS_DIR);
         let text = dir.display().to_string();
         let io = |source: io::Error| io_error(&text, source);
@@ -205,16 +326,33 @@ impl ClientStore {
             Err(err) if err == Errno::WOULDBLOCK => return Err(ClientsError::InUse(text.clone())),
             locked => locked.map_err(io::Error::from).map_err(io)?,
         }
-        let enrolled = read_pins(&handle, &dir.join(PINS_FILE), runtime.0)?;
+        let path = dir.join(PINS_FILE);
+        let enrolled = read_pins(&handle, &path, runtime.0)?;
+        for (pin, role) in &enrolled {
+            if let Some(fixed) = roles.get(pin).filter(|fixed| *fixed != role) {
+                return Err(ClientsError::EnrolledRole {
+                    path: path.display().to_string(),
+                    pin: *pin,
+                    fixed: RoleName(*fixed),
+                    enrolled: RoleName(*role),
+                });
+            }
+        }
         // Close-on-exec, as `OPEN` asks: no worker inherits it.
         let dir_fd = OwnedFd::from(handle);
+        let metrics = roles
+            .values()
+            .chain(enrolled.values())
+            .filter(|role| **role == ClientRole::Metrics)
+            .count();
         tracing::info!(
-            fixed = fixed.len(),
+            fixed = roles.len(),
             enrolled = enrolled.len(),
+            metrics,
             "control TLS clients loaded"
         );
         Ok(Self {
-            fixed: fixed.iter().copied().collect(),
+            fixed: roles,
             enrolled: RwLock::new(enrolled),
             writing: Mutex::new(()),
             dir,
@@ -237,14 +375,20 @@ impl ClientStore {
         (&self.dir, self.dir_fd.as_fd())
     }
 
-    /// Whether `pin` may connect.
+    /// Whether `pin` may connect, with either role.
     pub(crate) fn allows(&self, pin: &Fingerprint) -> bool {
-        self.fixed.contains(pin)
-            || self
-                .enrolled
+        self.role(pin).is_some()
+    }
+
+    /// `pin`'s role, `None` when it may not connect.
+    pub(crate) fn role(&self, pin: &Fingerprint) -> Option<ClientRole> {
+        self.fixed.get(pin).copied().or_else(|| {
+            self.enrolled
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
-                .contains(pin)
+                .get(pin)
+                .copied()
+        })
     }
 
     /// Whether no client may connect yet.
@@ -257,19 +401,41 @@ impl ClientStore {
                 .is_empty()
     }
 
-    /// Enrolls `pin`: the file first, then the set, so a pin is allowed
-    /// only once it is on disk. An error means nothing changed. Once the
-    /// new file is renamed into place the pin is enrolled; a failed sync of
-    /// the directory after that is logged, as a crash could still lose the
-    /// enrollment. Blocking: run it off the runtime's threads.
+    /// Enrolls `pin` as a `control` client, as pairing does: [`Self::add`],
+    /// with a pin that is a `metrics` client refused as an error, so a
+    /// pairing never widens what a pin may do. Blocking: run it off the
+    /// runtime's threads.
     pub(crate) fn enroll(&self, pin: Fingerprint) -> io::Result<()> {
+        match self.add(pin, ClientRole::Control)? {
+            Addition::Added | Addition::Already => Ok(()),
+            Addition::OtherRole(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the pin is a metrics client; remove it before pairing it",
+            )),
+        }
+    }
+
+    /// Enrolls `pin` with `role`: the file first, then the map, so a pin
+    /// is allowed only once it is on disk. A pin that already has `role`,
+    /// fixed or enrolled, is left as it is, and one that has the other is
+    /// refused: its role changes only by removing it first. An error means
+    /// nothing changed. Once the new file is renamed into place the pin is
+    /// enrolled; a failed sync of the directory after that is logged, as a
+    /// crash could still lose the enrollment. Blocking: run it off the
+    /// runtime's threads.
+    pub(crate) fn add(&self, pin: Fingerprint, role: ClientRole) -> io::Result<Addition> {
         let writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        match self.role(&pin) {
+            Some(had) if had == role => return Ok(Addition::Already),
+            Some(other) => return Ok(Addition::OtherRole(other)),
+            None => {}
+        }
         let mut next = self
             .enrolled
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        next.insert(pin);
+        next.insert(pin, role);
         write_pins(&self.dir_fd, &next)?;
         *self
             .enrolled
@@ -277,7 +443,7 @@ impl ClientStore {
             .unwrap_or_else(PoisonError::into_inner) = next;
         self.sync_after_rename(pin, "enrolled");
         drop(writing);
-        Ok(())
+        Ok(Addition::Added)
     }
 
     /// Syncs [`CLIENTS_DIR`] after [`PINS_FILE`] was renamed into place
@@ -324,24 +490,25 @@ impl ClientStore {
         self.connections().remove(&id);
     }
 
-    /// Every allowed pin, ordered, whether it is fixed and whether it has a
-    /// connection open.
+    /// Every allowed pin, ordered, whether it is fixed, its role and
+    /// whether it has a connection open.
     pub(crate) fn list(&self) -> ClientList {
         let connected: HashSet<Fingerprint> =
             self.connections().values().map(|(pin, _)| *pin).collect();
-        let mut pins: BTreeMap<Fingerprint, bool> = self
+        let mut pins: BTreeMap<Fingerprint, (bool, ClientRole)> = self
             .enrolled
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|pin| (*pin, false))
+            .map(|(pin, role)| (*pin, (false, *role)))
             .collect();
-        pins.extend(self.fixed.iter().map(|pin| (*pin, true)));
+        pins.extend(self.fixed.iter().map(|(pin, role)| (*pin, (true, *role))));
         let clients = pins
             .into_iter()
-            .map(|(pin, fixed)| ControlClient {
+            .map(|(pin, (fixed, role))| ControlClient {
                 pin: pin.to_string(),
                 fixed,
+                role,
                 connected: connected.contains(&pin),
             })
             .collect();
@@ -360,7 +527,7 @@ impl ClientStore {
     /// whatever it is answering. A fixed pin stays. Blocking: run it off
     /// the runtime's threads.
     pub(crate) fn remove(&self, pin: Fingerprint, by: ConnectionId) -> io::Result<Removal> {
-        if self.fixed.contains(&pin) {
+        if self.fixed.contains_key(&pin) {
             return Ok(Removal::Fixed);
         }
         let writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
@@ -369,7 +536,7 @@ impl ClientStore {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if !next.remove(&pin) {
+        if next.remove(&pin).is_none() {
             return Ok(Removal::Unknown);
         }
         write_pins(&self.dir_fd, &next)?;
@@ -446,32 +613,26 @@ const OPEN: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 
 /// The pins in [`PINS_FILE`] in the directory `dir`, which `path` names,
-/// none when it does not exist. Blank lines are skipped; anything else
-/// must be a pin.
-fn read_pins(dir: &File, path: &Path, owner: u32) -> Result<BTreeSet<Fingerprint>, ClientsError> {
+/// with their roles ([`parse_pins`]), none when it does not exist.
+fn read_pins(
+    dir: &File,
+    path: &Path,
+    owner: u32,
+) -> Result<BTreeMap<Fingerprint, ClientRole>, ClientsError> {
     let text = path.display().to_string();
     let io = |source: io::Error| io_error(&text, source);
     let mut file = match rustix::fs::openat(dir, PINS_FILE, OPEN, Mode::empty()) {
-        Err(err) if err == Errno::NOENT => return Ok(BTreeSet::new()),
+        Err(err) if err == Errno::NOENT => return Ok(BTreeMap::new()),
         opened => File::from(opened.map_err(io::Error::from).map_err(io)?),
     };
     check(&text, &file.metadata().map_err(io)?, "regular file", owner)?;
     let mut content = String::new();
     io::Read::read_to_string(&mut file, &mut content).map_err(io)?;
-    let mut pins = BTreeSet::new();
-    for (index, line) in content.lines().enumerate() {
-        let line_number = index.saturating_add(1);
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let pin = Fingerprint::parse(line).map_err(|_| ClientsError::Pin {
-            path: text.clone(),
-            line: line_number,
-        })?;
-        pins.insert(pin);
-    }
-    Ok(pins)
+    parse_pins(&content).map_err(|err| ClientsError::Pin {
+        path: text.clone(),
+        line: err.line,
+        what: err.what,
+    })
 }
 
 /// How [`write_pins`] makes its file: write-only, new (`EXCL` also refuses a
@@ -484,20 +645,15 @@ const CREATE: OFlags = OFlags::WRONLY
 /// The new file's mode: 0600.
 const PRIVATE: Mode = Mode::RUSR.union(Mode::WUSR);
 
-/// Replaces [`PINS_FILE`] in the directory `dir` with `pins`: a new file
+/// Replaces [`PINS_FILE`] in the directory `dir` with `pins` ([`render_pins`]): a new file
 /// with mode 0600, synced and renamed into place; the caller syncs the
 /// directory. A partial file a crash left behind is replaced. An error
 /// means [`PINS_FILE`] is unchanged.
-fn write_pins(dir: &OwnedFd, pins: &BTreeSet<Fingerprint>) -> io::Result<()> {
+fn write_pins(dir: &OwnedFd, pins: &BTreeMap<Fingerprint, ClientRole>) -> io::Result<()> {
     let _stale = rustix::fs::unlinkat(dir, PARTIAL_FILE, AtFlags::empty());
     let fd = rustix::fs::openat(dir, PARTIAL_FILE, CREATE, PRIVATE)?;
     let mut file = File::from(fd);
-    let mut content = String::new();
-    for pin in pins {
-        content.push_str(&pin.to_string());
-        content.push('\n');
-    }
-    file.write_all(content.as_bytes())?;
+    file.write_all(render_pins(pins).as_bytes())?;
     file.sync_all()?;
     drop(file);
     rustix::fs::renameat(dir, PARTIAL_FILE, dir, PINS_FILE)?;
@@ -529,6 +685,20 @@ mod tests {
         fixed: &[Fingerprint],
         runtime: (u32, u32),
     ) -> Result<ClientStore, ClientsError> {
+        let fixed: Vec<_> = fixed
+            .iter()
+            .map(|pin| (*pin, ClientRole::Control))
+            .collect();
+        open_with(dir, &fixed, runtime)
+    }
+
+    /// The store in the data directory `dir`, with `fixed` pins of either
+    /// role.
+    fn open_with(
+        dir: &Path,
+        fixed: &[(Fingerprint, ClientRole)],
+        runtime: (u32, u32),
+    ) -> Result<ClientStore, ClientsError> {
         ClientStore::open(&File::open(dir).unwrap(), dir, fixed, runtime)
     }
 
@@ -537,6 +707,206 @@ mod tests {
             rustix::process::getuid().as_raw(),
             rustix::process::getgid().as_raw(),
         )
+    }
+
+    /// A pin's text as the file holds it.
+    fn pin(seed: &[u8]) -> (Fingerprint, String) {
+        let pin = Fingerprint::of(seed);
+        (pin, pin.to_string())
+    }
+
+    #[test]
+    fn a_pin_alone_is_a_control_client_as_in_files_from_before_roles() {
+        let (a, a_text) = pin(b"a");
+        let (b, _) = pin(b"b");
+        let old = format!("{a_text}\n\n  {}  \n", b.to_hex().to_uppercase());
+        let parsed = parse_pins(&old).unwrap();
+        assert_eq!(
+            parsed.into_iter().collect::<Vec<_>>(),
+            [(a, ClientRole::Control), (b, ClientRole::Control)]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(parse_pins(""), Ok(BTreeMap::new()));
+    }
+
+    #[test]
+    fn a_pin_and_its_role_after_blanks_parse_and_render_back() {
+        let (a, a_text) = pin(b"a");
+        let (b, b_text) = pin(b"b");
+        let text = format!("{a_text}\tmetrics\n{b_text}  control \n{a_text} metrics\n");
+        let parsed = parse_pins(&text).unwrap();
+        assert_eq!(parsed.get(&a), Some(&ClientRole::Metrics));
+        assert_eq!(parsed.get(&b), Some(&ClientRole::Control));
+        assert_eq!(parsed.len(), 2, "the same pin and role twice is one");
+        let rendered = render_pins(&parsed);
+        assert_eq!(parse_pins(&rendered), Ok(parsed.clone()));
+        for line in rendered.lines() {
+            let (pin, role) = line.split_once(' ').unwrap();
+            assert_eq!(
+                parsed
+                    .get(&Fingerprint::parse(pin).unwrap())
+                    .unwrap()
+                    .as_str(),
+                role
+            );
+        }
+        assert!(rendered.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_pin_and_a_role_refuses_the_file_with_its_number() {
+        let (_, a) = pin(b"a");
+        for (text, line, what) in [
+            ("nope\n".to_owned(), 1, "not a certificate pin"),
+            (format!("\n{a} admin\n"), 2, "not a role"),
+            (format!("{a} Metrics\n"), 1, "not a role"),
+            (
+                format!("{a} metrics extra\n"),
+                1,
+                "more than a pin and a role",
+            ),
+            (
+                format!("{a} metrics\n{a} control\n"),
+                2,
+                "the pin again, with another role",
+            ),
+            (
+                format!("{a}\n{a} metrics\n"),
+                2,
+                "the pin again, with another role",
+            ),
+        ] {
+            assert_eq!(parse_pins(&text), Err(PinsError { line, what }), "{text:?}");
+        }
+        assert_eq!(
+            PinsError {
+                line: 3,
+                what: "not a role"
+            }
+            .to_string(),
+            "line 3: not a role"
+        );
+    }
+
+    #[test]
+    fn a_pin_keeps_one_role_and_pairing_never_widens_a_metrics_client() {
+        let dir = data_dir("roles");
+        let (fixed, scraper, viewer) = (
+            Fingerprint::of(b"fixed"),
+            Fingerprint::of(b"scraper"),
+            Fingerprint::of(b"viewer"),
+        );
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let store = open_with(&dir, &[(fixed, ClientRole::Metrics)], runtime()).unwrap();
+        let loaded = logs.text();
+        assert!(
+            loaded.contains("control TLS clients loaded fixed=1 enrolled=0 metrics=1"),
+            "{loaded}"
+        );
+        assert_eq!(store.role(&fixed), Some(ClientRole::Metrics));
+        assert_eq!(store.role(&scraper), None);
+        assert_eq!(
+            store.add(scraper, ClientRole::Metrics).unwrap(),
+            Addition::Added
+        );
+        assert_eq!(
+            store.add(scraper, ClientRole::Metrics).unwrap(),
+            Addition::Already
+        );
+        assert_eq!(
+            store.add(scraper, ClientRole::Control).unwrap(),
+            Addition::OtherRole(ClientRole::Metrics)
+        );
+        assert_eq!(
+            store.add(fixed, ClientRole::Metrics).unwrap(),
+            Addition::Already
+        );
+        assert_eq!(
+            store.add(fixed, ClientRole::Control).unwrap(),
+            Addition::OtherRole(ClientRole::Metrics)
+        );
+        let err = store.enroll(scraper).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(store.role(&scraper), Some(ClientRole::Metrics));
+        store.enroll(viewer).unwrap();
+        store.enroll(viewer).unwrap();
+        assert_eq!(store.role(&viewer), Some(ClientRole::Control));
+        let roles: Vec<(String, bool, ClientRole)> = store
+            .list()
+            .clients
+            .into_iter()
+            .map(|client| (client.pin, client.fixed, client.role))
+            .collect();
+        let mut expected = vec![
+            (fixed.to_string(), true, ClientRole::Metrics),
+            (scraper.to_string(), false, ClientRole::Metrics),
+            (viewer.to_string(), false, ClientRole::Control),
+        ];
+        expected.sort_by_key(|(pin, _, _)| Fingerprint::parse(pin).unwrap());
+        assert_eq!(roles, expected);
+        let file = dir.join(CLIENTS_DIR).join(PINS_FILE);
+        let written = parse_pins(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(written.len(), 2, "the fixed pin is not written");
+        assert_eq!(written[&scraper], ClientRole::Metrics);
+        assert_eq!(
+            store.remove(scraper, ConnectionId(9)).unwrap(),
+            Removal::Removed { closed: 0 }
+        );
+        assert_eq!(
+            store.add(scraper, ClientRole::Control).unwrap(),
+            Addition::Added
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pin_fixed_with_both_roles_or_enrolled_with_the_other_is_refused_at_open() {
+        let dir = data_dir("role-conflicts");
+        let (fixed, viewer) = (Fingerprint::of(b"fixed"), Fingerprint::of(b"viewer"));
+        let store = open(&dir, &[], runtime()).unwrap();
+        store.enroll(viewer).unwrap();
+        let file = dir.join(CLIENTS_DIR).join(PINS_FILE);
+        drop(store);
+        let err = open_with(
+            &dir,
+            &[(fixed, ClientRole::Metrics), (fixed, ClientRole::Control)],
+            runtime(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ClientsError::FixedRoles(pin) if pin == fixed),
+            "{err}"
+        );
+        let err = open_with(&dir, &[(viewer, ClientRole::Metrics)], runtime()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientsError::EnrolledRole {
+                    pin,
+                    fixed: RoleName(ClientRole::Metrics),
+                    enrolled: RoleName(ClientRole::Control),
+                    ..
+                } if pin == viewer
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&format!(
+                "client pin {viewer} is configured as a metrics client but enrolled as a control one in {}",
+                file.display()
+            )),
+            "{err}"
+        );
+        open_with(
+            &dir,
+            &[(viewer, ClientRole::Control), (viewer, ClientRole::Control)],
+            runtime(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -565,7 +935,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            format!("{enrolled}\n")
+            format!("{enrolled} control\n")
         );
         assert!(!clients.join(PARTIAL_FILE).exists());
 
@@ -772,16 +1142,19 @@ mod tests {
             ControlClient {
                 pin: fixed.to_string(),
                 fixed: true,
+                role: ClientRole::Control,
                 connected: false,
             },
             ControlClient {
                 pin: gone.to_string(),
                 fixed: false,
+                role: ClientRole::Control,
                 connected: true,
             },
             ControlClient {
                 pin: kept.to_string(),
                 fixed: false,
+                role: ClientRole::Control,
                 connected: true,
             },
         ];
@@ -813,7 +1186,10 @@ mod tests {
             "idempotent"
         );
         let file = dir.join(CLIENTS_DIR).join(PINS_FILE);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{kept}\n"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("{kept} control\n")
+        );
         // A connection of a pin removed since its handshake closes at once.
         assert!(store.attach(ConnectionId(5), gone).is_cancelled());
         assert!(!store.attach(ConnectionId(6), fixed).is_cancelled());
@@ -836,7 +1212,10 @@ mod tests {
         store.enroll(pin).unwrap();
         assert!(store.allows(&pin), "the renamed file is the list in force");
         let file = dir.join(CLIENTS_DIR).join(PINS_FILE);
-        assert_eq!(std::fs::read_to_string(file).unwrap(), format!("{pin}\n"));
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            format!("{pin} control\n")
+        );
         assert!(logs.text().contains("a crash may undo the change"));
         assert!(logs.text().contains("change=\"enrolled\""));
         assert_eq!(
