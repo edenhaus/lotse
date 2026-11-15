@@ -3711,6 +3711,11 @@ mod tests {
             failing.push(Kind::Video, recording_frame(t0, 0, 0, true, b"x")),
             Err(RecordingError::Failed(_))
         ));
+        let mut skipping = FakeLiveMuxerFactory {
+            fail: Some(FakeLiveFailure::Skip),
+        }
+        .muxer();
+        assert!(matches!(skipping.skip(), Err(RecordingError::Failed(_))));
     }
 
     /// The fake recording container carries H.264, H.265, AAC-LC and Opus and
