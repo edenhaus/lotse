@@ -143,7 +143,8 @@ impl Live {
             // A started output has its origin.
             let origin = self.origin.unwrap_or(frame.wallclock);
             self.video.push(frame, origin)?;
-            return self.ready(self.video.has_ready());
+            // The frame before it is finished now: its fragment, if any.
+            return self.ready(true);
         }
         if !frame.keyframe {
             return Ok(LiveStep::Dropped);

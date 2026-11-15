@@ -728,11 +728,6 @@ impl TrackWriter {
         self.ready_bytes
     }
 
-    /// Whether a sample is ready for the next fragment.
-    pub(crate) const fn has_ready(&self) -> bool {
-        !self.ready.is_empty()
-    }
-
     /// The decode time of the first sample ready for the next fragment and
     /// where the last one's decode ends, from the media time 0; `None` with
     /// none ready.
