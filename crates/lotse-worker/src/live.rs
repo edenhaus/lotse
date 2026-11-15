@@ -578,6 +578,10 @@ impl Output {
         loop {
             // A new pipe is writable once the runtime polled it, not before.
             self.write()?;
+            // tokio's readiness futures spend no budget: a pipe that reads
+            // as writable while a write takes nothing would otherwise keep
+            // this loop from ever yielding the thread.
+            tokio::task::consume_budget().await;
             tokio::select! {
                 biased;
                 fetch = fetched(asked) => {
@@ -656,6 +660,8 @@ impl Output {
             if let Err(reason) = self.write() {
                 return reason;
             }
+            // As in `await_fetch`: the loop yields the thread now and again.
+            tokio::task::consume_budget().await;
             let left = deadline.saturating_duration_since(self.clock.now());
             let step = tokio::select! {
                 biased;
