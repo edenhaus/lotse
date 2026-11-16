@@ -2348,13 +2348,14 @@ mod tests {
             },
         )
         .await;
+        // Up to 5 s for the hand-off; `received` starts empty, so the loop
+        // reads at least once and none of its lines depends on timing.
         let mut received = Vec::new();
-        for _ in 0..500 {
-            received = std::fs::read(&out).unwrap_or_default();
-            if received.windows(17).any(|w| w == b"tcp-handoff-ufrag") {
-                break;
-            }
+        let mut tries = 0;
+        while tries < 500 && !received.windows(17).any(|w| w == b"tcp-handoff-ufrag") {
             SystemClock.sleep(Duration::from_millis(10)).await;
+            received = std::fs::read(&out).unwrap_or_default();
+            tries += 1;
         }
         assert!(
             received.windows(10).any(|w| w == b"live-offer"),
