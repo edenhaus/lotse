@@ -150,7 +150,7 @@ sha1 = { version = "0.11", default-features = false }
 # The TURN client's long-term credential key for the MD5 password algorithm (RFC 8489 §9.2.2,
 # §18.5.1.1), which every TURN server still offers; already in the tree via retina's Digest auth
 # (http-auth), on digest 0.10.
-md-5 = { version = "0.10", default-features = false }
+md-5 = { version = "0.11", default-features = false }
 # Socket options the standard library lacks: dual-stack, buffer sizes, DSCP, and `sendmsg` with a
 # control message for the audio track's DSCP.
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
