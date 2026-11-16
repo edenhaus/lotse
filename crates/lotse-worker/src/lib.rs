@@ -4314,17 +4314,13 @@ mod tests {
                     &mut frame,
                 );
                 datagrams.send(&frame).unwrap();
-                let (echoed, _, mark) = within(async {
-                    loop {
-                        browser.readable().await.unwrap();
-                        if let Ok(received) = browser.try_io(tokio::io::Interest::READABLE, || {
-                            Ok(lotse_testing::dscp::recv_marked(&browser)?)
-                        }) {
-                            break received;
-                        }
-                    }
-                })
-                .await;
+                // `async_io` waits out a spurious readiness itself.
+                let (echoed, _, mark) =
+                    within(browser.async_io(tokio::io::Interest::READABLE, || {
+                        Ok(lotse_testing::dscp::recv_marked(&browser)?)
+                    }))
+                    .await
+                    .unwrap();
                 assert_eq!((&echoed[..], mark), (payload, Some(dscp)));
             }
         }
