@@ -231,15 +231,28 @@ async fn rfc9111_5_2_2_5_a_live_body_is_an_uncached_chunked_200_of_its_mime_type
     assert_eq!(headers[header::CONNECTION], "close");
     assert_eq!(headers["x-live-id"], "01JL");
     assert_eq!(*body.subscribe().borrow(), BodyState::Taken);
-    let bytes = axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .unwrap();
-    assert_eq!(&bytes[..], b"init");
+    assert_eq!(bounded_bytes(response.into_body()).await, b"init");
     assert!(logs.text().contains("live body: the output ended"));
     // A MIME type no header can carry falls back to the container's.
     let odd = |_: &LiveId| Ok(live(b"", "video/mp4\n"));
     let response = answer_to("/v0/live/01JL", &body, &odd);
     assert_eq!(response.headers()[header::CONTENT_TYPE], FALLBACK_MIME);
+}
+
+/// More chunks than any body here has: a body that never ends is cut at
+/// this many, so its test fails at once instead of growing until nextest
+/// ends it.
+const MAX_CHUNKS: usize = 64;
+
+/// `body`'s bytes, read as at most [`MAX_CHUNKS`] chunks; one that has not
+/// ended by then fails the test.
+async fn bounded_bytes(body: Body) -> Vec<u8> {
+    let chunks: Vec<_> = body.into_data_stream().take(MAX_CHUNKS).collect().await;
+    assert!(chunks.len() < MAX_CHUNKS, "a body that never ends");
+    chunks
+        .into_iter()
+        .flat_map(|chunk| chunk.unwrap().to_vec())
+        .collect()
 }
 
 /// A reader that yields its chunk once, then fails.
@@ -272,6 +285,7 @@ async fn a_live_body_is_read_in_chunks_of_a_pipe_s_capacity() {
         peer: peer(),
     };
     let sizes: Vec<usize> = body_stream(sending)
+        .take(MAX_CHUNKS)
         .map(|chunk| chunk.unwrap().len())
         .collect()
         .await;
@@ -287,7 +301,7 @@ async fn rfc9112_8_a_live_body_whose_read_fails_is_cut() {
         live_id: LiveId::new("01JL").unwrap(),
         peer: peer(),
     };
-    let chunks: Vec<io::Result<Bytes>> = body_stream(sending).collect().await;
+    let chunks: Vec<io::Result<Bytes>> = body_stream(sending).take(MAX_CHUNKS).collect().await;
     assert_eq!(chunks.len(), 2);
     assert_eq!(&chunks[0].as_ref().unwrap()[..], b"moof");
     assert!(chunks[1].is_err());
