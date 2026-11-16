@@ -332,7 +332,7 @@ pub(crate) struct ServeArgs {
     pub(crate) max_hls_blocked: Option<u32>,
 
     /// LL-HLS requests of one session in flight at once, until their
-    /// response is sent.
+    /// response's connection ends.
     #[arg(long, env = "LOTSE_MAX_HLS_REQUESTS_PER_SESSION", value_name = "N")]
     pub(crate) max_hls_requests_per_session: Option<u32>,
 

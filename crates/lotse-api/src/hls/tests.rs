@@ -234,7 +234,7 @@ async fn rfc8216bis_4_a_playlist_is_an_uncached_mpegurl_of_its_length_on_a_closi
     let (logs, _guard) = capture();
     let text = "#EXTM3U\n".to_owned();
     let answer = (HlsReply::Playlist(text.clone()), InFlight::default());
-    let response = reply(&peer(), &id("01JH"), Ok(answer));
+    let response = reply(&peer(), &id("01JH"), Ok(answer), &BodyWatch::new());
     assert_eq!(response.status(), StatusCode::OK);
     let headers = response.headers().clone();
     assert_eq!(
@@ -275,7 +275,7 @@ async fn rfc8216bis_3_1_2_a_resource_is_its_chunks_as_mp4_of_their_length() {
     };
     assert!(segment.as_slice().len() > 1, "{segment:?}");
     let answer = (HlsReply::Media(segment), InFlight::default());
-    let response = reply(&peer(), &id("01JH"), Ok(answer));
+    let response = reply(&peer(), &id("01JH"), Ok(answer), &BodyWatch::new());
     let headers = response.headers().clone();
     assert_eq!(headers[header::CONTENT_TYPE], "video/mp4");
     assert_eq!(headers[header::CACHE_CONTROL], "max-age=60");
@@ -312,7 +312,7 @@ async fn rfc8216bis_6_2_5_2_the_handler_s_refusals_map_to_their_status_and_code(
         ),
         (HlsError::Timeout, 503, "source_timeout"),
     ] {
-        let response = reply(&peer(), &id("01JH"), Err(error));
+        let response = reply(&peer(), &id("01JH"), Err(error), &BodyWatch::new());
         assert_eq!(response.headers()[header::CONNECTION], "close");
         let (got, body) = status_and_error(response).await;
         assert_eq!((got, body["code"].as_str().unwrap()), (status, code));
@@ -349,42 +349,31 @@ fn one_place() -> (InFlight, Arc<tokio::sync::Semaphore>) {
     (InFlight::new(vec![permit]), places)
 }
 
-/// A response's body holds its place among the requests in flight while
-/// it has parts to send, and gives it back as its last part is taken,
-/// though the body is not dropped yet.
+/// A `200`'s connection holds its place among the requests in flight past
+/// the response and its body, whatever the client took, and gives it back
+/// as the connection ends: when the last clone of its watch goes.
 #[tokio::test(flavor = "current_thread")]
-async fn a_body_holds_its_place_in_flight_until_its_last_part_is_taken() {
-    use futures_util::StreamExt as _;
-
-    let (in_flight, places) = one_place();
-    let parts = vec![Bytes::from_static(b"moof"), Bytes::from_static(b"mdat")];
-    let mut sending = Sending::new(parts, in_flight);
-    for part in [&b"moof"[..], b"mdat"] {
-        assert_eq!(places.available_permits(), 0, "parts left");
-        assert_eq!(sending.next().await.unwrap().unwrap(), part);
+async fn a_response_s_place_in_flight_is_held_until_its_connection_ends() {
+    let playlist = || HlsReply::Playlist("#EXTM3U\n".to_owned());
+    let media = || HlsReply::Media(Chunks::from(Bytes::from_static(b"moof")));
+    for answer in [playlist(), media()] {
+        let (in_flight, places) = one_place();
+        let connection = BodyWatch::new();
+        let service = connection.clone();
+        let response = reply(&peer(), &id("01JH"), Ok((answer, in_flight)), &service);
+        assert_eq!(places.available_permits(), 0, "the connection holds it");
+        let sent = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+        assert!(!sent.is_empty());
+        assert_eq!(places.available_permits(), 0, "sent, the connection open");
+        drop(service);
+        assert_eq!(
+            places.available_permits(),
+            0,
+            "the connection's task holds it"
+        );
+        drop(connection);
+        assert_eq!(places.available_permits(), 1, "the connection ended");
     }
-    assert_eq!(places.available_permits(), 0, "the end not taken yet");
-    assert!(sending.next().await.is_none());
-    assert_eq!(places.available_permits(), 1, "sent");
-    assert!(sending.next().await.is_none());
-    assert_eq!(places.available_permits(), 1);
-}
-
-/// A response's body dropped before its end, as when its client goes,
-/// gives its place back; so does the response it is the body of.
-#[tokio::test(flavor = "current_thread")]
-async fn a_body_dropped_unsent_gives_its_place_in_flight_back() {
-    use futures_util::StreamExt as _;
-
-    let (in_flight, places) = one_place();
-    let mut sending = Sending::new(vec![Bytes::from_static(b"moof")], in_flight);
-    assert!(sending.next().await.is_some());
-    drop(sending);
-    assert_eq!(places.available_permits(), 1);
-    let (in_flight, places) = one_place();
-    let answer = (HlsReply::Playlist("#EXTM3U\n".to_owned()), in_flight);
-    let response = reply(&peer(), &id("01JH"), Ok(answer));
-    assert_eq!(places.available_permits(), 0, "the response holds it");
-    drop(response);
-    assert_eq!(places.available_permits(), 1);
 }

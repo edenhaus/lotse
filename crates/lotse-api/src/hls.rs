@@ -14,8 +14,9 @@
 //! by its own limits.
 //!
 //! A response carries its `Content-Length`, so it needs no chunked transfer
-//! coding and any HTTP/1.x request is served. Its body holds the handler's
-//! [`InFlight`] until it is sent or dropped: the handler's limits on the
+//! coding and any HTTP/1.x request is served. Its connection holds the
+//! handler's [`InFlight`] until it ends, after the socket took the last
+//! byte through any TLS session, or is dropped: the handler's limits on the
 //! requests in flight bound the responses a client takes slowly too, and
 //! with them the media they keep after the window let it go. Once the
 //! handler is asked, the
@@ -53,8 +54,6 @@
 //! [`Handler::hls`]: crate::Handler::hls
 
 use std::convert::Infallible;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use axum::Extension;
 use axum::body::{Body, Bytes};
@@ -109,10 +108,11 @@ pub enum HlsReply {
     Media(Chunks),
 }
 
-/// What a request's response holds until it is sent or dropped: the
-/// handler's places among the requests in flight, so a client taking a
-/// response slowly keeps its place, and a limit on them bounds the
-/// connections and the bytes the responses hold.
+/// What a request's response holds until its connection ends, its last
+/// byte taken by the socket or the connection dropped: the handler's
+/// places among the requests in flight, so a client taking a response
+/// slowly keeps its place, and a limit on them bounds the connections and
+/// the bytes the responses hold.
 #[derive(Debug, Default)]
 pub struct InFlight {
     /// The places, given back as they are dropped.
@@ -120,7 +120,7 @@ pub struct InFlight {
 }
 
 impl InFlight {
-    /// Holds `permits` until the response is sent or dropped.
+    /// Holds `permits` until the response's connection ends.
     #[must_use]
     pub const fn new(permits: Vec<OwnedSemaphorePermit>) -> Self {
         Self { _permits: permits }
@@ -185,7 +185,7 @@ pub(crate) async fn fetch<H: Handler>(
     // From here the connection serves this one request: see the module docs.
     body.set(BodyState::Taken);
     let answer = state.handler.hls(&hls_id, asked).await;
-    reply(&peer, &hls_id, answer)
+    reply(&peer, &hls_id, answer, &body)
 }
 
 /// Any other method on a session's path, HEAD included: 405 with
@@ -308,25 +308,28 @@ fn admit(request: &Request<'_>) -> Result<(HlsId, HlsRequest), Box<Response>> {
 }
 
 /// The response to the handler's `answer` for session `hls_id`; every one
-/// closes its connection (see the module docs), and a `200`'s body holds
-/// the answer's [`InFlight`] until it is sent or dropped.
+/// closes its connection (see the module docs), and a `200`'s connection,
+/// whose `body` watch this is, holds the answer's [`InFlight`] until it
+/// ends: hyper hands the last of a response to a TLS session before the
+/// socket has taken it, and the session holds it, flushing, until then.
 fn reply(
     peer: &PeerInfo,
     hls_id: &HlsId,
     answer: Result<(HlsReply, InFlight), HlsError>,
+    body: &BodyWatch,
 ) -> Response {
     let mut response = match answer {
         Ok((HlsReply::Playlist(text), in_flight)) => {
             tracing::trace!(%peer, hls.id = %hls_id, bytes = text.len(), "LL-HLS playlist sent");
+            body.hold(in_flight);
             let len = text.len();
-            let body = Sending::new(vec![Bytes::from(text)], in_flight);
-            ok(PLAYLIST_MIME, PLAYLIST_CACHE, len, body)
+            ok(PLAYLIST_MIME, PLAYLIST_CACHE, len, vec![Bytes::from(text)])
         }
         Ok((HlsReply::Media(chunks), in_flight)) => {
             tracing::trace!(%peer, hls.id = %hls_id, bytes = chunks.len(), "LL-HLS resource sent");
+            body.hold(in_flight);
             let len = chunks.len();
-            let body = Sending::new(chunks.into_vec(), in_flight);
-            ok(MEDIA_MIME, MEDIA_CACHE, len, body)
+            ok(MEDIA_MIME, MEDIA_CACHE, len, chunks.into_vec())
         }
         Err(error) => {
             tracing::debug!(%peer, hls.id = %hls_id, %error, "LL-HLS request refused");
@@ -339,43 +342,11 @@ fn reply(
     response
 }
 
-/// A response's body: its parts, in order, and the [`InFlight`] it holds
-/// until the last part is taken or the body is dropped unsent (the client
-/// gone, its socket stalled, shutdown).
-#[derive(Debug)]
-struct Sending {
-    /// The parts not yet taken.
-    parts: std::vec::IntoIter<Bytes>,
-    /// Released once the last part is taken.
-    in_flight: Option<InFlight>,
-}
-
-impl Sending {
-    /// A body of `parts` holding `in_flight`.
-    fn new(parts: Vec<Bytes>, in_flight: InFlight) -> Self {
-        Self {
-            parts: parts.into_iter(),
-            in_flight: Some(in_flight),
-        }
-    }
-}
-
-impl futures_util::Stream for Sending {
-    type Item = Result<Bytes, Infallible>;
-
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let part = self.parts.next();
-        if part.is_none() {
-            self.in_flight = None;
-        }
-        Poll::Ready(part.map(Ok))
-    }
-}
-
 /// A `200` of `len` bytes of `mime`, cached as `cache` says, its body
-/// `sending`.
-fn ok(mime: &'static str, cache: &'static str, len: usize, sending: Sending) -> Response {
-    let mut response = Body::from_stream(sending).into_response();
+/// `parts` in order.
+fn ok(mime: &'static str, cache: &'static str, len: usize, parts: Vec<Bytes>) -> Response {
+    let parts = futures_util::stream::iter(parts.into_iter().map(Ok::<_, Infallible>));
+    let mut response = Body::from_stream(parts).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
