@@ -355,6 +355,85 @@ fn the_control_tls_listener_starts_with_its_identity_and_identity_prints_its_pin
     }
 }
 
+/// An identity an older daemon made, without the DNS name: `--certificate`
+/// prints it and says what to do, `--reissue` replaces the certificate
+/// from the same key, and the pin changes.
+#[test]
+fn identity_prints_the_certificate_rfc7468_5_and_reissues_it_naming_lotse_rfc5280_4_2_1_6() {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    let dir = socket_dir("identity-reissue");
+    let data = dir.join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let identity = |args: &[&str]| {
+        lotse()
+            .arg("identity")
+            .args(args)
+            .env("LOTSE_DATA_DIR", &data)
+            .output()
+            .expect("runs")
+    };
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    let missing = identity(&["--reissue"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(text(&missing.stderr).contains("reissuing the control identity"));
+
+    let legacy = lotse_testing::control_tls::legacy_server_identity_pem().unwrap();
+    let file = data.join("control-identity.pem");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&file)
+        .unwrap()
+        .write_all(legacy.as_bytes())
+        .unwrap();
+    let old_pin = text(&identity(&[]).stdout).trim().to_owned();
+    let old = identity(&["--certificate"]);
+    assert!(old.status.success());
+    let old_pem = text(&old.stdout);
+    assert!(
+        old_pem.starts_with("-----BEGIN CERTIFICATE-----\n"),
+        "{old_pem}"
+    );
+    assert!(
+        old_pem.ends_with("-----END CERTIFICATE-----\n"),
+        "{old_pem}"
+    );
+    assert!(!old_pem.contains("PRIVATE"), "never the key");
+    assert!(legacy.ends_with(&old_pem), "the certificate as it is");
+    assert!(text(&old.stderr).contains("lotse identity --reissue"));
+
+    let both = identity(&["--certificate", "--reissue"]);
+    assert_eq!(both.status.code(), Some(2), "the flags exclude each other");
+    assert_eq!(text(&identity(&[]).stdout).trim(), old_pin, "untouched");
+
+    let reissued = identity(&["--reissue"]);
+    assert!(reissued.status.success(), "{reissued:?}");
+    let new_pin = text(&reissued.stdout).trim().to_owned();
+    assert_ne!(new_pin, old_pin);
+    assert!(text(&reissued.stderr).contains("every client must pair again"));
+    assert_eq!(text(&identity(&[]).stdout).trim(), new_pin);
+    let new = identity(&["--certificate"]);
+    assert!(new.status.success());
+    assert_ne!(text(&new.stdout), old_pem);
+    assert!(
+        new.stderr.is_empty(),
+        "it names lotse: {}",
+        text(&new.stderr)
+    );
+    let key = |pem: &str| pem[..pem.find("-----BEGIN CERTIFICATE").unwrap()].to_owned();
+    assert_eq!(
+        key(&std::fs::read_to_string(&file).unwrap()),
+        key(&legacy),
+        "the same key"
+    );
+}
+
 #[test]
 fn without_a_client_the_daemon_logs_a_first_code_and_pair_prints_a_new_one() {
     use std::os::unix::fs::DirBuilderExt as _;

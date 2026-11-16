@@ -65,6 +65,20 @@ impl ClientIdentity {
     }
 }
 
+/// The PEM of a control identity as the daemon made it before its
+/// certificate named the DNS name `lotse`: a P-256 key, then a certificate
+/// with the Common Name `lotse control` alone.
+pub fn legacy_server_identity_pem() -> io::Result<String> {
+    let key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(io::Error::other)?;
+    let mut params = rcgen::CertificateParams::default();
+    let mut name = rcgen::DistinguishedName::new();
+    name.push(rcgen::DnType::CommonName, "lotse control");
+    params.distinguished_name = name;
+    let certificate = params.self_signed(&key).map_err(io::Error::other)?;
+    Ok(format!("{}{}", key.serialize_pem(), certificate.pem()))
+}
+
 /// The certificate a client presents.
 #[derive(Debug, Clone, Copy)]
 pub enum ClientCert<'a> {
