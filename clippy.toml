@@ -1,6 +1,6 @@
 too-many-arguments-threshold = 6
 # Proper names that are not code; ".." keeps clippy's defaults.
-doc-valid-idents = ["WebDriver", "WebAudio", "MediaMTX", ".."]
+doc-valid-idents = ["WebDriver", "WebAudio", "MediaMTX", "OpenMetrics", ".."]
 # The deny-level lints in Cargo.toml target production code, not tests.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true

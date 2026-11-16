@@ -18,8 +18,11 @@
 //! it serves event recordings' bytes, `GET /v0/recording/{recording_id}`, as chunked
 //! response bodies the handler hands over ([`Handler::recording_body`]),
 //! bounded by the client taking them and, over TLS, by its client staying
-//! enrolled. A TLS client's role decides which routes it reaches
-//! (the `access` module): a `metrics` client none of these.
+//! enrolled. Beside them it serves the daemon's metrics, `GET /v0/metrics`,
+//! in OpenMetrics or the Prometheus text format as the scraper negotiates
+//! ([`exporter`]). A TLS client's role
+//! decides which routes it reaches (the `access` module): a `metrics`
+//! client only the metrics.
 //!
 //! Standards: RFC 6455 (WebSocket, close codes §7.4.1, `Origin` §10.2),
 //! RFC 9110 (HTTP), RFC 9112 (HTTP/1.1, the chunked transfer coding §7.1
@@ -55,6 +58,7 @@ use tokio_util::task::task_tracker::TaskTrackerToken;
 mod access;
 mod clients;
 mod connection;
+pub mod exporter;
 pub mod identity;
 mod listener;
 mod outbox;
@@ -144,6 +148,9 @@ enum Limit {
     PendingUpgrades,
     /// [`UPGRADE_TIMEOUT`]: a connection closed before its upgrade.
     UpgradeDeadline,
+    /// [`exporter::MAX_EXPORTED_STREAMS`] or
+    /// [`exporter::MAX_EXPORTED_WORKERS`]: a metrics exposition capped.
+    ExportedSeries,
 }
 
 /// The rate limits of the [`Limit`] warnings, one for both listeners and
@@ -238,6 +245,15 @@ pub trait Handler: Send + Sync + 'static {
     /// The connection is gone; its sessions are now orphaned.
     fn connection_closed(&self, connection: ConnectionId) {
         let _ = connection;
+    }
+
+    /// `GET /v0/metrics`, from any peer either listener admits (over TLS,
+    /// a `control` or a `metrics` client still allowed): the snapshot
+    /// `metrics/get` returns, the one source of the exposition
+    /// ([`exporter`]). Never waits on a camera. `None` without metrics,
+    /// answered 503.
+    fn metrics_snapshot(&self) -> impl Future<Output = Option<lotse_api_types::Metrics>> + Send {
+        std::future::ready(None)
     }
 
     /// `GET /v0/recording/{recording_id}` in HTTP/1.1, from any peer either listener
@@ -536,6 +552,10 @@ impl Admission {
                 get(connection::upgrade::<H>).layer(control_only(lotse_api_types::WS_PATH)),
             )
             .route(
+                lotse_api_types::METRICS_PATH,
+                get(exporter::fetch::<H>).fallback(exporter::not_allowed),
+            )
+            .route(
                 RECORDING_ROUTE,
                 get(recording::fetch::<H>)
                     .head(recording::not_allowed)
@@ -809,6 +829,7 @@ mod tests {
             Outcome::Result(serde_json::Value::Null)
         ));
         assert!(handler.unsubscribed(ConnectionId(1), 2).is_none());
+        assert!(handler.metrics_snapshot().await.is_none());
         handler.connection_closed(ConnectionId(1));
         assert_eq!(handler.hello().api, lotse_api_types::API_VERSION);
         // Without recordings, no id has a body.

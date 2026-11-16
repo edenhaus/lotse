@@ -55,6 +55,16 @@ struct Minimal;
 /// Notified each time [`Minimal`] begins a `metrics/get`.
 static STALLED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
+/// Set by a test to hold [`Minimal`]'s metrics snapshot: it notifies
+/// [`SNAPSHOT_HELD`] and waits for [`SNAPSHOT_RELEASED`].
+static HOLD_SNAPSHOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Notified once a held snapshot has begun.
+static SNAPSHOT_HELD: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Notified to let a held snapshot finish.
+static SNAPSHOT_RELEASED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 /// How many times [`Minimal`] handed out recording `kept`; only one test asks
 /// for it.
 static KEPT_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -95,6 +105,26 @@ impl Handler for Minimal {
                 std::future::pending::<()>().await;
             }
             Outcome::Result(Value::Null)
+        }
+    }
+
+    /// One stream, `front`, with nine packets lost.
+    /// Held while [`HOLD_SNAPSHOT`] is set, until [`SNAPSHOT_RELEASED`].
+    fn metrics_snapshot(&self) -> impl Future<Output = Option<lotse_api_types::Metrics>> + Send {
+        let held = HOLD_SNAPSHOT.load(std::sync::atomic::Ordering::SeqCst);
+        let snapshot = serde_json::json!({
+            "supervisor": { "pid": 1, "uptime_ms": 2000, "rss_bytes": null, "pss_bytes": null, "tasks": null, "demux": null },
+            "workers": {},
+            "worker_restarts": 0,
+            "sessions": 0,
+            "streams": { "front": { "packets_lost": 9 } },
+        });
+        async move {
+            if held {
+                SNAPSHOT_HELD.notify_one();
+                SNAPSHOT_RELEASED.notified().await;
+            }
+            serde_json::from_value(snapshot).ok()
         }
     }
 
@@ -1842,4 +1872,132 @@ fn a_pin_fixed_with_both_roles_or_enrolled_with_the_other_stops_the_start() {
     // The same role in both places is no conflict.
     drop(Server::bind(config_with(&dir, &data, vec![], vec![pin])).unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// One request with `Connection: close` and the header fields `extra`
+/// (each ended by CRLF), and the whole answer's text.
+async fn answer_once<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    connected: io::Result<S>,
+    method: &str,
+    path: &str,
+    extra: &str,
+) -> String {
+    let mut stream = connected.unwrap();
+    let head =
+        format!("{method} {path} HTTP/1.1\r\nHost: lotse\r\n{extra}Connection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    within_5_s(stream.read_to_end(&mut answer)).await.unwrap();
+    String::from_utf8(answer).unwrap()
+}
+
+/// The `Accept` of Prometheus 3's default scrape protocols
+/// (`content_negotiation.md`, "Default Accept Header").
+const PROMETHEUS_ACCEPT: &str = "Accept: application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.3,text/plain;version=0.0.4;q=0.2,*/*;q=0.1\r\n";
+
+#[tokio::test(flavor = "current_thread")]
+async fn either_role_and_the_socket_read_the_metrics_in_the_format_they_accept() {
+    let control = ClientIdentity::generate().unwrap();
+    let metrics = ClientIdentity::generate().unwrap();
+    let (dir, data) = dirs("metrics-route");
+    let running = start_with(dir, data, vec![control.pin], vec![metrics.pin]);
+    let socket = || tokio::net::UnixStream::connect(running.dir.join("lotse.sock"));
+    let as_metrics = || connect(running.addr, running.config(ClientCert::Own(&metrics)));
+    let as_control = || connect(running.addr, running.config(ClientCert::Own(&control)));
+    let path = lotse_api_types::METRICS_PATH;
+    let text = "content-type: text/plain; version=0.0.4; charset=utf-8\r\n";
+    let openmetrics = "content-type: application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=allow-utf-8\r\n";
+    for (answer, content_type) in [
+        (answer_once(as_metrics().await, "GET", path, "").await, text),
+        (answer_once(as_control().await, "GET", path, "").await, text),
+        (answer_once(socket().await, "GET", path, "").await, text),
+        (
+            answer_once(as_metrics().await, "GET", path, PROMETHEUS_ACCEPT).await,
+            openmetrics,
+        ),
+        (
+            answer_once(socket().await, "GET", path, PROMETHEUS_ACCEPT).await,
+            openmetrics,
+        ),
+    ] {
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains(content_type), "{head}");
+        assert!(head.contains("connection: close"), "{head}");
+        assert!(
+            body.contains("lotse_supervisor_uptime_seconds 2.0\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("lotse_stream_packets_lost_total{stream=\"front\"} 9\n"),
+            "{body}"
+        );
+        assert_eq!(
+            body.ends_with("# EOF\n"),
+            content_type == openmetrics,
+            "{body}"
+        );
+    }
+    // HEAD as GET without the body; any other method 405.
+    let answer = answer_once(as_metrics().await, "HEAD", path, "").await;
+    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+    assert!(answer.ends_with("\r\n\r\n"), "no body: {answer}");
+    let (status, body) = request_once(as_metrics().await, "POST", path).await;
+    assert_eq!((status, code_of(&body)), (405, "invalid_request".into()));
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9110_15_5_4_a_metrics_client_removed_after_its_handshake_reads_no_more() {
+    let (logs, _guard) = capture();
+    let scraper = ClientIdentity::generate().unwrap();
+    let running = start("metrics-removed", vec![]);
+    let mut admin = local(&running).await;
+    let answer = call(&mut admin, add(1, scraper.pin, "metrics")).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    let connected = connect(running.addr, running.config(ClientCert::Own(&scraper))).await;
+    let answer = call(&mut admin, remove(2, scraper.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    let (status, body) = request_once(connected, "GET", lotse_api_types::METRICS_PATH).await;
+    assert_eq!((status, code_of(&body)), (403, "not_permitted".into()));
+    assert!(
+        logs.text()
+            .contains("metrics refused: its client was removed")
+    );
+    drop(admin);
+    running.finish().await;
+}
+
+/// Regression (Copilot's review of edenhaus/lotse#183): the scraper's
+/// enrollment was checked only before the snapshot, so a pin removed while
+/// it was collected still got the metrics.
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9110_15_5_4_a_metrics_client_removed_while_its_snapshot_is_collected_gets_none_of_it() {
+    let (logs, _guard) = capture();
+    let scraper = ClientIdentity::generate().unwrap();
+    let running = start("metrics-removed-during", vec![]);
+    let mut admin = local(&running).await;
+    let answer = call(&mut admin, add(1, scraper.pin, "metrics")).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    HOLD_SNAPSHOT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let connected = connect(running.addr, running.config(ClientCert::Own(&scraper))).await;
+    let removal = async {
+        within_5_s(SNAPSHOT_HELD.notified()).await;
+        let answer = call(&mut admin, remove(2, scraper.pin)).await;
+        assert_eq!(answer["success"], true, "{answer}");
+        SNAPSHOT_RELEASED.notify_one();
+    };
+    let ((status, body), ()) = tokio::join!(
+        request_once(connected, "GET", lotse_api_types::METRICS_PATH),
+        removal
+    );
+    assert_eq!((status, code_of(&body)), (403, "not_permitted".into()));
+    assert!(!body.contains("lotse_"), "none of the metrics: {body}");
+    assert!(
+        logs.text()
+            .contains("metrics refused: its client was removed")
+    );
+    drop(admin);
+    running.finish().await;
 }
