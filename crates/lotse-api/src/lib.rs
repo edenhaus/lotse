@@ -284,8 +284,8 @@ pub trait Handler: Send + Sync + 'static {
     /// the window can answer it (draft-pantos-hls-rfc8216bis-22 §6.2.5.2,
     /// §4.4.5.3), at most three Target Durations, then
     /// [`HlsError::Timeout`]. The future is dropped when the client goes.
-    /// The answer's [`InFlight`] is held until its response is sent or
-    /// dropped. Without LL-HLS, every id is [`HlsError::NotFound`].
+    /// The answer's [`InFlight`] is held until its response's connection
+    /// ends. Without LL-HLS, every id is [`HlsError::NotFound`].
     fn hls(
         &self,
         hls_id: &HlsId,
@@ -1405,9 +1405,10 @@ mod tests {
     }
 
     /// A handler with LL-HLS sessions of any id that answers every request
-    /// with 64 KiB of media, at once, holding one of `places`.
+    /// with `bytes` of media, at once, holding one of `places`.
     struct BigHls {
         places: Arc<Semaphore>,
+        bytes: usize,
     }
 
     impl Handler for BigHls {
@@ -1429,7 +1430,7 @@ mod tests {
             _request: HlsRequest,
         ) -> impl Future<Output = Result<(HlsReply, InFlight), HlsError>> + Send {
             let permit = Arc::clone(&self.places).try_acquire_owned().unwrap();
-            let media = axum::body::Bytes::from(vec![7_u8; 64 * 1024]);
+            let media = axum::body::Bytes::from(vec![7_u8; self.bytes]);
             let reply = HlsReply::Media(lotse_hls::Chunks::from(media));
             std::future::ready(Ok((reply, InFlight::new(vec![permit]))))
         }
@@ -1447,6 +1448,7 @@ mod tests {
         let places = Arc::new(Semaphore::new(1));
         let handler = BigHls {
             places: Arc::clone(&places),
+            bytes: 64 * 1024,
         };
         assert_eq!(handler.hello(), Minimal.hello());
         let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
@@ -1754,6 +1756,66 @@ mod tests {
             bytes.len(),
             "every byte of the recording"
         );
+        drop(admission);
+    }
+
+    /// Over TLS, hyper hands a response that fits the session's buffer to
+    /// the session at once and ends its body, while the socket has taken
+    /// only 4 KiB of it: the connection, flushing, still holds the
+    /// response's place among the requests in flight, and gives it back once
+    /// the client took the rest and the connection ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tls_hls_response_holds_its_place_in_flight_while_the_session_flushes_it() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let places = Arc::new(Semaphore::new(1));
+        let handler = BigHls {
+            places: Arc::clone(&places),
+            bytes: 16 * 1024,
+        };
+        let (admission, pending) = admission_with(&clock, handler);
+        let (acceptor, config) = tls_pair();
+        let (client, server) = tokio::io::duplex(SOCKET_BYTES);
+        let body = recording::BodyWatch::new();
+        let server = recording::Watched::new(
+            Box::new(server),
+            body.clone(),
+            Arc::<lotse_core::clock::FakeClock>::clone(&clock),
+        );
+        let name = rustls::pki_types::ServerName::try_from("lotse").unwrap();
+        let (session, client) = tokio::join!(
+            acceptor.accept(server),
+            tokio_rustls::TlsConnector::from(config).connect(name, client)
+        );
+        admission.serve(
+            session.unwrap(),
+            body,
+            PeerInfo::Unix { uid: 0, pid: None },
+            Arc::clone(&pending).try_acquire_owned().unwrap(),
+            clock.sleep(UPGRADE_TIMEOUT),
+        );
+        let mut client = client.unwrap();
+        client
+            .write_all(b"GET /v0/hls/01JH/seg0.m4s HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let (mut socket, mut session) = client.into_inner();
+        for _ in 0..8 {
+            settle().await;
+        }
+        assert_eq!(places.available_permits(), 0, "the session still flushes");
+        let cipher = finish(&mut socket).await;
+        let (plain, closed) = decrypt(&mut session, &cipher);
+        assert!(closed, "the session ends with close_notify");
+        assert!(plain.ends_with(&[7_u8; 16 * 1024]), "the whole response");
+        let mut tries = 0;
+        while places.available_permits() == 0 {
+            tries += 1;
+            assert!(tries < 100, "the place is given back");
+            settle().await;
+        }
         drop(admission);
     }
 }

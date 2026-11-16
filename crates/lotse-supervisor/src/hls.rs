@@ -31,8 +31,9 @@
 //! its live output's ([`hls_reason`]). An output counts against the live
 //! outputs' limits too, being one.
 //!
-//! A request is in flight from its arrival until its response is sent or
-//! dropped, its places held by the response's body (`lotse_api::InFlight`):
+//! A request is in flight from its arrival until its response's connection
+//! ends or is dropped, its places held by that connection
+//! (`lotse_api::InFlight`):
 //! at most [`HlsLimits::max_requests_per_session`] and
 //! [`HlsLimits::max_requests`] at once (over is 429, RFC 6585 §4). A client
 //! taking a response slowly keeps its place, so these bound the
@@ -126,8 +127,8 @@ pub struct HlsLimits {
     /// session.
     pub max_blocked: u32,
     /// `limits.max_hls_requests_per_session`: requests of one session in
-    /// flight at once, from their arrival until their response is sent or
-    /// dropped, blocked ones included.
+    /// flight at once, from their arrival until their response's
+    /// connection ends or is dropped, blocked ones included.
     pub max_requests_per_session: u32,
     /// `limits.max_hls_requests`: requests in flight at once over every
     /// session.

@@ -266,7 +266,8 @@ the player; the daemon refuses a request that carries `Origin`.
   `limits.max_hls_blocked` (128) bound how many wait at once, past which a
   request is 429 `limit_reached`. A directive asking too far ahead is 400.
 - **Requests in flight.** A request counts from its arrival until its
-  response is sent or its client goes, a held one included:
+  response's connection ends (the client took the last byte, through TLS
+  too) or its client goes, a held one included:
   `limits.max_hls_requests_per_session` (8: the two held, a download and
   the init segment, twice) and `limits.max_hls_requests` (256) bound how
   many are in flight at once, past which a request is 429 `limit_reached`.
