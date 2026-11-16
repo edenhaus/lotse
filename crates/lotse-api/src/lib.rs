@@ -1810,12 +1810,8 @@ mod tests {
         let (plain, closed) = decrypt(&mut session, &cipher);
         assert!(closed, "the session ends with close_notify");
         assert!(plain.ends_with(&[7_u8; 16 * 1024]), "the whole response");
-        let mut tries = 0;
-        while places.available_permits() == 0 {
-            tries += 1;
-            assert!(tries < 100, "the place is given back");
-            settle().await;
-        }
+        settle().await;
+        assert_eq!(places.available_permits(), 1, "the connection ended");
         drop(admission);
     }
 }
