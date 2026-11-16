@@ -41,6 +41,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use lotse_api_types::clients::ClientRole;
 use lotse_core::backoff::AcceptBackoff;
 use lotse_core::clock::Clock;
 use lotse_core::fingerprint::Fingerprint;
@@ -103,9 +104,14 @@ const VERIFY_SCHEMES: [SignatureScheme; 2] = [
 pub struct TlsConfig {
     /// The address to listen on.
     pub listen: SocketAddr,
-    /// The pins of the client certificates the configuration allows. They
-    /// are fixed: pairing adds pins of its own and removes none of these.
+    /// The pins of the client certificates the configuration allows as
+    /// `control` clients. They are fixed: pairing and `clients/add` add pins
+    /// of their own and remove none of these.
     pub clients: Vec<Fingerprint>,
+    /// The pins the configuration allows as `metrics` clients, which may
+    /// read `GET /v0/metrics` and nothing else; fixed alike. A pin in both
+    /// lists stops the start.
+    pub metrics_clients: Vec<Fingerprint>,
     /// Where the [`ServerIdentity`] and the enrolled clients are kept.
     pub data_dir: PathBuf,
     /// The uid and gid the daemon runs as after the privilege drop (the
@@ -143,12 +149,18 @@ pub(crate) fn bind(settings: &TlsConfig, owners: Owners) -> Result<BoundTls, Bin
     // Checked as the identity's was, and used through this descriptor
     // from here on.
     let data = crate::identity::checked_directory(&settings.data_dir, owners, false)?;
-    let store = ClientStore::open(
-        &data,
-        &settings.data_dir,
-        &settings.clients,
-        settings.state_owner,
-    )?;
+    let fixed: Vec<(Fingerprint, ClientRole)> = settings
+        .clients
+        .iter()
+        .map(|pin| (*pin, ClientRole::Control))
+        .chain(
+            settings
+                .metrics_clients
+                .iter()
+                .map(|pin| (*pin, ClientRole::Metrics)),
+        )
+        .collect();
+    let store = ClientStore::open(&data, &settings.data_dir, &fixed, settings.state_owner)?;
     let tcp = |source| BindError::TlsListen {
         addr: settings.listen,
         source,
@@ -162,6 +174,7 @@ pub(crate) fn bind(settings: &TlsConfig, owners: Owners) -> Result<BoundTls, Bin
         server_pin = %identity.pin(),
         names_server = identity.names_server(),
         clients = settings.clients.len(),
+        metrics_clients = settings.metrics_clients.len(),
         "control TLS listener bound"
     );
     Ok(BoundTls {
@@ -748,6 +761,7 @@ mod tests {
         let settings = TlsConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             clients: vec![],
+            metrics_clients: vec![],
             data_dir: dir.clone(),
             state_owner: (
                 rustix::process::getuid().as_raw(),

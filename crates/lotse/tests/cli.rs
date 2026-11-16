@@ -518,7 +518,7 @@ fn pair_without_a_control_tls_listener_fails() {
 }
 
 #[test]
-fn ctl_clients_lists_the_pins_and_removes_an_enrolled_one_for_good() {
+fn ctl_clients_lists_the_pins_adds_a_metrics_pin_and_removes_an_enrolled_one_for_good() {
     use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 
@@ -585,8 +585,8 @@ fn ctl_clients_lists_the_pins_and_removes_an_enrolled_one_for_good() {
     assert_eq!(
         printed(&output),
         serde_json::json!({ "clients": [
-            { "pin": enrolled, "fixed": false, "connected": false },
-            { "pin": fixed, "fixed": true, "connected": false },
+            { "pin": enrolled, "fixed": false, "role": "control", "connected": false },
+            { "pin": fixed, "fixed": true, "role": "control", "connected": false },
         ] })
     );
     let output = ctl(&["remove", fixed]);
@@ -599,9 +599,69 @@ fn ctl_clients_lists_the_pins_and_removes_an_enrolled_one_for_good() {
     let output = ctl(&["list"]);
     assert_eq!(
         printed(&output)["clients"],
-        serde_json::json!([{ "pin": fixed, "fixed": true, "connected": false }])
+        serde_json::json!([{ "pin": fixed, "fixed": true, "role": "control", "connected": false }])
+    );
+    // A scraper's pin, as `openssl x509 -fingerprint -sha256` prints it:
+    // enrolled as `metrics` on the socket, no restart.
+    let scraper = ["AB"; 32].join(":");
+    let output = ctl(&["add", &scraper, "metrics"]);
+    assert!(output.status.success(), "{output:?}");
+    daemon.wait_for("control client added");
+    let output = ctl(&["add", fixed, "metrics"]);
+    assert_eq!(printed(&output)["error"]["details"]["role"], "control");
+    let output = ctl(&["add", &scraper, "admin"]);
+    assert_eq!(printed(&output)["error"]["code"], "invalid_request");
+    let output = ctl(&["list"]);
+    assert_eq!(
+        printed(&output)["clients"][0],
+        serde_json::json!({ "pin": scraper.to_lowercase(), "fixed": false, "role": "metrics", "connected": false })
     );
     let (exit, rest) = daemon.terminate();
     assert_eq!(exit, Some(0), "clean exit\n{}", rest.join("\n"));
-    assert_eq!(std::fs::read_to_string(&pins).unwrap(), "");
+    assert_eq!(
+        std::fs::read_to_string(&pins).unwrap(),
+        format!("{} metrics\n", scraper.to_lowercase())
+    );
+}
+
+#[test]
+fn a_pin_in_both_client_lists_stops_the_start() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let dir = socket_dir("both-roles");
+    let socket = dir.join("lotse.sock");
+    let data = dir.join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let pin = ["ab"; 32].join(":");
+    let output = lotse()
+        .args([
+            "serve",
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket.to_str().expect("utf-8 path"),
+            "--sandbox",
+            "off",
+            "--control-listen",
+            "127.0.0.1:0",
+            "--data-dir",
+            data.to_str().expect("utf-8 path"),
+            "--control-clients",
+            &pin,
+            "--metrics-clients",
+            &pin,
+        ])
+        .output()
+        .expect("runs");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("is configured both as a control and as a metrics client"),
+        "{output:?}"
+    );
 }

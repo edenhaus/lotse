@@ -1525,7 +1525,8 @@ impl Supervisor {
             | Command::Unsubscribe(_)
             | Command::PairingCreate(_)
             | Command::ClientsList(_)
-            | Command::ClientsRemove(_) => {
+            | Command::ClientsRemove(_)
+            | Command::ClientsAdd(_) => {
                 tracing::error!(
                     command = command.name(),
                     "the server answers this command itself"

@@ -184,6 +184,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "client_pins"
+path = "fuzz_targets/client_pins.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pair_request"
 path = "fuzz_targets/pair_request.rs"
 test = false
