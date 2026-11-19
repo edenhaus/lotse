@@ -538,6 +538,22 @@ impl State {
         }
     }
 
+    /// Whether the start of live output `live_id`, which the driver is about
+    /// to hand to a worker, is still wanted: only while the output is held.
+    /// One that ended meanwhile (its worker exited before the driver took
+    /// the start from the queue) is dropped with its pipe, so it never holds
+    /// a slot of the worker that comes next.
+    pub(crate) fn live_start_wanted(&self, live_id: &str) -> bool {
+        if self.lives.contains_key(live_id) {
+            return true;
+        }
+        tracing::debug!(
+            live.id = live_id,
+            "live output ended before its worker got it; its start is dropped"
+        );
+        false
+    }
+
     /// Live output `live_id`'s start left its driver's queue without
     /// reaching a worker: it ends now, for the reason the supervisor gave.
     pub(crate) fn live_unqueued(&mut self, live_id: &str) {
