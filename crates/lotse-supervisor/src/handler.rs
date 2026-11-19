@@ -307,8 +307,9 @@ impl Supervisor {
         }
     }
 
-    /// Closes every session and ends every recording, LL-HLS output and live
-    /// output with `shutting_down`, and ends the signaling (each offered signal closes
+    /// Closes every session and ends every recording and live output with
+    /// `shutting_down`, an LL-HLS output and its sessions among the live
+    /// outputs, and ends the signaling (each offered signal closes
     /// `source_stopped`, each signaling subscription ends); the first step
     /// of the shutdown, before the control connections say goodbye. A
     /// recording's worker writes its last fragment while it stops, but its
@@ -323,7 +324,6 @@ impl Supervisor {
             CloseBy::Supervisor,
         );
         state.end_recordings_where(|_| true, RecordingCloseReason::ShuttingDown);
-        state.hls_shutdown();
         state.close_lives_now(LiveCloseReason::ShuttingDown);
         state.signaling_shutdown();
     }

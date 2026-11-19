@@ -812,15 +812,6 @@ impl State {
             self.close_hls_session(&hls_id, HlsCloseReason::SessionClosed, false)
         })
     }
-
-    /// The daemon stops: every output ends `shutting_down` at once, its
-    /// worker's report not waited for.
-    pub(crate) fn hls_shutdown(&mut self) {
-        let ids: Vec<String> = self.hls.outputs.keys().cloned().collect();
-        for live_id in ids {
-            self.close_hls_output(&live_id, HlsCloseReason::ShuttingDown);
-        }
-    }
 }
 
 /// What `hls/create` registered: the session's events and the start it
