@@ -603,6 +603,95 @@ fn rfc3550_5_1_audio_of_a_reconnect_whose_video_came_first_is_taken_at_once() {
     assert_eq!(pts(&audio[1]), key / 90 * 16 + audio_ticks(10));
 }
 
+/// Two reconnects in a row whose audio comes before their video: the
+/// first reconnect's keyframe placed its audio, so the second's audio
+/// waits for its own keyframe again instead of joining the old timeline.
+#[test]
+fn rfc3550_5_1_audio_of_each_reconnect_whose_audio_came_first_waits_for_its_own_keyframe() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    for (epoch, at, n) in [(1, 1000, 2), (2, 3000, 4)] {
+        assert_eq!(
+            out.push(Kind::Audio, aac(base, at, 0, epoch, 1)),
+            LiveStep::Dropped,
+            "reconnect {epoch}'s audio before its keyframe"
+        );
+        out.push(Kind::Video, video(base, at + 40, 0, true, epoch, n));
+        assert_eq!(
+            out.push(Kind::Audio, aac(base, at + 50, AAC_FRAME, epoch, 2)),
+            LiveStep::Held,
+            "reconnect {epoch}'s audio after its keyframe"
+        );
+        out.push(
+            Kind::Video,
+            video(base, at + 80, FRAME, false, epoch, n + 1),
+        );
+    }
+    out.push(Kind::Audio, aac(base, 3114, 2 * AAC_FRAME, 2, 3));
+    out.push(Kind::Video, video(base, 3120, 2 * FRAME, false, 2, 6));
+    let (video, audio) = tracks(&out);
+    let key = resumed_at(&video, 4);
+    assert_eq!(audio.len(), 3, "{audio:?}");
+    assert_eq!(pts(&audio[2]), key / 90 * 16 + audio_ticks(10));
+}
+
+/// A reconnect whose video came first, then one whose audio came first:
+/// the first's keyframe placed its audio, taken at once, so the second's
+/// audio waits for its own keyframe.
+#[test]
+fn rfc3550_5_1_audio_of_a_reconnect_after_one_whose_video_came_first_waits_for_its_own_keyframe() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    out.push(Kind::Video, video(base, 1000, 0, true, 1, 2));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 1010, 0, 1, 1)),
+        LiveStep::Held,
+        "the first reconnect's audio, after its keyframe"
+    );
+    out.push(Kind::Video, video(base, 1040, FRAME, false, 1, 3));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 3000, 0, 2, 2)),
+        LiveStep::Dropped,
+        "the second reconnect's audio, before its keyframe"
+    );
+    out.push(Kind::Video, video(base, 3040, 0, true, 2, 4));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 3050, AAC_FRAME, 2, 3)),
+        LiveStep::Held
+    );
+}
+
+/// Audio whose timestamp does not advance re-anchors at its capture time,
+/// as a recording's (`audio_whose_timestamp_does_not_advance_starts_a_new_epoch`):
+/// the samples before it go out at once, so the run they are in does not
+/// carry it on from them.
+#[test]
+fn iso14496_12_8_8_8_audio_whose_timestamp_does_not_advance_begins_a_run_of_its_own() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Audio, aac(base, 64, AAC_FRAME, 0, 1));
+    // The same timestamp again, 200 ms in.
+    assert!(is_fragment(
+        &out.push(Kind::Audio, aac(base, 200, AAC_FRAME, 0, 2))
+    ));
+    out.push(Kind::Audio, aac(base, 264, 2 * AAC_FRAME, 0, 3));
+    out.push(Kind::Video, video(base, 300, FRAME, false, 0, 1));
+    let audio: Vec<(usize, u64, u32)> = samples(&out.file, 2)
+        .iter()
+        .map(|sample| (sample.fragment, sample.dts, sample.duration))
+        .collect();
+    // 200 ms at 16 kHz is 3200.
+    assert_eq!(audio, [(0, 0, 1024), (0, 1024, 1024), (1, 3200, 1024)]);
+}
+
 #[test]
 fn iso14496_12_8_8_8_the_video_s_last_frame_lasts_at_most_what_its_duration_field_holds() {
     let base = base();
