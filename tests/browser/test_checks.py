@@ -617,6 +617,23 @@ def test_without_capture_times_the_mse_latency_is_its_difference_from_webrtc() -
     assert latency_summary(found).startswith("WebRTC none, MSE none, MSE minus WebRTC 300 ms")
 
 
+def test_latency_leaves_out_malformed_samples_and_flashes() -> None:
+    expected = latency(mse_page(), AAC)
+    page = mse_page()
+    page["video"]["capture"] += [
+        "not a sample",
+        {"shown": 1_000_050.0},
+        {"capture": NTP_1970 + 1_000_000},
+        {"shown": "late", "capture": NTP_1970 + 1_000_000},
+        {"shown": 1_000_050.0, "capture": None},
+    ]
+    page["video"]["flashes"] += ["not a time", None]
+    found = latency(page, AAC)
+    assert found["webrtc_ms"] == expected["webrtc_ms"] == {"median": 40.0, "p90": 40.0, "count": 20}
+    assert found["mse_ms"] == expected["mse_ms"]
+    assert found["mse_minus_webrtc_ms"] == expected["mse_minus_webrtc_ms"]
+
+
 def test_the_p90_is_the_nearest_rank() -> None:
     page = mse_page()
     for sample, delay in zip(page["video"]["capture"], range(20), strict=True):
