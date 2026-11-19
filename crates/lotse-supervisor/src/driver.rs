@@ -1948,7 +1948,12 @@ impl Driver {
             DriverCommand::StopRecording { recording_id } => {
                 worker.stop_recording(&recording_id).await
             }
-            DriverCommand::StartLive { spec, pipe } => worker.start_live(&spec, pipe).await,
+            DriverCommand::StartLive { spec, pipe } => {
+                if !shared.lock().live_start_wanted(&spec.live_id) {
+                    return;
+                }
+                worker.start_live(&spec, pipe).await
+            }
             DriverCommand::FetchLive { live_id } => worker.fetch_live(&live_id).await,
             DriverCommand::StopLive { live_id } => worker.stop_live(&live_id).await,
             DriverCommand::OpenSession(spec) => {
@@ -6180,6 +6185,59 @@ mod tests {
     /// one they are logged as not sent); without a worker the start waits
     /// in the queue, a stop takes it out and ends the output there, a stop
     /// for a start none holds and a fetch are dropped.
+    /// A live output of stream `front` on `c1`, stopped as asked, owned by
+    /// `owner`.
+    fn live_entry(owner: Option<crate::live::LiveOwner>) -> crate::live::LiveEntry {
+        crate::live::LiveEntry {
+            serial: 1,
+            stream_id: "front".into(),
+            connection: "c1".into(),
+            owner,
+            waiting: None,
+            mime: None,
+            body: None,
+            fetch_slot: None,
+            stop_slot: None,
+            ending: Some(lotse_api_types::live::LiveCloseReason::Closed),
+            warned: false,
+            timer: None,
+        }
+    }
+
+    /// The worker exited after `live/create` sent the start and before the
+    /// driver took it: the crash ended the output, so the start is dropped
+    /// with its pipe, never handed to the worker that comes next, where it
+    /// would hold a slot of the stream's.
+    #[tokio::test]
+    async fn a_live_start_whose_output_ended_before_the_driver_took_it_reaches_no_worker() {
+        let shared = shared("/usr/bin/true");
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let mut worker = dead_worker(&shared).await;
+        let (commands, _rx) = mpsc::channel(1);
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let start = DriverCommand::StartLive {
+            spec: live_spec("gone"),
+            pipe: writer.into(),
+        };
+        Driver::send(&mut worker, &shared, &commands, start).await;
+        assert!(
+            captured
+                .lines("session message could not be sent")
+                .is_empty(),
+            "nothing went to the worker"
+        );
+        assert_eq!(
+            captured
+                .lines("live output ended before its worker got it; its start is dropped")
+                .len(),
+            1
+        );
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut rest).unwrap();
+        assert!(rest.is_empty(), "the start's pipe went with it");
+    }
+
     #[tokio::test]
     async fn live_messages_reach_the_worker_or_wait_and_a_stop_ends_a_waiting_start_here() {
         let shared = shared("/usr/bin/true");
@@ -6191,6 +6249,7 @@ mod tests {
         let (commands, _rx) = mpsc::channel(1);
         let worker = driver.worker.as_mut().unwrap();
         let (_reader, writer) = std::io::pipe().unwrap();
+        shared.lock().lives.insert("l1".into(), live_entry(None));
         for command in [
             DriverCommand::StartLive {
                 spec: live_spec("l1"),
@@ -6212,24 +6271,11 @@ mod tests {
         let (events_tx, mut events) = mpsc::channel(4);
         shared.lock().lives.insert(
             "l2".into(),
-            crate::live::LiveEntry {
-                serial: 1,
-                stream_id: "front".into(),
-                connection: "c1".into(),
-                owner: Some(crate::live::LiveOwner {
-                    connection: ConnectionId(1),
-                    subscription: 1,
-                    events: events_tx,
-                }),
-                waiting: None,
-                mime: None,
-                body: None,
-                fetch_slot: None,
-                stop_slot: None,
-                ending: Some(lotse_api_types::live::LiveCloseReason::Closed),
-                warned: false,
-                timer: None,
-            },
+            live_entry(Some(crate::live::LiveOwner {
+                connection: ConnectionId(1),
+                subscription: 1,
+                events: events_tx,
+            })),
         );
         driver.queue(DriverCommand::StartLive {
             spec: live_spec("l2"),
