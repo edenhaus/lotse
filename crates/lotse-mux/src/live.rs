@@ -37,22 +37,23 @@
 //!   decode ends, ahead of its presentation by a negative composition
 //!   offset (ISO/IEC 14496-12 §8.8.8), as a recording's epoch is.
 //! - Until the video started again, the audio is left out: after a skip,
-//!   and for audio of a new epoch until the video starts a new epoch (a
-//!   reconnect's keyframe) captured after the last audio frame of the
-//!   epoch before, taken or left out, or with it. Capture times, not arrival order,
-//!   pair them: a reconnect whose video came first has started already,
-//!   and its audio is taken from its first frame; one whose audio came
-//!   first waits for its keyframe; and the keyframe of a reconnect that
-//!   never sent its own video is captured before the audio of the one
-//!   after it ends, so it starts no later audio. Once the video started
-//!   a new epoch, or again after a skip, audio captured before that
-//!   keyframe is left out, late frames of the old connection or of the
-//!   hole among it: placed by the origin the keyframe set, they would hold
-//!   the audio after it back. The audio's first
-//!   epoch is the stream's own, whatever keyframe it comes after: a writer
-//!   that saw no audio before cannot tell a reconnect's from it. Placed by
-//!   the origin of then, it is still followed by the video, whose last
-//!   frame lasts until it ends.
+//!   and for audio of a new epoch until a reconnect's keyframe (a video
+//!   keyframe of a new epoch) comes after the last audio frame of the
+//!   epoch before. The order the frames come in pairs them, not their
+//!   capture times, which the clock maps afresh for a new connection: a
+//!   reconnect whose video came first has started already, and its audio
+//!   is taken from its first frame; one whose audio came first waits for
+//!   its keyframe; and the audio of a reconnect that never sent its own
+//!   video came before the next reconnect's keyframe, so it takes no
+//!   start from the audio after it. Once the video started again, after a
+//!   skip or a reconnect, audio captured before that keyframe is left out,
+//!   late frames of the hole or of the old connection among it: placed by
+//!   the origin the keyframe set, they would hold the audio after it back.
+//!   The audio's first epoch is the stream's own, whatever keyframe it
+//!   comes after, as is one that began before the video's first keyframe:
+//!   a writer that saw no video before cannot pair it. Placed by the
+//!   origin of then, it is still followed by the video, whose last frame
+//!   lasts until it ends.
 //! - Audio whose timestamp did not advance re-anchors its timeline at its
 //!   capture time, as a recording's does; the samples before it go out at
 //!   once, since the samples of one run follow on from each other
@@ -138,18 +139,24 @@ struct Live {
     /// captured before it is left out: placed by the origin it set, it
     /// would hold the audio after it back.
     restarted: Option<Instant>,
-    /// The capture time of the keyframe that started the video's latest
+    /// How many frames were pushed, in the order they came: what pairs a
+    /// reconnect's audio with its video. Capture times do not order them
+    /// across a reconnect, whose new connection the clock maps afresh.
+    pushed: u64,
+    /// [`Live::pushed`] at the keyframe that started the video's latest
     /// epoch after its first, a reconnect's; `None` before one. It places a
     /// new audio epoch ([`Live::audio_after`]).
-    reconnected: Option<Instant>,
-    /// The capture time of the latest audio frame of the current epoch,
-    /// taken or left out; `None` before the first.
-    audio_last: Option<Instant>,
-    /// For an audio epoch after the first, the capture time of the epoch
-    /// before's last frame: the audio is left out until the video starts
-    /// an epoch captured after it ([`Live::reconnected`]). `None` for the
-    /// first epoch, the stream's own.
-    audio_after: Option<Instant>,
+    reconnected: Option<u64>,
+    /// [`Live::pushed`] at the latest audio frame of the current epoch,
+    /// taken or left out, but for one left out as captured before the
+    /// video's latest start; `None` before the first.
+    audio_last: Option<u64>,
+    /// For an audio epoch after the first that began once the video had
+    /// started, [`Live::audio_last`] of the epoch before: the audio is left
+    /// out until a reconnect's keyframe comes after it
+    /// ([`Live::reconnected`]). `None` for the stream's own audio: the
+    /// first epoch, or one that began before the video's first keyframe.
+    audio_after: Option<u64>,
     /// The sequence number of the latest fragment (ISO/IEC 14496-12
     /// §8.8.5): 0 before the first.
     sequence: u32,
@@ -167,6 +174,7 @@ impl Live {
             video_epoch: None,
             audio_epoch: None,
             restarted: None,
+            pushed: 0,
             reconnected: None,
             audio_last: None,
             audio_after: None,
@@ -188,6 +196,7 @@ impl Live {
 
     /// Takes a video frame.
     fn push_video(&mut self, frame: Arc<MediaFrame>) -> Result<LiveStep, RecordingError> {
+        self.pushed = self.pushed.wrapping_add(1);
         let new_epoch = self.video_epoch != Some(frame.epoch);
         if !(self.waiting || new_epoch) {
             // A started output has its origin.
@@ -206,7 +215,7 @@ impl Live {
         if self.origin.is_some() {
             self.restarted = Some(frame.wallclock);
             if new_epoch {
-                self.reconnected = Some(frame.wallclock);
+                self.reconnected = Some(self.pushed);
             }
         }
         let origin = self.start_at(&frame);
@@ -254,25 +263,29 @@ impl Live {
                 "an audio frame for a live output without audio".into(),
             ));
         };
+        self.pushed = self.pushed.wrapping_add(1);
         if self.audio_epoch != Some(frame.epoch) {
-            // The first epoch is the stream's own. A later one is a
-            // reconnect's: it waits for a video epoch captured after the
-            // audio before it ends.
+            // The first epoch is the stream's own, and so is one that began
+            // before the video's first keyframe: no video epoch to pair it
+            // with. A later one is a reconnect's: it waits for a
+            // reconnect's keyframe that came after the audio before it.
             self.audio_after = self
-                .audio_epoch
-                .map(|_| self.audio_last.unwrap_or(frame.wallclock));
+                .origin
+                .and(self.audio_epoch)
+                .map(|_| self.audio_last.unwrap_or(self.pushed));
             self.audio_epoch = Some(frame.epoch);
         }
-        self.audio_last = Some(frame.wallclock);
-        // A keyframe captured with the audio before's last frame starts the
-        // new audio too: a tie never mutes it.
-        let placed = self.audio_after.is_none_or(|after| {
-            self.reconnected
-                .is_some_and(|reconnected| reconnected >= after)
-        });
         let after_restart = self
             .restarted
             .is_none_or(|restarted| frame.wallclock >= restarted);
+        if after_restart {
+            // A frame left out as late does not keep the audio before going.
+            self.audio_last = Some(self.pushed);
+        }
+        let placed = self.audio_after.is_none_or(|after| {
+            self.reconnected
+                .is_some_and(|reconnected| reconnected > after)
+        });
         // The video's starts break the audio's epoch too: the audio after
         // one starts a new epoch on its track.
         let started = !self.waiting && placed && after_restart;
