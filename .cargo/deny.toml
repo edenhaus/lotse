@@ -14,7 +14,13 @@ yanked = "deny"
 # An exemption that matches no dependency fails the check, so it is deleted with the update that
 # makes it unnecessary and cannot hide the advisory if the vulnerable version comes back.
 unused-ignored-advisory = "deny"
-ignore = []
+ignore = [
+  # chrono is unmaintained (no fix to wait for), not vulnerable. It comes in only through
+  # m3u8-rs 6.0.1, the newest release, which needs it to parse the dates of EXT-X-PROGRAM-DATE-TIME
+  # and EXT-X-DATERANGE (RFC 3339): lotse-http reads neither, and the parsing runs in the
+  # sandboxed worker. Remove with the m3u8-rs release or the own playlist parser that drops it.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; only via m3u8-rs's date parsing, unused by lotse" },
+]
 
 [licenses]
 version = 2
