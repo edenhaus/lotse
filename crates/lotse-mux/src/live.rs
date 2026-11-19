@@ -39,7 +39,9 @@
 //! - Until the video started again, the audio is left out: after a skip,
 //!   and for audio of a new epoch until the video's first keyframe after
 //!   that epoch's first audio frame, whether the audio before was taken
-//!   or left out. The audio's first epoch is the stream's own, whatever
+//!   or left out. A reconnect whose video came first, a keyframe of a new
+//!   epoch after the old audio epoch began, has started already: its
+//!   audio is taken from its first frame. The audio's first epoch is the stream's own, whatever
 //!   keyframe it comes after: a writer that saw no audio before cannot
 //!   tell a reconnect's from it. Placed by the origin of then, it is
 //!   still followed by the video, whose last frame lasts until it ends.
@@ -122,11 +124,16 @@ struct Live {
     /// How often the video started: at the first keyframe and after each
     /// hole.
     starts: u64,
-    /// [`Live::starts`] when the audio's epoch began, 0 for its first: the
-    /// audio is taken once the video started after that. Before, audio of
-    /// a new epoch would be placed by an origin the video's next start
-    /// moves.
+    /// [`Live::starts`] up to which the audio's epoch waits, 0 for its
+    /// first: the audio is taken once the video started after that. Before,
+    /// audio of a new epoch would be placed by an origin the video's next
+    /// start moves.
     audio_since: u64,
+    /// [`Live::starts`] when the audio's current epoch began.
+    audio_epoch_began: u64,
+    /// [`Live::starts`] at the latest start that began a video epoch: the
+    /// first keyframe's, or a reconnect's.
+    video_epoch_start: u64,
     /// The sequence number of the latest fragment (ISO/IEC 14496-12
     /// §8.8.5): 0 before the first.
     sequence: u32,
@@ -145,6 +152,8 @@ impl Live {
             audio_epoch: None,
             starts: 0,
             audio_since: 0,
+            audio_epoch_began: 0,
+            video_epoch_start: 0,
             sequence: 0,
         }
     }
@@ -182,6 +191,9 @@ impl Live {
         self.waiting = false;
         self.video_epoch = Some(frame.epoch);
         self.starts = self.starts.saturating_add(1);
+        if new_epoch {
+            self.video_epoch_start = self.starts;
+        }
         // The samples the break finished go out before the keyframe is
         // taken, which a fragment of its own carries once the next frame
         // comes.
@@ -225,10 +237,20 @@ impl Live {
             ));
         };
         if self.audio_epoch != Some(frame.epoch) {
-            // The first epoch is the stream's own; a later one is a
-            // reconnect's, whose video starts again after it.
-            self.audio_since = self.audio_epoch.map_or(0, |_| self.starts);
+            // The first epoch is the stream's own. A later one is a
+            // reconnect's: taken from the video's start of a new epoch, if
+            // that came after the old audio epoch began and was not the
+            // stream's first (the reconnect's video came first); else from
+            // the video's next start.
+            self.audio_since = match self.audio_epoch {
+                None => 0,
+                Some(_) if self.video_epoch_start > self.audio_epoch_began.max(1) => {
+                    self.video_epoch_start.saturating_sub(1)
+                }
+                Some(_) => self.starts,
+            };
             self.audio_epoch = Some(frame.epoch);
+            self.audio_epoch_began = self.starts;
         }
         // The video's starts break the audio's epoch too: the audio after
         // one starts a new epoch on its track.
