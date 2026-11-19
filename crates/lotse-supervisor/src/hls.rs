@@ -33,7 +33,8 @@
 //!
 //! A request is in flight from its arrival until its response's connection
 //! ends or is dropped, its places held by that connection
-//! (`lotse_api::InFlight`):
+//! (`lotse_api::InFlight`), whether it is answered or refused once it took
+//! them:
 //! at most [`HlsLimits::max_requests_per_session`] and
 //! [`HlsLimits::max_requests`] at once (over is 429, RFC 6585 §4). A client
 //! taking a response slowly keeps its place, so these bound the
@@ -59,7 +60,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use lotse_api::{ConnectionId, Event, EventClass, HlsError, HlsReply, HlsRequest, InFlight};
+use lotse_api::{
+    ConnectionId, Event, EventClass, HlsAnswer, HlsError, HlsReply, HlsRequest, InFlight,
+};
 use lotse_api_types::command::HlsCreate;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::hls::{HlsCloseReason, HlsCreateResult, HlsEvent, hls_playlist_path};
@@ -1284,19 +1287,19 @@ struct Asked {
 }
 
 /// `GET /v0/hls/{hls_id}/{name}`: touches the session's idle clock, takes
-/// the request's places in flight, which its response holds, and answers
-/// from its window, waiting, bounded, for what it does not hold yet. See
-/// the module docs.
-pub(crate) async fn serve(
-    shared: &Arc<Shared>,
-    hls_id: &HlsId,
-    request: HlsRequest,
-) -> Result<(HlsReply, InFlight), HlsError> {
+/// the request's places in flight, which its response holds, a refusal's
+/// too, and answers from its window, waiting, bounded, for what it does
+/// not hold yet. A request refused before it took them holds none. See the
+/// module docs.
+pub(crate) async fn serve(shared: &Arc<Shared>, hls_id: &HlsId, request: HlsRequest) -> HlsAnswer {
     let now = shared.clock.now();
-    let asked = shared.lock().hls_asked(hls_id, now)?;
-    let in_flight = InFlight::new(take(shared, hls_id, &asked.in_flight)?);
-    let reply = answer(shared, hls_id, request, &asked).await?;
-    Ok((reply, in_flight))
+    let none = |error| (error, InFlight::default());
+    let asked = shared.lock().hls_asked(hls_id, now).map_err(none)?;
+    let in_flight = InFlight::new(take(shared, hls_id, &asked.in_flight).map_err(none)?);
+    match answer(shared, hls_id, request, &asked).await {
+        Ok(reply) => Ok((reply, in_flight)),
+        Err(error) => Err((error, in_flight)),
+    }
 }
 
 /// The answer to `request` from the window `asked` names, once it has one.

@@ -78,7 +78,7 @@ pub mod test_util;
 pub mod tls;
 
 pub use clients::{ClientsError, PinsError, RoleName, parse_pins, render_pins};
-pub use hls::{HlsError, HlsReply, HlsRequest, InFlight};
+pub use hls::{HlsAnswer, HlsError, HlsReply, HlsRequest, InFlight};
 pub use listener::{BindError, PeerInfo};
 pub use live::{LiveBody, LiveBodyError, live_id_of};
 pub use owners::Owners;
@@ -312,15 +312,12 @@ pub trait Handler: Send + Sync + 'static {
     /// the window can answer it (draft-pantos-hls-rfc8216bis-22 §6.2.5.2,
     /// §4.4.5.3), at most three Target Durations, then
     /// [`HlsError::Timeout`]. The future is dropped when the client goes.
-    /// The answer's [`InFlight`] is held until its response's connection
-    /// ends. Without LL-HLS, every id is [`HlsError::NotFound`].
-    fn hls(
-        &self,
-        hls_id: &HlsId,
-        request: HlsRequest,
-    ) -> impl Future<Output = Result<(HlsReply, InFlight), HlsError>> + Send {
+    /// The answer's [`InFlight`], a refusal's too, is held until its
+    /// response's connection ends ([`HlsAnswer`]). Without LL-HLS, every id
+    /// is [`HlsError::NotFound`].
+    fn hls(&self, hls_id: &HlsId, request: HlsRequest) -> impl Future<Output = HlsAnswer> + Send {
         let _ = (hls_id, request);
-        std::future::ready(Err(HlsError::NotFound))
+        std::future::ready(Err((HlsError::NotFound, InFlight::default())))
     }
 }
 
@@ -1375,7 +1372,7 @@ mod tests {
             &self,
             hls_id: &HlsId,
             request: HlsRequest,
-        ) -> impl Future<Output = Result<(HlsReply, InFlight), HlsError>> + Send {
+        ) -> impl Future<Output = HlsAnswer> + Send {
             let release = Arc::clone(&self.release);
             let id = hls_id.clone();
             async move {
@@ -1385,7 +1382,9 @@ mod tests {
                     HlsRequest::Media(lotse_hls::Resource::Init) => HlsReply::Media(
                         lotse_hls::Chunks::from(axum::body::Bytes::from_static(b"init")),
                     ),
-                    HlsRequest::Media(_) => return Err(HlsError::ResourceNotFound),
+                    HlsRequest::Media(_) => {
+                        return Err((HlsError::ResourceNotFound, InFlight::default()));
+                    }
                 };
                 Ok((reply, InFlight::default()))
             }
@@ -1504,7 +1503,7 @@ mod tests {
             &self,
             _hls_id: &HlsId,
             _request: HlsRequest,
-        ) -> impl Future<Output = Result<(HlsReply, InFlight), HlsError>> + Send {
+        ) -> impl Future<Output = HlsAnswer> + Send {
             let permit = Arc::clone(&self.places).try_acquire_owned().unwrap();
             let media = axum::body::Bytes::from(vec![7_u8; self.bytes]);
             let reply = HlsReply::Media(lotse_hls::Chunks::from(media));

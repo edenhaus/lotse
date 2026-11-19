@@ -312,7 +312,18 @@ async fn rfc8216bis_6_2_5_2_the_handler_s_refusals_map_to_their_status_and_code(
         ),
         (HlsError::Timeout, 503, "source_timeout"),
     ] {
-        let response = reply(&peer(), &id("01JH"), Err(error), &BodyWatch::new());
+        let body = BodyWatch::new();
+        let response = reply(
+            &peer(),
+            &id("01JH"),
+            Err((error, InFlight::default())),
+            &body,
+        );
+        assert_eq!(
+            *body.subscribe().borrow(),
+            BodyState::Idle,
+            "refused before it took a place: still a pending upgrade"
+        );
         assert_eq!(response.headers()[header::CONNECTION], "close");
         let (got, body) = status_and_error(response).await;
         assert_eq!((got, body["code"].as_str().unwrap()), (status, code));
@@ -376,4 +387,34 @@ async fn a_response_s_place_in_flight_is_held_until_its_connection_ends() {
         drop(connection);
         assert_eq!(places.available_permits(), 1, "the connection ended");
     }
+}
+
+/// A refusal of a request that took places in flight, one that blocked and
+/// timed out, say, holds them as a `200` does: its connection leaves the
+/// pending upgrades and gives them back only as it ends, so a client that
+/// takes refusals slowly stays within the limits on requests in flight.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refusal_s_places_in_flight_are_held_until_its_connection_ends() {
+    let (in_flight, places) = one_place();
+    assert!(!in_flight.is_empty());
+    assert!(InFlight::default().is_empty());
+    let connection = BodyWatch::new();
+    let service = connection.clone();
+    let response = reply(
+        &peer(),
+        &id("01JH"),
+        Err((HlsError::Timeout, in_flight)),
+        &service,
+    );
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(*connection.subscribe().borrow(), BodyState::Taken);
+    drop(response);
+    drop(service);
+    assert_eq!(
+        places.available_permits(),
+        0,
+        "the connection's task holds it"
+    );
+    drop(connection);
+    assert_eq!(places.available_permits(), 1, "the connection ended");
 }
