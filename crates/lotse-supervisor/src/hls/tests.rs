@@ -766,6 +766,34 @@ async fn rfc8216bis_6_2_5_2_blocked_requests_are_bounded_in_number_and_time() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// `unsubscribe` of one of two creates waiting on the same output ends its
+/// session and refuses that create `hls_not_found` at once, while the
+/// output goes on for the other create, answered once the output starts:
+/// a cancelled create holds no subscription slot until the start timeout.
+#[tokio::test]
+async fn unsubscribing_a_waiting_hls_create_refuses_it_at_once_and_leaves_the_output() {
+    let dir = private_dir("hls-unsubscribe-waiting");
+    let clock = Arc::new(FakeClock::from_system());
+    let (s, mut commands) = rig(&dir, HlsLimits::DEFAULT, clock.clone()).await;
+    let first = spawn_create(&s, 2, true);
+    let (spec, _pipe) = output_start(&mut commands).await;
+    let second = spawn_create(&s, 3, true);
+    while s.shared.lock().hls.sessions.len() < 2 {
+        settle().await;
+    }
+    assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+    let err = error(within(first).await.unwrap());
+    assert_eq!(err.code, ErrorCode::HlsNotFound);
+    assert!(err.details["hls_id"].is_string(), "{err:?}");
+    assert!(!second.is_finished(), "the other create still waits");
+    assert_eq!(s.shared.lock().hls.outputs.len(), 1, "the output goes on");
+    live_report(&s, &spec.live_id, live_started());
+    let (answer, _events) = started(within(second).await.unwrap());
+    assert!(answer["hls_id"].is_string(), "{answer}");
+    stop(&s, &clock).await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A request refused once it took its places in flight hands them on with
 /// its refusal, for its connection to hold until it ends, as a response's;
 /// one refused before it took any, an unknown session's, hands on none.
