@@ -1675,6 +1675,9 @@ async fn rfc9110_15_5_4_a_metrics_client_is_refused_every_route_with_403_and_a_m
         ("GET", "/v0/recording/c1"),
         ("HEAD", "/v0/recording/c1"),
         ("DELETE", "/v0/recording/c1"),
+        ("GET", "/v0/live/01JL"),
+        ("HEAD", "/v0/live/01JL"),
+        ("DELETE", "/v0/live/01JL"),
     ] {
         let (status, body) = request_once(as_metrics().await, method, path).await;
         // RFC 9110 §9.3.2: a HEAD answer has no content.
@@ -1729,7 +1732,7 @@ async fn rfc9110_15_5_4_a_metrics_client_is_refused_every_route_with_403_and_a_m
         "request refused: a metrics client may only read GET /v0/metrics",
     );
     assert_eq!(refused.len(), 2, "{refused:?}");
-    assert!(refused[1].ends_with("refused=5"), "{refused:?}");
+    assert!(refused[1].ends_with("refused=8"), "{refused:?}");
     assert!(
         refused[1].contains("route=\"/v0/recording/{recording_id}\""),
         "{refused:?}"

@@ -136,6 +136,9 @@ pub const RECORDING_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The route of a recording's bytes, as the router has it.
 const RECORDING_ROUTE: &str = "/v0/recording/{recording_id}";
 
+/// The route of a live output's bytes, as the router has it.
+const LIVE_ROUTE: &str = "/v0/live/{live_id}";
+
 /// Connections accepted and not yet upgraded, at once: 8. One more is
 /// closed at accept, without a response. A TLS connection takes its place
 /// when it authenticates, and holds it while it waits for the serve loop.
@@ -584,10 +587,11 @@ impl Admission {
                     .layer(control_only(RECORDING_ROUTE)),
             )
             .route(
-                &format!("{}/{{live_id}}", lotse_api_types::LIVE_PATH),
+                LIVE_ROUTE,
                 get(live::fetch::<H>)
                     .head(live::not_allowed)
-                    .fallback(live::not_allowed),
+                    .fallback(live::not_allowed)
+                    .layer(control_only(LIVE_ROUTE)),
             )
             .with_state(state);
         let mut http = http1::Builder::new();
@@ -837,6 +841,14 @@ mod tests {
         assert_eq!(
             RECORDING_ROUTE,
             format!("{}/{{recording_id}}", lotse_api_types::RECORDING_PATH)
+        );
+    }
+
+    #[test]
+    fn the_live_route_is_the_live_path_and_its_id() {
+        assert_eq!(
+            LIVE_ROUTE,
+            format!("{}/{{live_id}}", lotse_api_types::LIVE_PATH)
         );
     }
 
