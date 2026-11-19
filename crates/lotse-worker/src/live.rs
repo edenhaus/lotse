@@ -635,6 +635,24 @@ impl Output {
                 return Err(LiveEnd::CodecChanged);
             }
         }
+        let gop = gop.filter(|gop| {
+            let cached = RecordingTrack {
+                codec: (**gop.codec()).clone(),
+                clock_rate,
+            };
+            // A change within the family (another profile) keeps the
+            // cache, so its frames may be of a format the init segment,
+            // written since, does not describe.
+            let carried = self.muxer.continues(Kind::Video, &cached);
+            if !carried {
+                tracing::info!(
+                    live.id = %self.id,
+                    codec = gop.codec().name(),
+                    "live: fetched; the cached GOP's format is not the init segment's, joining at the next keyframe"
+                );
+            }
+            carried
+        });
         match gop {
             Some(gop) if !gop.truncated() => {
                 tracing::info!(
