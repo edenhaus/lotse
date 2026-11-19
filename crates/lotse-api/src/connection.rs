@@ -12,7 +12,10 @@
 //! `live/create`: the connection reads and answers further commands while
 //! it waits (a signaled source's `signaling/answer` may be what releases
 //! it), holding its subscription slot from the start, so
-//! `max_subscriptions` bounds them. One the handler is still awaiting when
+//! `max_subscriptions` bounds them. `unsubscribe` of one still waiting
+//! cancels it: the handler hears the unsubscribe at once, so its output
+//! ends and the command is answered as that end makes it, and no
+//! subscription opens for it, whatever the answer. One the handler is still awaiting when
 //! the connection's client is removed or the daemon shuts down is dropped
 //! and refused, so it never holds up the close; one still waiting when the
 //! peer leaves is dropped with the connection, before the handler hears it
@@ -404,6 +407,10 @@ struct Connection<H> {
     /// ([`Self::subscription_slot_free`]); dropped when the connection
     /// closes.
     waiting: FuturesUnordered<BoxFuture<'static, Answered>>,
+    /// The ids of the commands in [`Self::waiting`], each with whether
+    /// `unsubscribe` cancelled it: a cancelled one opens no subscription
+    /// when it is answered.
+    waiting_ids: HashMap<u64, bool>,
     /// The warning of each limit a command was refused at, by
     /// [`RefusalKey`]: fixed in the code, so the map stays small.
     refusals: HashMap<RefusalKey, Throttle>,
@@ -472,6 +479,7 @@ async fn serve<H: Handler>(
         removed,
         pending: None,
         waiting: FuturesUnordered::new(),
+        waiting_ids: HashMap::new(),
         refusals: HashMap::new(),
     };
     connection.send(Class::Signaling, &connection.state.handler.hello());
@@ -753,9 +761,10 @@ impl<H: Handler> Connection<H> {
     /// runs before the next frame is read, its wait while they are, and
     /// [`Self::answer`] answers it once the handler, or [`unless_closing`],
     /// is done.
-    fn wait_for(&self, id: u64, name: &'static str, command: Command) {
+    fn wait_for(&mut self, id: u64, name: &'static str, command: Command) {
         let handling = self.handled(id, command);
         tracing::debug!(id, command = name, "command waits; reading on");
+        self.waiting_ids.insert(id, false);
         self.waiting.push(Box::pin(async move {
             let outcome = handling.await;
             Answered { id, name, outcome }
@@ -766,6 +775,7 @@ impl<H: Handler> Connection<H> {
     /// refusal, or a result and the subscription it opened.
     fn answer(&mut self, answered: Answered) {
         let Answered { id, name, outcome } = answered;
+        let cancelled = self.waiting_ids.remove(&id) == Some(true);
         match outcome {
             Outcome::Result(result) => self.send(Class::Signaling, &Success::new(id, result)),
             Outcome::Error(error) => self.refuse(Some(id), Some(name), error),
@@ -777,6 +787,17 @@ impl<H: Handler> Connection<H> {
                 self.send(Class::Signaling, &Success::new(id, result));
                 self.subscribe(id, events);
             }
+        }
+        // Unsubscribed while it waited: answered, but a subscription it
+        // opened ends before its forwarder ever runs, so none of its events
+        // goes out.
+        if cancelled && let Some(task) = self.subscriptions.remove(&id) {
+            task.abort();
+            tracing::debug!(
+                id,
+                command = name,
+                "unsubscribed command answered; its subscription ended"
+            );
         }
     }
 
@@ -818,6 +839,19 @@ impl<H: Handler> Connection<H> {
                 Class::Signaling,
                 &Success::new(id, lotse_api_types::schema::committed()),
             ),
+            Command::Unsubscribe(unsubscribe)
+                if self
+                    .waiting_ids
+                    .get(&unsubscribe.subscription)
+                    .is_some_and(|cancelled| !cancelled) =>
+            {
+                let subscription = unsubscribe.subscription;
+                self.waiting_ids.insert(subscription, true);
+                tracing::debug!(subscription, "unsubscribe of a command still waiting");
+                // No subscription opened, so a last event has nowhere to go.
+                let _last = self.state.handler.unsubscribed(self.id, subscription);
+                self.send(Class::Signaling, &Success::new(id, Empty::default()));
+            }
             Command::Unsubscribe(unsubscribe) => {
                 match self.subscriptions.remove(&unsubscribe.subscription) {
                     Some(task) => {

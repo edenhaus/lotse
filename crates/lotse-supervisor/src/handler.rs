@@ -2138,6 +2138,10 @@ fn live_start_error(reason: LiveCloseReason) -> ApiError {
         LiveCloseReason::StreamDeleted => {
             ApiError::new(ErrorCode::StreamNotFound, "the stream was deleted")
         }
+        LiveCloseReason::SessionClosed => ApiError::new(
+            ErrorCode::LiveNotFound,
+            "the live output was closed before it started: its subscription was unsubscribed",
+        ),
         other => ApiError::new(
             ErrorCode::InternalError,
             "the live output ended before it started",
@@ -7444,6 +7448,31 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// `unsubscribe` of a `live/create` still waiting for its init segment
+    /// ends the output `session_closed`, asked of its worker, and refuses
+    /// the create `live_not_found`.
+    #[tokio::test]
+    async fn unsubscribing_a_waiting_live_create_ends_it_and_refuses_the_create() {
+        let dir = private_dir("live-unsubscribe-waiting");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+        let err = error(within(create).await.unwrap());
+        assert_eq!(err.code, ErrorCode::LiveNotFound);
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// `live/create` holds the request to its stream, a container to write
     /// with, the limits (refused at either, logged rate-limited) and room in
     /// the connection's queue for its start, fetch and stop.
@@ -7722,6 +7751,7 @@ mod tests {
             (LiveCloseReason::WorkerCrashed, ErrorCode::WorkerCrashed),
             (LiveCloseReason::ShuttingDown, ErrorCode::ShuttingDown),
             (LiveCloseReason::StreamDeleted, ErrorCode::StreamNotFound),
+            (LiveCloseReason::SessionClosed, ErrorCode::LiveNotFound),
             (LiveCloseReason::CodecChanged, ErrorCode::InternalError),
         ] {
             assert_eq!(live_start_error(reason).code, code, "{reason}");
