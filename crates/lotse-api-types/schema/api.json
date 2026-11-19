@@ -1476,7 +1476,7 @@
         },
         {
           "const": "live_not_found",
-          "description": "`GET /v0/live/{live_id}` (HTTP 404) or `live/close` of a live output\nthat is not open: never created, already ended, or an id that is no\nlive output's.",
+          "description": "`GET /v0/live/{live_id}` (HTTP 404) or `live/close` of a live output\nthat is not open: never created, already ended, or an id that is no\nlive output's; and `live/create` whose subscription was unsubscribed\nbefore its output started.",
           "type": "string"
         },
         {
