@@ -4,6 +4,20 @@
 //! before the privilege drop. Clients pin the certificate by its SHA-256
 //! ([`Fingerprint`]), which every start logs.
 //!
+//! A generated certificate names [`SERVER_NAME`] as a DNS name in its
+//! subject alternative names, so a client whose TLS stack verifies by name
+//! can trust it as its own root and verify it by that name: Go's x509
+//! never matches a name against the Common Name (from Go 1.15), so an
+//! identity without the name is refused (observed with Prometheus 3.16.0,
+//! `server_name: lotse`, on 2026-11-15: "x509: certificate is not valid
+//! for any names, but wanted to match lotse"), and Go accepts a leaf that
+//! is itself in the root pool as a chain of one, which amounts to pinning
+//! it (the same Prometheus scraped the reissued identity). An
+//! identity made before the name keeps working as it is: the pin is the
+//! SHA-256 of the whole certificate, so a new certificate is a new pin
+//! and every client pairs again. Only [`ServerIdentity::reissue`] makes
+//! one, from the same key, when the operator asks.
+//!
 //! The key and the certificate share one PEM file, so a generation is one
 //! atomic rename and a crash leaves either no identity or a whole one. The
 //! file is written with mode 0600 from its creation (`O_EXCL`, then
@@ -20,8 +34,13 @@
 //! first starts agree on one identity.
 //!
 //! Standards: RFC 5280 §4.1.2.5 (validity: `notAfter` 99991231235959Z, "no
-//! well-defined expiration date"), RFC 5958 (PKCS #8 private keys), RFC
-//! 7468 (PEM), FIPS 186-4 (P-256 ECDSA).
+//! well-defined expiration date"), §4.1.2.2 (a positive serial of at
+//! most 20 octets, unique per certificate of an issuer: random here, so a
+//! reissue from the same key never repeats one), §4.2.1.6 (the subject alternative name's
+//! `dNSName`), RFC 6125 §6.4.4 (a client checks the Common Name only
+//! without a DNS name in the subject alternative names), RFC 5958 (PKCS #8
+//! private keys), RFC 7468 (PEM, §5 the certificate's), FIPS 186-4 (P-256
+//! ECDSA).
 
 use std::fmt;
 use std::fs::File;
@@ -30,11 +49,14 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use lotse_core::fingerprint::Fingerprint;
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SignatureAlgorithm};
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, KeyPair, SerialNumber, SignatureAlgorithm,
+};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
+use rustls::crypto::SecureRandom;
 use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
 use crate::owners::Owners;
 
@@ -48,6 +70,17 @@ const PARTIAL_FILE: &str = "control-identity.pem.partial";
 /// The certificate's subject and issuer common name.
 const CERTIFICATE_NAME: &str = "lotse control";
 
+/// The DNS name a generated certificate names in its subject alternative
+/// names (RFC 5280 §4.2.1.6), fixed whatever host the daemon runs on: a
+/// client that verifies by name trusts the certificate itself and gives
+/// this name as the server's (Prometheus' `server_name`).
+pub const SERVER_NAME: &str = "lotse";
+
+/// The serial's length: the longest RFC 5280 §4.1.2.2 allows ("MUST NOT
+/// use serialNumber values longer than 20 octets"), all of it random but
+/// the top two bits.
+const SERIAL_BYTES: usize = 20;
+
 /// The daemon's control identity: its certificate, the key, and the pin
 /// clients check. The key never leaves the process: `Debug` redacts it.
 pub struct ServerIdentity {
@@ -57,6 +90,8 @@ pub struct ServerIdentity {
     pub(crate) key: PrivateKeyDer<'static>,
     /// The certificate's SHA-256.
     pin: Fingerprint,
+    /// The uid and gid the file belongs to, which a reissue keeps.
+    owner: (u32, u32),
 }
 
 impl fmt::Debug for ServerIdentity {
@@ -147,6 +182,9 @@ pub enum IdentityError {
     /// The key or the certificate could not be made.
     #[error("generating the control identity: {0}")]
     Generate(#[source] rcgen::Error),
+    /// The system provided no randomness for the certificate's serial.
+    #[error("generating the control identity: the system provides no randomness")]
+    Random,
 }
 
 impl ServerIdentity {
@@ -155,21 +193,110 @@ impl ServerIdentity {
         self.pin
     }
 
+    /// The certificate alone as PEM (RFC 7468 §5), never the key: what a
+    /// client trusts as its CA file to verify the daemon by
+    /// [`SERVER_NAME`].
+    pub fn certificate_pem(&self) -> String {
+        let block = pem::Pem::new("CERTIFICATE", self.certificate.as_ref());
+        pem::encode_config(
+            &block,
+            pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
+        )
+    }
+
+    /// Whether the certificate names [`SERVER_NAME`] as a DNS name in its
+    /// subject alternative names, as every certificate made since does: a
+    /// client that verifies by name (RFC 6125 §6.4.4: not by the Common
+    /// Name once a DNS name is there; Go's x509 never by it) accepts
+    /// only such a one. An identity made before has none until
+    /// [`Self::reissue`].
+    pub fn names_server(&self) -> bool {
+        ServerName::try_from(SERVER_NAME).is_ok_and(|name| {
+            webpki::EndEntityCert::try_from(&self.certificate).is_ok_and(|certificate| {
+                certificate.verify_is_valid_for_subject_name(&name).is_ok()
+            })
+        })
+    }
+
+    /// A new certificate for the identity in `dir`, from the same key and
+    /// naming [`SERVER_NAME`], in place of the old one, which `dir` must
+    /// hold; checked and locked as [`Self::load_or_create`] does it, and
+    /// written as atomically, with the old file's owner and group: run as
+    /// root on an identity that belongs to the uid the daemon starts as, it
+    /// leaves the file that uid can read. The pin changes, so every client
+    /// pairs again; a running daemon serves the old certificate until it
+    /// restarts. Asked for by the operator only, never on a start.
+    ///
+    /// The rename is the change, as for the enrolled clients: once it is
+    /// done the new certificate is the identity, and a failed sync of the
+    /// directory after it is no error but part of the result
+    /// ([`Reissued::notice`]), so the operator learns the new pin and does
+    /// not reissue again.
+    pub fn reissue(dir: &Path, owners: Owners) -> Result<Reissued, IdentityError> {
+        Self::reissue_with(
+            dir,
+            owners,
+            rustls::crypto::ring::default_provider().secure_random,
+            File::sync_all,
+        )
+    }
+
+    /// [`Self::reissue`] with the serial's randomness from `random` and the
+    /// directory synced by `sync_dir`.
+    fn reissue_with(
+        dir: &Path,
+        owners: Owners,
+        random: &dyn SecureRandom,
+        sync_dir: SyncDir,
+    ) -> Result<Reissued, IdentityError> {
+        let locked = checked_directory(dir, owners, true)?;
+        let old = Self::load_in(&locked, dir, owners)?;
+        let key = KeyPair::try_from(&old.key).map_err(IdentityError::Generate)?;
+        let pem = certify(&key, random)?;
+        let unsynced = write_new(&locked, dir, &pem, Some(old.owner), sync_dir)?;
+        let identity = Self::load_in(&locked, dir, owners)?;
+        tracing::info!(
+            event = "control_identity_reissued",
+            path = %dir.join(IDENTITY_FILE).display(),
+            old_pin = %old.pin,
+            server_pin = %identity.pin,
+            "control identity reissued: every client must pair again"
+        );
+        Ok(Reissued { identity, unsynced })
+    }
+
     /// The identity in `dir`, made there first when there is none. `dir`
     /// and the file must belong to one of `owners`: the uid the daemon
     /// started as or, started as root, the uid it drops to.
     pub fn load_or_create(dir: &Path, owners: Owners) -> Result<Self, IdentityError> {
         let locked = checked_directory(dir, owners, true)?;
-        Self::load_or_create_in(&locked, dir, owners)
+        Self::load_or_create_in(&locked, dir, owners, File::sync_all)
     }
 
     /// [`Self::load_or_create`] in `handle`, `dir` opened, checked and
-    /// locked by [`checked_directory`]; `dir` only names it in messages.
-    fn load_or_create_in(handle: &File, dir: &Path, owners: Owners) -> Result<Self, IdentityError> {
+    /// locked by [`checked_directory`], the directory synced by
+    /// `sync_dir`; `dir` only names it in messages. Once the new file is
+    /// renamed into place it is the identity: a failed sync of the
+    /// directory after that is logged, as a crash could still lose it and
+    /// the next start make another.
+    fn load_or_create_in(
+        handle: &File,
+        dir: &Path,
+        owners: Owners,
+        sync_dir: SyncDir,
+    ) -> Result<Self, IdentityError> {
         match Self::load_in(handle, dir, owners) {
             Err(IdentityError::Missing(_)) => {
-                let pem = generate(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-                write_new(handle, dir, &pem)?;
+                let random = rustls::crypto::ring::default_provider().secure_random;
+                let pem = generate(&rcgen::PKCS_ECDSA_P256_SHA256, random)?;
+                let unsynced = write_new(handle, dir, &pem, None, sync_dir)?;
+                if let Some(err) = unsynced {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %err,
+                        "control identity generated, but syncing its directory failed: a crash may lose it"
+                    );
+                }
                 let identity = Self::load_in(handle, dir, owners)?;
                 tracing::info!(
                     event = "control_identity_created",
@@ -240,6 +367,7 @@ impl ServerIdentity {
             certificate,
             key,
             pin,
+            owner: (meta.uid(), meta.gid()),
         })
     }
 }
@@ -312,14 +440,26 @@ fn directory_error(path: &str, source: io::Error) -> IdentityError {
     }
 }
 
-/// A fresh key for `alg` and its self-signed certificate, as the PEM text
-/// of [`IDENTITY_FILE`]. Valid from 2000-01-01 and without expiry (RFC
-/// 5280 §4.1.2.5), so neither a wrong clock at boot nor a date turns into
-/// an outage: replacing the identity is a decision, not a deadline. The
-/// serial is derived from the public key, so nothing reads a clock.
-fn generate(alg: &'static SignatureAlgorithm) -> Result<String, IdentityError> {
+/// A fresh key for `alg` and its self-signed certificate ([`certify`]),
+/// as the PEM text of [`IDENTITY_FILE`].
+fn generate(
+    alg: &'static SignatureAlgorithm,
+    random: &dyn SecureRandom,
+) -> Result<String, IdentityError> {
     let key = KeyPair::generate_for(alg).map_err(IdentityError::Generate)?;
-    let mut params = CertificateParams::default();
+    certify(&key, random)
+}
+
+/// `key`'s self-signed certificate naming [`SERVER_NAME`], with the key
+/// before it, as the PEM text of [`IDENTITY_FILE`]. Valid from 2000-01-01
+/// and without expiry (RFC 5280 §4.1.2.5), so neither a wrong clock at
+/// boot nor a date turns into an outage: replacing the identity is a
+/// decision, not a deadline. The serial is random, from `random`
+/// ([`serial`]), so nothing reads a clock.
+fn certify(key: &KeyPair, random: &dyn SecureRandom) -> Result<String, IdentityError> {
+    let mut params =
+        CertificateParams::new(vec![SERVER_NAME.to_owned()]).map_err(IdentityError::Generate)?;
+    params.serial_number = Some(serial(random)?);
     let mut name = DistinguishedName::new();
     name.push(DnType::CommonName, CERTIFICATE_NAME);
     params.distinguished_name = name;
@@ -333,15 +473,71 @@ fn generate(alg: &'static SignatureAlgorithm) -> Result<String, IdentityError> {
         .and_then(|at| at.replace_minute(59))
         .and_then(|at| at.replace_second(59))
         .unwrap_or(last_day);
-    let certificate = params.self_signed(&key).map_err(IdentityError::Generate)?;
+    let certificate = params.self_signed(key).map_err(IdentityError::Generate)?;
     Ok(format!("{}{}", key.serialize_pem(), certificate.pem()))
 }
 
+/// A certificate's serial (RFC 5280 §4.1.2.2): [`SERIAL_BYTES`] random
+/// bytes from `random`, the top bit clear and the next one set, so the
+/// integer is positive and its DER takes all 20 octets. The issuer is the
+/// same for every identity and the key the same across a reissue, so only
+/// randomness keeps a serial from being repeated: 158 random bits.
+fn serial(random: &dyn SecureRandom) -> Result<SerialNumber, IdentityError> {
+    let mut bytes = [0_u8; SERIAL_BYTES];
+    random.fill(&mut bytes).map_err(|_| IdentityError::Random)?;
+    if let Some(first) = bytes.first_mut() {
+        *first = (*first & 0x3f) | 0x40;
+    }
+    Ok(SerialNumber::from(bytes.to_vec()))
+}
+
+/// Syncs the data directory after the rename: [`File::sync_all`], or a
+/// test's fault.
+type SyncDir = fn(&File) -> io::Result<()>;
+
+/// What [`ServerIdentity::reissue`] made.
+#[derive(Debug)]
+pub struct Reissued {
+    /// The new identity, in place.
+    pub identity: ServerIdentity,
+    /// Why the directory could not be synced after the rename, if it could
+    /// not: a crash before the system writes it may bring the old
+    /// certificate back.
+    unsynced: Option<io::Error>,
+}
+
+impl Reissued {
+    /// What the operator must know next, for `lotse identity --reissue` to
+    /// print beside the new pin: every client pairs again and the daemon
+    /// restarts to serve it, and, if the sync failed, that a crash may
+    /// still undo it.
+    pub fn notice(&self) -> String {
+        let unsynced = self.unsynced.as_ref().map_or_else(String::new, |err| {
+            format!(
+                " Syncing the data directory failed ({err}): a crash before the system writes it may bring back the old certificate; check it with `lotse identity` before pairing."
+            )
+        });
+        format!(
+            "the control identity has a new certificate from the same key, naming the DNS name `{SERVER_NAME}`, and the pin above replaces the old one: every client must pair again. Restart the daemon to serve it.{unsynced}"
+        )
+    }
+}
+
 /// Writes `pem` as [`IDENTITY_FILE`] in `handle`, the directory `dir`
-/// opened: to a new file created with mode 0600, synced, renamed into
-/// place, and the directory synced. A partial file a crash left behind is
-/// replaced.
-fn write_new(handle: &File, dir: &Path, pem: &str) -> Result<(), IdentityError> {
+/// opened: to a new file created with mode 0600, given `owner` (a uid and
+/// gid) when there is one and else left the creator's, synced, renamed
+/// into place, and the directory synced by `sync_dir`. A partial file a
+/// crash left behind is replaced. An error means [`IDENTITY_FILE`] is
+/// unchanged; once it is renamed into place the new file is the identity,
+/// and a failed sync of the directory is returned as its error, not as
+/// the result's.
+fn write_new(
+    handle: &File,
+    dir: &Path,
+    pem: &str,
+    owner: Option<(u32, u32)>,
+    sync_dir: SyncDir,
+) -> Result<Option<io::Error>, IdentityError> {
     let text = dir.join(PARTIAL_FILE).display().to_string();
     let io = |source: io::Error| io_error(&text, source);
     let _stale = rustix::fs::unlinkat(handle, PARTIAL_FILE, AtFlags::empty());
@@ -349,13 +545,16 @@ fn write_new(handle: &File, dir: &Path, pem: &str) -> Result<(), IdentityError> 
     let flags = write_only | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let created = rustix::fs::openat(handle, PARTIAL_FILE, flags, Mode::RUSR | Mode::WUSR);
     let mut file = File::from(created.map_err(io::Error::from).map_err(io)?);
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::fchown(&file, Some(uid), Some(gid)).map_err(io)?;
+    }
     file.write_all(pem.as_bytes()).map_err(io)?;
     file.sync_all().map_err(io)?;
     drop(file);
     rustix::fs::renameat(handle, PARTIAL_FILE, handle, IDENTITY_FILE)
         .map_err(io::Error::from)
         .map_err(io)?;
-    handle.sync_all().map_err(io)
+    Ok(sync_dir(handle).err())
 }
 
 #[cfg(test)]
@@ -449,7 +648,7 @@ mod tests {
         let _gone = std::fs::remove_dir_all(&checked);
         std::fs::rename(&dir, &checked).unwrap();
         std::fs::DirBuilder::new().mode(0o777).create(&dir).unwrap();
-        let made = ServerIdentity::load_or_create_in(&locked, &dir, me()).unwrap();
+        let made = ServerIdentity::load_or_create_in(&locked, &dir, me(), File::sync_all).unwrap();
         assert!(!dir.join(IDENTITY_FILE).exists(), "not written to the swap");
         let kept = ServerIdentity::load(&checked, me()).unwrap();
         assert_eq!(kept.pin(), made.pin(), "written where checked");
@@ -470,10 +669,242 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// An identity as lotse made it before its certificate named
+    /// [`SERVER_NAME`]: the Common Name alone, rcgen's serial.
+    fn legacy_pem() -> String {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::default();
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, CERTIFICATE_NAME);
+        params.distinguished_name = name;
+        let certificate = params.self_signed(&key).unwrap();
+        format!("{}{}", key.serialize_pem(), certificate.pem())
+    }
+
+    /// The DER of the public key in the identity `pem`'s key.
+    fn public_key(pem: &str) -> Vec<u8> {
+        use rcgen::PublicKeyData as _;
+
+        KeyPair::from_pem(pem).unwrap().subject_public_key_info()
+    }
+
+    #[test]
+    fn a_new_certificate_names_lotse_as_its_dns_name_rfc5280_4_2_1_6() {
+        let dir = data_dir("san", 0o700);
+        let made = ServerIdentity::load_or_create(&dir, me()).unwrap();
+        assert!(made.names_server());
+        // The name is in the subject alternative names as a dNSName ([2]
+        // IA5String, RFC 5280 §4.2.1.6), not only in the Common Name.
+        let san = b"\x82\x05lotse";
+        let der = made.certificate.as_ref();
+        assert!(der.windows(san.len()).any(|w| w == san));
+        assert_eq!(SERVER_NAME, "lotse");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The provider's randomness, as a start and a reissue use it.
+    fn random() -> &'static dyn SecureRandom {
+        rustls::crypto::ring::default_provider().secure_random
+    }
+
+    /// The serial of the DER certificate `der`: the INTEGER after the
+    /// version (RFC 5280 §4.1: `[0] INTEGER 2`, then `serialNumber`), as
+    /// long as its length octet says (X.690 §8.1.3.4, the short form: at
+    /// most 20 octets, RFC 5280 §4.1.2.2). Not always 20: rcgen's own
+    /// serial, a legacy identity's, loses a leading zero octet in DER.
+    fn serial_of(der: &[u8]) -> Vec<u8> {
+        let version_then_integer = [0xa0, 0x03, 0x02, 0x01, 0x02, 0x02];
+        let at = der
+            .windows(version_then_integer.len())
+            .position(|w| w == version_then_integer)
+            .unwrap()
+            + version_then_integer.len();
+        let len = usize::from(der[at]);
+        assert!(len <= 20, "a short-form length of at most 20 octets");
+        der[at + 1..][..len].to_vec()
+    }
+
+    #[test]
+    fn a_serial_is_read_at_the_length_der_gives_it_x690_8_1_3_4() {
+        // A legacy identity's serial is rcgen's: when its first octet is
+        // 0, DER drops it, which the old fixed 20-octet read panicked on.
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        for serial in [vec![0x01], vec![0x7f; 19], vec![0x40; 20]] {
+            let mut params = CertificateParams::default();
+            params.serial_number = Some(SerialNumber::from(serial.clone()));
+            let certificate = params.self_signed(&key).unwrap();
+            assert_eq!(serial_of(certificate.der()), serial);
+        }
+    }
+
+    #[test]
+    fn the_serial_is_random_positive_and_20_octets_rfc5280_4_1_2_2() {
+        let serials: Vec<Vec<u8>> = (0..64)
+            .map(|_| serial(random()).unwrap().as_ref().to_vec())
+            .collect();
+        for serial in &serials {
+            assert_eq!(serial.len(), 20);
+            assert_eq!(serial[0] & 0xc0, 0x40, "positive, and all 20 octets in DER");
+        }
+        let distinct: std::collections::HashSet<_> = serials.iter().collect();
+        assert_eq!(distinct.len(), serials.len());
+        // In the certificate as that DER INTEGER.
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let der = |pem: String| CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        let first = serial_of(&der(certify(&key, random()).unwrap()));
+        let second = serial_of(&der(certify(&key, random()).unwrap()));
+        assert_ne!(first, second, "the same key, another serial");
+        assert_eq!(first[0] & 0xc0, 0x40);
+    }
+
+    #[test]
+    fn without_randomness_no_certificate_is_made() {
+        let no_random = &crate::pairing::test_support::NO_RANDOM;
+        assert!(matches!(serial(no_random), Err(IdentityError::Random)));
+        let err = generate(&rcgen::PKCS_ECDSA_P256_SHA256, no_random).unwrap_err();
+        assert!(matches!(err, IdentityError::Random), "{err}");
+        assert!(err.to_string().contains("no randomness"), "{err}");
+        let dir = data_dir("no-random", 0o700);
+        let legacy = legacy_pem();
+        write_new(
+            &open_directory(&dir).unwrap(),
+            &dir,
+            &legacy,
+            None,
+            File::sync_all,
+        )
+        .unwrap();
+        let err = ServerIdentity::reissue_with(&dir, me(), no_random, File::sync_all).unwrap_err();
+        assert!(matches!(err, IdentityError::Random), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(IDENTITY_FILE)).unwrap(),
+            legacy,
+            "nothing replaced"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_identity_without_the_name_keeps_working_untouched() {
+        let dir = data_dir("legacy", 0o700);
+        let legacy = legacy_pem();
+        write_new(
+            &open_directory(&dir).unwrap(),
+            &dir,
+            &legacy,
+            None,
+            File::sync_all,
+        )
+        .unwrap();
+        let loaded = ServerIdentity::load_or_create(&dir, me()).unwrap();
+        assert!(!loaded.names_server());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(IDENTITY_FILE)).unwrap(),
+            legacy,
+            "a start never replaces it"
+        );
+        assert_eq!(
+            ServerIdentity::load(&dir, me()).unwrap().pin(),
+            loaded.pin()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reissue_names_lotse_from_the_same_key_and_changes_the_pin_serial_but_not_the_owner() {
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let dir = data_dir("reissue", 0o700);
+        let err = ServerIdentity::reissue(&dir, me()).unwrap_err();
+        assert!(matches!(err, IdentityError::Missing(_)), "{err}");
+        let err = ServerIdentity::reissue(&dir, someone_else()).unwrap_err();
+        assert!(matches!(err, IdentityError::DirectoryOwner { .. }), "{err}");
+        let legacy = legacy_pem();
+        write_new(
+            &open_directory(&dir).unwrap(),
+            &dir,
+            &legacy,
+            None,
+            File::sync_all,
+        )
+        .unwrap();
+        let old = ServerIdentity::load(&dir, me()).unwrap();
+        let reissued = ServerIdentity::reissue(&dir, me()).unwrap();
+        let notice = reissued.notice();
+        assert!(!notice.contains("Syncing"), "{notice}");
+        assert!(reissued.notice().contains("every client must pair again"));
+        let new = reissued.identity;
+        assert!(new.names_server());
+        assert_ne!(new.pin(), old.pin());
+        let path = dir.join(IDENTITY_FILE);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(public_key(&written), public_key(&legacy), "the same key");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        assert_eq!((meta.uid(), meta.gid()), old.owner, "the owner kept");
+        assert_eq!(new.owner, old.owner);
+        assert_eq!(ServerIdentity::load(&dir, me()).unwrap().pin(), new.pin());
+        // A second reissue of the same key: a serial of its own again.
+        let again = ServerIdentity::reissue(&dir, me()).unwrap().identity;
+        let serials = [&old, &new, &again].map(|identity| serial_of(identity.certificate.as_ref()));
+        assert_ne!(serials[0], serials[1]);
+        assert_ne!(serials[1], serials[2]);
+        assert_ne!(again.pin(), new.pin());
+        let text = logs.text();
+        assert!(text.contains("control identity reissued"), "{text}");
+        assert!(text.contains(&format!("old_pin={}", old.pin())), "{text}");
+        assert!(
+            text.contains(&format!("server_pin={}", new.pin())),
+            "{text}"
+        );
+        assert!(!dir.join(PARTIAL_FILE).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_sync_after_the_rename_keeps_the_new_identity_and_says_so() {
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let disk = |_: &File| Err(io::Error::other("disk"));
+        let dir = data_dir("sync-fails", 0o700);
+        let locked = checked_directory(&dir, me(), true).unwrap();
+        let made = ServerIdentity::load_or_create_in(&locked, &dir, me(), disk).unwrap();
+        drop(locked);
+        let logged = logs.text();
+        assert!(logged.contains("syncing its directory failed"), "{logged}");
+        assert_eq!(ServerIdentity::load(&dir, me()).unwrap().pin(), made.pin());
+        let reissued = ServerIdentity::reissue_with(&dir, me(), random(), disk).unwrap();
+        assert_ne!(reissued.identity.pin(), made.pin());
+        assert_eq!(
+            ServerIdentity::load(&dir, me()).unwrap().pin(),
+            reissued.identity.pin(),
+            "the renamed file is the identity in force"
+        );
+        let notice = reissued.notice();
+        assert!(notice.contains("every client must pair again"), "{notice}");
+        assert!(
+            notice.contains("Syncing the data directory failed (disk)"),
+            "{notice}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_certificate_pem_is_the_certificate_alone_rfc7468_5() {
+        let dir = data_dir("certificate-pem", 0o700);
+        let made = ServerIdentity::load_or_create(&dir, me()).unwrap();
+        let pem = made.certificate_pem();
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
+        assert!(pem.ends_with("-----END CERTIFICATE-----\n"));
+        assert!(!pem.contains('\r'), "LF line endings");
+        assert!(!pem.contains("PRIVATE"), "never the key");
+        let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        assert_eq!(der, made.certificate);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_backend_that_cannot_make_the_key_is_an_error() {
         // `ring` signs with RSA keys but cannot generate them.
-        let err = generate(&rcgen::PKCS_RSA_SHA256).unwrap_err();
+        let err = generate(&rcgen::PKCS_RSA_SHA256, random()).unwrap_err();
         assert!(matches!(err, IdentityError::Generate(_)), "{err}");
         assert!(
             err.to_string()
@@ -620,11 +1051,18 @@ mod tests {
     fn a_file_without_a_key_or_a_certificate_or_unreadable_is_refused() {
         let dir = data_dir("pem", 0o700);
         let path = dir.join(IDENTITY_FILE);
-        let made = generate(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let made = generate(&rcgen::PKCS_ECDSA_P256_SHA256, random()).unwrap();
         let (key, certificate) = made.split_at(made.find("-----BEGIN CERTIFICATE").unwrap());
         for (content, what) in [(certificate, "private key"), (key, "certificate")] {
             let _gone = std::fs::remove_file(&path);
-            write_new(&open_directory(&dir).unwrap(), &dir, content).unwrap();
+            write_new(
+                &open_directory(&dir).unwrap(),
+                &dir,
+                content,
+                None,
+                File::sync_all,
+            )
+            .unwrap();
             let err = ServerIdentity::load(&dir, me()).unwrap_err();
             assert!(
                 matches!(&err, IdentityError::Pem { what: w, .. } if w.starts_with(what)),
@@ -645,7 +1083,14 @@ mod tests {
         std::fs::DirBuilder::new()
             .create(dir.join(PARTIAL_FILE))
             .unwrap();
-        let err = write_new(&open_directory(&dir).unwrap(), &dir, &made).unwrap_err();
+        let err = write_new(
+            &open_directory(&dir).unwrap(),
+            &dir,
+            &made,
+            None,
+            File::sync_all,
+        )
+        .unwrap_err();
         assert!(matches!(err, IdentityError::Io { .. }), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }

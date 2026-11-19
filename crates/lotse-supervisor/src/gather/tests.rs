@@ -603,10 +603,64 @@ enum Udp {
     Each(Arc<FakeTurn>),
 }
 
-/// A UDP socket on `port` of loopback doing `udp`; the datagrams it
-/// read.
-fn udp_server(port: u16, udp: Udp) -> Arc<AtomicUsize> {
-    let socket = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+/// How many ports [`twin_sockets`] and [`turn_server_with_udp_twin`] try.
+const TWIN_PORT_TRIES: usize = 64;
+
+/// A UDP socket on loopback's `port`, or `None` while another socket holds
+/// it: an ephemeral port free over TCP is not reserved over UDP, and a
+/// test running at once may hold it there (`EADDRINUSE`).
+fn udp_on(port: u16) -> Option<UdpSocket> {
+    match UdpSocket::bind(("127.0.0.1", port)) {
+        Ok(socket) => Some(socket),
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => None,
+        Err(err) => panic!("binding UDP port {port} of loopback: {err}"),
+    }
+}
+
+/// A TCP listener and a UDP socket on the same free port of loopback, the
+/// next port tried while the UDP half of one is taken ([`udp_on`]).
+fn twin_sockets() -> (std::net::TcpListener, UdpSocket) {
+    for _ in 0..TWIN_PORT_TRIES {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if let Some(socket) = udp_on(port) {
+            return (listener, socket);
+        }
+    }
+    panic!("no port of loopback free over both TCP and UDP");
+}
+
+/// A fake TURN server over TCP and a UDP socket on its port, the server
+/// started again while that port is taken over UDP ([`udp_on`]).
+async fn turn_server_with_udp_twin(turn: &Arc<FakeTurn>) -> (FakeTurnServer, UdpSocket) {
+    for _ in 0..TWIN_PORT_TRIES {
+        let server = FakeTurnServer::start(Arc::clone(turn)).await.unwrap();
+        if let Some(socket) = udp_on(server.tcp_addr().port()) {
+            return (server, socket);
+        }
+    }
+    panic!("no fake TURN server's port free over UDP");
+}
+
+#[test]
+fn a_port_another_socket_holds_over_udp_is_skipped_not_unwrapped() {
+    // Regression: the twins took a free TCP port and unwrapped the UDP
+    // bind on its number, which a test running at once could hold
+    // (`EADDRINUSE`, observed in CI on 2026-11-15).
+    let held = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    assert!(udp_on(port).is_none());
+    drop(held);
+    assert!(udp_on(port).is_some());
+    let (listener, socket) = twin_sockets();
+    assert_eq!(
+        listener.local_addr().unwrap().port(),
+        socket.local_addr().unwrap().port()
+    );
+}
+
+/// `socket`, a UDP socket on loopback, doing `udp`; the datagrams it read.
+fn udp_server(socket: UdpSocket, udp: Udp) -> Arc<AtomicUsize> {
     let read = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&read);
     std::thread::spawn(move || {
@@ -630,7 +684,7 @@ fn udp_server(port: u16, udp: Udp) -> Arc<AtomicUsize> {
 /// with a UDP socket on its port doing `udp`: a UDP server and its
 /// TCP twin. The port, the datagrams read and the connections taken.
 fn twin_ports(udp: Udp) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let (listener, socket) = twin_sockets();
     let port = listener.local_addr().unwrap().port();
     let accepted = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&accepted);
@@ -640,7 +694,7 @@ fn twin_ports(udp: Udp) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
             drop(stream);
         }
     });
-    (port, udp_server(port, udp), accepted)
+    (port, udp_server(socket, udp), accepted)
 }
 
 /// An entry for the server on `port` of loopback over UDP, with its
@@ -821,11 +875,11 @@ async fn a_udp_turn_server_that_answers_only_its_challenge_keeps_its_twin_waitin
     let clock = Arc::new(FakeClock::from_system());
     let (client, demux, local) = turn_client(&clock);
     let turn = fake_turn();
-    let server = FakeTurnServer::start(Arc::clone(&turn)).await.unwrap();
+    let (server, socket) = turn_server_with_udp_twin(&turn).await;
     // The 401 comes over UDP, then nothing: the path carries UDP, and
     // the twin waits for that attempt to fail.
     let address = server.tcp_addr();
-    let read = udp_server(address.port(), Udp::First(Arc::clone(&turn)));
+    let read = udp_server(socket, Udp::First(Arc::clone(&turn)));
     let test = async {
         eventually(|| client.answered(address, &Via::Udp, 0)).await;
         clock.advance(TWIN_DELAY);
@@ -857,12 +911,12 @@ async fn a_session_joining_while_its_udp_allocation_is_deleted_unanswered_starts
     let start = clock.now();
     let (client, demux, local) = turn_client(&clock);
     let turn = fake_turn();
-    let server = FakeTurnServer::start(Arc::clone(&turn)).await.unwrap();
+    let (server, socket) = turn_server_with_udp_twin(&turn).await;
     // The UDP server on the TCP twin's port answers an allocation, then
     // goes silent: its deletion stays unanswered.
     let address = server.tcp_addr();
     let udp = fake_turn();
-    let _read = udp_server(address.port(), Udp::Each(Arc::clone(&udp)));
+    let _read = udp_server(socket, Udp::Each(Arc::clone(&udp)));
     let entry = twinned(address.port(), "pw");
     let credentials = entry.server.credentials.clone();
     let earlier = client
@@ -908,12 +962,12 @@ async fn a_udp_turn_server_silent_after_a_host_address_change_starts_its_twin_rf
     let start = clock.now();
     let (client, demux, local) = turn_client(&clock);
     let turn = fake_turn();
-    let server = FakeTurnServer::start(Arc::clone(&turn)).await.unwrap();
+    let (server, socket) = turn_server_with_udp_twin(&turn).await;
     // The UDP server on the TCP twin's port answers an allocation of the
     // host addresses at startup, then goes silent.
     let address = server.tcp_addr();
     let udp = fake_turn();
-    let _read = udp_server(address.port(), Udp::Each(Arc::clone(&udp)));
+    let _read = udp_server(socket, Udp::Each(Arc::clone(&udp)));
     let entry = twinned(address.port(), "pw");
     let credentials = entry.server.credentials.clone();
     let _earlier = client

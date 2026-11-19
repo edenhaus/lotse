@@ -12,7 +12,7 @@
 //! API change does not bump it.
 
 /// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`], [`RECORDING_PATH`],
-/// [`LIVE_PATH`] and [`PAIR_PATH`]
+/// [`LIVE_PATH`], [`PAIR_PATH`] and [`METRICS_PATH`]
 /// from one `major, minor, patch`, so they cannot disagree.
 macro_rules! api_version {
     ($major:literal, $minor:literal, $patch:literal) => {
@@ -42,6 +42,11 @@ macro_rules! api_version {
         /// the pairing code's `LOTSE1` prefix versions the code's format,
         /// not the route.
         pub const PAIR_PATH: &str = concat!("/v", $major, "/pair");
+
+        /// Where the daemon's metrics are read, in OpenMetrics or the
+        /// Prometheus text format: `GET /v<major>/metrics`, by any client of either
+        /// listener, a `metrics` client of the TLS listener included.
+        pub const METRICS_PATH: &str = concat!("/v", $major, "/metrics");
     };
 }
 
@@ -120,6 +125,7 @@ mod tests {
         assert_eq!(PAIR_PATH, "/v0/pair");
         assert_eq!(RECORDING_PATH, "/v0/recording");
         assert_eq!(LIVE_PATH, "/v0/live");
+        assert_eq!(METRICS_PATH, "/v0/metrics");
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
     }
 

@@ -227,7 +227,8 @@ impl Handler for FakeHandler {
             | Command::Unsubscribe(_)
             | Command::PairingCreate(_)
             | Command::ClientsList(_)
-            | Command::ClientsRemove(_) => Outcome::Error(ApiError::new(
+            | Command::ClientsRemove(_)
+            | Command::ClientsAdd(_) => Outcome::Error(ApiError::new(
                 ErrorCode::InternalError,
                 "the server answers these itself",
             )),

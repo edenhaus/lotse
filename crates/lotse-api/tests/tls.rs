@@ -25,8 +25,8 @@ use lotse_api::tls::{
     HANDSHAKE_TIMEOUT, MAX_HANDSHAKES_PER_ADDRESS, MAX_PENDING_HANDSHAKES, TlsConfig,
 };
 use lotse_api::{
-    BindError, CLOSE_TIMEOUT, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES, Outcome, Owners,
-    RecordingBody, RecordingBodyError, ServeError, Server, UPGRADE_TIMEOUT,
+    BindError, CLOSE_TIMEOUT, ClientsError, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES,
+    Outcome, Owners, RecordingBody, RecordingBodyError, ServeError, Server, UPGRADE_TIMEOUT,
 };
 use lotse_api_types::command::Command;
 use lotse_api_types::frame::{Hello, HelloTag};
@@ -54,6 +54,16 @@ struct Minimal;
 
 /// Notified each time [`Minimal`] begins a `metrics/get`.
 static STALLED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Set by a test to hold [`Minimal`]'s metrics snapshot: it notifies
+/// [`SNAPSHOT_HELD`] and waits for [`SNAPSHOT_RELEASED`].
+static HOLD_SNAPSHOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Notified once a held snapshot has begun.
+static SNAPSHOT_HELD: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Notified to let a held snapshot finish.
+static SNAPSHOT_RELEASED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// How many times [`Minimal`] handed out recording `kept`; only one test asks
 /// for it.
@@ -95,6 +105,26 @@ impl Handler for Minimal {
                 std::future::pending::<()>().await;
             }
             Outcome::Result(Value::Null)
+        }
+    }
+
+    /// One stream, `front`, with nine packets lost.
+    /// Held while [`HOLD_SNAPSHOT`] is set, until [`SNAPSHOT_RELEASED`].
+    fn metrics_snapshot(&self) -> impl Future<Output = Option<lotse_api_types::Metrics>> + Send {
+        let held = HOLD_SNAPSHOT.load(std::sync::atomic::Ordering::SeqCst);
+        let snapshot = serde_json::json!({
+            "supervisor": { "pid": 1, "uptime_ms": 2000, "rss_bytes": null, "pss_bytes": null, "tasks": null, "demux": null },
+            "workers": {},
+            "worker_restarts": 0,
+            "sessions": 0,
+            "streams": { "front": { "packets_lost": 9 } },
+        });
+        async move {
+            if held {
+                SNAPSHOT_HELD.notify_one();
+                SNAPSHOT_RELEASED.notified().await;
+            }
+            serde_json::from_value(snapshot).ok()
         }
     }
 
@@ -168,6 +198,17 @@ fn dirs(name: &str) -> (PathBuf, PathBuf) {
 }
 
 fn config(dir: &Path, data: &Path, clients: Vec<Fingerprint>) -> Config {
+    config_with(dir, data, clients, Vec::new())
+}
+
+/// [`config`] with `metrics` pins fixed as `metrics` clients beside the
+/// `control` ones.
+fn config_with(
+    dir: &Path,
+    data: &Path,
+    clients: Vec<Fingerprint>,
+    metrics_clients: Vec<Fingerprint>,
+) -> Config {
     let uid = uid_of(dir);
     Config {
         socket: dir.join("lotse.sock"),
@@ -178,6 +219,7 @@ fn config(dir: &Path, data: &Path, clients: Vec<Fingerprint>) -> Config {
         tls: Some(TlsConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             clients,
+            metrics_clients,
             data_dir: data.to_path_buf(),
             state_owner: (uid, gid_of(dir)),
         }),
@@ -191,7 +233,18 @@ fn start(name: &str, clients: Vec<Fingerprint>) -> Running {
 
 /// A server in directories an earlier one used.
 fn start_in(dir: PathBuf, data: PathBuf, clients: Vec<Fingerprint>) -> Running {
-    let server = Server::bind(config(&dir, &data, clients)).unwrap();
+    start_with(dir, data, clients, Vec::new())
+}
+
+/// A server with `clients` fixed as `control` clients and `metrics` as
+/// `metrics` clients, in directories an earlier one may have used.
+fn start_with(
+    dir: PathBuf,
+    data: PathBuf,
+    clients: Vec<Fingerprint>,
+    metrics: Vec<Fingerprint>,
+) -> Running {
+    let server = Server::bind(config_with(&dir, &data, clients, metrics)).unwrap();
     let (state_dir, fd) = server.state_dir().unwrap();
     assert_eq!(state_dir, data.join("clients"));
     // A copy shares the store's lock (flock(2)): this one is closed at once.
@@ -992,7 +1045,7 @@ async fn the_enrolled_pin_survives_a_restart_and_no_code_is_logged_then() {
     assert_eq!(std::fs::metadata(&pins).unwrap().mode() & 0o777, 0o600);
     assert_eq!(
         std::fs::read_to_string(&pins).unwrap(),
-        format!("{}\n", client.pin)
+        format!("{} control\n", client.pin)
     );
 
     let running = start_in(dir, data, vec![]);
@@ -1183,8 +1236,8 @@ async fn removing_a_client_closes_its_connection_and_refuses_it_from_then_on() {
     let mut other = remote(&running, &fixed).await;
 
     let mut expected = vec![
-        serde_json::json!({ "pin": fixed.pin.to_string(), "fixed": true, "connected": true }),
-        serde_json::json!({ "pin": enrolled.pin.to_string(), "fixed": false, "connected": true }),
+        serde_json::json!({ "pin": fixed.pin.to_string(), "fixed": true, "role": "control", "connected": true }),
+        serde_json::json!({ "pin": enrolled.pin.to_string(), "fixed": false, "role": "control", "connected": true }),
     ];
     expected.sort_by_key(|client| client["pin"].as_str().unwrap().to_owned());
     let listed = call(
@@ -1561,6 +1614,393 @@ async fn a_recording_body_s_connection_is_forgotten_once_it_ends() {
         }
     })
     .await;
+    drop(admin);
+    running.finish().await;
+}
+
+/// One request with `Connection: close` (RFC 9112 §9.6), so the server
+/// closes after its answer, and the answer's status and body.
+async fn request_once<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    connected: io::Result<S>,
+    method: &str,
+    path: &str,
+) -> (u16, String) {
+    let mut stream = connected.unwrap();
+    let head = format!("{method} {path} HTTP/1.1\r\nHost: lotse\r\nConnection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    within_5_s(stream.read_to_end(&mut answer)).await.unwrap();
+    let text = String::from_utf8_lossy(&answer).into_owned();
+    let status = text
+        .get(9..12)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// The lines logged so far that contain `message`.
+fn lines_with(logs: &Captured, message: &str) -> Vec<String> {
+    logs.text()
+        .lines()
+        .filter(|line| line.contains(message))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The error code of a refusal's body.
+fn code_of(body: &str) -> Value {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|error| error.get("code").cloned())
+        .unwrap_or(Value::Null)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9110_15_5_4_a_metrics_client_is_refused_every_route_with_403_and_a_missing_one_with_404()
+ {
+    let (logs, _guard) = capture();
+    let control = ClientIdentity::generate().unwrap();
+    let metrics = ClientIdentity::generate().unwrap();
+    let (dir, data) = dirs("roles");
+    let running = start_with(dir, data, vec![control.pin], vec![metrics.pin]);
+    let as_metrics = || connect(running.addr, running.config(ClientCert::Own(&metrics)));
+    let forbidden = (403, Value::from("not_permitted"));
+    for (method, path) in [
+        ("GET", lotse_api_types::WS_PATH),
+        ("POST", lotse_api_types::WS_PATH),
+        ("GET", "/v0/recording/c1"),
+        ("HEAD", "/v0/recording/c1"),
+        ("DELETE", "/v0/recording/c1"),
+        ("GET", "/v0/live/01JL"),
+        ("HEAD", "/v0/live/01JL"),
+        ("DELETE", "/v0/live/01JL"),
+    ] {
+        let (status, body) = request_once(as_metrics().await, method, path).await;
+        // RFC 9110 §9.3.2: a HEAD answer has no content.
+        let code = if method == "HEAD" {
+            forbidden.1.clone()
+        } else {
+            code_of(&body)
+        };
+        assert_eq!((status, code), forbidden, "{method} {path}");
+    }
+    // RFC 9110 §15.5.5: a path no route has is 404, for either role.
+    let (status, _) = request_once(as_metrics().await, "GET", "/v0/nothing").await;
+    assert_eq!(status, 404);
+    let as_control = || connect(running.addr, running.config(ClientCert::Own(&control)));
+    let (status, _) = request_once(as_control().await, "GET", "/v0/nothing").await;
+    assert_eq!(status, 404);
+    // A control client passes the check and reaches the routes.
+    let (status, body) = request_once(as_control().await, "GET", "/v0/recording/none").await;
+    assert_eq!(
+        (status, code_of(&body)),
+        (404, "recording_not_found".into())
+    );
+    let stream = as_control().await.unwrap();
+    assert_eq!(hello(stream).await["type"], "hello");
+    assert!(
+        !logs.text().contains(&format!(
+            "control connection opened peer=client {}",
+            metrics.pin
+        )),
+        "the metrics client never upgraded"
+    );
+
+    // The first refusal is logged with the pin and the route's template,
+    // the rest summed once per interval.
+    let refused = lines_with(
+        &logs,
+        "request refused: a metrics client may only read GET /v0/metrics",
+    );
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0].contains(&format!("client_pin={}", metrics.pin)),
+        "{refused:?}"
+    );
+    assert!(refused[0].contains("route=\"/v0/ws\""), "{refused:?}");
+    running
+        .clock
+        .advance(lotse_core::throttle::SUMMARY_INTERVAL);
+    let (status, _) = request_once(as_metrics().await, "GET", "/v0/recording/c1").await;
+    assert_eq!(status, 403);
+    let refused = lines_with(
+        &logs,
+        "request refused: a metrics client may only read GET /v0/metrics",
+    );
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert!(refused[1].ends_with("refused=8"), "{refused:?}");
+    assert!(
+        refused[1].contains("route=\"/v0/recording/{recording_id}\""),
+        "{refused:?}"
+    );
+    running.finish().await;
+}
+
+/// `clients/add` of `pin` with `role` as command `id`.
+fn add(id: u64, pin: Fingerprint, role: &str) -> Value {
+    serde_json::json!({ "id": id, "type": "clients/add", "pin": pin.to_string(), "role": role })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn clients_add_enrolls_a_metrics_pin_on_the_socket_only_and_it_persists_with_its_role() {
+    let (logs, _guard) = capture();
+    let control = ClientIdentity::generate().unwrap();
+    let scraper = ClientIdentity::generate().unwrap();
+    let running = start("clients-add", vec![control.pin]);
+    let refused = connect(running.addr, running.config(ClientCert::Own(&scraper))).await;
+    assert!(
+        refused.is_err() || exchange(refused).await.is_err(),
+        "not yet enrolled"
+    );
+
+    // Over TLS, even a control client may not add one.
+    let mut remote = remote(&running, &control).await;
+    let answer = call(&mut remote, add(1, scraper.pin, "metrics")).await;
+    assert_eq!(answer["error"]["code"], "not_permitted", "{answer}");
+    assert!(
+        logs.text()
+            .contains("clients/add refused: not on the control socket")
+    );
+
+    let mut admin = local(&running).await;
+    let answer = call(
+        &mut admin,
+        serde_json::json!({ "id": 1, "type": "clients/add", "pin": "nope", "role": "metrics" }),
+    )
+    .await;
+    assert_eq!(answer["error"]["details"]["field"], "pin", "{answer}");
+    let answer = call(&mut admin, add(2, scraper.pin, "metrics")).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    assert!(logs.text().contains("control client added"));
+    let answer = call(&mut admin, add(3, scraper.pin, "metrics")).await;
+    assert_eq!(answer["success"], true, "idempotent: {answer}");
+    // Its role changes only by removing it first; the fixed pin's too.
+    let answer = call(&mut admin, add(4, scraper.pin, "control")).await;
+    assert_eq!(answer["error"]["code"], "not_permitted", "{answer}");
+    assert_eq!(answer["error"]["details"]["role"], "metrics", "{answer}");
+    let answer = call(&mut admin, add(5, control.pin, "metrics")).await;
+    assert_eq!(answer["error"]["details"]["role"], "control", "{answer}");
+    let answer = call(&mut admin, add(6, control.pin, "control")).await;
+    assert_eq!(answer["success"], true, "already fixed: {answer}");
+    let answer = call(
+        &mut admin,
+        serde_json::json!({ "id": 7, "type": "clients/list" }),
+    )
+    .await;
+    assert_eq!(
+        answer["result"]["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|client| client["pin"] == scraper.pin.to_string())
+            .unwrap()["role"],
+        "metrics",
+        "{answer}"
+    );
+
+    // Enrolled at once, no restart: in, but only as a metrics client.
+    let as_scraper = || connect(running.addr, running.config(ClientCert::Own(&scraper)));
+    let (status, _) = request_once(as_scraper().await, "GET", lotse_api_types::WS_PATH).await;
+    assert_eq!(status, 403);
+    drop((remote, admin));
+    let (dir, data) = running.stop().await;
+    let file = std::fs::read_to_string(data.join("clients").join("pins")).unwrap();
+    assert_eq!(file, format!("{} metrics\n", scraper.pin));
+    let running = start_in(dir, data, vec![control.pin]);
+    let (status, _) = request_once(
+        as_scraper_of(&running, &scraper).await,
+        "GET",
+        lotse_api_types::WS_PATH,
+    )
+    .await;
+    assert_eq!(status, 403, "still a metrics client after the restart");
+    // Removed like any client.
+    let mut admin = local(&running).await;
+    let answer = call(&mut admin, remove(1, scraper.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    let refused = as_scraper_of(&running, &scraper).await;
+    assert!(
+        refused.is_err() || exchange(refused).await.is_err(),
+        "removed"
+    );
+    drop(admin);
+    running.finish().await;
+}
+
+/// `client`'s connection to `running`.
+async fn as_scraper_of(
+    running: &Running,
+    client: &ClientIdentity,
+) -> io::Result<TlsStream<TcpStream>> {
+    connect(running.addr, running.config(ClientCert::Own(client))).await
+}
+
+#[test]
+fn a_pin_fixed_with_both_roles_or_enrolled_with_the_other_stops_the_start() {
+    let pin = ClientIdentity::generate().unwrap().pin;
+    let (dir, data) = dirs("role-conflict");
+    let err = Server::bind(config_with(&dir, &data, vec![pin], vec![pin])).unwrap_err();
+    assert!(
+        matches!(err, BindError::Clients(ClientsError::FixedRoles(refused)) if refused == pin),
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("both as a control and as a metrics client"),
+        "{err}"
+    );
+    let clients = data.join("clients");
+    private_dir(&clients);
+    let mut pins = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(clients.join("pins"))
+        .unwrap();
+    io::Write::write_all(&mut pins, format!("{pin} metrics\n").as_bytes()).unwrap();
+    let err = Server::bind(config_with(&dir, &data, vec![pin], vec![])).unwrap_err();
+    assert!(
+        matches!(err, BindError::Clients(ClientsError::EnrolledRole { .. })),
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("configured as a control client but enrolled as a metrics one"),
+        "{err}"
+    );
+    // The same role in both places is no conflict.
+    drop(Server::bind(config_with(&dir, &data, vec![], vec![pin])).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// One request with `Connection: close` and the header fields `extra`
+/// (each ended by CRLF), and the whole answer's text.
+async fn answer_once<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    connected: io::Result<S>,
+    method: &str,
+    path: &str,
+    extra: &str,
+) -> String {
+    let mut stream = connected.unwrap();
+    let head =
+        format!("{method} {path} HTTP/1.1\r\nHost: lotse\r\n{extra}Connection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    within_5_s(stream.read_to_end(&mut answer)).await.unwrap();
+    String::from_utf8(answer).unwrap()
+}
+
+/// The `Accept` of Prometheus 3's default scrape protocols
+/// (`content_negotiation.md`, "Default Accept Header").
+const PROMETHEUS_ACCEPT: &str = "Accept: application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.3,text/plain;version=0.0.4;q=0.2,*/*;q=0.1\r\n";
+
+#[tokio::test(flavor = "current_thread")]
+async fn either_role_and_the_socket_read_the_metrics_in_the_format_they_accept() {
+    let control = ClientIdentity::generate().unwrap();
+    let metrics = ClientIdentity::generate().unwrap();
+    let (dir, data) = dirs("metrics-route");
+    let running = start_with(dir, data, vec![control.pin], vec![metrics.pin]);
+    let socket = || tokio::net::UnixStream::connect(running.dir.join("lotse.sock"));
+    let as_metrics = || connect(running.addr, running.config(ClientCert::Own(&metrics)));
+    let as_control = || connect(running.addr, running.config(ClientCert::Own(&control)));
+    let path = lotse_api_types::METRICS_PATH;
+    let text = "content-type: text/plain; version=0.0.4; charset=utf-8\r\n";
+    let openmetrics = "content-type: application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=allow-utf-8\r\n";
+    for (answer, content_type) in [
+        (answer_once(as_metrics().await, "GET", path, "").await, text),
+        (answer_once(as_control().await, "GET", path, "").await, text),
+        (answer_once(socket().await, "GET", path, "").await, text),
+        (
+            answer_once(as_metrics().await, "GET", path, PROMETHEUS_ACCEPT).await,
+            openmetrics,
+        ),
+        (
+            answer_once(socket().await, "GET", path, PROMETHEUS_ACCEPT).await,
+            openmetrics,
+        ),
+    ] {
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains(content_type), "{head}");
+        assert!(head.contains("connection: close"), "{head}");
+        assert!(
+            body.contains("lotse_supervisor_uptime_seconds 2.0\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("lotse_stream_packets_lost_total{stream=\"front\"} 9\n"),
+            "{body}"
+        );
+        assert_eq!(
+            body.ends_with("# EOF\n"),
+            content_type == openmetrics,
+            "{body}"
+        );
+    }
+    // HEAD as GET without the body; any other method 405.
+    let answer = answer_once(as_metrics().await, "HEAD", path, "").await;
+    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+    assert!(answer.ends_with("\r\n\r\n"), "no body: {answer}");
+    let (status, body) = request_once(as_metrics().await, "POST", path).await;
+    assert_eq!((status, code_of(&body)), (405, "invalid_request".into()));
+    running.finish().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9110_15_5_4_a_metrics_client_removed_after_its_handshake_reads_no_more() {
+    let (logs, _guard) = capture();
+    let scraper = ClientIdentity::generate().unwrap();
+    let running = start("metrics-removed", vec![]);
+    let mut admin = local(&running).await;
+    let answer = call(&mut admin, add(1, scraper.pin, "metrics")).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    let connected = connect(running.addr, running.config(ClientCert::Own(&scraper))).await;
+    let answer = call(&mut admin, remove(2, scraper.pin)).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    let (status, body) = request_once(connected, "GET", lotse_api_types::METRICS_PATH).await;
+    assert_eq!((status, code_of(&body)), (403, "not_permitted".into()));
+    assert!(
+        logs.text()
+            .contains("metrics refused: its client was removed")
+    );
+    drop(admin);
+    running.finish().await;
+}
+
+/// Regression (Copilot's review of edenhaus/lotse#183): the scraper's
+/// enrollment was checked only before the snapshot, so a pin removed while
+/// it was collected still got the metrics.
+#[tokio::test(flavor = "current_thread")]
+async fn rfc9110_15_5_4_a_metrics_client_removed_while_its_snapshot_is_collected_gets_none_of_it() {
+    let (logs, _guard) = capture();
+    let scraper = ClientIdentity::generate().unwrap();
+    let running = start("metrics-removed-during", vec![]);
+    let mut admin = local(&running).await;
+    let answer = call(&mut admin, add(1, scraper.pin, "metrics")).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    HOLD_SNAPSHOT.store(true, std::sync::atomic::Ordering::SeqCst);
+    let connected = connect(running.addr, running.config(ClientCert::Own(&scraper))).await;
+    let removal = async {
+        within_5_s(SNAPSHOT_HELD.notified()).await;
+        let answer = call(&mut admin, remove(2, scraper.pin)).await;
+        assert_eq!(answer["success"], true, "{answer}");
+        SNAPSHOT_RELEASED.notify_one();
+    };
+    let ((status, body), ()) = tokio::join!(
+        request_once(connected, "GET", lotse_api_types::METRICS_PATH),
+        removal
+    );
+    assert_eq!((status, code_of(&body)), (403, "not_permitted".into()));
+    assert!(!body.contains("lotse_"), "none of the metrics: {body}");
+    assert!(
+        logs.text()
+            .contains("metrics refused: its client was removed")
+    );
     drop(admin);
     running.finish().await;
 }

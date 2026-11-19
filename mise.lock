@@ -227,6 +227,29 @@ url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9
 url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/703616437"
 provenance = "github-attestations"
 
+[[tools."github:prometheus/prometheus"]]
+version = "3.16.0"
+backend = "github:prometheus/prometheus"
+specifiers = ["3.16.0"]
+
+[tools."github:prometheus/prometheus"."platforms.linux-arm64"]
+checksum = "sha256:fd8571b8162f4020232d886f17340bcf92e1722985ae3b4c1d096157826c0fbe"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.16.0/prometheus-3.16.0.linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/713900769"
+provenance = "github-attestations"
+
+[tools."github:prometheus/prometheus"."platforms.linux-x64"]
+checksum = "sha256:68727009472a2c02e1ff7f062fd5b3e637285bffc8fc2d340c76fb449d6e0f34"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.16.0/prometheus-3.16.0.linux-amd64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/713900575"
+provenance = "github-attestations"
+
+[tools."github:prometheus/prometheus"."platforms.macos-arm64"]
+checksum = "sha256:f7c71b553316f822bdd860a3ea527ebefb2f8e944e5b7dfd419ae2653cf3ba01"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.16.0/prometheus-3.16.0.darwin-arm64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/713898764"
+provenance = "github-attestations"
+
 [[tools."github:rust-cross/cargo-zigbuild"]]
 version = "0.24.1"
 backend = "github:rust-cross/cargo-zigbuild"
