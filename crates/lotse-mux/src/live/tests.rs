@@ -667,6 +667,97 @@ fn rfc3550_5_1_audio_of_a_reconnect_after_one_whose_video_came_first_waits_for_i
     );
 }
 
+/// A reconnect that sends audio but never its video, then one whose video
+/// comes first: the abandoned audio epoch does not take the second
+/// reconnect's keyframe, captured after it ended, so that reconnect's own
+/// audio is taken at once, placed after the keyframe by capture time.
+#[test]
+fn rfc3550_5_1_audio_of_a_reconnect_after_one_without_video_is_taken_after_its_keyframe() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    // The first reconnect: its audio, but its video never comes.
+    for (at, ts) in [(1000, 0), (1064, AAC_FRAME)] {
+        assert_eq!(
+            out.push(Kind::Audio, aac(base, at, ts, 1, 1)),
+            LiveStep::Dropped,
+            "audio waiting for a keyframe that never comes"
+        );
+    }
+    // The second: its keyframe, then its audio.
+    out.push(Kind::Video, video(base, 3000, 0, true, 2, 2));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 3010, 0, 2, 2)),
+        LiveStep::Held,
+        "the second reconnect's audio, after its keyframe"
+    );
+    out.push(Kind::Video, video(base, 3040, FRAME, false, 2, 3));
+    out.push(Kind::Audio, aac(base, 3074, AAC_FRAME, 2, 3));
+    out.push(Kind::Video, video(base, 3080, 2 * FRAME, false, 2, 4));
+    let (video, audio) = tracks(&out);
+    let key = resumed_at(&video, 2);
+    assert_eq!(audio.len(), 2, "{audio:?}");
+    assert_eq!(pts(&audio[1]), key / 90 * 16 + audio_ticks(10));
+}
+
+/// A reconnect's keyframe captured with the last frame of the audio before
+/// starts the reconnect's audio too: a tie never mutes it.
+#[test]
+fn rfc3550_5_1_a_keyframe_captured_with_the_old_audio_s_last_frame_starts_the_new_audio() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 40, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    // A reconnect's audio without its video, its last frame at 1064 ms.
+    out.push(Kind::Audio, aac(base, 1000, 0, 1, 1));
+    out.push(Kind::Audio, aac(base, 1064, AAC_FRAME, 1, 2));
+    // The next reconnect's keyframe, captured at 1064 ms too.
+    out.push(Kind::Video, video(base, 1064, 0, true, 2, 2));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 1070, 0, 2, 3)),
+        LiveStep::Held,
+        "placed by the keyframe captured with the audio before's last frame"
+    );
+}
+
+/// Frames of the old connection's audio that arrive after the reconnect's
+/// keyframe are left out: placed by the origin that keyframe set, they
+/// would push the reconnect's audio past where it was captured.
+#[test]
+fn rfc3550_5_1_old_audio_late_after_a_reconnect_s_keyframe_is_left_out() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    out.push(Kind::Video, video(base, 1000, 0, true, 1, 2));
+    for (at, ts) in [(64, AAC_FRAME), (128, 2 * AAC_FRAME)] {
+        assert_eq!(
+            out.push(Kind::Audio, aac(base, at, ts, 0, 1)),
+            LiveStep::Dropped,
+            "the old connection's audio, late"
+        );
+    }
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 1010, 0, 1, 2)),
+        LiveStep::Held
+    );
+    out.push(Kind::Video, video(base, 1040, FRAME, false, 1, 3));
+    out.push(Kind::Audio, aac(base, 1074, AAC_FRAME, 1, 3));
+    out.push(Kind::Video, video(base, 1080, 2 * FRAME, false, 1, 4));
+    let (video, audio) = tracks(&out);
+    let key = resumed_at(&video, 2);
+    assert_eq!(audio.len(), 2, "{audio:?}");
+    assert_eq!(
+        pts(&audio[1]),
+        key / 90 * 16 + audio_ticks(10),
+        "10 ms after the keyframe, as captured"
+    );
+}
+
 /// Audio whose timestamp does not advance re-anchors at its capture time,
 /// as a recording's (`audio_whose_timestamp_does_not_advance_starts_a_new_epoch`):
 /// the samples before it go out at once, so the run they are in does not
