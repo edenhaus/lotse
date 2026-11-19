@@ -143,13 +143,18 @@ async fn stop(s: &Arc<Supervisor>, clock: &FakeClock) {
     }
 }
 
+/// The refusal of a refused request, its places in flight let go.
+fn refused((error, _in_flight): (HlsError, InFlight)) -> HlsError {
+    error
+}
+
 /// Requests `request` of session `id` in a task of its own, as it may
 /// block.
 fn spawn_request(
     s: &Arc<Supervisor>,
     id: &HlsId,
     request: HlsRequest,
-) -> tokio::task::JoinHandle<Result<(HlsReply, InFlight), HlsError>> {
+) -> tokio::task::JoinHandle<HlsAnswer> {
     let s = Arc::clone(s);
     let id = id.clone();
     spawn_named("test.hls_request", async move { s.hls(&id, request).await })
@@ -309,13 +314,15 @@ async fn rfc8216bis_6_2_5_2_an_hls_session_serves_its_output_s_window_until_it_c
     assert_eq!(
         within(s.hls(&id, HlsRequest::Media(Resource::Segment { msn: 9 })))
             .await
-            .err(),
+            .err()
+            .map(refused),
         Some(HlsError::ResourceNotFound)
     );
     assert_eq!(
         within(s.hls(&id, playlist(Blocking::Segment { msn: 9 })))
             .await
-            .err(),
+            .err()
+            .map(refused),
         Some(HlsError::BadRequest)
     );
     // Segment 1 completes: the blocked reload is answered.
@@ -343,7 +350,10 @@ async fn rfc8216bis_6_2_5_2_an_hls_session_serves_its_output_s_window_until_it_c
         (ErrorCode::HlsNotFound, &json!(id.as_str()))
     );
     assert_eq!(
-        within(s.hls(&id, playlist(Blocking::None))).await.err(),
+        within(s.hls(&id, playlist(Blocking::None)))
+            .await
+            .err()
+            .map(refused),
         Some(HlsError::NotFound)
     );
     s.shutdown().await;
@@ -695,13 +705,19 @@ async fn rfc8216bis_6_2_5_2_blocked_requests_are_bounded_in_number_and_time() {
     let early = spawn_request(&s, &id, HlsRequest::Media(Resource::Init));
     settle().await;
     assert_eq!(
-        within(s.hls(&id, playlist(Blocking::None))).await.err(),
+        within(s.hls(&id, playlist(Blocking::None)))
+            .await
+            .err()
+            .map(refused),
         Some(HlsError::TooManyBlocked {
             limit: "max_hls_blocked_per_session"
         })
     );
     clock.advance(start_timeout);
-    assert_eq!(within(early).await.unwrap().err(), Some(HlsError::Timeout));
+    assert_eq!(
+        within(early).await.unwrap().err().map(refused),
+        Some(HlsError::Timeout)
+    );
     pipe.write_all(&first_segment()).unwrap();
     published(&s, &live_id, 5).await;
     let hinted = HlsRequest::Media(Resource::Part { msn: 1, index: 0 });
@@ -715,7 +731,7 @@ async fn rfc8216bis_6_2_5_2_blocked_requests_are_bounded_in_number_and_time() {
     let third = hls_id(&third);
     for _ in 0..2 {
         assert_eq!(
-            within(s.hls(&third, hinted)).await.err(),
+            within(s.hls(&third, hinted)).await.err().map(refused),
             Some(HlsError::TooManyBlocked {
                 limit: "max_hls_blocked"
             })
@@ -734,13 +750,53 @@ async fn rfc8216bis_6_2_5_2_blocked_requests_are_bounded_in_number_and_time() {
     settle().await;
     assert!(!ahead.is_finished());
     clock.advance(Duration::from_secs(3));
-    assert_eq!(within(ahead).await.unwrap().err(), Some(HlsError::Timeout));
+    assert_eq!(
+        within(ahead).await.unwrap().err().map(refused),
+        Some(HlsError::Timeout)
+    );
     let gone = spawn_request(&s, &third, playlist(Blocking::Segment { msn: 2 }));
     settle().await;
     let close = json!({ "id": 7, "type": "hls/close", "hls_id": third.as_str() });
     result(call(&s, &close.to_string()).await);
-    assert_eq!(within(gone).await.unwrap().err(), Some(HlsError::NotFound));
+    assert_eq!(
+        within(gone).await.unwrap().err().map(refused),
+        Some(HlsError::NotFound)
+    );
     stop(&s, &clock).await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A request refused once it took its places in flight hands them on with
+/// its refusal, for its connection to hold until it ends, as a response's;
+/// one refused before it took any, an unknown session's, hands on none.
+#[tokio::test]
+async fn a_refusal_after_its_places_were_taken_hands_them_on() {
+    let dir = private_dir("hls-refusal-places");
+    let clock = Arc::new(FakeClock::from_system());
+    let limits = HlsLimits {
+        idle_timeout: Duration::from_secs(3600),
+        ..HlsLimits::DEFAULT
+    };
+    let (s, mut commands) = rig(&dir, limits, clock.clone()).await;
+    let (live_id, mut pipe, id, _events) = first_session(&s, &mut commands).await;
+    pipe.write_all(&first_segment()).unwrap();
+    published(&s, &live_id, 5).await;
+    let in_flight = || s.shared.lock().hls.requests.available_permits();
+    let before = in_flight();
+    let_assert!(
+        Err((HlsError::ResourceNotFound, places)) =
+            within(s.hls(&id, HlsRequest::Media(Resource::Segment { msn: 9 }))).await
+    );
+    assert!(!places.is_empty());
+    assert_eq!(in_flight(), before - 1, "held by the refusal");
+    drop(places);
+    assert_eq!(in_flight(), before);
+    let unknown = HlsId::new("01JZ").unwrap();
+    let_assert!(
+        Err((HlsError::NotFound, places)) = within(s.hls(&unknown, playlist(Blocking::None))).await
+    );
+    assert!(places.is_empty());
+    s.shutdown().await;
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -774,14 +830,17 @@ async fn requests_in_flight_are_bounded_until_their_responses_are_dropped() {
     let per_session = Some(HlsError::TooManyRequests {
         limit: "max_hls_requests_per_session",
     });
-    assert_eq!(within(s.hls(&id, init)).await.err(), per_session);
+    assert_eq!(
+        within(s.hls(&id, init)).await.err().map(refused),
+        per_session
+    );
     let create = json!({ "id": 5, "type": "hls/create", "stream_id": "front" });
     let (second, _second_events) = started(within(call_on(&s, 1, &create)).await);
     let second = hls_id(&second);
     let held = within(s.hls(&second, init)).await.unwrap();
     for _ in 0..2 {
         assert_eq!(
-            within(s.hls(&second, init)).await.err(),
+            within(s.hls(&second, init)).await.err().map(refused),
             Some(HlsError::TooManyRequests {
                 limit: "max_hls_requests"
             })

@@ -15,15 +15,18 @@
 //!
 //! A response carries its `Content-Length`, so it needs no chunked transfer
 //! coding and any HTTP/1.x request is served. Its connection holds the
-//! handler's [`InFlight`] until it ends, after the socket took the last
-//! byte through any TLS session, or is dropped: the handler's limits on the
-//! requests in flight bound the responses a client takes slowly too, and
-//! with them the media they keep after the window let it go. Once the
-//! handler is asked, the
-//! connection leaves the pending upgrades and their deadline, as a live
+//! handler's [`InFlight`], a refusal's too, until it ends, after the socket
+//! took the last byte through any TLS session, or is dropped: the
+//! handler's limits on the requests in flight bound the responses a client
+//! takes slowly, and with them the media they keep after the window let it
+//! go. A connection whose request the handler holds, or that took places
+//! in flight, leaves the pending upgrades and their deadline, as a live
 //! output's body does (`crate::live`): a blocked request may wait longer
 //! than the upgrade deadline, and requests blocked at once must not take
-//! the few places of connections awaiting their upgrade. Its response then
+//! the few places of connections awaiting their upgrade. One refused before
+//! it took a place (an unknown session, a request over a limit) stays among
+//! them, as a refused live body's does, so the connections are bounded
+//! either way. Every response
 //! carries `Connection: close` (RFC 9112 §9.6): the connection serves that
 //! one request, bounded as a body's connection is, by the client taking the
 //! response, shutdown's close timeout and its TLS client staying enrolled.
@@ -60,6 +63,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse as _, Response};
+use futures_util::FutureExt as _;
 use lotse_api_types::HLS_PATH;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::hls::PLAYLIST_NAME;
@@ -116,16 +120,29 @@ pub enum HlsReply {
 #[derive(Debug, Default)]
 pub struct InFlight {
     /// The places, given back as they are dropped.
-    _permits: Vec<OwnedSemaphorePermit>,
+    permits: Vec<OwnedSemaphorePermit>,
 }
 
 impl InFlight {
     /// Holds `permits` until the response's connection ends.
     #[must_use]
     pub const fn new(permits: Vec<OwnedSemaphorePermit>) -> Self {
-        Self { _permits: permits }
+        Self { permits }
+    }
+
+    /// Whether it holds no place: the request took none, as one refused
+    /// before it did.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.permits.is_empty()
     }
 }
+
+/// The handler's answer to an LL-HLS request: the reply or the refusal,
+/// each with the places among the requests in flight the request took,
+/// which its connection holds until it ends, a refusal's too, so a client
+/// that takes neither slowly keeps within the limits on them.
+pub type HlsAnswer = Result<(HlsReply, InFlight), (HlsError, InFlight)>;
 
 /// Why the handler answers a request with no playlist or resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -182,9 +199,16 @@ pub(crate) async fn fetch<H: Handler>(
         Ok(admitted) => admitted,
         Err(refused) => return *refused,
     };
-    // From here the connection serves this one request: see the module docs.
-    body.set(BodyState::Taken);
-    let answer = state.handler.hls(&hls_id, asked).await;
+    let mut answering = std::pin::pin!(state.handler.hls(&hls_id, asked));
+    // A request the handler holds leaves the pending upgrades: see the
+    // module docs. One answered at once leaves them only for the places it
+    // took ([`reply`]).
+    let answer = if let Some(answer) = (&mut answering).now_or_never() {
+        answer
+    } else {
+        body.set(BodyState::Taken);
+        answering.await
+    };
     reply(&peer, &hls_id, answer, &body)
 }
 
@@ -308,34 +332,37 @@ fn admit(request: &Request<'_>) -> Result<(HlsId, HlsRequest), Box<Response>> {
 }
 
 /// The response to the handler's `answer` for session `hls_id`; every one
-/// closes its connection (see the module docs), and a `200`'s connection,
-/// whose `body` watch this is, holds the answer's [`InFlight`] until it
-/// ends: hyper hands the last of a response to a TLS session before the
-/// socket has taken it, and the session holds it, flushing, until then.
-fn reply(
-    peer: &PeerInfo,
-    hls_id: &HlsId,
-    answer: Result<(HlsReply, InFlight), HlsError>,
-    body: &BodyWatch,
-) -> Response {
-    let mut response = match answer {
+/// closes its connection (see the module docs). A connection, whose `body`
+/// watch this is, that took places among the requests in flight, its
+/// answer's [`InFlight`], leaves the pending upgrades and holds them until
+/// it ends, a refusal's as a `200`'s: hyper hands the last of a response to
+/// a TLS session before the socket has taken it, and the session holds it,
+/// flushing, until then. One refused before it took any stays among the
+/// pending upgrades, bounded by their limit and deadline as any request
+/// before its upgrade is.
+fn reply(peer: &PeerInfo, hls_id: &HlsId, answer: HlsAnswer, body: &BodyWatch) -> Response {
+    let (mut response, in_flight) = match answer {
         Ok((HlsReply::Playlist(text), in_flight)) => {
             tracing::trace!(%peer, hls.id = %hls_id, bytes = text.len(), "LL-HLS playlist sent");
-            body.hold(in_flight);
             let len = text.len();
-            ok(PLAYLIST_MIME, PLAYLIST_CACHE, len, vec![Bytes::from(text)])
+            let response = ok(PLAYLIST_MIME, PLAYLIST_CACHE, len, vec![Bytes::from(text)]);
+            (response, in_flight)
         }
         Ok((HlsReply::Media(chunks), in_flight)) => {
             tracing::trace!(%peer, hls.id = %hls_id, bytes = chunks.len(), "LL-HLS resource sent");
-            body.hold(in_flight);
             let len = chunks.len();
-            ok(MEDIA_MIME, MEDIA_CACHE, len, chunks.into_vec())
+            let response = ok(MEDIA_MIME, MEDIA_CACHE, len, chunks.into_vec());
+            (response, in_flight)
         }
-        Err(error) => {
+        Err((error, in_flight)) => {
             tracing::debug!(%peer, hls.id = %hls_id, %error, "LL-HLS request refused");
-            refused(error)
+            (refused(error), in_flight)
         }
     };
+    if !in_flight.is_empty() {
+        body.set(BodyState::Taken);
+        body.hold(in_flight);
+    }
     response
         .headers_mut()
         .insert(header::CONNECTION, HeaderValue::from_static("close"));

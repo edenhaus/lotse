@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lotse_api::{
-    ConnectionId, Event, Handler, HlsError, HlsReply, HlsRequest, InFlight, LiveBody,
-    LiveBodyError, Outcome, RecordingBody, RecordingBodyError,
+    ConnectionId, Event, Handler, HlsAnswer, HlsRequest, LiveBody, LiveBodyError, Outcome,
+    RecordingBody, RecordingBodyError,
 };
 use lotse_api_types::API_VERSION;
 use lotse_api_types::command::{
@@ -1876,11 +1876,7 @@ impl Handler for Supervisor {
 
     /// Answers an LL-HLS request from its session's window, waiting,
     /// bounded, for what it does not hold yet (`crate::hls::serve`).
-    fn hls(
-        &self,
-        hls_id: &HlsId,
-        request: HlsRequest,
-    ) -> impl Future<Output = Result<(HlsReply, InFlight), HlsError>> + Send {
+    fn hls(&self, hls_id: &HlsId, request: HlsRequest) -> impl Future<Output = HlsAnswer> + Send {
         let shared = Arc::clone(&self.shared);
         let hls_id = hls_id.clone();
         async move { crate::hls::serve(&shared, &hls_id, request).await }
