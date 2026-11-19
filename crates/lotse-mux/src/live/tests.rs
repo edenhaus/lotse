@@ -572,6 +572,37 @@ fn rfc3550_5_1_audio_of_a_reconnect_after_a_resumed_skip_waits_for_the_video_s_k
     assert_eq!(pts(&audio[2]), key / 90 * 16 + audio_ticks(10));
 }
 
+/// A reconnect whose video keyframe comes before its audio: the video has
+/// started its new epoch already, so the new audio is taken from its first
+/// frame, placed by capture time after the keyframe, not left out until
+/// another start.
+#[test]
+fn rfc3550_5_1_audio_of_a_reconnect_whose_video_came_first_is_taken_at_once() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    // The reconnect: its keyframe first, then its audio.
+    out.push(Kind::Video, video(base, 3000, 0, true, 1, 2));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 3010, 0, 1, 2)),
+        LiveStep::Held,
+        "the reconnect's audio, after its video's keyframe"
+    );
+    out.push(Kind::Video, video(base, 3040, FRAME, false, 1, 3));
+    out.push(Kind::Audio, aac(base, 3074, AAC_FRAME, 1, 3));
+    out.push(Kind::Video, video(base, 3080, 2 * FRAME, false, 1, 4));
+    let (video, audio) = tracks(&out);
+    let key = resumed_at(&video, 2);
+    assert_eq!(
+        audio.len(),
+        2,
+        "the old epoch's frame and the new one written so far"
+    );
+    assert_eq!(pts(&audio[1]), key / 90 * 16 + audio_ticks(10));
+}
+
 #[test]
 fn iso14496_12_8_8_8_the_video_s_last_frame_lasts_at_most_what_its_duration_field_holds() {
     let base = base();
