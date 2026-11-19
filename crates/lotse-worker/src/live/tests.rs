@@ -697,8 +697,10 @@ async fn a_frame_lost_while_the_queue_drains_keeps_the_drain_until_the_queue_emp
     rig.video_frame(7, true, 10);
     settle().await;
     // The rest of the queue, then a delta frame on an empty queue and the
-    // next keyframe.
-    loop {
+    // next keyframe. At most 16 reads of the pipe: an output that wrote the
+    // same bytes again would otherwise fill the pipe for as long as it is
+    // read and the test's memory with it.
+    for _ in 0..16 {
         let read = available(&reader).await;
         if read.is_empty() {
             break;
