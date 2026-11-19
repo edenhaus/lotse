@@ -549,7 +549,7 @@ impl Output {
         asked: &mut watch::Receiver<Asked>,
         settings: LiveSettings,
     ) -> LiveEnd {
-        if let Err(reason) = self.await_fetch(asked).await {
+        if let Err(reason) = self.await_fetch(&media.video, asked).await {
             return reason;
         }
         match self.join(&media) {
@@ -559,8 +559,15 @@ impl Output {
     }
 
     /// Writes the init segment as the pipe takes it until a reader took the
-    /// body; the output's end before that.
-    async fn await_fetch(&mut self, asked: &mut watch::Receiver<Asked>) -> Result<(), LiveEnd> {
+    /// body; the output's end before that, the video track's close among
+    /// it. The video's events until then are only watched for that close:
+    /// the media starts at the fetch.
+    async fn await_fetch(
+        &mut self,
+        video: &Arc<Track>,
+        asked: &mut watch::Receiver<Asked>,
+    ) -> Result<(), LiveEnd> {
+        let mut watched = video.subscribe(Unit::Frames);
         loop {
             // A new pipe is writable once the runtime polled it, not before.
             self.write()?;
@@ -575,6 +582,10 @@ impl Output {
                 }
                 _ = self.pipe.writable(), if !self.pending.is_empty() => {}
                 () = hangup(&self.pipe) => return Err(self.gone()),
+                event = watched.next() => if event.is_none() {
+                    tracing::info!(live.id = %self.id, "live: the video track closed before the fetch");
+                    return Err(LiveEnd::StreamDeleted);
+                },
             }
         }
     }
