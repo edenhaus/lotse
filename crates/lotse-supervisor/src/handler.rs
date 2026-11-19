@@ -292,12 +292,13 @@ impl Supervisor {
         }
     }
 
-    /// Closes every session and ends every recording with `shutting_down`,
-    /// and ends the signaling (each offered signal closes `source_stopped`,
-    /// each signaling subscription ends); the first step of the shutdown,
-    /// before the control connections say goodbye. A recording's worker
-    /// writes its last fragment while it stops, but its report is not
-    /// waited for, so the body is cut.
+    /// Closes every session and ends every recording and live output with
+    /// `shutting_down`, and ends the signaling (each offered signal closes
+    /// `source_stopped`, each signaling subscription ends); the first step
+    /// of the shutdown, before the control connections say goodbye. A
+    /// recording's worker writes its last fragment while it stops, but its
+    /// report is not waited for, so the body is cut; a live output's
+    /// `closed` goes out at once, its counters zero, for the same reason.
     pub fn close_sessions(&self) {
         let mut state = self.shared.lock();
         state.close_sessions_where(
@@ -307,7 +308,7 @@ impl Supervisor {
             CloseBy::Supervisor,
         );
         state.end_recordings_where(|_| true, RecordingCloseReason::ShuttingDown);
-        state.end_lives_where(|_| true, LiveCloseReason::ShuttingDown);
+        state.close_lives_now(LiveCloseReason::ShuttingDown);
         state.signaling_shutdown();
     }
 
@@ -725,15 +726,20 @@ impl Supervisor {
         state.next_connection = state.next_connection.saturating_add(1);
         let id = format!("c{}", state.next_connection);
         let (demand, demand_rx) = watch::channel(Demand::default());
-        // Room besides the rest for the close each session reserves and
-        // the stop each recording does.
+        // Room besides the rest for the close each session reserves, the
+        // stop each recording does, and the fetch and stop each live output
+        // does.
         let sessions = usize::try_from(self.settings.limits.max_sessions).unwrap_or(usize::MAX);
         let recordings =
             usize::try_from(state.recording_limits.max_recordings).unwrap_or(usize::MAX);
+        let lives = usize::try_from(state.live_limits.max_live)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2);
         let (commands, commands_rx) = mpsc::channel(
             COMMAND_QUEUE
                 .saturating_add(sessions)
-                .saturating_add(recordings),
+                .saturating_add(recordings)
+                .saturating_add(lives),
         );
         state.connections.insert(
             id.clone(),
@@ -7375,6 +7381,40 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A shutdown closes a started live output `shutting_down` at once: its
+    /// owner gets `closed`, its last event, without the worker's report,
+    /// and the worker is asked to stop it.
+    #[tokio::test]
+    async fn a_shutdown_closes_a_live_output_shutting_down_without_its_worker_s_report() {
+        let dir = private_dir("live-shutdown");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        live_report(&s, &live_id, live_started());
+        let (_answer, mut events) = started(within(create).await.unwrap());
+        s.close_sessions();
+        let closed = next(&mut events).await;
+        assert_eq!(
+            (&closed["type"], &closed["reason"], &closed["bytes"]),
+            (&json!("closed"), &json!("shutting_down"), &json!(0))
+        );
+        assert!(events.recv().await.is_none(), "closed is the last event");
+        assert!(s.shared.lock().lives.is_empty());
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        // The worker's late report finds the output gone.
+        live_report(&s, &live_id, live_closed(lotse_ipc::STOPPED_AS_ASKED));
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// `unsubscribe` of a live output's subscription ends it
     /// `session_closed`, asked of its worker; nothing answers but the
     /// unsubscribe itself.
@@ -7491,6 +7531,33 @@ mod tests {
             .live_report(&back_connection, &back_id, live_closed("no_video_track"));
         let err = error(within(back).await.unwrap());
         assert_eq!(err.code, ErrorCode::NoVideoTrack);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The queue of a connection holds the fetch and the stop every live
+    /// output the daemon allows reserves besides its own room: outputs up
+    /// to `max_live` never leave a create without room in an idle queue.
+    #[tokio::test]
+    async fn a_connection_s_queue_holds_the_slots_every_allowed_live_output_reserves() {
+        let dir = private_dir("live-room");
+        let mut settings = session_settings();
+        settings.limits.live = LiveLimits {
+            max_live: 3,
+            ..LiveLimits::DEFAULT
+        };
+        let mut environment = environment(&blocking_worker(&dir));
+        environment.registries.live = Some(Arc::new(
+            lotse_core::test_util::FakeLiveMuxerFactory::default(),
+        ));
+        let s = Supervisor::new(settings, environment, Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let sessions = usize::try_from(s.settings.limits.max_sessions).unwrap();
+        let recordings = usize::try_from(s.shared.lock().recording_limits.max_recordings).unwrap();
+        assert_eq!(
+            s.shared.lock().connections["c1"].commands.max_capacity(),
+            COMMAND_QUEUE + sessions + recordings + 3 * 2
+        );
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
