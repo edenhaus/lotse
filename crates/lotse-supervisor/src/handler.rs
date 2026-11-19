@@ -726,15 +726,20 @@ impl Supervisor {
         state.next_connection = state.next_connection.saturating_add(1);
         let id = format!("c{}", state.next_connection);
         let (demand, demand_rx) = watch::channel(Demand::default());
-        // Room besides the rest for the close each session reserves and
-        // the stop each recording does.
+        // Room besides the rest for the close each session reserves, the
+        // stop each recording does, and the fetch and stop each live output
+        // does.
         let sessions = usize::try_from(self.settings.limits.max_sessions).unwrap_or(usize::MAX);
         let recordings =
             usize::try_from(state.recording_limits.max_recordings).unwrap_or(usize::MAX);
+        let lives = usize::try_from(state.live_limits.max_live)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2);
         let (commands, commands_rx) = mpsc::channel(
             COMMAND_QUEUE
                 .saturating_add(sessions)
-                .saturating_add(recordings),
+                .saturating_add(recordings)
+                .saturating_add(lives),
         );
         state.connections.insert(
             id.clone(),
@@ -7526,6 +7531,33 @@ mod tests {
             .live_report(&back_connection, &back_id, live_closed("no_video_track"));
         let err = error(within(back).await.unwrap());
         assert_eq!(err.code, ErrorCode::NoVideoTrack);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The queue of a connection holds the fetch and the stop every live
+    /// output the daemon allows reserves besides its own room: outputs up
+    /// to `max_live` never leave a create without room in an idle queue.
+    #[tokio::test]
+    async fn a_connection_s_queue_holds_the_slots_every_allowed_live_output_reserves() {
+        let dir = private_dir("live-room");
+        let mut settings = session_settings();
+        settings.limits.live = LiveLimits {
+            max_live: 3,
+            ..LiveLimits::DEFAULT
+        };
+        let mut environment = environment(&blocking_worker(&dir));
+        environment.registries.live = Some(Arc::new(
+            lotse_core::test_util::FakeLiveMuxerFactory::default(),
+        ));
+        let s = Supervisor::new(settings, environment, Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let sessions = usize::try_from(s.settings.limits.max_sessions).unwrap();
+        let recordings = usize::try_from(s.shared.lock().recording_limits.max_recordings).unwrap();
+        assert_eq!(
+            s.shared.lock().connections["c1"].commands.max_capacity(),
+            COMMAND_QUEUE + sessions + recordings + 3 * 2
+        );
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
