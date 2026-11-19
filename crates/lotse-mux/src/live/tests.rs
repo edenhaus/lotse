@@ -702,24 +702,43 @@ fn rfc3550_5_1_audio_of_a_reconnect_after_one_without_video_is_taken_after_its_k
     assert_eq!(pts(&audio[1]), key / 90 * 16 + audio_ticks(10));
 }
 
-/// A reconnect's keyframe captured with the last frame of the audio before
-/// starts the reconnect's audio too: a tie never mutes it.
+/// A reconnect's keyframe whose capture time the clock, mapping the new
+/// connection afresh, puts before the old audio's last frame: it came
+/// after that frame, so the reconnect's audio is taken at once, not muted.
 #[test]
-fn rfc3550_5_1_a_keyframe_captured_with_the_old_audio_s_last_frame_starts_the_new_audio() {
+fn rfc3550_5_1_a_reconnect_s_keyframe_captured_before_the_old_audio_ends_starts_its_audio() {
     let base = base();
     let mut out = Output::start(&h264_track(), Some(&aac_track()));
     out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
-    out.push(Kind::Audio, aac(base, 40, 0, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
     out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
-    // A reconnect's audio without its video, its last frame at 1064 ms.
-    out.push(Kind::Audio, aac(base, 1000, 0, 1, 1));
-    out.push(Kind::Audio, aac(base, 1064, AAC_FRAME, 1, 2));
-    // The next reconnect's keyframe, captured at 1064 ms too.
-    out.push(Kind::Video, video(base, 1064, 0, true, 2, 2));
+    out.push(Kind::Audio, aac(base, 100, AAC_FRAME, 0, 1));
+    out.push(Kind::Video, video(base, 90, 0, true, 1, 2));
     assert_eq!(
-        out.push(Kind::Audio, aac(base, 1070, 0, 2, 3)),
+        out.push(Kind::Audio, aac(base, 110, 0, 1, 2)),
         LiveStep::Held,
-        "placed by the keyframe captured with the audio before's last frame"
+        "the reconnect's audio, after its keyframe"
+    );
+}
+
+/// Audio that changed its epoch before the video's first keyframe is the
+/// stream's own: there is no video epoch to pair it with, so it is taken
+/// from the first keyframe on, not muted until a reconnect.
+#[test]
+fn rfc3550_5_1_audio_whose_epoch_changed_before_the_first_keyframe_is_taken_after_it() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    for (at, epoch) in [(0, 0), (100, 1)] {
+        assert_eq!(
+            out.push(Kind::Audio, aac(base, at, 0, epoch, 0)),
+            LiveStep::Dropped,
+            "before the first keyframe"
+        );
+    }
+    out.push(Kind::Video, video(base, 200, 0, true, 0, 0));
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 210, AAC_FRAME, 1, 1)),
+        LiveStep::Held
     );
 }
 
