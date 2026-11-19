@@ -189,6 +189,19 @@ subtle = { version = "2", default-features = false }
 # every WebRTC session, the control API's server certificate and the fake camera's TLS certificate;
 # `pem` writes the control API's identity file.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+# The Prometheus project's Rust client (prometheus/client_rust): its OpenMetrics 1.0 and Prometheus
+# text 0.0.4 encoders render `GET /v0/metrics` from the `metrics/get` snapshot through a `Collector`
+# made per scrape. No protobuf.
+prometheus-client = { version = "0.26", default-features = false }
+# The media ranges of the metrics' `Accept` header (RFC 9110 §12.5.1 grammar, quoted strings
+# included), which picks the exposition format; the selection over them is lotse's (exporter.rs).
+mediatype = { version = "0.23", default-features = false }
+# PEM (RFC 7468) of the control identity's certificate alone, which `lotse identity --certificate`
+# prints for a client that trusts it as its CA file; already in the tree via rcgen's `pem`.
+pem = { version = "4", default-features = false }
+# X.509 parsing of the control identity's certificate: whether it names the DNS name a client
+# verifies it by (RFC 6125 §6.4, as Go's verifier requires); already in the tree via rustls.
+rustls-webpki = { version = "0.103", default-features = false }
 # The allocation-counting tests of the hot paths: a global allocator counting the calling thread's
 # allocations, linked only into the test binaries that use it.
 allocation-counter = { version = "0.8", default-features = false }

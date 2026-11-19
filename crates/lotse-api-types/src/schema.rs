@@ -81,6 +81,7 @@ mod generator {
         );
         for name in [
             "clients/remove",
+            "clients/add",
             "stream/delete",
             "stream/subscribe",
             "unsubscribe",
