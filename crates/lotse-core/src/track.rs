@@ -167,6 +167,11 @@ pub struct GopSnapshot {
     /// frame over `max_frame_bytes`, so only the keyframe is kept until the
     /// next keyframe.
     truncated: bool,
+    /// The track's descriptor when the keyframe was published: the one its
+    /// frames were published under. A change of family or clock rate
+    /// empties the cache, one within the family (another profile) does
+    /// not, so the track's descriptor may have moved on since.
+    codec: Arc<Codec>,
 }
 
 /// One frame after a GOP's keyframe, linked to the frame before it. Every
@@ -226,6 +231,12 @@ impl GopSnapshot {
         self.truncated
     }
 
+    /// The track's descriptor when the keyframe was published, which a
+    /// joiner whose format was set by a later descriptor compares.
+    pub const fn codec(&self) -> &Arc<Codec> {
+        &self.codec
+    }
+
     /// This GOP cut back to its keyframe, truncated.
     fn cut(&self) -> Self {
         Self {
@@ -234,6 +245,7 @@ impl GopSnapshot {
             frames: 1,
             bytes: self.keyframe.payload.len(),
             truncated: true,
+            codec: Arc::clone(&self.codec),
         }
     }
 
@@ -1959,6 +1971,7 @@ impl Track {
                 frames: 1,
                 bytes,
                 truncated: false,
+                codec: self.codec(),
             })));
             return;
         }
@@ -2007,6 +2020,7 @@ impl Track {
                 frames: count,
                 bytes: total,
                 truncated: false,
+                codec: Arc::clone(&current.codec),
             }
         };
         self.gop.store(Some(Arc::new(next)));
