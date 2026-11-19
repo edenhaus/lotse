@@ -248,6 +248,9 @@ fn an_output_ended_before_its_start_refuses_its_creates_with_why() {
         (HlsCloseReason::WorkerCrashed, ErrorCode::WorkerCrashed),
         (HlsCloseReason::ShuttingDown, ErrorCode::ShuttingDown),
         (HlsCloseReason::StreamDeleted, ErrorCode::StreamNotFound),
+        // Its last session left, the create's own among them.
+        (HlsCloseReason::Closed, ErrorCode::HlsNotFound),
+        (HlsCloseReason::SessionClosed, ErrorCode::HlsNotFound),
         (HlsCloseReason::WindowFull, ErrorCode::InternalError),
     ] {
         assert_eq!(start_error(reason).code, code, "{reason}");
@@ -790,6 +793,28 @@ async fn unsubscribing_a_waiting_hls_create_refuses_it_at_once_and_leaves_the_ou
     live_report(&s, &spec.live_id, live_started());
     let (answer, _events) = started(within(second).await.unwrap());
     assert!(answer["hls_id"].is_string(), "{answer}");
+    stop(&s, &clock).await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `unsubscribe` of the only create waiting on an output ends its session,
+/// the output with it, its last session gone, `closed`; the create is
+/// refused `hls_not_found`, as when another session keeps the output, not
+/// `internal_error`.
+#[tokio::test]
+async fn unsubscribing_the_only_waiting_hls_create_refuses_it_hls_not_found() {
+    let dir = private_dir("hls-unsubscribe-only");
+    let clock = Arc::new(FakeClock::from_system());
+    let (s, mut commands) = rig(&dir, HlsLimits::DEFAULT, clock.clone()).await;
+    let create = spawn_create(&s, 2, true);
+    let (spec, _pipe) = output_start(&mut commands).await;
+    assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+    let err = error(within(create).await.unwrap());
+    assert_eq!(err.code, ErrorCode::HlsNotFound, "{err:?}");
+    assert!(err.details["hls_id"].is_string(), "{err:?}");
+    let_assert!(Some(DriverCommand::StopLive { live_id }) = within(commands.recv()).await);
+    assert_eq!(live_id, spec.live_id, "its last session left");
+    assert!(s.shared.lock().hls.outputs.is_empty());
     stop(&s, &clock).await;
     std::fs::remove_dir_all(dir).unwrap();
 }
