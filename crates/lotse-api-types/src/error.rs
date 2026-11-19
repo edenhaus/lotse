@@ -90,7 +90,8 @@ pub enum ErrorCode {
     SignalNotFound,
     /// `GET /v0/live/{live_id}` (HTTP 404) or `live/close` of a live output
     /// that is not open: never created, already ended, or an id that is no
-    /// live output's.
+    /// live output's; and `live/create` whose subscription was unsubscribed
+    /// before its output started.
     LiveNotFound,
     /// `GET /v0/live/{live_id}` (HTTP 409) of a live output whose bytes
     /// another request already took: a live output has one body.

@@ -1401,6 +1401,7 @@ mod recording {
     /// The `codecs` a live output of `video` and `audio` names (RFC 6381):
     /// the video's sample entry, then the audio's when the container carries
     /// it as it is.
+    #[cfg(feature = "output-live")]
     fn live_codecs(video: Video, audio: Audio) -> (&'static str, Option<&'static str>) {
         let video = match video {
             Video::H264 => "avc1.",
