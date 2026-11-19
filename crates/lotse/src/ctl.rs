@@ -187,8 +187,19 @@ pub(crate) enum RecordingCommand {
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClientsCommand {
     /// Every client certificate pin the TLS listener lets in, fixed by the
-    /// configuration or enrolled by pairing.
+    /// configuration or enrolled by pairing or `add`, with its role.
     List,
+    /// Enroll a client certificate's pin with a role, for a client that
+    /// cannot pair: `metrics` may only read `GET /v0/metrics` (a Prometheus
+    /// scraper), `control` may do everything. Succeeds when the pin is
+    /// already enrolled with that role.
+    Add {
+        /// The client certificate's SHA-256, 64 hex digits, optionally with
+        /// a colon between each pair, in any case.
+        pin: String,
+        /// `control` or `metrics`.
+        role: String,
+    },
     /// Remove an enrolled client and close its connections; succeeds when
     /// it is not enrolled.
     Remove {
@@ -292,6 +303,9 @@ fn command_of(command: &CtlCommand, stdin: impl Read) -> anyhow::Result<Value> {
         CtlCommand::Schema => json!({ "type": "schema" }),
         CtlCommand::Clients { command } => match command {
             ClientsCommand::List => json!({ "type": "clients/list" }),
+            ClientsCommand::Add { pin, role } => {
+                json!({ "type": "clients/add", "pin": pin, "role": role })
+            }
             ClientsCommand::Remove { pin } => json!({ "type": "clients/remove", "pin": pin }),
         },
         CtlCommand::Stream { command } => match command {
@@ -964,6 +978,17 @@ mod tests {
             )
             .unwrap(),
             json!({ "type": "clients/remove", "pin": "ab" })
+        );
+        assert_eq!(
+            command_of(
+                &clients(ClientsCommand::Add {
+                    pin: "ab".into(),
+                    role: "metrics".into()
+                }),
+                b"".as_slice()
+            )
+            .unwrap(),
+            json!({ "type": "clients/add", "pin": "ab", "role": "metrics" })
         );
         let stream = |command| CtlCommand::Stream { command };
         assert_eq!(

@@ -66,7 +66,7 @@ pub use live::LiveLimits;
 pub use lotse_api::Owners;
 pub use lotse_api::Server as ApiServer;
 pub use lotse_api::TlsConfig as ControlTls;
-pub use lotse_api::identity::{IdentityError, ServerIdentity};
+pub use lotse_api::identity::{IdentityError, SERVER_NAME as CONTROL_SERVER_NAME, ServerIdentity};
 pub use recording::RecordingLimits;
 
 use crate::net::demux::Demux;

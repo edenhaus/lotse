@@ -8,6 +8,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::clients::ClientRole;
 use crate::error::{ApiError, ErrorCode};
 #[cfg(feature = "schema")]
 use crate::limits::{ID_PATTERN, RECORDING_ID_PATTERN, SIGNAL_ERROR_CODE_PATTERN};
@@ -84,6 +85,21 @@ pub struct ClientsRemove {
     /// colon between each pair.
     #[cfg_attr(feature = "schema", schemars(length(max = MAX_PIN_CHARS)))]
     pub pin: String,
+}
+
+/// `clients/add`; idempotent for a pin already enrolled with the role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ClientsAdd {
+    /// The command id.
+    pub id: u64,
+    /// The client certificate's SHA-256, 64 hex digits, optionally with a
+    /// colon between each pair.
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_PIN_CHARS)))]
+    pub pin: String,
+    /// What the pin may do.
+    pub role: ClientRole,
 }
 
 /// `stream/put`: the idempotent upsert of a stream's desired state.
@@ -557,6 +573,12 @@ pub enum Command {
     #[serde(rename = "clients/remove")]
     #[cfg_attr(feature = "schema", schemars(title = "ClientsRemoveCommand"))]
     ClientsRemove(ClientsRemove),
+    /// `clients/add`: enrolls a pin with a role, for a client that cannot
+    /// pair (a metrics scraper); only on the Unix socket. A pin enrolled
+    /// or fixed with the other role is refused.
+    #[serde(rename = "clients/add")]
+    #[cfg_attr(feature = "schema", schemars(title = "ClientsAddCommand"))]
+    ClientsAdd(ClientsAdd),
     /// `stream/put`: the idempotent upsert of a stream's desired state.
     #[serde(rename = "stream/put")]
     #[cfg_attr(feature = "schema", schemars(title = "StreamPutCommand"))]
@@ -666,6 +688,7 @@ impl Command {
         "pairing/create",
         "clients/list",
         "clients/remove",
+        "clients/add",
         "stream/put",
         "stream/get",
         "stream/list",
@@ -699,6 +722,7 @@ impl Command {
             Self::PairingCreate(c) => c.id,
             Self::ClientsList(c) => c.id,
             Self::ClientsRemove(c) => c.id,
+            Self::ClientsAdd(c) => c.id,
             Self::StreamPut(c) => c.id,
             Self::StreamGet(c) => c.id,
             Self::StreamList(c) => c.id,
@@ -731,6 +755,7 @@ impl Command {
             Self::PairingCreate(_) => "pairing/create",
             Self::ClientsList(_) => "clients/list",
             Self::ClientsRemove(_) => "clients/remove",
+            Self::ClientsAdd(_) => "clients/add",
             Self::StreamPut(_) => "stream/put",
             Self::StreamGet(_) => "stream/get",
             Self::StreamList(_) => "stream/list",
@@ -991,6 +1016,7 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
         Command::ClientsRemove(remove) => cap_chars("pin", &remove.pin, MAX_PIN_CHARS)?,
         Command::LiveCreate(create) => cap_stream_id(&create.stream_id)?,
         Command::LiveClose(close) => cap_chars("live_id", &close.live_id, MAX_ID_CHARS)?,
+        Command::ClientsAdd(add) => cap_chars("pin", &add.pin, MAX_PIN_CHARS)?,
         Command::RecordingCreate(start) => check_recording(start)?,
         Command::Ping(_)
         | Command::Info(_)
@@ -1206,6 +1232,10 @@ mod tests {
             (
                 r#"{"id":28,"type":"live/close","live_id":"01JL"}"#,
                 "live/close",
+            ),
+            (
+                r#"{"id":29,"type":"clients/add","pin":"00","role":"metrics"}"#,
+                "clients/add",
             ),
         ];
         for (index, (text, name)) in cases.iter().enumerate() {
@@ -1561,9 +1591,11 @@ mod tests {
         let reoffer = |session: usize, sdp: usize| json!({ "id": 1, "type": "webrtc/reoffer", "session_id": text(session), "sdp": text(sdp) });
         let at_cap = server(MAX_ICE_URLS, MAX_TEXT_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS);
         let remove = |pin: usize| json!({ "id": 1, "type": "clients/remove", "pin": text(pin) });
+        let add = |pin: usize| json!({ "id": 1, "type": "clients/add", "pin": text(pin), "role": "metrics" });
         let pinned = |pin: usize| json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "protocol": "https", "url": "https://c/", "tls": { "pin": text(pin) } }] });
         let accepted = [
             remove(MAX_PIN_CHARS),
+            add(MAX_PIN_CHARS),
             put(MAX_SOURCES, MAX_URL_CHARS),
             pinned(MAX_PIN_CHARS),
             offer(MAX_SDP_CHARS, vec![at_cap.clone(); MAX_ICE_SERVERS]),
@@ -1575,6 +1607,7 @@ mod tests {
         }
         let refused = [
             (remove(MAX_PIN_CHARS + 1), "pin"),
+            (add(MAX_PIN_CHARS + 1), "pin"),
             (put(MAX_SOURCES + 1, 10), "sources"),
             (put(1, MAX_URL_CHARS + 1), "sources[].url"),
             (pinned(MAX_PIN_CHARS + 1), "sources[].tls.pin"),

@@ -20,7 +20,11 @@
 //! response bodies the handler hands over ([`Handler::recording_body`],
 //! [`Handler::live_body`]),
 //! bounded by the client taking them and, over TLS, by its client staying
-//! enrolled.
+//! enrolled. Beside them it serves the daemon's metrics, `GET /v0/metrics`,
+//! in OpenMetrics or the Prometheus text format as the scraper negotiates
+//! ([`exporter`]). A TLS client's role
+//! decides which routes it reaches (the `access` module): a `metrics`
+//! client only the metrics.
 //!
 //! Standards: RFC 6455 (WebSocket, close codes §7.4.1, `Origin` §10.2),
 //! RFC 9110 (HTTP), RFC 9112 (HTTP/1.1, the chunked transfer coding §7.1
@@ -53,8 +57,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
+mod access;
 mod clients;
 mod connection;
+pub mod exporter;
 pub mod identity;
 mod listener;
 mod live;
@@ -66,7 +72,7 @@ mod recording;
 pub mod test_util;
 pub mod tls;
 
-pub use clients::ClientsError;
+pub use clients::{ClientsError, PinsError, RoleName, parse_pins, render_pins};
 pub use listener::{BindError, PeerInfo};
 pub use live::{LiveBody, LiveBodyError, live_id_of};
 pub use owners::Owners;
@@ -127,6 +133,9 @@ pub const BODY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// reports as it closes its pipe.
 pub const RECORDING_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The route of a recording's bytes, as the router has it.
+const RECORDING_ROUTE: &str = "/v0/recording/{recording_id}";
+
 /// Connections accepted and not yet upgraded, at once: 8. One more is
 /// closed at accept, without a response. A TLS connection takes its place
 /// when it authenticates, and holds it while it waits for the serve loop.
@@ -143,6 +152,9 @@ enum Limit {
     PendingUpgrades,
     /// [`UPGRADE_TIMEOUT`]: a connection closed before its upgrade.
     UpgradeDeadline,
+    /// [`exporter::MAX_EXPORTED_STREAMS`] or
+    /// [`exporter::MAX_EXPORTED_WORKERS`]: a metrics exposition capped.
+    ExportedSeries,
 }
 
 /// The rate limits of the [`Limit`] warnings, one for both listeners and
@@ -208,7 +220,7 @@ pub enum Outcome {
 }
 
 /// What the supervisor implements. `ping`, `schema`, `unsubscribe`,
-/// `pairing/create`, `clients/list` and `clients/remove` are answered by
+/// `pairing/create`, `clients/list`, `clients/remove` and `clients/add` are answered by
 /// the server itself; everything else goes here, and so do the requests
 /// for recordings' bytes.
 pub trait Handler: Send + Sync + 'static {
@@ -243,6 +255,15 @@ pub trait Handler: Send + Sync + 'static {
     /// The connection is gone; its sessions are now orphaned.
     fn connection_closed(&self, connection: ConnectionId) {
         let _ = connection;
+    }
+
+    /// `GET /v0/metrics`, from any peer either listener admits (over TLS,
+    /// a `control` or a `metrics` client still allowed): the snapshot
+    /// `metrics/get` returns, the one source of the exposition
+    /// ([`exporter`]). Never waits on a camera. `None` without metrics,
+    /// answered 503.
+    fn metrics_snapshot(&self) -> impl Future<Output = Option<lotse_api_types::Metrics>> + Send {
+        std::future::ready(None)
     }
 
     /// `GET /v0/recording/{recording_id}` in HTTP/1.1, from any peer either listener
@@ -533,13 +554,34 @@ impl Admission {
         let serving = state.serving.clone();
         let clients = state.clients.clone();
         let next_id = Arc::clone(&state.next_id);
+        let lines = Arc::new(access::RefusalLines::new(Arc::clone(&clock)));
+        // A layer of each route's own, so every method of it, its
+        // fallback's too, is checked, and the log names the route.
+        let control_only = |route: &'static str| {
+            axum::middleware::from_fn_with_state(
+                access::ControlOnly {
+                    clients: clients.clone(),
+                    lines: Arc::clone(&lines),
+                    route,
+                },
+                access::control_only,
+            )
+        };
         let app = Router::new()
-            .route(lotse_api_types::WS_PATH, get(connection::upgrade::<H>))
             .route(
-                &format!("{}/{{recording_id}}", lotse_api_types::RECORDING_PATH),
+                lotse_api_types::WS_PATH,
+                get(connection::upgrade::<H>).layer(control_only(lotse_api_types::WS_PATH)),
+            )
+            .route(
+                lotse_api_types::METRICS_PATH,
+                get(exporter::fetch::<H>).fallback(exporter::not_allowed),
+            )
+            .route(
+                RECORDING_ROUTE,
                 get(recording::fetch::<H>)
                     .head(recording::not_allowed)
-                    .fallback(recording::not_allowed),
+                    .fallback(recording::not_allowed)
+                    .layer(control_only(RECORDING_ROUTE)),
             )
             .route(
                 &format!("{}/{{live_id}}", lotse_api_types::LIVE_PATH),
@@ -791,6 +833,14 @@ mod tests {
     }
 
     #[test]
+    fn the_recording_route_is_the_recording_path_and_its_id() {
+        assert_eq!(
+            RECORDING_ROUTE,
+            format!("{}/{{recording_id}}", lotse_api_types::RECORDING_PATH)
+        );
+    }
+
+    #[test]
     fn the_inbound_message_cap_is_64_kib_and_the_outbound_budget_1_mib() {
         assert_eq!(MAX_MESSAGE_BYTES, 65_536);
         assert_eq!(OUTBOUND_BUDGET_BYTES, 1_048_576);
@@ -806,6 +856,7 @@ mod tests {
             Outcome::Result(serde_json::Value::Null)
         ));
         assert!(handler.unsubscribed(ConnectionId(1), 2).is_none());
+        assert!(handler.metrics_snapshot().await.is_none());
         handler.connection_closed(ConnectionId(1));
         assert_eq!(handler.hello().api, lotse_api_types::API_VERSION);
         // Without recordings, no id has a body.
