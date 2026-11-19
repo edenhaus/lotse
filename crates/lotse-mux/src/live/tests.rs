@@ -758,6 +758,39 @@ fn rfc3550_5_1_old_audio_late_after_a_reconnect_s_keyframe_is_left_out() {
     );
 }
 
+/// After a skip, audio captured before the keyframe that started the video
+/// again is left out, though of the same epoch: audio of the hole a caller
+/// hands on after that keyframe would be placed by the origin it set and
+/// hold the audio after it back.
+#[test]
+fn audio_of_a_skip_s_hole_after_the_resume_keyframe_is_left_out() {
+    let base = base();
+    let mut out = Output::start(&h264_track(), Some(&aac_track()));
+    out.push(Kind::Video, video(base, 0, 0, true, 0, 0));
+    out.push(Kind::Audio, aac(base, 0, 0, 0, 0));
+    out.push(Kind::Video, video(base, 40, FRAME, false, 0, 1));
+    assert!(out.skip());
+    out.push(Kind::Video, video(base, 2000, 50 * FRAME, true, 0, 2));
+    for (at, ts) in [(1000, 15 * AAC_FRAME), (1064, 16 * AAC_FRAME)] {
+        assert_eq!(
+            out.push(Kind::Audio, aac(base, at, ts, 0, 1)),
+            LiveStep::Dropped,
+            "audio of the hole, after the resume keyframe"
+        );
+    }
+    assert_eq!(
+        out.push(Kind::Audio, aac(base, 2010, 31 * AAC_FRAME, 0, 2)),
+        LiveStep::Held
+    );
+    out.push(Kind::Video, video(base, 2040, 51 * FRAME, false, 0, 3));
+    out.push(Kind::Audio, aac(base, 2074, 32 * AAC_FRAME, 0, 3));
+    out.push(Kind::Video, video(base, 2080, 52 * FRAME, false, 0, 4));
+    let (video, audio) = tracks(&out);
+    let key = resumed_at(&video, 2);
+    assert_eq!(audio.len(), 2, "{audio:?}");
+    assert_eq!(pts(&audio[1]), key / 90 * 16 + audio_ticks(10));
+}
+
 /// Audio whose timestamp does not advance re-anchors at its capture time,
 /// as a recording's (`audio_whose_timestamp_does_not_advance_starts_a_new_epoch`):
 /// the samples before it go out at once, so the run they are in does not
