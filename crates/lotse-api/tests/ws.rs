@@ -60,6 +60,10 @@ struct FakeHandler {
     reoffering: Notify,
     /// Releases a `webrtc/reoffer`.
     reoffered: Notify,
+    /// The ids of the `live/create` commands waiting.
+    waiting_creates: Mutex<Vec<u64>>,
+    /// The waiting `live/create` commands `unsubscribe` named, in order.
+    unsubscribed_creates: Mutex<Vec<u64>>,
 }
 
 /// Counts a waiting create in [`FakeHandler::creating`] until
@@ -135,12 +139,21 @@ impl FakeHandler {
     /// `closed`, which ends the subscription. On stream `door`, a
     /// signaled source's, it waits for a `signaling/answer`, as the
     /// supervisor's waits for the init segment a source sends only once
-    /// the camera's answer is relayed.
+    /// the camera's answer is relayed, or for its `unsubscribe`, which
+    /// refuses it, as the supervisor's output ended. On stream `porch` it
+    /// waits too, but an `unsubscribe` comes too late: it answers anyway.
     async fn live_create(&self, id: u64, stream_id: &str) -> Outcome {
         self.lives.fetch_add(1, Ordering::AcqRel);
-        if stream_id == "door" {
+        if stream_id == "door" || stream_id == "porch" {
             let _creating = Creating::new(&self.creating);
+            self.waiting_creates.lock().unwrap().push(id);
             self.answered.notified().await;
+        }
+        if stream_id == "door" && self.unsubscribed_creates.lock().unwrap().contains(&id) {
+            return Outcome::Error(ApiError::new(
+                ErrorCode::LiveNotFound,
+                "the live output was closed before it started",
+            ));
         }
         let (tx, rx) = mpsc::channel(8);
         let _queued = tx.try_send(Event {
@@ -262,6 +275,12 @@ impl Handler for FakeHandler {
     }
 
     fn unsubscribed(&self, _connection: ConnectionId, subscription: u64) -> Option<Event> {
+        if self.waiting_creates.lock().unwrap().contains(&subscription) {
+            self.unsubscribed_creates.lock().unwrap().push(subscription);
+            self.answered.notify_one();
+            // A last event, which no subscription takes.
+            return Some(Self::event("door", "closed"));
+        }
         {
             let mut sessions = self.sessions.lock().unwrap();
             let index = sessions.iter().position(|(id, _)| *id == subscription)?;
@@ -887,6 +906,64 @@ async fn a_waiting_hls_create_leaves_its_connection_answering_the_commands_that_
     );
     assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
     assert_eq!(running.handler.hls.lock().unwrap().len(), 1);
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `unsubscribe` of a `live/create` still waiting cancels it: the handler
+/// hears it at once, the unsubscribe is answered, and the create is
+/// answered as the handler ends it, with no subscription opened, even when
+/// the handler answers it with one (its events never go out). A second
+/// `unsubscribe` finds nothing.
+#[tokio::test]
+async fn unsubscribe_cancels_a_waiting_live_create_and_opens_no_subscription() {
+    let running = start_limited("live-unsubscribe", FakeHandler::default(), 8, 4);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    for (id, stream) in [(1, "door"), (2, "porch")] {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "live/create", "stream_id": stream }),
+        )
+        .await;
+    }
+    send(&mut ws, json!({ "id": 3, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    for (id, subscription) in [(4, 1), (5, 2), (6, 1)] {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "unsubscribe", "subscription": subscription }),
+        )
+        .await;
+    }
+    send(&mut ws, json!({ "id": 7, "type": "ping" })).await;
+    let mut answers = BTreeMap::new();
+    while answers.len() < 6 {
+        let frame = recv(&mut ws).await;
+        assert_ne!(frame["type"], "event", "no event goes out: {frame}");
+        answers.insert(frame["id"].as_u64().unwrap(), frame);
+    }
+    assert_eq!(
+        answers[&1]["error"]["code"], "live_not_found",
+        "{answers:?}"
+    );
+    assert_eq!(answers[&2]["result"]["live_id"], "l2", "{answers:?}");
+    assert_eq!(answers[&4]["success"], true);
+    assert_eq!(answers[&5]["success"], true);
+    assert_eq!(
+        answers[&6]["error"]["code"], "subscription_not_found",
+        "{answers:?}"
+    );
+    assert_eq!(answers[&7]["type"], "pong");
+    assert_eq!(
+        *running.handler.unsubscribed_creates.lock().unwrap(),
+        [1, 2]
+    );
+    // The porch create's `closed` would be next, had its subscription
+    // opened.
+    send(&mut ws, json!({ "id": 8, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["id"], 8);
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
     ws.close(None).await.unwrap();
     running.finish().await;
 }
