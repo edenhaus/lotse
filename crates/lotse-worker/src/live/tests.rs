@@ -630,9 +630,20 @@ async fn a_reader_that_falls_behind_costs_it_the_frames_up_to_the_next_keyframe_
         );
         settle().await;
     }
-    // Read: the queue goes into the pipe, and the next keyframe starts the
-    // media again; the frames before it are left out.
-    let mut all = Vec::new();
+    // Read: the queue goes into the pipe up to the drop's mark, however
+    // little a pipe takes at once (8 KiB once the user's pipe pages run
+    // short), and the next keyframe starts the media again; the frames
+    // before it are left out.
+    let mut all = within(async {
+        let mut all = Vec::new();
+        // A frame read in part is no line yet: the mark is looked for in
+        // the bytes.
+        while !all.windows(5).any(|bytes| bytes == b"skip\n") {
+            all.extend(available(&reader).await);
+        }
+        all
+    })
+    .await;
     for index in 8..12 {
         all.extend(available(&reader).await);
         rig.video_frame(index, index == 10, 10);
