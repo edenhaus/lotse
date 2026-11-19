@@ -40,11 +40,18 @@
 //!   and for audio of a new epoch until the video's first keyframe after
 //!   that epoch's first audio frame, whether the audio before was taken
 //!   or left out. A reconnect whose video came first, a keyframe of a new
-//!   epoch after the old audio epoch began, has started already: its
-//!   audio is taken from its first frame. The audio's first epoch is the stream's own, whatever
-//!   keyframe it comes after: a writer that saw no audio before cannot
-//!   tell a reconnect's from it. Placed by the origin of then, it is
-//!   still followed by the video, whose last frame lasts until it ends.
+//!   epoch no audio epoch was placed by yet, has started already: its
+//!   audio is taken from its first frame. Each epoch start of the video
+//!   places one audio epoch, so the audio of the reconnect after it waits
+//!   for its own keyframe again. The audio's first epoch is the stream's
+//!   own, whatever keyframe it comes after: a writer that saw no audio
+//!   before cannot tell a reconnect's from it. Placed by the origin of
+//!   then, it is still followed by the video, whose last frame lasts until
+//!   it ends.
+//! - Audio whose timestamp did not advance re-anchors its timeline at its
+//!   capture time, as a recording's does; the samples before it go out at
+//!   once, since the samples of one run follow on from each other
+//!   (ISO/IEC 14496-12 §8.8.8).
 //!
 //! Sans-IO and pure, as the recording muxer: no I/O, no clock (the frames'
 //! capture times are the only time), no logging (the caller logs).
@@ -129,11 +136,18 @@ struct Live {
     /// audio of a new epoch would be placed by an origin the video's next
     /// start moves.
     audio_since: u64,
-    /// [`Live::starts`] when the audio's current epoch began.
-    audio_epoch_began: u64,
     /// [`Live::starts`] at the latest start that began a video epoch: the
     /// first keyframe's, or a reconnect's.
     video_epoch_start: u64,
+    /// The latest of the video's epoch starts an audio epoch was placed
+    /// by: the first, which the stream's own audio is, or one a new audio
+    /// epoch waited for or was taken at once after. Each start places one
+    /// audio epoch, so a later audio epoch never reuses an earlier
+    /// reconnect's start.
+    placed_by: u64,
+    /// Whether the audio's epoch waits for the video's next epoch start,
+    /// which then places it.
+    audio_waits_epoch: bool,
     /// The sequence number of the latest fragment (ISO/IEC 14496-12
     /// §8.8.5): 0 before the first.
     sequence: u32,
@@ -152,8 +166,9 @@ impl Live {
             audio_epoch: None,
             starts: 0,
             audio_since: 0,
-            audio_epoch_began: 0,
             video_epoch_start: 0,
+            placed_by: 0,
+            audio_waits_epoch: false,
             sequence: 0,
         }
     }
@@ -193,6 +208,10 @@ impl Live {
         self.starts = self.starts.saturating_add(1);
         if new_epoch {
             self.video_epoch_start = self.starts;
+            if self.audio_waits_epoch || self.starts == 1 {
+                self.placed_by = self.starts;
+                self.audio_waits_epoch = false;
+            }
         }
         // The samples the break finished go out before the keyframe is
         // taken, which a fragment of its own carries once the next frame
@@ -225,7 +244,7 @@ impl Live {
     }
 
     /// Takes an audio frame; its samples go out alone once they reach
-    /// `limits`.
+    /// `limits`, or before a frame that re-anchored the audio's timeline.
     fn push_audio(
         &mut self,
         frame: Arc<MediaFrame>,
@@ -237,20 +256,25 @@ impl Live {
             ));
         };
         if self.audio_epoch != Some(frame.epoch) {
-            // The first epoch is the stream's own. A later one is a
-            // reconnect's: taken from the video's start of a new epoch, if
-            // that came after the old audio epoch began and was not the
-            // stream's first (the reconnect's video came first); else from
-            // the video's next start.
-            self.audio_since = match self.audio_epoch {
-                None => 0,
-                Some(_) if self.video_epoch_start > self.audio_epoch_began.max(1) => {
-                    self.video_epoch_start.saturating_sub(1)
-                }
-                Some(_) => self.starts,
+            // The first epoch is the stream's own, placed by whatever start
+            // came before it. A later one is a reconnect's: taken from the
+            // video's latest epoch start if no audio epoch was placed by
+            // that start yet (the reconnect's video came first); else from
+            // the video's next start, which its next epoch start places.
+            let first = self.audio_epoch.is_none();
+            let unplaced = self.video_epoch_start > self.placed_by;
+            self.audio_since = if first {
+                0
+            } else if unplaced {
+                self.video_epoch_start.saturating_sub(1)
+            } else {
+                self.starts
             };
+            if first || unplaced {
+                self.placed_by = self.video_epoch_start;
+            }
+            self.audio_waits_epoch = !(first || unplaced);
             self.audio_epoch = Some(frame.epoch);
-            self.audio_epoch_began = self.starts;
         }
         // The video's starts break the audio's epoch too: the audio after
         // one starts a new epoch on its track.
@@ -258,12 +282,16 @@ impl Live {
         let Some(origin) = self.origin.filter(|_| started) else {
             return Ok(LiveStep::Dropped);
         };
-        audio.push(frame, origin)?;
-        let full = audio.ready_bytes() >= limits.audio_bytes
+        // A frame that re-anchored the audio's timeline (a timestamp that
+        // did not advance) begins a run of its own: a run's decode times
+        // follow on from each other, so the samples before it go out now.
+        let anchored = audio.push(frame, origin)?;
+        let due = anchored
+            || audio.ready_bytes() >= limits.audio_bytes
             || audio
                 .ready_span()
                 .is_some_and(|(from, to)| to.saturating_sub(from) >= limits.audio_span);
-        self.ready(full)
+        self.ready(due)
     }
 
     /// The fragment of the samples ready when `due`, if any; else the frame
