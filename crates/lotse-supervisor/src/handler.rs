@@ -292,12 +292,13 @@ impl Supervisor {
         }
     }
 
-    /// Closes every session and ends every recording with `shutting_down`,
-    /// and ends the signaling (each offered signal closes `source_stopped`,
-    /// each signaling subscription ends); the first step of the shutdown,
-    /// before the control connections say goodbye. A recording's worker
-    /// writes its last fragment while it stops, but its report is not
-    /// waited for, so the body is cut.
+    /// Closes every session and ends every recording and live output with
+    /// `shutting_down`, and ends the signaling (each offered signal closes
+    /// `source_stopped`, each signaling subscription ends); the first step
+    /// of the shutdown, before the control connections say goodbye. A
+    /// recording's worker writes its last fragment while it stops, but its
+    /// report is not waited for, so the body is cut; a live output's
+    /// `closed` goes out at once, its counters zero, for the same reason.
     pub fn close_sessions(&self) {
         let mut state = self.shared.lock();
         state.close_sessions_where(
@@ -307,7 +308,7 @@ impl Supervisor {
             CloseBy::Supervisor,
         );
         state.end_recordings_where(|_| true, RecordingCloseReason::ShuttingDown);
-        state.end_lives_where(|_| true, LiveCloseReason::ShuttingDown);
+        state.close_lives_now(LiveCloseReason::ShuttingDown);
         state.signaling_shutdown();
     }
 
@@ -7371,6 +7372,40 @@ mod tests {
             s.live_body(&LiveId::new("gone").unwrap()).unwrap_err(),
             LiveBodyError::NotFound
         );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A shutdown closes a started live output `shutting_down` at once: its
+    /// owner gets `closed`, its last event, without the worker's report,
+    /// and the worker is asked to stop it.
+    #[tokio::test]
+    async fn a_shutdown_closes_a_live_output_shutting_down_without_its_worker_s_report() {
+        let dir = private_dir("live-shutdown");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        live_report(&s, &live_id, live_started());
+        let (_answer, mut events) = started(within(create).await.unwrap());
+        s.close_sessions();
+        let closed = next(&mut events).await;
+        assert_eq!(
+            (&closed["type"], &closed["reason"], &closed["bytes"]),
+            (&json!("closed"), &json!("shutting_down"), &json!(0))
+        );
+        assert!(events.recv().await.is_none(), "closed is the last event");
+        assert!(s.shared.lock().lives.is_empty());
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        // The worker's late report finds the output gone.
+        live_report(&s, &live_id, live_closed(lotse_ipc::STOPPED_AS_ASKED));
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
