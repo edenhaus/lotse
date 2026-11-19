@@ -561,9 +561,16 @@ const fn live_reason(reason: HlsCloseReason) -> LiveCloseReason {
 }
 
 /// The error `hls/create` answers with when its output ended for `reason`
-/// before its init segment.
+/// before its init segment. An output ends `closed` before it started only
+/// as its last session left, the create's own among them: the create's
+/// session is gone, `hls_not_found`, as when another session keeps the
+/// output.
 fn start_error(reason: HlsCloseReason) -> ApiError {
     match reason {
+        HlsCloseReason::Closed | HlsCloseReason::SessionClosed => ApiError::new(
+            ErrorCode::HlsNotFound,
+            "the LL-HLS session was closed before it started: its subscription was unsubscribed",
+        ),
         HlsCloseReason::NoVideoTrack => {
             ApiError::new(ErrorCode::NoVideoTrack, "the stream has no video track")
         }
@@ -896,11 +903,7 @@ pub(crate) async fn create(
         // sessions, whose creates wait on.
         () = gone.cancelled() => {
             tracing::debug!(hls.id = %hls_id, live.id = %live_id, "LL-HLS session closed before its output started");
-            return Err(ApiError::new(
-                ErrorCode::HlsNotFound,
-                "the LL-HLS session was closed before it started: its subscription was unsubscribed",
-            )
-            .with_detail("hls_id", hls_id.as_str()));
+            return Err(start_error(HlsCloseReason::SessionClosed).with_detail("hls_id", hls_id.as_str()));
         }
         () = shared.clock.sleep(wait) => Err(HlsCloseReason::SourceNotLive),
     };
