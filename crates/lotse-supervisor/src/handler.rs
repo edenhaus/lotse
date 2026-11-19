@@ -1708,7 +1708,8 @@ impl Supervisor {
             | Command::Unsubscribe(_)
             | Command::PairingCreate(_)
             | Command::ClientsList(_)
-            | Command::ClientsRemove(_) => {
+            | Command::ClientsRemove(_)
+            | Command::ClientsAdd(_) => {
                 tracing::error!(
                     command = command.name(),
                     "the server answers this command itself"
@@ -1806,6 +1807,12 @@ impl Handler for Supervisor {
             tracing::debug!(live.id = %live_id, %error, "live body refused");
         }
         body
+    }
+
+    /// The snapshot `metrics/get` answers with, for `GET /v0/metrics`: the
+    /// one collection of the numbers.
+    async fn metrics_snapshot(&self) -> Option<Metrics> {
+        Some(self.metrics().await)
     }
 
     /// Hands out the read end of the recording's pipe once, with the way its
@@ -2962,6 +2969,11 @@ mod tests {
             cfg!(target_os = "linux")
         );
         assert_eq!(metrics["sessions"], 0);
+        // `GET /v0/metrics` reads the same snapshot.
+        let snapshot = Handler::metrics_snapshot(&s).await.unwrap();
+        let snapshot = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(snapshot["workers"], metrics["workers"]);
+        assert_eq!(snapshot["supervisor"]["uptime_ms"], 1500);
         let front = result(call(&s, r#"{"id":3,"type":"stream/get","stream_id":"front"}"#).await);
         assert_eq!(
             front["sources"][0]["connection"]["worker"]["pss_bytes"],

@@ -42,7 +42,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::future::OptionFuture;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt as _, StreamExt as _};
-use lotse_api_types::clients::ClientList;
+use lotse_api_types::clients::{ClientList, ClientRole};
 use lotse_api_types::command::Command;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Empty, EventFrame, Failure, Pong, Shutdown, Success};
@@ -55,7 +55,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::clients::{ClientStore, Removal};
+use crate::clients::{Addition, ClientStore, Removal};
 use crate::listener::PeerInfo;
 use crate::outbox::{Class, Outbox, Outgoing, Overflow};
 use crate::pairing::Pairing;
@@ -131,7 +131,7 @@ pub(crate) async fn upgrade<H: Handler>(
 }
 
 /// The answer to a command about the TLS listener's clients
-/// (`pairing/create`, `clients/list`, `clients/remove`), which the server
+/// (`pairing/create`, `clients/list`, `clients/remove`, `clients/add`), which the server
 /// answers itself, asked by connection `by`; and whether `by` closes once
 /// it has sent the answer: its client removed itself. Not generic over the
 /// handler, so every handler's connection shares this one function.
@@ -152,6 +152,9 @@ async fn listener_answer(
             leaving = removed.is_ok() && matches!(peer, PeerInfo::Tls { .. });
             removed.map(to_json)
         }
+        Command::ClientsAdd(add) => clients_add(clients, peer, &add.pin, add.role)
+            .await
+            .map(to_json),
         _ => pairing_create(pairing, peer).map(to_json),
     };
     let frame = match outcome {
@@ -178,6 +181,78 @@ fn clients_list(clients: Option<&Arc<ClientStore>>) -> Result<ClientList, ApiErr
         .ok_or_else(listener_off)
 }
 
+/// `invalid_request` for a `pin` field that is no certificate pin.
+fn invalid_pin() -> ApiError {
+    ApiError::new(
+        ErrorCode::InvalidRequest,
+        "`pin` must be a certificate's SHA-256 as 64 hex digits, optionally with a colon between each pair",
+    )
+    .with_detail("field", "pin")
+}
+
+/// `clients/add`: enrolls `pin` with `role` (see [`ClientStore::add`]),
+/// for a client that cannot pair. Only a peer on the Unix socket may ask,
+/// as for `pairing/create`: an enrolled TLS client must not enroll
+/// others. A pin that has the other role is refused, `not_permitted`: its
+/// role changes only by removing it first.
+async fn clients_add(
+    clients: Option<&Arc<ClientStore>>,
+    peer: &PeerInfo,
+    pin: &str,
+    role: ClientRole,
+) -> Result<Empty, ApiError> {
+    if matches!(peer, PeerInfo::Tls { .. }) {
+        tracing::warn!(%peer, "clients/add refused: not on the control socket");
+        return Err(ApiError::new(
+            ErrorCode::NotPermitted,
+            "clients are added on the control socket only",
+        ));
+    }
+    let pin = Fingerprint::parse(pin).map_err(|_| invalid_pin())?;
+    let Some(clients) = clients else {
+        return Err(listener_off());
+    };
+    let store = Arc::clone(clients);
+    let added = spawn_blocking_named("api.clients_add", move || store.add(pin, role));
+    let role_name = role.as_str();
+    match added
+        .await
+        .map_err(io::Error::other)
+        .and_then(|addition| addition)
+    {
+        Ok(Addition::Added) => {
+            tracing::info!(
+                event = "control_client_added",
+                client_pin = %pin,
+                role = role_name,
+                by = %peer,
+                "control client added"
+            );
+            Ok(Empty::default())
+        }
+        Ok(Addition::Already) => {
+            tracing::info!(client_pin = %pin, role = role_name, by = %peer, "clients/add: the pin already has the role, nothing to add");
+            Ok(Empty::default())
+        }
+        Ok(Addition::OtherRole(other)) => {
+            let other = other.as_str();
+            tracing::warn!(%peer, client_pin = %pin, role = role_name, has = other, "clients/add refused: the pin has the other role");
+            Err(ApiError::new(
+                ErrorCode::NotPermitted,
+                format!("the pin is a {other} client; remove it before adding it as a {role_name} client"),
+            )
+            .with_detail("role", other))
+        }
+        Err(err) => {
+            tracing::error!(%peer, client_pin = %pin, error = %err, "adding the control client failed");
+            Err(ApiError::new(
+                ErrorCode::InternalError,
+                "the client list could not be stored",
+            ))
+        }
+    }
+}
+
 /// `clients/remove`, asked by connection `by`: removes an enrolled pin and
 /// closes its connections but `by` (see [`ClientStore::remove`]). Over the
 /// TLS listener a client may remove only itself; a fixed pin stays; a pin
@@ -188,13 +263,7 @@ async fn clients_remove(
     by: ConnectionId,
     pin: &str,
 ) -> Result<Empty, ApiError> {
-    let Ok(pin) = Fingerprint::parse(pin) else {
-        return Err(ApiError::new(
-            ErrorCode::InvalidRequest,
-            "`pin` must be a certificate's SHA-256 as 64 hex digits, optionally with a colon between each pair",
-        )
-        .with_detail("field", "pin"));
-    };
+    let pin = Fingerprint::parse(pin).map_err(|_| invalid_pin())?;
     let Some(clients) = clients else {
         return Err(listener_off());
     };
@@ -743,7 +812,8 @@ impl<H: Handler> Connection<H> {
             Command::Ping(_) => self.send(Class::Signaling, &Pong::new(id)),
             command @ (Command::PairingCreate(_)
             | Command::ClientsList(_)
-            | Command::ClientsRemove(_)) => self.listener_command(command),
+            | Command::ClientsRemove(_)
+            | Command::ClientsAdd(_)) => self.listener_command(command),
             Command::Schema(_) => self.send(
                 Class::Signaling,
                 &Success::new(id, lotse_api_types::schema::committed()),
@@ -1018,6 +1088,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clients_add_needs_the_socket_a_listener_a_pin_and_a_disk() {
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let enrolled = Fingerprint::of(b"enrolled");
+        let (store, dir) = store_with("add", &[], enrolled, |_| Ok(()));
+        let clients = Some(&store);
+        let unix = PeerInfo::Unix { uid: 0, pid: None };
+        let scraper = Fingerprint::of(b"scraper");
+        let code = |result: Result<Empty, ApiError>| result.unwrap_err().code;
+        let text = scraper.to_string();
+        assert_eq!(
+            code(clients_add(clients, &tls_peer(enrolled, 1), &text, ClientRole::Metrics).await),
+            ErrorCode::NotPermitted
+        );
+        assert_eq!(
+            code(clients_add(None, &unix, &text, ClientRole::Metrics).await),
+            ErrorCode::InvalidRequest
+        );
+        let refused = clients_add(clients, &unix, "zz", ClientRole::Metrics)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.details["field"], "pin");
+        let blocker = dir.join(crate::clients::CLIENTS_DIR).join("pins.partial");
+        std::fs::create_dir(&blocker).unwrap();
+        assert_eq!(
+            code(clients_add(clients, &unix, &text, ClientRole::Metrics).await),
+            ErrorCode::InternalError
+        );
+        assert_eq!(store.role(&scraper), None, "nothing changed");
+        std::fs::remove_dir(&blocker).unwrap();
+        let add = command(&format!(
+            r#"{{"id":5,"type":"clients/add","pin":"{}","role":"metrics"}}"#,
+            scraper.to_hex()
+        ));
+        let (answer, leaving) = listener_answer(None, clients, &unix, ConnectionId(2), add).await;
+        assert_eq!(answer["success"], true, "{answer}");
+        assert!(!leaving);
+        assert_eq!(store.role(&scraper), Some(ClientRole::Metrics));
+        assert!(
+            clients_add(clients, &unix, &text, ClientRole::Metrics)
+                .await
+                .is_ok(),
+            "idempotent"
+        );
+        let refused = clients_add(clients, &unix, &text, ClientRole::Control)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::NotPermitted);
+        assert_eq!(refused.details["role"], "metrics");
+        assert_eq!(store.role(&scraper), Some(ClientRole::Metrics));
+        let text = logs.text();
+        for line in [
+            "clients/add refused: not on the control socket",
+            "adding the control client failed",
+            "clients/add refused: the pin has the other role",
+            "clients/add: the pin already has the role, nothing to add",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        let added = text
+            .lines()
+            .find(|line| line.contains("control client added"))
+            .unwrap();
+        assert!(added.contains(&format!("client_pin={scraper}")), "{added}");
+        assert!(added.contains("role=\"metrics\""), "{added}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn only_a_client_that_removed_itself_leaves_and_only_after_the_answer() {
         let (own, other) = (Fingerprint::of(b"own"), Fingerprint::of(b"other"));
         let (store, dir) = store_with("leaving", &[], own, |_| Ok(()));
@@ -1082,8 +1220,12 @@ mod tests {
             rustix::process::getuid().as_raw(),
             rustix::process::getgid().as_raw(),
         );
+        let fixed: Vec<_> = fixed
+            .iter()
+            .map(|pin| (*pin, ClientRole::Control))
+            .collect();
         let store =
-            ClientStore::open(&std::fs::File::open(&dir).unwrap(), &dir, fixed, runtime).unwrap();
+            ClientStore::open(&std::fs::File::open(&dir).unwrap(), &dir, &fixed, runtime).unwrap();
         store.enroll(pin).unwrap();
         (Arc::new(store.with_sync_dir(sync_dir)), dir)
     }

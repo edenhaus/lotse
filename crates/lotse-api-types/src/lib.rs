@@ -36,4 +36,6 @@ pub use error::{ApiError, ErrorCode};
 pub use frame::{EventFrame, Failure, Hello, Pong, Shutdown, Success};
 pub use info::{InfoResult, Metrics};
 pub use stream::{Stream, StreamEvent, StreamState};
-pub use version::{API_VERSION, ApiVersion, LIVE_PATH, PAIR_PATH, RECORDING_PATH, WS_PATH};
+pub use version::{
+    API_VERSION, ApiVersion, LIVE_PATH, METRICS_PATH, PAIR_PATH, RECORDING_PATH, WS_PATH,
+};
