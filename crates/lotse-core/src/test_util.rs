@@ -1506,7 +1506,16 @@ impl LiveMuxer for FakeLiveMuxer {
         }))
     }
 
+    /// The family, the clock rate and, for H.264, the `profile-level-id`,
+    /// as the real container's `codecs` entry tells a change it cannot
+    /// carry apart.
     fn continues(&self, track: Kind, entry: &RecordingTrack) -> bool {
+        let profile = |codec: &Codec| match codec {
+            Codec::H264 {
+                profile_level_id, ..
+            } => *profile_level_id,
+            _ => None,
+        };
         let written = self
             .entries
             .as_ref()
@@ -1515,7 +1524,9 @@ impl LiveMuxer for FakeLiveMuxer {
                 Kind::Audio => audio.as_ref(),
             });
         written.is_some_and(|written| {
-            written.codec.family() == entry.codec.family() && written.clock_rate == entry.clock_rate
+            written.codec.family() == entry.codec.family()
+                && written.clock_rate == entry.clock_rate
+                && profile(&written.codec) == profile(&entry.codec)
         })
     }
 

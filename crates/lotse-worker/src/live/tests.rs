@@ -515,6 +515,40 @@ async fn an_output_started_after_a_codec_family_change_joins_at_the_new_family_s
     rig.closed().await;
 }
 
+/// A change within the family (another H.264 profile) keeps the GOP
+/// cache: an output started after it writes the new profile's init
+/// segment, so the cached GOP of the old one is not sent under it, and the
+/// output joins at the new profile's first keyframe.
+#[tokio::test]
+async fn an_output_started_after_a_profile_change_does_not_send_the_old_profile_s_gop() {
+    let (logs, _guard) = Logs::capture();
+    let mut rig = Rig::new(None);
+    rig.video_frame(0, true, 1);
+    rig.video_frame(1, false, 2);
+    rig.video().set_codec(Codec::H264 {
+        profile_level_id: Some([0x42, 0xc0, 0x1f]),
+        sps: None,
+        pps: None,
+    });
+    assert!(rig.video().gop().is_some(), "the cache stays");
+    let reader = rig.fetched().await;
+    rig.video_frame(2, false, 3);
+    rig.video_frame(3, true, 4);
+    assert_eq!(
+        lines(&available(&reader).await),
+        ["init video=h264", "frame v 0 10800 k 4"]
+    );
+    assert_eq!(
+        logs.count(
+            Level::INFO,
+            "live: fetched; the cached GOP's format is not the init segment's, joining at the next keyframe"
+        ),
+        1
+    );
+    rig.lives.stop("l1", LiveEnd::Stopped);
+    rig.closed().await;
+}
+
 /// The video track closes while the output waits for a codec it carries:
 /// the output ends `stream_deleted` at once, not at the start timeout,
 /// and does not spin on the closed subscription meanwhile.
