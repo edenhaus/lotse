@@ -1350,7 +1350,8 @@ mod tests {
     }
 
     /// A handler with LL-HLS sessions of any id whose answers wait until
-    /// `release` is notified: a playlist, an init segment, else not found.
+    /// `release` is notified: a playlist, an init segment, else not found;
+    /// a part is not found at once, before the handler takes any place.
     struct HeldHls {
         release: Arc<tokio::sync::Notify>,
     }
@@ -1376,6 +1377,9 @@ mod tests {
             let release = Arc::clone(&self.release);
             let id = hls_id.clone();
             async move {
+                if let HlsRequest::Media(lotse_hls::Resource::Part { .. }) = request {
+                    return Err((HlsError::ResourceNotFound, InFlight::default()));
+                }
                 release.notified().await;
                 let reply = match request {
                     HlsRequest::Playlist(_) => HlsReply::Playlist(format!("#EXTM3U\n#{id}\n")),
@@ -1451,6 +1455,12 @@ mod tests {
             // hold it: the name is no resource's.
             (
                 &b"GET /v0/hls/01JH/nothing HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "404",
+            ),
+            // Refused by the handler at once, holding no place: answered
+            // as a pending upgrade, never held.
+            (
+                &b"GET /v0/hls/01JH/part0.1.m4s HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
                 "404",
             ),
         ] {
