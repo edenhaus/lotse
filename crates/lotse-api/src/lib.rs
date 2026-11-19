@@ -145,6 +145,10 @@ const RECORDING_ROUTE: &str = "/v0/recording/{recording_id}";
 /// The route of a live output's bytes, as the router has it.
 const LIVE_ROUTE: &str = "/v0/live/{live_id}";
 
+/// The route of an LL-HLS session's playlist and resources, as the router
+/// has it.
+const HLS_ROUTE: &str = "/v0/hls/{hls_id}/{name}";
+
 /// Connections accepted and not yet upgraded, at once: 8. One more is
 /// closed at accept, without a response. A TLS connection takes its place
 /// when it authenticates, and holds it while it waits for the serve loop.
@@ -618,10 +622,11 @@ impl Admission {
                     .layer(control_only(LIVE_ROUTE)),
             )
             .route(
-                &format!("{}/{{hls_id}}/{{name}}", lotse_api_types::HLS_PATH),
+                HLS_ROUTE,
                 get(hls::fetch::<H>)
                     .head(hls::not_allowed)
-                    .fallback(hls::not_allowed),
+                    .fallback(hls::not_allowed)
+                    .layer(control_only(HLS_ROUTE)),
             )
             .with_state(state);
         let mut http = http1::Builder::new();
@@ -871,6 +876,14 @@ mod tests {
         assert_eq!(
             RECORDING_ROUTE,
             format!("{}/{{recording_id}}", lotse_api_types::RECORDING_PATH)
+        );
+    }
+
+    #[test]
+    fn the_hls_route_is_the_hls_path_its_id_and_a_name() {
+        assert_eq!(
+            HLS_ROUTE,
+            format!("{}/{{hls_id}}/{{name}}", lotse_api_types::HLS_PATH)
         );
     }
 
