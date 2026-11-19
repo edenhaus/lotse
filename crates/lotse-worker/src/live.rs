@@ -598,10 +598,17 @@ impl Output {
         media: &Media,
     ) -> Result<(TrackSubscription, Option<TrackSubscription>), LiveEnd> {
         let (video, gop, codec, clock_rate) = media.video.subscribe_from_gop();
-        let audio = media
-            .audio
-            .as_ref()
-            .map(|track| track.subscribe(Unit::Frames));
+        // The audio's subscription and descriptor are taken together too,
+        // under the track's lock: a descriptor read after would miss a
+        // change the subscription's queued frames were published under.
+        let (audio, audio_entry) = media.audio.as_ref().map_or((None, None), |track| {
+            let (audio, _gop, codec, clock_rate) = track.subscribe_from_gop();
+            let entry = RecordingTrack {
+                codec: (*codec).clone(),
+                clock_rate,
+            };
+            (Some(audio), Some(entry))
+        });
         let entries = [
             Some((
                 Kind::Video,
@@ -610,10 +617,7 @@ impl Output {
                     clock_rate,
                 },
             )),
-            media
-                .audio
-                .as_ref()
-                .map(|track| (Kind::Audio, entry(track))),
+            audio_entry.map(|entry| (Kind::Audio, entry)),
         ];
         for (kind, entry) in entries.iter().flatten() {
             if !self.muxer.continues(*kind, entry) {
