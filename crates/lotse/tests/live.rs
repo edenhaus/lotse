@@ -176,11 +176,12 @@ async fn rfc9112_7_1_a_live_output_streams_one_frame_per_fragment_until_closed()
 }
 
 /// An output nobody fetches within `limits.live_fetch_timeout_ms` ends
-/// `not_fetched`; one whose control connection closes ends with it.
+/// `not_fetched`; a fetched one whose control connection closes ends with
+/// it, `session_closed`, its body with its last chunk, nothing else asking.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_output_not_fetched_or_left_by_its_control_connection_ends() {
     let camera = camera().await;
-    let (daemon, control, dir) = daemon("live-ends", &["--live-fetch-timeout-ms", "500"]).await;
+    let (mut daemon, control, dir) = daemon("live-ends", &["--live-fetch-timeout-ms", "500"]).await;
     put(&control, &camera).await;
     let (_result, mut events) = create(&control).await;
     let events = until_closed(&mut events).await;
@@ -193,14 +194,16 @@ async fn a_live_output_not_fetched_or_left_by_its_control_connection_ends() {
         .await
         .expect("a second control connection");
     let (result, _events) = create(&other).await;
+    let fetch = fetch_on_socket(&dir.join("lotse.sock"), result["url"].as_str().unwrap()).await;
+    // Fetched: the fetch timeout is over, and only the connection's close
+    // ends the output.
+    daemon.wait_for("\"event\":\"live_fetched\"");
     other.close().await;
-    // Its output is gone once `live/close` no longer finds it.
-    let close = json!({ "type": "live/close", "live_id": result["live_id"] });
-    let deadline = SystemClock.now() + STEP;
-    while control.command(close.clone()).await.is_ok() {
-        assert!(SystemClock.now() < deadline, "the output never ended");
-        SystemClock.sleep(Duration::from_millis(100)).await;
-    }
+    let fetched = within("the body", fetch).await.expect("the fetch");
+    assert_eq!(fetched.status, 200);
+    assert!(fetched.whole, "the body ends with its last chunk");
+    let closed = daemon.wait_for("\"event\":\"live_closed\"");
+    assert!(closed.contains("\"reason\":\"session_closed\""), "{closed}");
     let (code, rest) = daemon.terminate();
     assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
 }

@@ -540,6 +540,27 @@ async fn a_video_track_closed_before_its_codec_is_carried_ends_the_output_stream
     );
 }
 
+/// The video track closes after `Started` but before any fetch: the
+/// output ends `stream_deleted` at once and frees its slot, and the frames
+/// it watched for that close until then were not sent.
+#[tokio::test]
+async fn a_video_track_closed_before_the_fetch_ends_the_output_stream_deleted() {
+    let (logs, _guard) = Logs::capture();
+    let mut rig = Rig::new(None);
+    let reader = rig.start(spec(false, 1 << 20));
+    rig.started().await;
+    rig.video_frame(0, true, 1);
+    settle().await;
+    assert_eq!(lines(&available(&reader).await), ["init video=h264"]);
+    rig.video().close();
+    assert_eq!(rig.closed().await.0, "stream_deleted");
+    assert_eq!(
+        logs.count(Level::INFO, "live: the video track closed before the fetch"),
+        1
+    );
+    assert!(!rig.lives.runs("l1"));
+}
+
 /// The real container holds a keyframe until the next frame gives its
 /// duration (the fake holds a frame without a payload): a keyframe taken
 /// before the start timeout ends the wait for one, even when its fragment
