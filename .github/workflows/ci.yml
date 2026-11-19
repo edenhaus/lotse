@@ -261,10 +261,11 @@ jobs:
           fail_ci_if_error: true # a report Codecov never got would leave its gate unchecked
 
   # The daemon against a third-party RTSP server (MediaMTX) fed by ffmpeg, over TCP and UDP, video
-  # only and with AAC, PCMU and Opus; and ffprobe reading the recording muxer's fixtures. Both tools are
-  # pinned in mise.toml; both arches, so both ffmpeg pins are exercised.
+  # only and with AAC, PCMU and Opus; ffprobe reading the recording muxer's fixtures; and a real
+  # Prometheus scraping the metrics over mutual TLS with the runner's openssl. The tools are pinned in
+  # mise.toml; both arches, so both ffmpeg pins are exercised.
   interop:
-    name: Interop with MediaMTX and ffmpeg (${{ matrix.arch }})
+    name: Interop with MediaMTX, ffmpeg and Prometheus (${{ matrix.arch }})
     needs: build
     strategy:
       fail-fast: false
@@ -284,7 +285,7 @@ jobs:
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
           version: 2026.11.8
-          install_args: github:nextest-rs/nextest github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds
+          install_args: github:nextest-rs/nextest github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds github:prometheus/prometheus
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tests-${{ matrix.arch }}

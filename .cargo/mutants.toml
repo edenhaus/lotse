@@ -33,6 +33,8 @@ exclude_re = [
     "delete match arm SessionEvent::(Answer|State|Warning)\\{.*\\} in State::deliver_session",
     # The shifted-in low byte is zero, so `|` and `^` produce the same value.
     "replace \\| with \\^ in encode_ulid",
+    # The mask clears bit 6 before it is set, so `|` and `^` produce the same value.
+    "lotse-api/src/identity.rs:.*replace \\| with \\^ in serial$",
     # The type preference, local preference and component occupy disjoint bits.
     "replace \\| with \\^ in srflx_candidate",
     # 248 itself maps to 'A' as 248 % 62 == 0: one value of bias, no observable behavior.

@@ -100,6 +100,21 @@
       ],
       "type": "object"
     },
+    "ClientRole": {
+      "description": "What a client certificate's pin may do on the control TLS listener. The\nrole is lotse's, kept with the pin; nothing in the certificate says it,\nsince a client makes its own certificate and its contents prove\nnothing.",
+      "oneOf": [
+        {
+          "const": "control",
+          "description": "The whole control API: the WebSocket, recordings' bytes and\n`GET /v0/metrics`. Pairing enrolls this role only.",
+          "type": "string"
+        },
+        {
+          "const": "metrics",
+          "description": "`GET /v0/metrics` and nothing else: every other route is refused\nwith 403.",
+          "type": "string"
+        }
+      ]
+    },
     "CloseCode": {
       "description": "The code of a `closed` event: every reason a session may end, and\nnothing else. The `source_*` codes and `worker_crashed` are also the\ncodes of `stream/get`'s `last_error`.",
       "oneOf": [
@@ -375,6 +390,39 @@
             "pin"
           ],
           "title": "ClientsRemoveCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`clients/add`: enrolls a pin with a role, for a client that cannot\npair (a metrics scraper); only on the Unix socket. A pin enrolled\nor fixed with the other role is refused.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pin": {
+              "description": "The client certificate's SHA-256, 64 hex digits, optionally with a\ncolon between each pair.",
+              "maxLength": 95,
+              "type": "string"
+            },
+            "role": {
+              "$ref": "#/$defs/ClientRole",
+              "description": "What the pin may do."
+            },
+            "type": {
+              "const": "clients/add",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "pin",
+            "role"
+          ],
+          "title": "ClientsAddCommand",
           "type": "object"
         },
         {
@@ -1220,17 +1268,22 @@
           "type": "boolean"
         },
         "fixed": {
-          "description": "The pin comes from the configuration (`--control-clients`), which\n`clients/remove` cannot change; otherwise it was enrolled by pairing.",
+          "description": "The pin comes from the configuration (`--control-clients`,\n`--metrics-clients`), which `clients/remove` cannot change;\notherwise it was enrolled by pairing or `clients/add`.",
           "type": "boolean"
         },
         "pin": {
           "description": "The SHA-256 of the client's certificate, as lowercase hex pairs\njoined by colons.",
           "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/ClientRole",
+          "description": "What the pin may do."
         }
       },
       "required": [
         "pin",
         "fixed",
+        "role",
         "connected"
       ],
       "type": "object"
@@ -1409,7 +1462,7 @@
         },
         {
           "const": "not_permitted",
-          "description": "The command is not allowed on this connection (`pairing/create`\nover the TLS listener, `clients/remove` of another client over it),\nor not for this target (`clients/remove` of a fixed pin).",
+          "description": "The command is not allowed on this connection (`pairing/create` or\n`clients/add` over the TLS listener, `clients/remove` of another\nclient over it), or not for this target (`clients/remove` of a\nfixed pin, `clients/add` of a pin that has the other role); or,\nwith HTTP 403, a route a `metrics` client may not take.",
           "type": "string"
         },
         {
@@ -4883,6 +4936,9 @@
   "results": {
     "backchannel/release": {
       "$ref": "#/$defs/Success_for_BackchannelReleaseResult"
+    },
+    "clients/add": {
+      "$ref": "#/$defs/Success_for_Empty"
     },
     "clients/list": {
       "$ref": "#/$defs/Success_for_ClientList"

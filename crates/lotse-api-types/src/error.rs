@@ -45,9 +45,11 @@ pub enum ErrorCode {
     SourceInUse,
     /// The command arrived during graceful shutdown.
     ShuttingDown,
-    /// The command is not allowed on this connection (`pairing/create`
-    /// over the TLS listener, `clients/remove` of another client over it),
-    /// or not for this target (`clients/remove` of a fixed pin).
+    /// The command is not allowed on this connection (`pairing/create` or
+    /// `clients/add` over the TLS listener, `clients/remove` of another
+    /// client over it), or not for this target (`clients/remove` of a
+    /// fixed pin, `clients/add` of a pin that has the other role); or,
+    /// with HTTP 403, a route a `metrics` client may not take.
     NotPermitted,
     /// An invariant failed; a bug, always logged with context.
     InternalError,

@@ -431,6 +431,90 @@ container's. What the rootless network does to this, observed on
   the browser's. Not verified: an ICE session through the default
   forwarder.
 
+## Metrics with Prometheus
+
+The daemon serves its metrics at `GET /v0/metrics`, on the control socket
+and on the mutual-TLS control listener (`LOTSE_CONTROL_LISTEN`), never
+anywhere without authentication. The scraper's `Accept` header picks the
+format, as Prometheus negotiates it: OpenMetrics 1.0, which Prometheus asks
+for by default, or the Prometheus text format 0.0.4, the fallback for
+anything else (a wildcard included).
+They are the numbers `metrics/get` returns: the supervisor's and each
+worker's memory and tasks, the WebRTC demux's counters, and each stream's
+counters, labelled with its stream id. A Prometheus scrapes them over the
+listener as a `metrics` client: its certificate's pin may read
+`/v0/metrics` and nothing else, so a leaked scraper key exposes the
+metrics, never control of the daemon. The commands below are those of the
+container above; `--socket` and `--data-dir` name the paths elsewhere.
+
+1. On the Prometheus host, make its key and certificate. The private key
+   never leaves that host; the daemon only gets the certificate's pin:
+
+   ```sh
+   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+     -keyout lotse-client.key -out lotse-client.pem -days 36500 -subj "/CN=prometheus"
+   openssl x509 -in lotse-client.pem -noout -fingerprint -sha256
+   ```
+
+   The fingerprint after `=` is the pin, taken as printed, in either case,
+   with or without the colons. The daemon never checks a client certificate's
+   validity (the pin is the authority, and removing it is how a client is
+   revoked), so the lifetime only matters to Prometheus. The listener
+   accepts ECDSA P-256 and Ed25519 keys only: an RSA key is refused in the
+   handshake.
+
+2. Enroll the pin as a `metrics` client, either fixed in the configuration
+   (`LOTSE_METRICS_CLIENTS`, `--metrics-clients` or `[metrics] clients`,
+   comma-separated like `LOTSE_CONTROL_CLIENTS`; a restart takes it), or at
+   once, with no restart, over the control socket, which keeps it in the
+   data directory:
+
+   ```sh
+   podman exec lotse /lotse ctl clients add <pin> metrics
+   ```
+
+   A pin is either a `control` or a `metrics` client: one given both roles
+   stops the start, and `clients add` refuses a pin that has the other
+   role until it is removed. `clients list` shows each pin's role.
+
+3. Copy the daemon's certificate to Prometheus, which trusts it as its CA
+   file and checks the DNS name `lotse` in it:
+
+   ```sh
+   podman exec lotse /lotse identity --certificate > lotse-server.pem
+   ```
+
+   It prints the certificate alone, never the key. An identity made before
+   the daemon put that name in its certificate has none, and the command
+   says so: `podman exec lotse /lotse identity --reissue` makes a new
+   certificate from the same key, which changes the pin, so every client
+   pairs again (and a client that pinned the old one by hand takes the new
+   one), and the daemon serves it once restarted.
+
+4. Scrape it:
+
+   ```yaml
+   scrape_configs:
+     - job_name: lotse
+       scheme: https
+       metrics_path: /v0/metrics
+       static_configs: [{ targets: ["<host>:18557"] }]
+       tls_config:
+         ca_file: /etc/prometheus/lotse-server.pem
+         server_name: lotse
+         cert_file: /etc/prometheus/lotse-client.pem
+         key_file: /etc/prometheus/lotse-client.key
+   ```
+
+5. Revoke it with `podman exec lotse /lotse ctl clients remove <pin>`,
+   which closes its connections at once; a fixed pin goes from the
+   configuration instead.
+
+The metrics' names start with `lotse_`, a counter's end in `_total`, and
+units are in the name (`_bytes`, `_seconds`). Over TLS, a `metrics`
+client is answered 403 on every other route and 404 on a path that does
+not exist. `mise run interop` runs this setup against a real Prometheus.
+
 ## License
 
 Licensed under either of

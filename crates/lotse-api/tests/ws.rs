@@ -80,6 +80,20 @@ impl Drop for Creating<'_> {
 }
 
 impl FakeHandler {
+    /// A recording's answer: a result with content, then its events.
+    fn recording_create(recording_id: Option<String>) -> Outcome {
+        let (tx, rx) = mpsc::channel(8);
+        let recording_id = recording_id.unwrap_or_default();
+        let _queued = tx.try_send(Event {
+            class: EventClass::Signaling,
+            payload: json!({ "type": "closed", "reason": "completed", "bytes": 0, "duration_ms": 0, "gaps": 0 }),
+        });
+        Outcome::SubscribedWith {
+            result: json!({ "recording_id": recording_id, "url": format!("/v0/recording/{recording_id}") }),
+            events: rx,
+        }
+    }
+
     fn event(stream_id: &str, state: &str) -> Event {
         Event {
             class: EventClass::StreamState {
@@ -207,19 +221,7 @@ impl Handler for FakeHandler {
                 Outcome::Subscribed(rx)
             }
             Command::HlsCreate(create) => self.hls_create(create.id, &create.stream_id).await,
-            Command::RecordingCreate(start) => {
-                // A result with content, then the recording's events.
-                let (tx, rx) = mpsc::channel(8);
-                let recording_id = start.recording_id.unwrap_or_default();
-                let _queued = tx.try_send(Event {
-                    class: EventClass::Signaling,
-                    payload: json!({ "type": "closed", "reason": "completed", "bytes": 0, "duration_ms": 0, "gaps": 0 }),
-                });
-                Outcome::SubscribedWith {
-                    result: json!({ "recording_id": recording_id, "url": format!("/v0/recording/{recording_id}") }),
-                    events: rx,
-                }
-            }
+            Command::RecordingCreate(start) => Self::recording_create(start.recording_id),
             Command::LiveCreate(create) => self.live_create(create.id, &create.stream_id).await,
             Command::SignalingAnswer(_) => {
                 self.answered.notify_one();
@@ -251,7 +253,8 @@ impl Handler for FakeHandler {
             | Command::Unsubscribe(_)
             | Command::PairingCreate(_)
             | Command::ClientsList(_)
-            | Command::ClientsRemove(_) => Outcome::Error(ApiError::new(
+            | Command::ClientsRemove(_)
+            | Command::ClientsAdd(_) => Outcome::Error(ApiError::new(
                 ErrorCode::InternalError,
                 "the server answers these itself",
             )),
