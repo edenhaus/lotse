@@ -827,6 +827,9 @@ struct Registered {
     start: watch::Receiver<Start>,
     /// The session's idle timeout, its timer armed once it starts.
     idle_timeout: Duration,
+    /// Cancelled when the session ends, by `unsubscribe` among others,
+    /// before its output started.
+    gone: CancellationToken,
 }
 
 /// What a new session takes of the output it joins or starts.
@@ -856,10 +859,13 @@ impl Joined {
 /// `hls/create`: validates against the limits, joins the stream's output
 /// of that audio choice or starts one, registers the session, and waits for
 /// the output's start for at most `limits.live_start_timeout_ms` and the
-/// slack of `live/create`. The command's future may be dropped at its wait,
-/// only as its control connection closes or the daemon shuts down: the
-/// session stays registered with its owner, whose connection's close ends
-/// it; its idle timer is armed only once the create answers.
+/// slack of `live/create`, or until the session ends before (an
+/// `unsubscribe` of the create), refused `hls_not_found` at once while
+/// the output goes on for its other sessions. The command's future may be
+/// dropped at its wait, only as its control connection closes or the
+/// daemon shuts down: the session stays registered with its owner, whose
+/// connection's close ends it; its idle timer is armed only once the
+/// create answers.
 pub(crate) async fn create(
     shared: &Arc<Shared>,
     connection: ConnectionId,
@@ -876,12 +882,26 @@ pub(crate) async fn create(
         events,
         mut start,
         idle_timeout,
+        gone,
     } = registered?;
     let outcome = tokio::select! {
+        // The output's end ends its sessions too: its reason comes first.
+        biased;
         started = start.wait_for(|start| start.outcome().is_some()) => started
             .map_or(Err(HlsCloseReason::InternalError), |start| {
                 start.outcome().unwrap_or(Err(HlsCloseReason::InternalError))
             }),
+        // The session ended before its output started, an `unsubscribe` of
+        // the create: it answers at once, the output left to its other
+        // sessions, whose creates wait on.
+        () = gone.cancelled() => {
+            tracing::debug!(hls.id = %hls_id, live.id = %live_id, "LL-HLS session closed before its output started");
+            return Err(ApiError::new(
+                ErrorCode::HlsNotFound,
+                "the LL-HLS session was closed before it started: its subscription was unsubscribed",
+            )
+            .with_detail("hls_id", hls_id.as_str()));
+        }
         () = shared.clock.sleep(wait) => Err(HlsCloseReason::SourceNotLive),
     };
     let mime = shared
@@ -990,6 +1010,7 @@ fn register(
     let serial = state.hls.last.wrapping_add(1);
     state.hls.last = serial;
     let gone = CancellationToken::new();
+    let ended = gone.clone();
     let now = shared.clock.now();
     let session = HlsSession {
         serial,
@@ -1029,6 +1050,7 @@ fn register(
         events: rx,
         start,
         idle_timeout: limits.idle_timeout,
+        gone: ended,
     })
 }
 
