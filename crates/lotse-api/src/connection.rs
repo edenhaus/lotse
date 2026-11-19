@@ -781,24 +781,36 @@ impl<H: Handler> Connection<H> {
             Outcome::Error(error) => self.refuse(Some(id), Some(name), error),
             Outcome::Subscribed(events) => {
                 self.send(Class::Signaling, &Success::new(id, Empty::default()));
-                self.subscribe(id, events);
+                self.open(id, name, events, cancelled);
             }
             Outcome::SubscribedWith { result, events } => {
                 self.send(Class::Signaling, &Success::new(id, result));
-                self.subscribe(id, events);
+                self.open(id, name, events, cancelled);
             }
         }
-        // Unsubscribed while it waited: answered, but a subscription it
-        // opened ends before its forwarder ever runs, so none of its events
-        // goes out.
-        if cancelled && let Some(task) = self.subscriptions.remove(&id) {
-            task.abort();
+    }
+
+    /// Opens subscription `id`, of command `name`, for `events`, unless
+    /// `unsubscribe` cancelled the command while it waited: then no
+    /// forwarder starts, and its events are dropped unread, so none of
+    /// them goes out after the unsubscribe's answer.
+    fn open(
+        &mut self,
+        id: u64,
+        name: &'static str,
+        events: mpsc::Receiver<Event>,
+        cancelled: bool,
+    ) {
+        if cancelled {
             tracing::debug!(
                 id,
                 command = name,
-                "unsubscribed command answered; its subscription ended"
+                "unsubscribed command answered; its subscription does not open"
             );
+            drop(events);
+            return;
         }
+        self.subscribe(id, events);
     }
 
     /// One text frame: parse, check the id, dispatch, answer.
