@@ -385,6 +385,18 @@ impl State {
         }
     }
 
+    /// Ends every live output for `reason` at once, as the shutdown does:
+    /// each worker is asked to stop its output, and each output closes now,
+    /// its owner told, with its counters as zero, since its worker's
+    /// `Closed` is not waited for.
+    pub(crate) fn close_lives_now(&mut self, reason: LiveCloseReason) {
+        let ids: Vec<String> = self.lives.keys().cloned().collect();
+        for live_id in ids {
+            self.end_live(&live_id, reason);
+            self.close_live(&live_id, reason, (0, 0, 0));
+        }
+    }
+
     /// Live output `live_id` is over for `reason` with the worker's
     /// `(bytes, dropped_frames, drops)`: it leaves the registry and its
     /// connection's demand, its owner gets `closed` and its subscription
