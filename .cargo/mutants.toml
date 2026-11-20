@@ -39,6 +39,9 @@ exclude_re = [
     "replace \\| with \\^ in srflx_candidate",
     # 248 itself maps to 'A' as 248 % 62 == 0: one value of bias, no observable behavior.
     "replace < with <= in random_chars",
+    # The reconnect's keyframe and the audio before are two frames, counted apart in the order
+    # pushed, so their counts are never equal and `>` and `>=` cannot differ.
+    "lotse-mux/src/live.rs:.*replace > with >= in Live::push_audio$",
     # An equal profile is taken by the arms before, so `>` and `>=` cannot differ there.
     "video/h264.rs:.*replace > with >= in choose_pt$",
     # The profile, constraint and level bytes are shifted into disjoint bits, so `|` and `^`

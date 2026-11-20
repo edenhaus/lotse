@@ -1,6 +1,6 @@
 [package]
 name = "lotse-mux"
-description = "Fragmented MP4 output: event recordings from H.264, H.265, AAC-LC and Opus frames."
+description = "Fragmented MP4 output: event recordings and live fragments from H.264, H.265, AAC-LC and Opus frames."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

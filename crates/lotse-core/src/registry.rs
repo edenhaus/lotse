@@ -1,12 +1,13 @@
 //! The factory registries the binary fills at startup: sources by
 //! protocol, those lotse connects to by URL and those whose signaling the
 //! client relays, outputs by kind, transcoders as a list, the recording
-//! container in its own slot. Nothing else in the tree names a concrete
+//! and the live containers in their own slots. Nothing else in the tree names a concrete
 //! source or output.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::live::LiveMuxerFactory;
 use crate::output::OutputFactory;
 use crate::recording::RecordingMuxerFactory;
 use crate::source::{SignaledSourceFactory, SourceFactory};
@@ -160,6 +161,10 @@ pub struct Registries {
     /// The container event recordings are written in, apart from `outputs`
     /// since a recording is no session; `None` runs no recording.
     pub recording: Option<Arc<dyn RecordingMuxerFactory>>,
+    /// The container live outputs are written in (live fMP4 over HTTP and
+    /// the LL-HLS parts), apart from `outputs` since a live output is no
+    /// WebRTC session; `None` runs no live output.
+    pub live: Option<Arc<dyn LiveMuxerFactory>>,
 }
 
 #[cfg(test)]
@@ -280,6 +285,7 @@ mod tests {
             registries.recording.is_none(),
             "no recording container by default"
         );
+        assert!(registries.live.is_none(), "no live container by default");
         assert_eq!(registries.sources.protocols(), Vec::<&str>::new());
         assert_eq!(registries.outputs.kinds(), Vec::<&str>::new());
         assert_eq!(
