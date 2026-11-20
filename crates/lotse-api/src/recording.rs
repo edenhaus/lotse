@@ -46,7 +46,7 @@
 use std::fmt;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -66,7 +66,9 @@ use tokio::sync::{oneshot, watch};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::clients::ClientStore;
 use crate::connection::refuse;
+use crate::hls::InFlight;
 use crate::listener::PeerInfo;
 use crate::{AppState, BODY_STALL_TIMEOUT, CLOSE_TIMEOUT, Handler, RECORDING_REPORT_TIMEOUT};
 
@@ -136,30 +138,61 @@ impl BodyState {
 /// A connection's [`BodyState`], shared by the route, the body it sends
 /// and the connection's task. Holding one keeps the task's receiver
 /// open.
-#[derive(Debug, Clone)]
-pub(crate) struct BodyWatch(Arc<watch::Sender<BodyState>>);
+///
+/// It also holds what must last as long as the connection: an LL-HLS
+/// response's [`InFlight`]. The connection's task and its service each
+/// hold a clone until the connection ends, after its last byte went
+/// through any TLS session to the socket, so what is held here is given
+/// back only then, or when the connection is dropped.
+#[derive(Clone)]
+pub(crate) struct BodyWatch {
+    /// The body's state.
+    state: Arc<watch::Sender<BodyState>>,
+    /// Kept only to be dropped as the last clone is, so erased: nothing
+    /// reads it back.
+    held: Arc<Mutex<Vec<Box<dyn Send>>>>,
+}
+
+impl fmt::Debug for BodyWatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BodyWatch")
+            .field("state", &*self.state.borrow())
+            .finish_non_exhaustive()
+    }
+}
 
 impl BodyWatch {
     /// A connection without a recording body.
     pub(crate) fn new() -> Self {
-        Self(Arc::new(watch::Sender::new(BodyState::Idle)))
+        Self {
+            state: Arc::new(watch::Sender::new(BodyState::Idle)),
+            held: Arc::default(),
+        }
     }
 
     /// Records what the body does now.
-    fn set(&self, state: BodyState) {
-        self.0.send_replace(state);
+    pub(crate) fn set(&self, state: BodyState) {
+        self.state.send_replace(state);
     }
 
     /// A receiver of every change.
     pub(crate) fn subscribe(&self) -> watch::Receiver<BodyState> {
-        self.0.subscribe()
+        self.state.subscribe()
+    }
+
+    /// Holds `in_flight` until the connection ends.
+    pub(crate) fn hold(&self, in_flight: InFlight) {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Box::new(in_flight));
     }
 
     /// The socket took bytes of the response: a wait for the client ends.
     /// Nobody is woken (the stall timer finds the change when it next
     /// fires), so a write costs no wake-up.
     fn progressed(&self) {
-        self.0.send_if_modified(|state| {
+        self.state.send_if_modified(|state| {
             if matches!(state, BodyState::Waiting(_)) {
                 *state = BodyState::Taken;
             }
@@ -171,7 +204,7 @@ impl BodyWatch {
     /// client from `clock`'s now, unless it already did. Nobody is woken,
     /// as for [`Self::progressed`]; with no body sent, nothing changes.
     fn refused(&self, clock: &dyn Clock) {
-        self.0.send_if_modified(|state| {
+        self.state.send_if_modified(|state| {
             if matches!(state, BodyState::Taken) {
                 *state = BodyState::Waiting(clock.now());
             }
@@ -284,10 +317,7 @@ pub(crate) async fn fetch<H: Handler>(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let removed = match (state.clients.as_deref(), &peer) {
-        (Some(clients), PeerInfo::Tls { pin, .. }) => !clients.allows(pin),
-        _ => false,
-    };
+    let removed = client_removed(state.clients.as_deref(), &peer);
     let request = Request {
         peer: &peer,
         removed,
@@ -302,6 +332,15 @@ pub(crate) async fn fetch<H: Handler>(
     answer(&request, &|recording_id| {
         handler.recording_body(recording_id)
     })
+}
+
+/// Whether `peer` is a TLS listener's client that `clients` no longer
+/// allows: one removed since its handshake. A body route refuses it.
+pub(crate) fn client_removed(clients: Option<&ClientStore>, peer: &PeerInfo) -> bool {
+    match (clients, peer) {
+        (Some(clients), PeerInfo::Tls { pin, .. }) => !clients.allows(pin),
+        _ => false,
+    }
 }
 
 /// Any other method on a recording's path, HEAD included: 405 with `Allow: GET`
@@ -623,7 +662,7 @@ mod tests {
 
     /// A log writer that keeps every line.
     #[derive(Clone, Default)]
-    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct Captured(Arc<Mutex<Vec<u8>>>);
 
     impl io::Write for Captured {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -737,6 +776,15 @@ mod tests {
         (status, code)
     }
 
+    /// A watch shows its body's state; what it holds is kept, not shown.
+    #[test]
+    fn a_body_watch_shows_its_state_and_not_what_it_holds() {
+        let watch = BodyWatch::new();
+        watch.hold(InFlight::default());
+        watch.set(BodyState::Taken);
+        assert_eq!(format!("{watch:?}"), "BodyWatch { state: Taken, .. }");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn rfc9110_15_5_a_request_that_names_no_recording_it_may_take_is_refused_with_the_error_body()
      {
@@ -819,9 +867,9 @@ mod tests {
     {
         let (logs, _guard) = capture(tracing::Level::INFO);
         let body = BodyWatch::new();
-        let asked = std::sync::Mutex::new(None);
+        let asked = Mutex::new(None);
         let (recording, mut writer, report) = new_recording();
-        let recording = std::sync::Mutex::new(Some(recording));
+        let recording = Mutex::new(Some(recording));
         let lookup = |id: &RecordingId| {
             *asked.lock().unwrap() = Some(id.clone());
             Ok(recording.lock().unwrap().take().unwrap())

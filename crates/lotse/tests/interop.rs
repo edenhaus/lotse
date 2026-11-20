@@ -21,7 +21,9 @@
 //!
 //! The [`recording`] tests record event recordings of the stream (H.264 or libx265's
 //! H.265; AAC, Opus, PCMU or G.722) from the daemon's pre-record window and
-//! have ffprobe decode them (ISO/IEC 14496-12).
+//! have ffprobe decode them (ISO/IEC 14496-12); its `mediamtx_hls_ll_` tests
+//! have ffmpeg play an LL-HLS session (draft-pantos-hls-rfc8216bis-22) as a
+//! plain HLS client and ffprobe decode what it took.
 //!
 //! Ignored by default: they need `mediamtx`, `ffmpeg` and `ffprobe` on
 //! `PATH`, which `mise run interop` provides (pinned in `mise.toml`) before
@@ -1394,5 +1396,430 @@ mod recording {
         let (code, rest) = daemon.terminate();
         assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
         camera.stop();
+    }
+
+    /// The `codecs` a live output of `video` and `audio` names (RFC 6381):
+    /// the video's sample entry, then the audio's when the container carries
+    /// it as it is.
+    #[cfg(feature = "output-live")]
+    fn live_codecs(video: Video, audio: Audio) -> (&'static str, Option<&'static str>) {
+        let video = match video {
+            Video::H264 => "avc1.",
+            Video::H265 => "hvc1.",
+        };
+        let audio = match audio {
+            Audio::Aac => Some("mp4a.40.2"),
+            Audio::Opus => Some("Opus"),
+            Audio::None | Audio::Pcmu | Audio::G722 => None,
+        };
+        (video, audio)
+    }
+
+    /// Every movie fragment of `body` holds at most one video sample (ISO/IEC
+    /// 14496-12 §8.8.4, track 1 the video's).
+    #[cfg(feature = "output-live")]
+    fn check_one_frame_per_fragment(body: &[u8]) {
+        use mp4_atom::{Any, Decode as _};
+
+        let mut rest = body;
+        while !rest.is_empty() {
+            if let Any::Moof(moof) = Any::decode(&mut rest).expect("a box") {
+                let video_samples: usize = moof
+                    .traf
+                    .iter()
+                    .filter(|traf| traf.tfhd.track_id == 1)
+                    .flat_map(|traf| &traf.trun)
+                    .map(|trun| trun.samples.len())
+                    .sum();
+                assert!(video_samples <= 1, "one video frame per fragment");
+            }
+        }
+    }
+
+    /// A live output of a camera sending `video` and `audio`
+    /// (`live/create`), fetched (`GET /v0/live/{live_id}`) for a few seconds
+    /// and closed (`live/close`): its body ends with its last chunk, its
+    /// type is the result's MIME type, every fragment holds at most one
+    /// video frame (ISO/IEC 14496-12 §8.8.4), and ffprobe decodes every
+    /// frame, the video from a keyframe on at the camera's rate without a
+    /// hole; audio the container does not carry is left out with
+    /// `audio_omitted`.
+    #[cfg(feature = "output-live")]
+    async fn live(video: Video, audio: Audio) {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let camera = Camera::start_video(video, audio, Arc::clone(&clock))
+            .await
+            .expect("MediaMTX and ffmpeg (run through `mise run interop`)");
+        let (daemon, control, dir) =
+            daemon(&format!("live-{}-{}", video.name(), audio.name())).await;
+        put_and_fill(&control, &camera, 1_000, &*clock).await;
+        let (_id, result, mut events) = control
+            .subscribe(json!({ "type": "live/create", "stream_id": STREAM }))
+            .await
+            .expect("live/create");
+        let mime = result["mime"].as_str().unwrap().to_owned();
+        let (video_codec, audio_codec) = live_codecs(video, audio);
+        assert!(
+            mime.starts_with(&format!("video/mp4; codecs=\"{video_codec}")),
+            "{mime}"
+        );
+        assert_eq!(
+            audio_codec.is_some_and(|codec| mime.ends_with(&format!(",{codec}\""))),
+            audio_codec.is_some(),
+            "{mime}"
+        );
+        let fetch = fetch_on_socket(&dir.join("lotse.sock"), result["url"].as_str().unwrap()).await;
+        clock.sleep(PLAY).await;
+        control
+            .command(json!({ "type": "live/close", "live_id": result["live_id"] }))
+            .await
+            .expect("live/close");
+        let events = until_closed(&mut events, &*clock).await;
+        let closed = events.last().unwrap();
+        assert_eq!(closed["reason"], "closed", "{events:?}");
+        let warned = events.iter().any(|event| event["code"] == "audio_omitted");
+        assert_eq!(
+            warned,
+            audio != Audio::None && audio_codec.is_none(),
+            "{events:?}"
+        );
+        let fetched = fetch.await.expect("the fetch");
+        assert_eq!(fetched.status, 200, "{fetched:?}");
+        assert_eq!(fetched.content_type.as_deref(), Some(mime.as_str()));
+        assert!(fetched.whole, "the body ends with its last chunk");
+        assert_eq!(
+            closed["bytes"].as_u64(),
+            u64::try_from(fetched.bytes.len()).ok()
+        );
+
+        check_one_frame_per_fragment(&fetched.bytes);
+        let file = dir.join("live.mp4");
+        std::fs::write(&file, &fetched.bytes).unwrap();
+        let (video_frames, audio_frames) = ffprobe(&file);
+        check_video(&video_frames, video);
+        assert!(
+            video_frames.span_ms() >= PLAY.as_millis().try_into().unwrap(),
+            "at least what played: {} ms",
+            video_frames.span_ms()
+        );
+        assert_eq!(
+            audio_frames.is_some(),
+            audio_codec.is_some(),
+            "an audio stream"
+        );
+        if let Some(sound) = audio_frames {
+            assert_eq!(sound.holes(), [], "the audio runs without a hole");
+        }
+
+        Arc::into_inner(control).expect("one owner").close().await;
+        let (code, rest) = daemon.terminate();
+        assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
+        camera.stop();
+    }
+
+    /// The request lines a [`forward`] took, one a connection, in order.
+    #[cfg(feature = "output-hls")]
+    type Asked = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A loopback TCP listener whose every connection is forwarded, byte for
+    /// byte, to the daemon's control `socket`: the HTTP client a test runs
+    /// (ffmpeg) speaks TCP only, the control socket is a Unix socket, and the
+    /// mTLS listener asks for a client certificate. Each connection's first
+    /// line, its request line (RFC 9112 §3), is kept in order; the daemon
+    /// closes a connection after its one LL-HLS answer, so a line is a
+    /// request. Ends with `cancel`.
+    #[cfg(feature = "output-hls")]
+    async fn forward(
+        socket: std::path::PathBuf,
+        cancel: CancellationToken,
+    ) -> (std::net::SocketAddr, Asked) {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let addr = listener.local_addr().unwrap();
+        let asked = Asked::default();
+        let kept = Arc::clone(&asked);
+        spawn_named("test.hls_forward", async move {
+            loop {
+                let (mut tcp, _) = tokio::select! {
+                    accepted = listener.accept() => accepted.expect("a connection"),
+                    () = cancel.cancelled() => return,
+                };
+                let (socket, kept) = (socket.clone(), Arc::clone(&kept));
+                spawn_named("test.hls_forward.connection", async move {
+                    let mut line = Vec::new();
+                    let mut byte = [0_u8];
+                    while !line.ends_with(b"\r\n") && line.len() < 8_192 {
+                        if tcp.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        line.push(byte[0]);
+                    }
+                    kept.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&line).trim_end().to_owned());
+                    let mut unix = tokio::net::UnixStream::connect(&socket)
+                        .await
+                        .expect("the control socket");
+                    unix.write_all(&line).await.unwrap();
+                    let _copied = tokio::io::copy_bidirectional(&mut tcp, &mut unix).await;
+                });
+            }
+        });
+        (addr, asked)
+    }
+
+    /// How long ffmpeg takes of an LL-HLS session.
+    #[cfg(feature = "output-hls")]
+    const HLS_TAKE: Duration = Duration::from_secs(3);
+
+    /// ffmpeg reading `url` as plain HLS and copying [`HLS_TAKE`] of it,
+    /// unchanged (`-c copy`), into the MP4 file `out`; its exit status and
+    /// what it wrote to stderr. It starts at the live playlist's last whole
+    /// segment (`-live_start_index -1`, so it must reload the playlist for
+    /// the rest), gives up on a connection silent for 10 s (`-rw_timeout`)
+    /// rather than hang, and reports errors only.
+    #[cfg(feature = "output-hls")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a third-party HLS client of the daemon, never the daemon's code"
+    )]
+    async fn ffmpeg_hls(url: String, out: std::path::PathBuf) -> (bool, String) {
+        lotse_core::task::spawn_blocking_named("test.ffmpeg_hls", move || {
+            let output = std::process::Command::new("ffmpeg")
+                .args([
+                    "-nostdin",
+                    "-hide_banner",
+                    "-v",
+                    "error",
+                    "-rw_timeout",
+                    "10000000",
+                    "-live_start_index",
+                    "-1",
+                    "-i",
+                    &url,
+                    "-t",
+                    &HLS_TAKE.as_secs().to_string(),
+                    "-c",
+                    "copy",
+                    "-y",
+                ])
+                .arg(&out)
+                .output()
+                .expect(
+                    "ffmpeg is not on PATH: `mise install`, then run through mise (mise run interop)",
+                );
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        })
+        .await
+        .expect("ffmpeg's task")
+    }
+
+    /// The requests of a plain HLS client of the session whose playlist is
+    /// at `playlist` (`asked`, request lines): the playlist, more than once
+    /// and without Delivery Directives, the init segment and whole segments,
+    /// never a part.
+    #[cfg(feature = "output-hls")]
+    fn check_plain_hls_requests(asked: &[String], playlist: &str) {
+        let base = playlist.trim_end_matches("index.m3u8");
+        let paths: Vec<&str> = asked
+            .iter()
+            .map(|line| {
+                let path = line
+                    .strip_prefix("GET ")
+                    .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+                    .unwrap_or_else(|| panic!("a GET: {line}"));
+                path.strip_prefix(base)
+                    .unwrap_or_else(|| panic!("the session's: {line}"))
+            })
+            .collect();
+        assert!(
+            paths.iter().filter(|&&path| path == "index.m3u8").count() >= 2,
+            "the playlist reloaded, as it is, without directives: {paths:?}"
+        );
+        assert!(paths.contains(&"init.mp4"), "{paths:?}");
+        assert!(
+            paths.iter().all(|path| path == &"index.m3u8"
+                || path == &"init.mp4"
+                || path.starts_with("seg")),
+            "whole segments, never a part: {paths:?}"
+        );
+    }
+
+    /// What ffmpeg took of a session of a camera sending H.264 and `audio`,
+    /// in `file`, as ffprobe decodes it: every frame, from a keyframe on,
+    /// two seconds of the camera's frames or more, without a hole; the
+    /// camera's audio where the container carries it, without a hole and
+    /// over the video's span.
+    #[cfg(feature = "output-hls")]
+    fn check_hls_take(file: &Path, audio: Audio) {
+        let (video, sound) = ffprobe(file);
+        assert_eq!(
+            (
+                &video.stream["codec_name"],
+                &video.stream["width"],
+                &video.stream["height"]
+            ),
+            (&json!("h264"), &json!(WIDTH), &json!(HEIGHT)),
+            "{}",
+            video.stream
+        );
+        let first = &video.frames[0];
+        assert!(
+            first.key && first.picture.as_deref() == Some("I"),
+            "the first frame is a keyframe: {first:?}"
+        );
+        assert!(
+            video.frames.len() >= usize::try_from(FPS).unwrap() * 2,
+            "{} frames of {HLS_TAKE:?}",
+            video.frames.len()
+        );
+        assert_eq!(video.holes(), [], "the video runs without a hole");
+        let codec = match audio {
+            Audio::Aac => Some("aac"),
+            Audio::Opus => Some("opus"),
+            Audio::None | Audio::Pcmu | Audio::G722 => None,
+        };
+        assert_eq!(
+            sound.as_ref().map(|sound| &sound.stream["codec_name"]),
+            codec.map(|codec| json!(codec)).as_ref(),
+            "the camera's audio where the container carries it"
+        );
+        if let Some(sound) = sound {
+            assert!(!sound.frames.is_empty(), "audio frames");
+            assert_eq!(sound.holes(), [], "the audio runs without a hole");
+            // The audio covers the video's take at both ends: `holes` only
+            // sees between frames. Each end is allowed an audio frame (`-t`
+            // cuts each track at a frame of its own) plus EBU R37's 40 ms.
+            // The start is allowed a GOP more (the camera's keyframe every
+            // `FPS` frames, 1 s): the output joins at the cached keyframe,
+            // and the GOP cache holds no audio, so the audio begins where
+            // the output joined (observed 0.48 to 0.62 s after the keyframe,
+            // 2026-11-15, MediaMTX 1.21.3, ffmpeg 9.0.2).
+            let slack_us = (sound.ms(sound.frames[0].duration) + AV_SYNC_MS) * 1_000;
+            let gop_us = 1_000_000;
+            let (video_start, audio_start) = (video.start_us(), sound.start_us());
+            let video_end = video_start + video.span_ms() * 1_000;
+            let audio_end = audio_start + sound.span_ms() * 1_000;
+            assert!(
+                audio_start + slack_us >= video_start
+                    && audio_start <= video_start + gop_us + slack_us
+                    && audio_end.abs_diff(video_end) <= slack_us,
+                "audio from {audio_start} to {audio_end} us, video from {video_start} to {video_end} us"
+            );
+        }
+    }
+
+    /// An LL-HLS session of a camera sending H.264 and `audio` (`hls/create`)
+    /// played by ffmpeg 9.0.2 (pinned in `mise.toml`), whose HLS demuxer
+    /// knows no Low-Latency tag: it reads the playlist as a plain live Media
+    /// Playlist, ignoring `EXT-X-SERVER-CONTROL`, `EXT-X-PART-INF`,
+    /// `EXT-X-PART` and `EXT-X-PRELOAD-HINT` as a client must ignore tags it
+    /// does not recognize (draft-pantos-hls-rfc8216bis-22 §6.3.1), and loads
+    /// the init segment and whole segments, reloading the playlist without
+    /// Delivery Directives (§6.3.4) and asking for the init segment again
+    /// after a reload, each request on a connection of its own as the daemon
+    /// closes each (observed 2026-11-15: playlist, init, `seg0`, playlist,
+    /// init, `seg1` for 3 s of 2 s segments). What it copied
+    /// decodes, every frame (ffprobe), from a keyframe on without a hole,
+    /// with the camera's audio where the container carries it; the requests
+    /// it made are the playlist, more than once, the init segment and
+    /// segments, never a part. `hls/close` then ends the session `closed`.
+    #[cfg(feature = "output-hls")]
+    async fn ll_hls(audio: Audio) {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let camera = Camera::start_video(Video::H264, audio, Arc::clone(&clock))
+            .await
+            .expect("MediaMTX and ffmpeg (run through `mise run interop`)");
+        let (daemon, control, dir) = daemon(&format!("hls-{}", audio.name())).await;
+        put_and_fill(&control, &camera, 1_000, &*clock).await;
+        let (_id, result, mut events) = control
+            .subscribe(json!({ "type": "hls/create", "stream_id": STREAM }))
+            .await
+            .expect("hls/create");
+        let mime = result["mime"].as_str().unwrap().to_owned();
+        let (video_codec, audio_codec) = live_codecs(Video::H264, audio);
+        assert!(
+            mime.starts_with(&format!("video/mp4; codecs=\"{video_codec}")),
+            "{mime}"
+        );
+        assert_eq!(
+            audio_codec.is_some_and(|codec| mime.ends_with(&format!(",{codec}\""))),
+            audio_codec.is_some(),
+            "{mime}"
+        );
+
+        let cancel = CancellationToken::new();
+        let (addr, asked) = forward(dir.join("lotse.sock"), cancel.clone()).await;
+        let playlist = result["playlist"].as_str().unwrap();
+        let file = dir.join("hls.mp4");
+        let (ok, stderr) = ffmpeg_hls(format!("http://{addr}{playlist}"), file.clone()).await;
+        let asked = asked.lock().unwrap().clone();
+        assert!(ok, "ffmpeg read the session: {stderr}\n{asked:#?}");
+        cancel.cancel();
+
+        check_plain_hls_requests(&asked, playlist);
+
+        control
+            .command(json!({ "type": "hls/close", "hls_id": result["hls_id"] }))
+            .await
+            .expect("hls/close");
+        let events = until_closed(&mut events, &*clock).await;
+        assert_eq!(events.last().unwrap()["reason"], "closed", "{events:?}");
+
+        check_hls_take(&file, audio);
+
+        Arc::into_inner(control).expect("one owner").close().await;
+        let (code, rest) = daemon.terminate();
+        assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
+        camera.stop();
+    }
+
+    #[cfg(feature = "output-hls")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_hls_ll_rfc8216bis_s6_3_1_ffmpeg_plays_h264_aac_as_plain_hls() {
+        ll_hls(Audio::Aac).await;
+    }
+
+    #[cfg(feature = "output-hls")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_hls_ll_rfc8216bis_s6_3_1_ffmpeg_plays_h264_opus_as_plain_hls() {
+        ll_hls(Audio::Opus).await;
+    }
+
+    #[cfg(feature = "output-live")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_live_h264_aac() {
+        live(Video::H264, Audio::Aac).await;
+    }
+
+    #[cfg(feature = "output-live")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_live_h265() {
+        live(Video::H265, Audio::None).await;
+    }
+
+    #[cfg(feature = "output-live")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_live_opus() {
+        live(Video::H264, Audio::Opus).await;
+    }
+
+    #[cfg(feature = "output-live")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_live_leaves_out_pcmu_with_a_warning() {
+        live(Video::H264, Audio::Pcmu).await;
     }
 }

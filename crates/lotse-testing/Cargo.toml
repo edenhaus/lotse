@@ -17,6 +17,8 @@ bytes = { workspace = true }
 hmac = { workspace = true } # MESSAGE-INTEGRITY of the fake TURN server (RFC 8489 §14.5) and of the Safari ICE test's hand-made STUN requests
 md-5 = { workspace = true } # the fake TURN server's long-term key (RFC 8489 §9.2.2)
 futures-util = { workspace = true } # the dev viewer's relay halves
+hyper = { workspace = true, features = ["client"] } # the dev viewer's GET of a live output's bytes from the daemon's control socket (`client::conn::http1`), streamed to the browser
+hyper-util = { workspace = true } # `TokioIo` between that request's Unix stream and hyper
 rcgen = { workspace = true } # the fake camera's self-signed certificate in TLS mode
 rtsp-types = { workspace = true }
 rustls = { workspace = true } # the fake camera's TLS server configuration
@@ -32,7 +34,8 @@ tokio-tungstenite = { workspace = true } # the dev viewer's WebSocket to the dae
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true } # the dev viewer: the browser test page's `api` parameter, parsed as the browser parses it
-lotse-api-types = { workspace = true } # the load generator reads `metrics/get` through its type
+lotse-api-types = { workspace = true } # the load generator reads `metrics/get` through its type; the dev viewer, the routes it proxies
+lotse-hls = { workspace = true } # the dev viewer checks an LL-HLS request's resource name as the daemon parses it, before it proxies it
 lotse-codec = { workspace = true, features = ["test-util"] } # hand-built parameter sets for the fake camera's stream
 lotse-core = { workspace = true, features = ["test-util"] } # `FakeClock`: the recording checks of the output suite run on it, and MediaMTX's start times out on it without waiting
 

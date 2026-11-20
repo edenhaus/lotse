@@ -164,7 +164,7 @@ description = "The TURN client against a real coturn in Docker (UDP and TCP, lon
 run = "scripts/turn-e2e.sh"
 
 [tasks.interop]
-description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (the ignored `mediamtx_iso14496_12_recording_` tests); and ffprobe reading the recording muxer's fixtures (the ignored `ffprobe_` tests); and a real Prometheus scraping `GET /v0/metrics` over mutual TLS with an openssl-made P-256 client certificate, in OpenMetrics and in the Prometheus text format, a certificate never enrolled refused (the ignored `prometheus_` test)"
+description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (the ignored `mediamtx_iso14496_12_recording_` tests); an LL-HLS session read by ffmpeg as plain HLS, H.264 with AAC and with Opus, and decoded by ffprobe (the ignored `mediamtx_hls_ll_` tests); and ffprobe reading the recording muxer's fixtures (the ignored `ffprobe_` tests); and a real Prometheus scraping `GET /v0/metrics` over mutual TLS with an openssl-made P-256 client certificate, in OpenMetrics and in the Prometheus text format, a certificate never enrolled refused (the ignored `prometheus_` test)"
 run = "scripts/nextest.sh -E 'binary_id(lotse::interop) | binary_id(lotse::metrics) | binary_id(lotse-mux::fixtures)' --run-ignored only --no-tests=fail mediamtx_ ffmpeg_ ffprobe_ prometheus_"
 
 [tasks.load]
@@ -185,11 +185,11 @@ arg "[cycle]" help="one cycle of viewers and a camera hang-up; over a minute, af
 run = 'scripts/load.sh --cameras 4 --viewers 2 --duration "$usage_duration" --cycle "$usage_cycle" --drop --sample 10s --report target/soak-report.json'
 
 [tasks.browser]
-description = "The browser test: Selenium has Chrome, Firefox or Safari play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash); report and logs in target/browser-<engine>/<case>/"
+description = "The browser test: Selenium has Chrome, Firefox or Safari play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash; live fMP4 through MSE beside WebRTC with AAC, PCMU and Opus, and LL-HLS through hls.js with AAC and Opus, their latency reported); report and logs in target/browser-<engine>/<case>/"
 usage = '''
 arg "[engine]" help="chrome, firefox or safari" default="chrome"
 arg "[play]" help="how long each window plays (20s); a case with a disruption plays one before it and one after" default="20s"
-arg "[case]" help="join, aac, pli, reconnect, crash or all" default="all"
+arg "[case]" help="join, aac, pli, reconnect, crash, mse, mse-pcmu, mse-opus, llhls, llhls-opus or all" default="all"
 '''
 run = 'scripts/browser.sh "$usage_engine" "$usage_play" --case "$usage_case"'
 

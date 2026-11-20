@@ -32,7 +32,9 @@ pub enum ErrorCode {
     SessionIdInUse,
     /// `unsubscribe` of an unknown subscription.
     SubscriptionNotFound,
-    /// Streams, sessions, sessions per stream or connections.
+    /// Streams, sessions, sessions per stream or connections; over HTTP
+    /// (429), LL-HLS requests blocked at once. `details.limit` names the
+    /// limit.
     LimitReached,
     /// The source's protocol is one the API defines but this build did
     /// not register: not in `info.protocols`. A protocol the API does not
@@ -55,7 +57,10 @@ pub enum ErrorCode {
     SourceUnreachable,
     /// The source rejected the credentials.
     SourceAuthFailed,
-    /// The read deadline or stall watchdog hit.
+    /// The read deadline or stall watchdog hit; or an LL-HLS request
+    /// blocked for three Target Durations without what it waits for (HTTP
+    /// 503, draft-pantos-hls-rfc8216bis-22 §6.2.5.2): the source sends no
+    /// media.
     SourceTimeout,
     /// The source violated its protocol.
     SourceProtocolError,
@@ -83,6 +88,26 @@ pub enum ErrorCode {
     /// `signaling/answer`, `signaling/candidate` or `signaling/error` of a
     /// signal that is not open, or that another control connection owns.
     SignalNotFound,
+    /// `GET /v0/live/{live_id}` (HTTP 404) or `live/close` of a live output
+    /// that is not open: never created, already ended, or an id that is no
+    /// live output's; and `live/create` whose subscription was unsubscribed
+    /// before its output started.
+    LiveNotFound,
+    /// `GET /v0/live/{live_id}` (HTTP 409) of a live output whose bytes
+    /// another request already took: a live output has one body.
+    LiveAlreadyFetched,
+    /// `live/create` on a stream whose source showed no video the live
+    /// container carries within `limits.live_start_timeout_ms`.
+    SourceNotLive,
+    /// `GET /v0/hls/{hls_id}/{name}` (HTTP 404) or `hls/close` of an LL-HLS
+    /// session that is not open: never created, already ended, or an id
+    /// that is no session's.
+    HlsNotFound,
+    /// `GET /v0/hls/{hls_id}/{name}` (HTTP 404) of a name that is no
+    /// resource the session's window holds or hints: out of the window,
+    /// never made, or no name the playlist writes
+    /// (draft-pantos-hls-rfc8216bis-22 §6.2.6). The session goes on.
+    HlsResourceNotFound,
 }
 
 impl ErrorCode {
@@ -117,6 +142,11 @@ impl ErrorCode {
             Self::RecordingIdInUse => "recording_id_in_use",
             Self::RecordingAlreadyFetched => "recording_already_fetched",
             Self::SignalNotFound => "signal_not_found",
+            Self::LiveNotFound => "live_not_found",
+            Self::LiveAlreadyFetched => "live_already_fetched",
+            Self::SourceNotLive => "source_not_live",
+            Self::HlsNotFound => "hls_not_found",
+            Self::HlsResourceNotFound => "hls_resource_not_found",
         }
     }
 
@@ -211,6 +241,11 @@ mod tests {
             ErrorCode::RecordingIdInUse,
             ErrorCode::RecordingAlreadyFetched,
             ErrorCode::SignalNotFound,
+            ErrorCode::LiveNotFound,
+            ErrorCode::LiveAlreadyFetched,
+            ErrorCode::SourceNotLive,
+            ErrorCode::HlsNotFound,
+            ErrorCode::HlsResourceNotFound,
         ];
         for code in all {
             let json = serde_json::to_value(code).unwrap();

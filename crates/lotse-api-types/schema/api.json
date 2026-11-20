@@ -958,6 +958,128 @@
         },
         {
           "additionalProperties": false,
+          "description": "`live/create`: a live output of a stream; its bytes are fetched\nwith `GET /v0/live/{live_id}`.",
+          "properties": {
+            "audio": {
+              "default": true,
+              "description": "Take the stream's audio, when the live container carries it as it\nis (AAC-LC, Opus); any other codec is left out with an\n`audio_omitted` warning and nothing is transcoded. `false` makes a\nvideo-only output, for a player that cannot play the stream's\naudio.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "The command id, which becomes the subscription id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "description": "The stream to play.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "live/create",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "stream_id"
+          ],
+          "title": "LiveCreateCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`live/close`: ends a live output.",
+          "properties": {
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "live_id": {
+              "description": "The live output.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "live/close",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "live_id"
+          ],
+          "title": "LiveCloseCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`hls/create`: an LL-HLS session of a stream; its playlist is\nfetched with `GET /v0/hls/{hls_id}/index.m3u8`.",
+          "properties": {
+            "audio": {
+              "default": true,
+              "description": "Take the stream's audio, as `live/create`'s `audio`: when the live\ncontainer carries it as it is (AAC-LC, Opus); any other codec is left\nout with an `audio_omitted` warning. `false` makes a video-only\nsession.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "The command id, which becomes the subscription id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "description": "The stream to play.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "hls/create",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "stream_id"
+          ],
+          "title": "HlsCreateCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`hls/close`: ends an LL-HLS session.",
+          "properties": {
+            "hls_id": {
+              "description": "The session.",
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "id": {
+              "description": "The command id.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "hls/close",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "hls_id"
+          ],
+          "title": "HlsCloseCommand",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "`signaling/subscribe`: a subscription to the offers of one\nstream's signaled sources, or of every stream's. Its end\n(`unsubscribe`, the connection's close, a supersede) ends every\nsignal it holds at once, live ones included, without `closed`:\ntheir sources connect again after their backoff.",
           "properties": {
             "id": {
@@ -1320,7 +1442,7 @@
         },
         {
           "const": "limit_reached",
-          "description": "Streams, sessions, sessions per stream or connections.",
+          "description": "Streams, sessions, sessions per stream or connections; over HTTP\n(429), LL-HLS requests blocked at once. `details.limit` names the\nlimit.",
           "type": "string"
         },
         {
@@ -1360,7 +1482,7 @@
         },
         {
           "const": "source_timeout",
-          "description": "The read deadline or stall watchdog hit.",
+          "description": "The read deadline or stall watchdog hit; or an LL-HLS request\nblocked for three Target Durations without what it waits for (HTTP\n503, draft-pantos-hls-rfc8216bis-22 §6.2.5.2): the source sends no\nmedia.",
           "type": "string"
         },
         {
@@ -1412,8 +1534,83 @@
           "const": "signal_not_found",
           "description": "`signaling/answer`, `signaling/candidate` or `signaling/error` of a\nsignal that is not open, or that another control connection owns.",
           "type": "string"
+        },
+        {
+          "const": "live_not_found",
+          "description": "`GET /v0/live/{live_id}` (HTTP 404) or `live/close` of a live output\nthat is not open: never created, already ended, or an id that is no\nlive output's; and `live/create` whose subscription was unsubscribed\nbefore its output started.",
+          "type": "string"
+        },
+        {
+          "const": "live_already_fetched",
+          "description": "`GET /v0/live/{live_id}` (HTTP 409) of a live output whose bytes\nanother request already took: a live output has one body.",
+          "type": "string"
+        },
+        {
+          "const": "source_not_live",
+          "description": "`live/create` on a stream whose source showed no video the live\ncontainer carries within `limits.live_start_timeout_ms`.",
+          "type": "string"
+        },
+        {
+          "const": "hls_not_found",
+          "description": "`GET /v0/hls/{hls_id}/{name}` (HTTP 404) or `hls/close` of an LL-HLS\nsession that is not open: never created, already ended, or an id\nthat is no session's.",
+          "type": "string"
+        },
+        {
+          "const": "hls_resource_not_found",
+          "description": "`GET /v0/hls/{hls_id}/{name}` (HTTP 404) of a name that is no\nresource the session's window holds or hints: out of the window,\nnever made, or no name the playlist writes\n(draft-pantos-hls-rfc8216bis-22 §6.2.6). The session goes on.",
+          "type": "string"
         }
       ]
+    },
+    "EventFrame_for_HlsEvent": {
+      "description": "An `event` of a subscription; `id` is the subscribing command's.",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/HlsEvent",
+          "description": "The event."
+        },
+        "id": {
+          "description": "The subscription's command id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/EventTag",
+          "description": "`\"event\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "event"
+      ],
+      "type": "object"
+    },
+    "EventFrame_for_LiveEvent": {
+      "description": "An `event` of a subscription; `id` is the subscribing command's.",
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/LiveEvent",
+          "description": "The event."
+        },
+        "id": {
+          "description": "The subscription's command id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/EventTag",
+          "description": "`\"event\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "event"
+      ],
+      "type": "object"
     },
     "EventFrame_for_RecordingEvent": {
       "description": "An `event` of a subscription; `id` is the subscribing command's.",
@@ -1603,6 +1800,147 @@
           "const": "hello",
           "description": "The only value.",
           "type": "string"
+        }
+      ]
+    },
+    "HlsCloseReason": {
+      "description": "Why an LL-HLS session ended: the `reason` of `closed`.",
+      "oneOf": [
+        {
+          "const": "closed",
+          "description": "`hls/close`.",
+          "type": "string"
+        },
+        {
+          "const": "session_closed",
+          "description": "The control connection that created it closed, or unsubscribed.",
+          "type": "string"
+        },
+        {
+          "const": "idle",
+          "description": "No request reached it within `limits.hls_idle_timeout_ms`.",
+          "type": "string"
+        },
+        {
+          "const": "window_full",
+          "description": "The stream sent no keyframe for longer than `limits.hls_window_bytes`\nhold: a segment must start with one, so the stream cannot be served\nas LL-HLS.",
+          "type": "string"
+        },
+        {
+          "const": "stream_deleted",
+          "description": "The stream was deleted, or its video track closed.",
+          "type": "string"
+        },
+        {
+          "const": "stream_changed",
+          "description": "The stream moved to another source connection, or the codec of what\nfollows is not known.",
+          "type": "string"
+        },
+        {
+          "const": "codec_changed",
+          "description": "A codec changed past what the init segment describes (another\ncodec, profile, level or picture size): a new session needs a new\ninit segment, so the client creates one.",
+          "type": "string"
+        },
+        {
+          "const": "no_video_track",
+          "description": "The stream has no video track.",
+          "type": "string"
+        },
+        {
+          "const": "source_not_live",
+          "description": "No keyframe came within `limits.live_start_timeout_ms`.",
+          "type": "string"
+        },
+        {
+          "const": "worker_crashed",
+          "description": "The stream's worker process exited.",
+          "type": "string"
+        },
+        {
+          "const": "shutting_down",
+          "description": "The daemon is stopping.",
+          "type": "string"
+        },
+        {
+          "const": "internal_error",
+          "description": "The container failed, or the worker broke the contract.",
+          "type": "string"
+        }
+      ]
+    },
+    "HlsCreateResult": {
+      "description": "`hls/create`'s result: the session, the MIME type of its media, and\nwhere its playlist is fetched.",
+      "properties": {
+        "hls_id": {
+          "description": "The session: a ULID.",
+          "type": "string"
+        },
+        "mime": {
+          "description": "The MIME type of its segments with the RFC 6381 `codecs` parameter\nof what the container writes, `video/mp4; codecs=\"avc1.640028,mp4a.40.2\"`:\nthe video's entry, then the audio's when the session has audio.",
+          "type": "string"
+        },
+        "playlist": {
+          "description": "The path to `GET` its Media Playlist from on the socket this command\ncame over: `/v0/hls/{hls_id}/index.m3u8`. A session no request\nreaches within `limits.hls_idle_timeout_ms` ends `idle`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hls_id",
+        "mime",
+        "playlist"
+      ],
+      "type": "object"
+    },
+    "HlsEvent": {
+      "description": "An event of `hls/create`: warnings, then `closed` always last.\nEach variant's schema title names the Python client's class for it.",
+      "oneOf": [
+        {
+          "description": "Non-fatal: the session goes on. A live output's warning, the same\ncodes.",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/LiveWarningCode",
+              "description": "The stable code."
+            },
+            "message": {
+              "description": "For humans.",
+              "type": "string"
+            },
+            "type": {
+              "const": "warning",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "message"
+          ],
+          "title": "HlsEventWarning",
+          "type": "object"
+        },
+        {
+          "description": "The last event; the subscription ends with it, and the session's\nroutes answer 404 `hls_not_found` from here on.",
+          "properties": {
+            "hls_id": {
+              "description": "The session.",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/HlsCloseReason",
+              "description": "Why."
+            },
+            "type": {
+              "const": "closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "hls_id",
+            "reason"
+          ],
+          "title": "HlsEventClosed",
+          "type": "object"
         }
       ]
     },
@@ -1830,6 +2168,178 @@
         "session_grace_ms"
       ],
       "type": "object"
+    },
+    "LiveCloseReason": {
+      "description": "Why a live output ended: the `reason` of `closed`.",
+      "oneOf": [
+        {
+          "const": "closed",
+          "description": "`live/close`.",
+          "type": "string"
+        },
+        {
+          "const": "client_gone",
+          "description": "The body's connection closed, or stopped taking bytes.",
+          "type": "string"
+        },
+        {
+          "const": "session_closed",
+          "description": "The control connection that created it closed, or unsubscribed.",
+          "type": "string"
+        },
+        {
+          "const": "not_fetched",
+          "description": "Nobody fetched the body within `limits.live_fetch_timeout_ms`.",
+          "type": "string"
+        },
+        {
+          "const": "stream_deleted",
+          "description": "The stream was deleted, or its video track closed.",
+          "type": "string"
+        },
+        {
+          "const": "stream_changed",
+          "description": "The stream moved to another source connection, or the codec of what\nfollows is not known.",
+          "type": "string"
+        },
+        {
+          "const": "codec_changed",
+          "description": "A codec changed past what the init segment describes (another\ncodec, profile, level or picture size): a new output needs a new\ninit segment, so the client creates one.",
+          "type": "string"
+        },
+        {
+          "const": "no_video_track",
+          "description": "The stream has no video track.",
+          "type": "string"
+        },
+        {
+          "const": "source_not_live",
+          "description": "No keyframe came within `limits.live_start_timeout_ms` of the fetch.",
+          "type": "string"
+        },
+        {
+          "const": "worker_crashed",
+          "description": "The stream's worker process exited.",
+          "type": "string"
+        },
+        {
+          "const": "shutting_down",
+          "description": "The daemon is stopping.",
+          "type": "string"
+        },
+        {
+          "const": "internal_error",
+          "description": "The container failed, or the worker broke the contract.",
+          "type": "string"
+        }
+      ]
+    },
+    "LiveCreateResult": {
+      "description": "`live/create`'s result: the live output, its MIME type, and where its\nbytes are fetched.",
+      "properties": {
+        "live_id": {
+          "description": "The live output: a ULID.",
+          "type": "string"
+        },
+        "mime": {
+          "description": "The MIME type of its bytes with the RFC 6381 `codecs` parameter of\nwhat the container writes, `video/mp4; codecs=\"avc1.640028,mp4a.40.2\"`:\nthe video's entry, then the audio's when the output has audio. What\n`MediaSource.isTypeSupported` takes.",
+          "type": "string"
+        },
+        "url": {
+          "description": "The path to `GET` its bytes from on the socket this command came\nover: `/v0/live/{live_id}`. One request takes them; a live output\nnot fetched within `limits.live_fetch_timeout_ms` ends `not_fetched`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "live_id",
+        "mime",
+        "url"
+      ],
+      "type": "object"
+    },
+    "LiveEvent": {
+      "description": "An event of `live/create`: warnings, then `closed` always last.\nEach variant's schema title names the Python client's class for it.",
+      "oneOf": [
+        {
+          "description": "Non-fatal: the output goes on.",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/LiveWarningCode",
+              "description": "The stable code."
+            },
+            "message": {
+              "description": "For humans.",
+              "type": "string"
+            },
+            "type": {
+              "const": "warning",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "message"
+          ],
+          "title": "LiveEventWarning",
+          "type": "object"
+        },
+        {
+          "description": "The last event; the subscription ends with it, and the body ends,\nwith its last chunk, once the bytes before it are read.",
+          "properties": {
+            "bytes": {
+              "description": "The bytes its worker wrote for the body; 0 when it ended without\nits worker's last word (`worker_crashed`, `shutting_down`).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "dropped_frames": {
+              "description": "The frames left out because the body was read slower than the\ncamera sends: each time the output fell behind, every frame up\nto the next keyframe.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "drops": {
+              "description": "How often it fell behind and dropped to the next keyframe.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "live_id": {
+              "description": "The live output.",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/LiveCloseReason",
+              "description": "Why."
+            },
+            "type": {
+              "const": "closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "live_id",
+            "reason",
+            "bytes",
+            "dropped_frames",
+            "drops"
+          ],
+          "title": "LiveEventClosed",
+          "type": "object"
+        }
+      ]
+    },
+    "LiveWarningCode": {
+      "description": "The code of a live output's `warning`.",
+      "oneOf": [
+        {
+          "const": "audio_omitted",
+          "description": "The stream's audio does not fit the live container (G.711, G.722,\nanything but AAC-LC and Opus) and is not transcoded: the output has\nno audio, its `mime` names none, and the message names the codec.",
+          "type": "string"
+        }
+      ]
     },
     "Metrics": {
       "description": "`metrics/get`'s result.",
@@ -3569,6 +4079,36 @@
       ],
       "type": "object"
     },
+    "Success_for_HlsCreateResult": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/HlsCreateResult",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
     "Success_for_InfoResult": {
       "description": "A successful `result`: exactly one per command.",
       "properties": {
@@ -3580,6 +4120,36 @@
         },
         "result": {
           "$ref": "#/$defs/InfoResult",
+          "description": "The command's result."
+        },
+        "success": {
+          "description": "Always `true` here.",
+          "type": "boolean"
+        },
+        "type": {
+          "$ref": "#/$defs/ResultTag",
+          "description": "`\"result\"`."
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "success",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Success_for_LiveCreateResult": {
+      "description": "A successful `result`: exactly one per command.",
+      "properties": {
+        "id": {
+          "description": "The command's id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/LiveCreateResult",
           "description": "The command's result."
         },
         "success": {
@@ -4335,6 +4905,12 @@
     "$ref": "#/$defs/Command"
   },
   "events": {
+    "hls/create": {
+      "$ref": "#/$defs/EventFrame_for_HlsEvent"
+    },
+    "live/create": {
+      "$ref": "#/$defs/EventFrame_for_LiveEvent"
+    },
     "recording/create": {
       "$ref": "#/$defs/EventFrame_for_RecordingEvent"
     },
@@ -4370,8 +4946,20 @@
     "clients/remove": {
       "$ref": "#/$defs/Success_for_Empty"
     },
+    "hls/close": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "hls/create": {
+      "$ref": "#/$defs/Success_for_HlsCreateResult"
+    },
     "info": {
       "$ref": "#/$defs/Success_for_InfoResult"
+    },
+    "live/close": {
+      "$ref": "#/$defs/Success_for_Empty"
+    },
+    "live/create": {
+      "$ref": "#/$defs/Success_for_LiveCreateResult"
     },
     "metrics/get": {
       "$ref": "#/$defs/Success_for_Metrics"

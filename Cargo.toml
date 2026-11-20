@@ -240,6 +240,7 @@ lotse-api = { path = "crates/lotse-api" }
 lotse-api-types = { path = "crates/lotse-api-types" }
 lotse-codec = { path = "crates/lotse-codec" }
 lotse-core = { path = "crates/lotse-core" }
+lotse-hls = { path = "crates/lotse-hls" }
 lotse-http = { path = "crates/lotse-http" }
 lotse-ipc = { path = "crates/lotse-ipc" }
 lotse-mux = { path = "crates/lotse-mux" }
