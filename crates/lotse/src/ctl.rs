@@ -566,9 +566,7 @@ async fn fetch(socket: &Path, url: &str, file: &mut Output) -> anyhow::Result<u6
         let mut body = response.into_body();
         if status != StatusCode::OK {
             let text = Limited::new(body, MAX_ERROR_BODY).collect().await;
-            let text = text
-                .map(http_body_util::Collected::to_bytes)
-                .unwrap_or_default();
+            let text = text.map_or_default(http_body_util::Collected::to_bytes);
             anyhow::bail!("GET {url}: {status} {}", String::from_utf8_lossy(&text));
         }
         let mut written = 0_u64;

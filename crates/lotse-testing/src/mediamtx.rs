@@ -880,13 +880,12 @@ pub fn ready_with(path: &Value, video: Video, audio: Audio) -> bool {
     let codecs: Vec<&str> = path
         .get("tracks2")
         .and_then(Value::as_array)
-        .map(|tracks| {
+        .map_or_default(|tracks| {
             tracks
                 .iter()
                 .filter_map(|track| track.get("codec").and_then(Value::as_str))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let wanted: Vec<&str> = std::iter::once(video.mediamtx_codec())
         .chain(audio.mediamtx_codec())
         .collect();

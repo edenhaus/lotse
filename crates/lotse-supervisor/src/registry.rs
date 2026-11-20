@@ -163,8 +163,7 @@ impl ConnectionSnapshot {
         self.stats
             .as_ref()
             .and_then(|stats| stats.talkback.iter().find(|(id, _)| id == session_id))
-            .map(|(_, counters)| *counters)
-            .unwrap_or_default()
+            .map_or_default(|(_, counters)| *counters)
     }
 }
 
@@ -261,8 +260,7 @@ impl fmt::Debug for ConnectionKey {
         let names: Vec<&str> = self
             .options
             .as_object()
-            .map(|fields| fields.keys().map(String::as_str).collect())
-            .unwrap_or_default();
+            .map_or_default(|fields| fields.keys().map(String::as_str).collect());
         f.debug_struct("ConnectionKey")
             .field("target", &self.target)
             .field("options", &names)
@@ -1177,9 +1175,7 @@ impl State {
         entry.dto(
             session_id,
             connection.is_some_and(|c| c.talker.session.as_deref() == Some(session_id)),
-            connection
-                .map(|c| c.snapshot.talkback(session_id))
-                .unwrap_or_default(),
+            connection.map_or_default(|c| c.snapshot.talkback(session_id)),
         )
     }
 

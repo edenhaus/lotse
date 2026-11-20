@@ -145,16 +145,13 @@ async fn readers(camera: &Camera) -> Vec<Value> {
         .await
         .expect("the API")
         .expect("a session list");
-    sessions["items"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter(|s| s["state"] == "read")
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+    sessions["items"].as_array().map_or_default(|items| {
+        items
+            .iter()
+            .filter(|s| s["state"] == "read")
+            .cloned()
+            .collect()
+    })
 }
 
 /// The `transport` of every MediaMTX session that reads the path.

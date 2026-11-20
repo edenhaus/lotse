@@ -259,8 +259,7 @@ fn nal_types(payload: &[u8]) -> Vec<u8> {
         FU => payload
             .get(2)
             .filter(|&&fu| fu & 0x80 != 0)
-            .map(|&fu| vec![fu & 0x3f])
-            .unwrap_or_default(),
+            .map_or_default(|&fu| vec![fu & 0x3f]),
         unit_type => vec![unit_type],
     }
 }

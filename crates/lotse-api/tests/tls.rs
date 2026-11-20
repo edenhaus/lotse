@@ -808,8 +808,7 @@ async fn request<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
         .unwrap_or(0);
     let body = text
         .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_owned())
-        .unwrap_or_default();
+        .map_or_default(|(_, body)| body.to_owned());
     Ok((status, body))
 }
 
@@ -1637,8 +1636,7 @@ async fn request_once<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
         .unwrap_or(0);
     let body = text
         .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_owned())
-        .unwrap_or_default();
+        .map_or_default(|(_, body)| body.to_owned());
     (status, body)
 }
 

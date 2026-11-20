@@ -222,10 +222,7 @@ impl Source for RtspSource {
 pub(crate) fn credentials(url: &SourceUrl) -> Option<Credentials> {
     url.credentials().map(|c| Credentials {
         username: c.username().to_owned(),
-        password: c
-            .password()
-            .map(|p| p.expose_secret().clone())
-            .unwrap_or_default(),
+        password: c.password().map_or_default(|p| p.expose_secret().clone()),
     })
 }
 

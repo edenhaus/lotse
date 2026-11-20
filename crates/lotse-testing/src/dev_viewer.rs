@@ -1809,9 +1809,7 @@ mod tests {
                 Some(format!("http://evil.example:{}", addr.port())),
             ),
         ] {
-            let origin = origin
-                .map(|o| format!("Origin: {o}\r\n"))
-                .unwrap_or_default();
+            let origin = origin.map_or_default(|o| format!("Origin: {o}\r\n"));
             let refused = raw(
                 addr,
                 &format!("GET /v0/live/01JL HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\r\n"),
@@ -2179,9 +2177,7 @@ mod tests {
             (format!("{addr}"), Some("http://evil.example".to_owned())),
             (format!("evil.example:{}", addr.port()), None),
         ] {
-            let origin = origin
-                .map(|o| format!("Origin: {o}\r\n"))
-                .unwrap_or_default();
+            let origin = origin.map_or_default(|o| format!("Origin: {o}\r\n"));
             let refused = raw(
                 addr,
                 &format!("GET /v0/hls/01JH/index.m3u8 HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: close\r\n\r\n"),

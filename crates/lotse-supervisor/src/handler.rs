@@ -598,7 +598,7 @@ impl Supervisor {
         }
         let reoriented = existing.is_some_and(|entry| entry.orientation != put.orientation);
         // The counters outlive a change of the stream.
-        let recordings = existing.map(|entry| entry.recordings).unwrap_or_default();
+        let recordings = existing.map_or_default(|entry| entry.recordings);
         let previous: Vec<String> = existing.map_or_else(Vec::new, |entry| {
             entry.sources.iter().map(|s| s.connection.clone()).collect()
         });
@@ -1980,8 +1980,7 @@ fn driver_spec(id: &str, source: &ValidatedSource) -> DriverSpec {
         host: source
             .target
             .url()
-            .map(|url| url.host().to_owned())
-            .unwrap_or_default(),
+            .map_or_default(|url| url.host().to_owned()),
         port: source.port(),
         backchannel: source.backchannel,
     }
@@ -2126,8 +2125,7 @@ fn check_recording_stream(
         .connections
         .get(connection)
         .filter(|entry| entry.snapshot.state == ConnectionState::Live)
-        .map(|entry| entry.snapshot.tracks.as_slice())
-        .unwrap_or_default();
+        .map_or_default(|entry| entry.snapshot.tracks.as_slice());
     if !tracks.is_empty() && !tracks.iter().any(|track| track.kind == Kind::Video.name()) {
         return Err(ApiError::new(
             ErrorCode::NoVideoTrack,

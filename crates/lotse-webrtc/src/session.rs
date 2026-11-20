@@ -825,10 +825,7 @@ fn talkback_rx(
 /// answers it with its own codecs among them, in its order
 /// (`Media::remote_pts`); none for an m-line it has not answered.
 fn kept_codecs<'r>(rtc: &'r Rtc, mid: &str) -> impl Iterator<Item = CodecFamily> + use<'r> {
-    let kept = rtc
-        .media(Mid::from(mid))
-        .map(Media::remote_pts)
-        .unwrap_or_default();
+    let kept = rtc.media(Mid::from(mid)).map_or_default(Media::remote_pts);
     rtc.codec_config()
         .params()
         .iter()
@@ -1826,9 +1823,8 @@ impl SessionEngine for Session {
     /// an answer changes them, and the worker answers no other re-offer
     /// while it decides this one).
     fn talkback_request(&self, offer: &str) -> TalkbackJudge {
-        let kept: Vec<CodecFamily> = audio::talkback_mid(offer)
-            .map(|mid| kept_codecs(&self.rtc, mid).collect())
-            .unwrap_or_default();
+        let kept: Vec<CodecFamily> =
+            audio::talkback_mid(offer).map_or_default(|mid| kept_codecs(&self.rtc, mid).collect());
         let offer = offer.to_owned();
         let audio = self.stream_audio.clone();
         let order = self.order.clone();

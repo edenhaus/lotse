@@ -638,13 +638,12 @@ fn audio_pts(offer: &str) -> Vec<u8> {
     offer
         .lines()
         .find_map(|line| line.strip_prefix("m=audio "))
-        .map(|rest| {
+        .map_or_default(|rest| {
             rest.split(' ')
                 .skip(2)
                 .filter_map(|pt| pt.trim().parse().ok())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The capture time of a received `packet` by its stream's last Sender
