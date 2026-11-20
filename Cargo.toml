@@ -132,7 +132,7 @@ mp4-atom = { version = "=0.17.1", default-features = false }
 rtsp-types = { version = "0.1", default-features = false }
 # SDP media descriptions in `lotse-rtsp`: the payload type and `a=ptime` of a camera's backchannel
 # media; the version retina parses with, already in the tree.
-sdp-types = { version = "0.2", default-features = false }
+sdp-types = { version = "0.3", default-features = false }
 # H.264 bitstream syntax (SPS profile, level and dimensions, SEI) on the side branch; the packet
 # layer parses only NAL headers itself.
 h264-reader = { version = "0.9", default-features = false }
