@@ -95,8 +95,9 @@ pub trait LiveMuxerFactory: fmt::Debug + Send + Sync {
 
 /// One live output's container writer. Sans-IO, as a recording's
 /// ([`crate::recording::RecordingMuxer`]): every call returns the bytes it
-/// completed as slices of the frames' own payloads.
-pub trait LiveMuxer: Send {
+/// completed as slices of the frames' own payloads. `Sync` too, so the task
+/// that drives it may hold it across an await while it waits on its pipe.
+pub trait LiveMuxer: Send + Sync {
     /// The init segment for the output's tracks: the video, and the audio
     /// when it has one.
     fn start(
@@ -108,6 +109,14 @@ pub trait LiveMuxer: Send {
     /// Takes the next frame of the `track` kind, in the order the frames
     /// arrive.
     fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<LiveStep, RecordingError>;
+
+    /// Whether the init segment [`start`](Self::start) wrote still
+    /// describes the `track` kind as `entry` has it now: a codec change
+    /// that keeps the sample entry's codecs, profile, level and picture size
+    /// goes on in the same output, the new parameter sets in band;
+    /// anything else needs a new init segment, so a new output. `false`
+    /// before the start.
+    fn continues(&self, track: Kind, entry: &RecordingTrack) -> bool;
 
     /// A hole: the caller left frames out. The frames held are finished
     /// as they are and returned, if any (the video's last lasting until the

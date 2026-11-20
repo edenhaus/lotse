@@ -1729,7 +1729,7 @@ mod tests {
         assert_eq!(changed.len(), 1);
         assert_eq!(
             changed[0].fields,
-            " track=a0 codec=\"pcmu\" was=16000 now=8000 epoch=1 prerecord_cleared=false"
+            " track=a0 codec=\"pcmu\" was=16000 now=8000 epoch=1 prerecord_cleared=false gop_cleared=false"
         );
         // `a1` stays in the set, but this attempt did not declare it.
         assert_eq!(set.tracks().len(), 3);

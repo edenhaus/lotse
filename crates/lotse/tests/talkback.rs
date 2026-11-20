@@ -575,6 +575,7 @@ impl InProcess {
             max_sessions: 256,
             shared_udp_fd: None,
             recording: lotse_worker::RecordingSettings::default(),
+            live: lotse_worker::LiveSettings::default(),
         };
         let registries = Arc::new(registries);
         let worker = spawn_named("test.worker", async move {

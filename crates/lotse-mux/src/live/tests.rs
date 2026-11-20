@@ -1080,3 +1080,68 @@ fn the_live_factory_accepts_the_recording_s_codecs_and_makes_fresh_writers() {
         Ok(LiveStep::Held)
     );
 }
+
+#[test]
+fn a_codec_change_continues_the_output_only_while_the_init_segment_describes_it() {
+    let mut writer = LiveWriter::new();
+    assert!(
+        !writer.continues(Kind::Video, &h264_track()),
+        "nothing written yet"
+    );
+    writer.start(&h264_track(), Some(&aac_track())).unwrap();
+    assert!(writer.continues(Kind::Video, &h264_track()));
+    assert!(writer.continues(Kind::Audio, &aac_track()));
+    let video = |codec: Codec, clock_rate: u32| RecordingTrack { codec, clock_rate };
+    let resized = h264_codec(h264::test_data::sps(640, 480));
+    assert!(
+        !writer.continues(Kind::Video, &video(resized, 90_000)),
+        "another picture size"
+    );
+    assert!(
+        !writer.continues(Kind::Video, &h265_track()),
+        "another codec"
+    );
+    assert!(
+        !writer.continues(Kind::Video, &video(h264_track().codec, 48_000)),
+        "another clock rate"
+    );
+    let unset = Codec::H264 {
+        profile_level_id: None,
+        sps: None,
+        pps: None,
+    };
+    assert!(
+        !writer.continues(Kind::Video, &video(unset, 90_000)),
+        "no entry to write"
+    );
+    assert!(!writer.continues(Kind::Audio, &opus_track(1)));
+    // RFC 6381 §3.3: the same `mp4a.40.2` at the same rate, but another
+    // configuration than the `esds` carries.
+    let stereo = RecordingTrack {
+        codec: Codec::AacLc {
+            sample_rate: 16_000,
+            channels: 2,
+            config: Bytes::from_static(&[0x14, 0x10]),
+        },
+        clock_rate: 16_000,
+    };
+    assert!(
+        !writer.continues(Kind::Audio, &stereo),
+        "another AAC configuration"
+    );
+    assert!(
+        !writer.continues(Kind::Audio, &h264_track()),
+        "video where the audio was"
+    );
+    let pcmu = RecordingTrack {
+        codec: Codec::Pcmu,
+        clock_rate: 8000,
+    };
+    assert!(!writer.continues(Kind::Audio, &pcmu), "nothing carries it");
+    let mut silent = LiveWriter::new();
+    silent.start(&h264_track(), None).unwrap();
+    assert!(
+        !silent.continues(Kind::Audio, &aac_track()),
+        "no audio written"
+    );
+}

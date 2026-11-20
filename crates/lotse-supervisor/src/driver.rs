@@ -123,6 +123,8 @@ use crate::signaling::{
     LIMIT_REACHED, MAX_ENDED_SIGNALS, MAX_PENDING_OPENS, OPEN_EXPIRY, SIGNAL_WAIT, SignalFrom,
 };
 use crate::worker::{Worker, WorkerEvent};
+use crate::worker_text::MAX_NAME_BYTES;
+use lotse_core::text::plain;
 
 /// Session messages a driver holds, queued or in flight, besides the
 /// close each open session reserves (`SessionEntry::close_slot`): a
@@ -1036,6 +1038,17 @@ impl Driver {
             .recording_report(&self.spec.connection_id, recording_id, event, at);
     }
 
+    /// A worker's report of live output `live_id`. No live output runs on
+    /// a worker yet: the supervisor sends no `StartLive`, so a report names
+    /// none it holds, and it is dropped.
+    fn on_live_report(&self, live_id: &str) {
+        tracing::debug!(
+            live.id = %plain(live_id, MAX_NAME_BYTES),
+            connection.id = %self.spec.connection_id,
+            "report for a live output the supervisor does not hold; dropped"
+        );
+    }
+
     /// The worker said something or exited.
     fn on_worker_event(&mut self, event: WorkerEvent) {
         match event {
@@ -1111,6 +1124,7 @@ impl Driver {
                 recording_id,
                 event,
             } => self.on_recording_report(&recording_id, event),
+            WorkerEvent::Live { live_id, .. } => self.on_live_report(&live_id),
             WorkerEvent::Signal(report) => self.on_signal_report(report),
             WorkerEvent::Talker {
                 session_id,
@@ -2043,7 +2057,7 @@ mod tests {
     use crate::registry::State;
     use crate::session::SessionEntry;
     use crate::test_support::{environment, private_dir};
-    use crate::worker::WorkerManager;
+    use crate::worker::{LiveReport, WorkerManager};
 
     /// One preloaded stream wants the connection, no viewer.
     const PRELOAD: Demand = Demand {
@@ -2284,13 +2298,14 @@ mod tests {
             },
         )
         .await;
+        // Up to 5 s for the hand-off; `received` starts empty, so the loop
+        // reads at least once and none of its lines depends on timing.
         let mut received = Vec::new();
-        for _ in 0..500 {
-            received = std::fs::read(&out).unwrap_or_default();
-            if received.windows(17).any(|w| w == b"tcp-handoff-ufrag") {
-                break;
-            }
+        let mut tries = 0;
+        while tries < 500 && !received.windows(17).any(|w| w == b"tcp-handoff-ufrag") {
             SystemClock.sleep(Duration::from_millis(10)).await;
+            received = std::fs::read(&out).unwrap_or_default();
+            tries += 1;
         }
         assert!(
             received.windows(10).any(|w| w == b"live-offer"),
@@ -3432,8 +3447,33 @@ mod tests {
         let lines = captured.lines("report for a recording the supervisor does not hold");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("recording.id=k x"), "{lines:?}");
-        let cap = crate::worker_text::MAX_NAME_BYTES;
+        let cap = MAX_NAME_BYTES;
         assert!(!lines[0].contains(&"x".repeat(cap)), "{lines:?}");
+    }
+
+    /// A worker's live report names no live output the supervisor holds:
+    /// dropped with a debug line whose id is plain and capped.
+    #[tokio::test]
+    async fn a_report_for_a_live_output_the_supervisor_does_not_hold_is_dropped() {
+        let captured = crate::test_support::Captured::default();
+        let _logs = captured.install();
+        let shared = shared("/usr/bin/true");
+        let (_demand_tx, demand) = watch::channel(Demand::default());
+        let mut driver = driver_on(&shared, demand);
+        driver.on_worker_event(WorkerEvent::Live {
+            live_id: format!("l\n{}", "x".repeat(100)),
+            event: LiveReport::Closed {
+                reason: "client_gone".into(),
+                bytes: 0,
+                dropped_frames: 0,
+                drops: 0,
+            },
+        });
+        assert!(driver.silence.is_some(), "a report is a sign of life");
+        drop(driver);
+        let lines = captured.lines("report for a live output the supervisor does not hold");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("live.id=l x"), "{lines:?}");
     }
 
     #[tokio::test]
