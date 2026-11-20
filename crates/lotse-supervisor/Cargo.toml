@@ -24,12 +24,13 @@ rustix = { workspace = true, features = ["event"] } # the demux thread's poll(2)
 quinn-udp = { workspace = true } # the receive thread: recvmmsg with GRO and each datagram's destination address
 socket2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "time", "process", "sync", "net"] } # the control-plane runtime, SIGTERM/SIGINT, worker processes, host resolution
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "time", "process", "sync", "net", "io-util"] } # the control-plane runtime, SIGTERM/SIGINT, worker processes, host resolution; `io-util`: an LL-HLS output's pipe read
 tokio-util = { workspace = true, features = ["rt"] } # the cancellation token of the API server, the task tracker of the connection drivers
 tracing = { workspace = true }
 lotse-api = { workspace = true }
 lotse-api-types = { workspace = true }
 lotse-core = { workspace = true }
+lotse-hls = { workspace = true } # the LL-HLS window each LL-HLS output's records fill
 lotse-ipc = { workspace = true }
 lotse-tls = { workspace = true } # the TLS handshake of a TURN allocation over TLS (`turns:`), against the embedded roots
 

@@ -48,6 +48,7 @@ fn manager_with_sandbox(sandbox: &str) -> WorkerManager {
             worker_address_space: 1 << 30,
             max_sessions: 256,
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
+            live: lotse_supervisor::LiveLimits::DEFAULT,
         },
         Some(Arc::new(udp)),
         Arc::new(SystemClock),
@@ -134,6 +135,7 @@ async fn a_worker_crash_is_observed_and_contained() {
             | WorkerEvent::ProbeEnded(_)
             | WorkerEvent::Talker { .. }
             | WorkerEvent::Recording { .. }
+            | WorkerEvent::Live { .. }
             | WorkerEvent::Signal(_)) => {
                 panic!("unexpected {other:?}")
             }

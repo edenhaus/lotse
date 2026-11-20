@@ -1590,6 +1590,7 @@ dependencies = [
  "hyper-util",
  "lotse-api-types",
  "lotse-core",
+ "lotse-hls",
  "lotse-testing",
  "mediatype",
  "pem",
@@ -1668,6 +1669,7 @@ dependencies = [
  "lotse-api-types",
  "lotse-codec",
  "lotse-core",
+ "lotse-hls",
  "lotse-http",
  "lotse-ipc",
  "lotse-mux",
@@ -1682,6 +1684,14 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+]
+
+[[package]]
+name = "lotse-hls"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1716,6 +1726,7 @@ dependencies = [
 name = "lotse-ipc"
 version = "0.0.0-dev"
 dependencies = [
+ "bytes",
  "postcard",
  "rustix",
  "serde",
@@ -1786,6 +1797,7 @@ dependencies = [
  "lotse-api",
  "lotse-api-types",
  "lotse-core",
+ "lotse-hls",
  "lotse-ipc",
  "lotse-testing",
  "lotse-tls",
@@ -1812,10 +1824,13 @@ dependencies = [
  "bytes",
  "futures-util",
  "hmac",
+ "hyper",
+ "hyper-util",
  "libc",
  "lotse-api-types",
  "lotse-codec",
  "lotse-core",
+ "lotse-hls",
  "lotse-webrtc",
  "md-5",
  "nix",

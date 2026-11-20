@@ -44,15 +44,127 @@ struct FakeHandler {
     flood: Option<Arc<Notify>>,
     /// The subscriptions `webrtc/offer` opened, which end with `closed`.
     sessions: Mutex<Vec<(u64, mpsc::Sender<Event>)>>,
+    /// The subscriptions `hls/create` opened, which end with `closed`.
+    hls: Mutex<Vec<mpsc::Sender<Event>>>,
+    /// The `live/create` commands the handler began.
+    lives: AtomicU64,
+    /// The `live/create` and `hls/create` commands of stream `door` still
+    /// waiting.
+    creating: AtomicU64,
+    /// [`Self::creating`] when the connection closed.
+    creating_at_close: AtomicU64,
+    /// `signaling/answer`: releases one `live/create` or `hls/create` of
+    /// stream `door`.
+    answered: Notify,
+    /// Notified once `webrtc/reoffer` began.
+    reoffering: Notify,
+    /// Releases a `webrtc/reoffer`.
+    reoffered: Notify,
+    /// The ids of the `live/create` commands waiting.
+    waiting_creates: Mutex<Vec<u64>>,
+    /// The waiting `live/create` commands `unsubscribe` named, in order.
+    unsubscribed_creates: Mutex<Vec<u64>>,
+}
+
+/// Counts a waiting create in [`FakeHandler::creating`] until
+/// dropped, its future with it.
+struct Creating<'a>(&'a AtomicU64);
+
+impl<'a> Creating<'a> {
+    fn new(creating: &'a AtomicU64) -> Self {
+        creating.fetch_add(1, Ordering::AcqRel);
+        Self(creating)
+    }
+}
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl FakeHandler {
+    /// A recording's answer: a result with content, then its events.
+    fn recording_create(recording_id: Option<String>) -> Outcome {
+        let (tx, rx) = mpsc::channel(8);
+        let recording_id = recording_id.unwrap_or_default();
+        let _queued = tx.try_send(Event {
+            class: EventClass::Signaling,
+            payload: json!({ "type": "closed", "reason": "completed", "bytes": 0, "duration_ms": 0, "gaps": 0 }),
+        });
+        Outcome::SubscribedWith {
+            result: json!({ "recording_id": recording_id, "url": format!("/v0/recording/{recording_id}") }),
+            events: rx,
+        }
+    }
+
     fn event(stream_id: &str, state: &str) -> Event {
         Event {
             class: EventClass::StreamState {
                 stream_id: stream_id.to_owned(),
             },
             payload: json!({ "type": "stream", "stream_id": stream_id, "state": state, "last_error": null }),
+        }
+    }
+
+    /// `hls/create` `id` of `stream_id`: a result with content, then the
+    /// session's events until the test ends them. On stream `door`, a
+    /// signaled source's, it waits for a `signaling/answer`, as the
+    /// supervisor's waits for the output's start a source gives only once
+    /// the camera's answer is relayed.
+    async fn hls_create(&self, id: u64, stream_id: &str) -> Outcome {
+        if stream_id == "door" {
+            let _creating = Creating::new(&self.creating);
+            self.answered.notified().await;
+        }
+        let (tx, rx) = mpsc::channel(8);
+        self.hls.lock().unwrap().push(tx);
+        Outcome::SubscribedWith {
+            result: json!({ "hls_id": format!("h{id}") }),
+            events: rx,
+        }
+    }
+}
+
+impl FakeHandler {
+    /// `webrtc/reoffer`: waits for the test, as the supervisor's for the
+    /// worker.
+    async fn reoffer(&self) -> Outcome {
+        self.reoffering.notify_one();
+        self.reoffered.notified().await;
+        Outcome::Result(json!({ "sdp": "v=0" }))
+    }
+
+    /// `live/create` `id` of `stream_id`: the output's result, then its
+    /// `closed`, which ends the subscription. On stream `door`, a
+    /// signaled source's, it waits for a `signaling/answer`, as the
+    /// supervisor's waits for the init segment a source sends only once
+    /// the camera's answer is relayed, or for its `unsubscribe`, which
+    /// refuses it, as the supervisor's output ended. On stream `porch` it
+    /// waits too, but an `unsubscribe` comes too late: it answers anyway.
+    async fn live_create(&self, id: u64, stream_id: &str) -> Outcome {
+        self.lives.fetch_add(1, Ordering::AcqRel);
+        if stream_id == "door" || stream_id == "porch" {
+            let _creating = Creating::new(&self.creating);
+            self.waiting_creates.lock().unwrap().push(id);
+            self.answered.notified().await;
+        }
+        if stream_id == "door" && self.unsubscribed_creates.lock().unwrap().contains(&id) {
+            return Outcome::Error(ApiError::new(
+                ErrorCode::LiveNotFound,
+                "the live output was closed before it started",
+            ));
+        }
+        let (tx, rx) = mpsc::channel(8);
+        let _queued = tx.try_send(Event {
+            class: EventClass::Signaling,
+            payload: json!({ "type": "closed", "reason": "closed" }),
+        });
+        let live_id = format!("l{id}");
+        Outcome::SubscribedWith {
+            result: json!({ "live_id": live_id, "url": format!("/v0/live/{live_id}"),
+                            "mime": "video/mp4; codecs=\"avc1.640028\"" }),
+            events: rx,
         }
     }
 }
@@ -121,19 +233,14 @@ impl Handler for FakeHandler {
                 self.sessions.lock().unwrap().push((offer.id, tx));
                 Outcome::Subscribed(rx)
             }
-            Command::RecordingCreate(start) => {
-                // A result with content, then the recording's events.
-                let (tx, rx) = mpsc::channel(8);
-                let recording_id = start.recording_id.unwrap_or_default();
-                let _queued = tx.try_send(Event {
-                    class: EventClass::Signaling,
-                    payload: json!({ "type": "closed", "reason": "completed", "bytes": 0, "duration_ms": 0, "gaps": 0 }),
-                });
-                Outcome::SubscribedWith {
-                    result: json!({ "recording_id": recording_id, "url": format!("/v0/recording/{recording_id}") }),
-                    events: rx,
-                }
+            Command::HlsCreate(create) => self.hls_create(create.id, &create.stream_id).await,
+            Command::RecordingCreate(start) => Self::recording_create(start.recording_id),
+            Command::LiveCreate(create) => self.live_create(create.id, &create.stream_id).await,
+            Command::SignalingAnswer(_) => {
+                self.answered.notify_one();
+                Outcome::Result(json!({}))
             }
+            Command::WebrtcReoffer(_) => self.reoffer().await,
             // A refusal at a limit, as the supervisor's busy connection.
             Command::BackchannelRelease(_) => Outcome::Error(
                 ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
@@ -145,15 +252,15 @@ impl Handler for FakeHandler {
             Command::MetricsGet(_) => Outcome::Result(json!({ "pad": "x".repeat(2 << 20) })),
             Command::StreamDelete(_)
             | Command::WebrtcCandidate(_)
-            | Command::WebrtcReoffer(_)
             | Command::SessionGet(_)
             | Command::SessionList(_)
             | Command::SessionClose(_)
             | Command::SessionAdopt(_)
             | Command::SignalingSubscribe(_)
-            | Command::SignalingAnswer(_)
             | Command::SignalingCandidate(_)
-            | Command::SignalingError(_) => Outcome::Result(json!({})),
+            | Command::SignalingError(_)
+            | Command::LiveClose(_)
+            | Command::HlsClose(_) => Outcome::Result(json!({})),
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)
@@ -168,6 +275,12 @@ impl Handler for FakeHandler {
     }
 
     fn unsubscribed(&self, _connection: ConnectionId, subscription: u64) -> Option<Event> {
+        if self.waiting_creates.lock().unwrap().contains(&subscription) {
+            self.unsubscribed_creates.lock().unwrap().push(subscription);
+            self.answered.notify_one();
+            // A last event, which no subscription takes.
+            return Some(Self::event("door", "closed"));
+        }
         {
             let mut sessions = self.sessions.lock().unwrap();
             let index = sessions.iter().position(|(id, _)| *id == subscription)?;
@@ -180,6 +293,8 @@ impl Handler for FakeHandler {
     }
 
     fn connection_closed(&self, _connection: ConnectionId) {
+        self.creating_at_close
+            .store(self.creating.load(Ordering::Acquire), Ordering::Release);
         self.closed.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -581,6 +696,7 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
             json!({ "type": "recording/create", "stream_id": "a", "duration_ms": 1_000 }),
         ),
         (7, json!({ "type": "signaling/subscribe" })),
+        (8, json!({ "type": "live/create", "stream_id": "a" })),
     ] {
         let mut frame = frame;
         frame["id"] = json!(id);
@@ -591,7 +707,8 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
     }
     assert_eq!(running.handler.subscribers.lock().unwrap().len(), 1);
     assert_eq!(running.handler.sessions.lock().unwrap().len(), 1);
-    // The first refusal is a warning, the four after it within the
+    assert_eq!(running.handler.lives.load(Ordering::Acquire), 0);
+    // The first refusal is a warning, the five after it within the
     // interval are counted for the next.
     let refusals = warned_limits(&logs);
     assert_eq!(refusals.len(), 1, "{refusals:?}");
@@ -605,23 +722,337 @@ async fn subscriptions_are_capped_per_connection_and_ended_ones_do_not_count() {
         assert!(refusals[0].contains(part), "{part}: {refusals:?}");
     }
     // Other commands are not affected.
-    send(&mut ws, json!({ "id": 8, "type": "info" })).await;
+    send(&mut ws, json!({ "id": 9, "type": "info" })).await;
     assert_eq!(recv(&mut ws).await["result"]["version"], "0.0.0-test");
 
     // The session's channel closes: its subscription ended and frees a slot.
     running.handler.sessions.lock().unwrap().clear();
-    send(&mut ws, json!({ "id": 9, "type": "ping" })).await;
+    send(&mut ws, json!({ "id": 10, "type": "ping" })).await;
     assert_eq!(recv(&mut ws).await["type"], "pong");
-    send(&mut ws, json!({ "id": 10, "type": "stream/subscribe" })).await;
+    send(&mut ws, json!({ "id": 11, "type": "stream/subscribe" })).await;
     assert_eq!(recv(&mut ws).await["success"], true);
     running.clock.advance(SUMMARY_INTERVAL);
-    send(&mut ws, json!({ "id": 11, "type": "stream/subscribe" })).await;
+    send(&mut ws, json!({ "id": 12, "type": "stream/subscribe" })).await;
     assert_eq!(recv(&mut ws).await["error"]["code"], "limit_reached");
     let refusals = warned_limits(&logs);
     assert_eq!(refusals.len(), 2, "{refusals:?}");
-    assert!(refusals[1].contains("id=11"), "{refusals:?}");
-    assert!(refusals[1].contains("refused=5"), "{refusals:?}");
+    assert!(refusals[1].contains("id=12"), "{refusals:?}");
+    assert!(refusals[1].contains("refused=6"), "{refusals:?}");
     ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `hls/create` opens a subscription, so it counts against
+/// `max_subscriptions` and is refused at it before the handler sees it; an
+/// LL-HLS session that ended (`closed`) frees its slot.
+#[tokio::test]
+async fn an_hls_session_counts_against_the_subscription_cap_until_it_closes() {
+    let running = start_limited("hls-subscription-cap", FakeHandler::default(), 8, 1);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    let create = |id: u64| json!({ "id": id, "type": "hls/create", "stream_id": "a" });
+    send(&mut ws, create(1)).await;
+    assert_eq!(
+        recv(&mut ws).await,
+        json!({ "id": 1, "type": "result", "success": true, "result": { "hls_id": "h1" } })
+    );
+    send(&mut ws, create(2)).await;
+    let refused = recv(&mut ws).await;
+    assert_eq!(
+        (&refused["id"], &refused["error"]["code"]),
+        (&json!(2), &json!("limit_reached")),
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["details"]["limit"], "max_subscriptions");
+    assert_eq!(running.handler.hls.lock().unwrap().len(), 1);
+    // The session closes: its subscription's last event, then its end.
+    let session = running.handler.hls.lock().unwrap().pop().unwrap();
+    let closed = Event {
+        class: EventClass::Signaling,
+        payload: json!({ "type": "closed", "hls_id": "h1", "reason": "closed" }),
+    };
+    session.send(closed).await.unwrap();
+    drop(session);
+    assert_eq!(recv(&mut ws).await["event"]["reason"], "closed");
+    send(&mut ws, json!({ "id": 3, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    send(&mut ws, create(4)).await;
+    assert_eq!(recv(&mut ws).await["result"]["hls_id"], "h4");
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `live/create` holds a subscription slot like every command that opens
+/// one: at the cap it is refused before the handler sees it, and an output
+/// that ended (`closed`) gives its slot back, its finished forwarder
+/// forgotten when the next command that opens a subscription is admitted.
+#[tokio::test]
+async fn a_live_output_holds_a_subscription_slot_until_it_ends() {
+    let running = start_limited("live-cap", FakeHandler::default(), 8, 1);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    for id in [1, 3] {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "live/create", "stream_id": "a" }),
+        )
+        .await;
+        let created = recv(&mut ws).await;
+        assert_eq!(created["id"], id, "{created}");
+        assert_eq!(created["result"]["url"], format!("/v0/live/l{id}"));
+        assert_eq!(
+            recv(&mut ws).await,
+            json!({ "id": id, "type": "event", "event": { "type": "closed", "reason": "closed" } })
+        );
+        send(&mut ws, json!({ "id": id + 1, "type": "ping" })).await;
+        assert_eq!(recv(&mut ws).await["type"], "pong");
+    }
+    send(&mut ws, json!({ "id": 5, "type": "stream/subscribe" })).await;
+    assert_eq!(recv(&mut ws).await["success"], true);
+    send(
+        &mut ws,
+        json!({ "id": 6, "type": "live/create", "stream_id": "a" }),
+    )
+    .await;
+    let refused = recv(&mut ws).await;
+    assert_eq!(refused["id"], 6, "{refused}");
+    assert_eq!(refused["error"]["code"], "limit_reached", "{refused}");
+    assert_eq!(
+        refused["error"]["details"]["limit"], "max_subscriptions",
+        "{refused}"
+    );
+    assert_eq!(running.handler.lives.load(Ordering::Acquire), 2);
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `live/create` waits for the worker's init segment, which a signaled
+/// source sends only once the client relayed the camera's answer, on the
+/// same connection as like as not: the connection reads and answers further
+/// commands while a create waits, and answers it once the handler does.
+/// Each waiting create holds its subscription slot from the start, so
+/// creates at once cannot pass `max_subscriptions`.
+#[tokio::test]
+async fn a_waiting_live_create_leaves_its_connection_answering_the_commands_that_release_it() {
+    let running = start_limited("live-waits", FakeHandler::default(), 8, 2);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    for id in 1..=3 {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "live/create", "stream_id": "door" }),
+        )
+        .await;
+    }
+    let refused = recv(&mut ws).await;
+    assert_eq!(refused["id"], 3, "{refused}");
+    assert_eq!(refused["error"]["code"], "limit_reached", "{refused}");
+    assert_eq!(running.handler.lives.load(Ordering::Acquire), 2);
+    for (create, answer) in [(1, 4), (2, 5)] {
+        send(
+            &mut ws,
+            json!({ "id": answer, "type": "signaling/answer", "signal_id": "s", "sdp": "v=0" }),
+        )
+        .await;
+        let answered = recv(&mut ws).await;
+        assert_eq!(answered["id"], answer, "{answered}");
+        assert_eq!(answered["success"], true, "{answered}");
+        let created = recv(&mut ws).await;
+        assert_eq!(created["id"], create, "{created}");
+        assert_eq!(created["result"]["url"], format!("/v0/live/l{create}"));
+        assert_eq!(
+            recv(&mut ws).await,
+            json!({ "id": create, "type": "event", "event": { "type": "closed", "reason": "closed" } })
+        );
+    }
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `hls/create` waits for its output's start as `live/create` does for its
+/// init segment, which a signaled source gives only once the client relayed
+/// the camera's answer, on the same connection as like as not: the
+/// connection reads and answers further commands while it waits, answers it
+/// once the handler does, and a waiting create holds its subscription slot
+/// from the start.
+#[tokio::test]
+async fn a_waiting_hls_create_leaves_its_connection_answering_the_commands_that_release_it() {
+    let running = start_limited("hls-waits", FakeHandler::default(), 8, 1);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    for id in 1..=2 {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "hls/create", "stream_id": "door" }),
+        )
+        .await;
+    }
+    let refused = recv(&mut ws).await;
+    assert_eq!(refused["id"], 2, "{refused}");
+    assert_eq!(refused["error"]["code"], "limit_reached", "{refused}");
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 1);
+    send(
+        &mut ws,
+        json!({ "id": 3, "type": "signaling/answer", "signal_id": "s", "sdp": "v=0" }),
+    )
+    .await;
+    let answered = recv(&mut ws).await;
+    assert_eq!(answered["id"], 3, "{answered}");
+    assert_eq!(answered["success"], true, "{answered}");
+    assert_eq!(
+        recv(&mut ws).await,
+        json!({ "id": 1, "type": "result", "success": true, "result": { "hls_id": "h1" } })
+    );
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
+    assert_eq!(running.handler.hls.lock().unwrap().len(), 1);
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// `unsubscribe` of a `live/create` still waiting cancels it: the handler
+/// hears it at once, the unsubscribe is answered, and the create is
+/// answered as the handler ends it, with no subscription opened, even when
+/// the handler answers it with one (its events never go out). A second
+/// `unsubscribe` finds nothing.
+#[tokio::test]
+async fn unsubscribe_cancels_a_waiting_live_create_and_opens_no_subscription() {
+    let running = start_limited("live-unsubscribe", FakeHandler::default(), 8, 4);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    for (id, stream) in [(1, "door"), (2, "porch")] {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "live/create", "stream_id": stream }),
+        )
+        .await;
+    }
+    send(&mut ws, json!({ "id": 3, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    for (id, subscription) in [(4, 1), (5, 2), (6, 1)] {
+        send(
+            &mut ws,
+            json!({ "id": id, "type": "unsubscribe", "subscription": subscription }),
+        )
+        .await;
+    }
+    send(&mut ws, json!({ "id": 7, "type": "ping" })).await;
+    let mut answers = BTreeMap::new();
+    while answers.len() < 6 {
+        let frame = recv(&mut ws).await;
+        assert_ne!(frame["type"], "event", "no event goes out: {frame}");
+        answers.insert(frame["id"].as_u64().unwrap(), frame);
+    }
+    assert_eq!(
+        answers[&1]["error"]["code"], "live_not_found",
+        "{answers:?}"
+    );
+    assert_eq!(answers[&2]["result"]["live_id"], "l2", "{answers:?}");
+    assert_eq!(answers[&4]["success"], true);
+    assert_eq!(answers[&5]["success"], true);
+    assert_eq!(
+        answers[&6]["error"]["code"], "subscription_not_found",
+        "{answers:?}"
+    );
+    assert_eq!(answers[&7]["type"], "pong");
+    assert_eq!(
+        *running.handler.unsubscribed_creates.lock().unwrap(),
+        [1, 2]
+    );
+    // The porch create's `closed` would be next, had its subscription
+    // opened.
+    send(&mut ws, json!({ "id": 8, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["id"], 8);
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// A command that does not wait on a camera, `webrtc/reoffer` here, is
+/// answered before the connection reads the next one, so what a client
+/// sends after it, the candidates of the new offer, reaches the handler
+/// after it.
+#[tokio::test]
+async fn a_command_that_does_not_wait_on_a_camera_is_answered_before_the_next_is_read() {
+    let running = start("reoffer-in-line", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    send(
+        &mut ws,
+        json!({ "id": 1, "type": "webrtc/reoffer", "session_id": "s1", "sdp": "v=0" }),
+    )
+    .await;
+    within_5_s(running.handler.reoffering.notified()).await;
+    send(&mut ws, json!({ "id": 2, "type": "ping" })).await;
+    // Every task here runs on this thread: yielding lets the connection
+    // read the ping, were it not held up.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    running.handler.reoffered.notify_one();
+    assert_eq!(recv(&mut ws).await["id"], 1);
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    ws.close(None).await.unwrap();
+    running.finish().await;
+}
+
+/// A shutdown refuses a `live/create` still waiting, its future dropped,
+/// before the `shutdown` frame and the close.
+#[tokio::test]
+async fn shutdown_refuses_a_waiting_live_create_before_it_says_goodbye() {
+    let running = start("live-shutdown", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    send(
+        &mut ws,
+        json!({ "id": 1, "type": "live/create", "stream_id": "door" }),
+    )
+    .await;
+    send(&mut ws, json!({ "id": 2, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 1);
+    running.shutdown.cancel();
+    let refused = recv(&mut ws).await;
+    assert_eq!(refused["id"], 1, "{refused}");
+    assert_eq!(refused["error"]["code"], "shutting_down", "{refused}");
+    assert_eq!(recv(&mut ws).await["type"], "shutdown");
+    // RFC 6455 §7.4.1: 1001, going away.
+    assert_eq!(recv(&mut ws).await, json!({ "closed": 1001 }));
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 0);
+    running.finish().await;
+}
+
+/// A `live/create` still waiting when its client leaves goes with the
+/// connection: its future is dropped before the handler hears the
+/// connection closed, which ends what the create opened.
+#[tokio::test]
+async fn a_waiting_live_create_is_dropped_before_its_connection_is_closed() {
+    let (logs, _guard) = capture(tracing::Level::INFO);
+    let running = start("live-left", FakeHandler::default(), 8);
+    let mut ws = connect(&running.socket).await;
+    recv(&mut ws).await;
+    send(
+        &mut ws,
+        json!({ "id": 1, "type": "live/create", "stream_id": "door" }),
+    )
+    .await;
+    send(&mut ws, json!({ "id": 2, "type": "ping" })).await;
+    assert_eq!(recv(&mut ws).await["type"], "pong");
+    assert_eq!(running.handler.creating.load(Ordering::Acquire), 1);
+    ws.close(None).await.unwrap();
+    within_5_s(async {
+        while running.handler.closed.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(running.handler.creating_at_close.load(Ordering::Acquire), 0);
+    let text = logs.text();
+    assert!(
+        text.contains("waiting=1")
+            && text.contains("commands still waiting dropped with the connection"),
+        "{text}"
+    );
     running.finish().await;
 }
 

@@ -11,7 +11,9 @@
 //! up to `gop_cache_bytes` of payload and `gop_cache_frames` frames, past
 //! which it is cut back to the keyframe; the keyframe itself is bounded
 //! only by `max_frame_bytes`, because a larger frame is dropped before it
-//! reaches the cache (its frame subscribers take the drop as a lag).
+//! reaches the cache (its frame subscribers take the drop as a lag, and the
+//! cache is cut back to its keyframe there, as the frames after the drop
+//! may reference it); a codec family or clock-rate change empties it.
 //! Nothing checks `max_frame_bytes` against `gop_cache_bytes`: the cache holds at most the larger of the two, which
 //! is `gop_cache_bytes` with the defaults (equal, and the only limits a
 //! worker gives its tracks). While a window is set the track also keeps a
@@ -161,9 +163,15 @@ pub struct GopSnapshot {
     frames: usize,
     /// Payload bytes held, keyframe included.
     bytes: usize,
-    /// The GOP outgrew `gop_cache_bytes` or `gop_cache_frames`, so only the
-    /// keyframe is kept until the next keyframe.
+    /// The GOP outgrew `gop_cache_bytes` or `gop_cache_frames`, or lost a
+    /// frame over `max_frame_bytes`, so only the keyframe is kept until the
+    /// next keyframe.
     truncated: bool,
+    /// The track's descriptor when the keyframe was published: the one its
+    /// frames were published under. A change of family or clock rate
+    /// empties the cache, one within the family (another profile) does
+    /// not, so the track's descriptor may have moved on since.
+    codec: Arc<Codec>,
 }
 
 /// One frame after a GOP's keyframe, linked to the frame before it. Every
@@ -216,9 +224,29 @@ impl GopSnapshot {
         self.bytes
     }
 
-    /// Whether the GOP outgrew the cache and only the keyframe is kept.
+    /// Whether the GOP outgrew the cache or lost a frame, and only the
+    /// keyframe is kept: a still, the frames after it not decodable from
+    /// it alone.
     pub const fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// The track's descriptor when the keyframe was published, which a
+    /// joiner whose format was set by a later descriptor compares.
+    pub const fn codec(&self) -> &Arc<Codec> {
+        &self.codec
+    }
+
+    /// This GOP cut back to its keyframe, truncated.
+    fn cut(&self) -> Self {
+        Self {
+            keyframe: Arc::clone(&self.keyframe),
+            newest: None,
+            frames: 1,
+            bytes: self.keyframe.payload.len(),
+            truncated: true,
+            codec: Arc::clone(&self.codec),
+        }
     }
 
     /// How old the keyframe is at `now`, by its capture time, but at
@@ -1251,6 +1279,8 @@ impl Track {
     /// does Opus's channel count), so the frames before it would be read
     /// with the new descriptor. A video keyframe carries its parameter sets
     /// in-band ([`MediaFrame::payload`]), so a video ring keeps its GOPs.
+    /// The GOP cache goes on the same changes, a joiner's start being of
+    /// the new descriptor ([`Self::subscribe_from_gop`]).
     /// The ring's clearing, the new descriptor and the event happen under
     /// the ring's lock, so a recording's subscription, snapshot and descriptor
     /// ([`Self::subscribe_from_prerecord`]) are all on one side of the change.
@@ -1281,6 +1311,10 @@ impl Track {
         let codec = Arc::new(codec);
         let clears = rate_changed || family != codec.family() || self.kind() == Kind::Audio;
         let prerecord_cleared = clears && fed.ring.clear();
+        // A joiner's GOP is of the descriptor and rate it joins under
+        // ([`Self::subscribe_from_gop`]): one of another family or timed at
+        // another rate goes too, until the next keyframe. Audio has none.
+        let gop_cleared = clears && self.gop.swap(None).is_some();
         self.codec.store(Arc::clone(&codec));
         if rate_changed {
             self.clock_rate.store(rate, Ordering::Relaxed);
@@ -1307,6 +1341,7 @@ impl Track {
                 now = rate,
                 epoch,
                 prerecord_cleared,
+                gop_cleared,
                 "track clock rate changed; a new epoch at the new rate"
             );
         }
@@ -1323,6 +1358,7 @@ impl Track {
                 track = %self.id,
                 codec = codec.name(),
                 prerecord_cleared,
+                gop_cleared,
                 count,
                 "track codec changed"
             );
@@ -1535,6 +1571,31 @@ impl Track {
         (subscription, snapshot, codec, clock_rate, source)
     }
 
+    /// A frame subscription, the GOP cache, the codec descriptor and the
+    /// clock rate, taken together under the ring's lock, as
+    /// [`Self::subscribe_from_prerecord`] takes its snapshot: every frame
+    /// reaches the GOP cache and the broadcast under that lock, so the GOP
+    /// holds the frames published before the subscription from its keyframe
+    /// on, the subscription yields every frame published after, and none is
+    /// in both or in neither. A live output's join: the GOP is a decodable
+    /// start, and the descriptor is the one of its frames and of those the
+    /// subscription yields up to its first `TrackChanged`: a change of
+    /// family or clock rate empties the cache under that lock
+    /// ([`Self::set_codec`], [`TrackPublisher::declare`](crate::source::TrackPublisher::declare)). The GOP is `None` before the first
+    /// keyframe and after such a change until the next one. The lock is
+    /// held for the subscribe and the loads only.
+    pub fn subscribe_from_gop(
+        self: &Arc<Self>,
+    ) -> (TrackSubscription, Option<Arc<GopSnapshot>>, Arc<Codec>, u32) {
+        let fed = self.lock_prerecord();
+        let subscription = self.subscribe(Unit::Frames);
+        let gop = self.gop();
+        let codec = self.codec();
+        let clock_rate = self.clock_rate();
+        drop(fed);
+        (subscription, gop, codec, clock_rate)
+    }
+
     /// Frees the pre-record ring and its window, for a closed track.
     fn free_prerecord(&self) {
         let _previous = self.lock_prerecord().ring.set_window(None);
@@ -1668,8 +1729,8 @@ impl Track {
     /// (and `discontinuity` if it is the epoch's first): updates the GOP
     /// cache (video) and broadcasts it. Returns `false` for a frame larger
     /// than `max_frame_bytes`, which is dropped, counted and reported to the
-    /// frame subscribers as a lag of one, and cuts the pre-record's GOP short
-    /// there (until the next keyframe).
+    /// frame subscribers as a lag of one, and cuts the pre-record's GOP and
+    /// the GOP cache short there (until the next keyframe).
     pub fn publish_frame(&self, frame: MediaFrame) -> bool {
         self.touch(frame.arrival);
         if !self.feeds.admits(self.tag, self.kind(), frame.keyframe) {
@@ -1725,6 +1786,12 @@ impl Track {
             }
             // The pre-record's GOP now misses this frame: it is cut there.
             fed.ring.frame_dropped();
+            // So does the cache's, whose joiners would send the frames
+            // after it without their reference: its keyframe alone is
+            // kept, until the next one, as for a GOP that outgrew it.
+            if let Some(current) = self.gop.load_full() {
+                self.gop.store(Some(Arc::new(current.cut())));
+            }
             // The subscribers miss it too: a lag of one, never a silent
             // hole before the frames that may reference it.
             let _delivered_to = self.frames.send((self.frame_seq(), None));
@@ -1904,6 +1971,7 @@ impl Track {
                 frames: 1,
                 bytes,
                 truncated: false,
+                codec: self.codec(),
             })));
             return;
         }
@@ -1941,13 +2009,7 @@ impl Track {
                     "gop cache: GOP exceeds the cache, keeping only the keyframe"
                 );
             }
-            GopSnapshot {
-                keyframe: Arc::clone(&current.keyframe),
-                newest: None,
-                frames: 1,
-                bytes: current.keyframe.payload.len(),
-                truncated: true,
-            }
+            current.cut()
         } else {
             GopSnapshot {
                 keyframe: Arc::clone(&current.keyframe),
@@ -1958,6 +2020,7 @@ impl Track {
                 frames: count,
                 bytes: total,
                 truncated: false,
+                codec: Arc::clone(&current.codec),
             }
         };
         self.gop.store(Some(Arc::new(next)));
@@ -2238,6 +2301,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_join_from_the_gop_takes_every_frame_once_with_the_codec() {
+        let track = Arc::new(video_track(TrackLimits::default()));
+        let (mut sub, gop, codec, rate) = track.subscribe_from_gop();
+        assert!(gop.is_none(), "no keyframe yet");
+        assert_eq!((codec, rate), (track.codec(), 90_000));
+        assert!(track.publish_frame(frame(true, 10)));
+        assert!(track.publish_frame(frame(false, 20)));
+        let (mut joined, gop, ..) = track.subscribe_from_gop();
+        assert!(track.publish_frame(frame(false, 30)));
+        let held: Vec<usize> = gop.unwrap().frames().map(|f| f.payload.len()).collect();
+        assert_eq!(held, [10, 20], "the GOP holds what came before");
+        crate::let_assert!(Some(TrackEvent::Frame(next)) = joined.next().await);
+        assert_eq!(next.payload.len(), 30, "the subscription what came after");
+        crate::let_assert!(Some(TrackEvent::Frame(first)) = sub.next().await);
+        assert_eq!(first.payload.len(), 10);
+    }
+
+    #[tokio::test]
     async fn frames_reach_the_side_branch_and_the_gop_cache() {
         let track = video_track(TrackLimits::default());
         let mut frames = track.subscribe_frames();
@@ -2424,6 +2505,84 @@ mod tests {
         assert_eq!(gop.frame_count(), 1);
         assert_eq!(gop.bytes(), 1000);
         assert!(gop.keyframe().keyframe);
+    }
+
+    /// A frame the track dropped over `max_frame_bytes` is a hole the
+    /// frames after it may reference: the cache keeps its GOP's keyframe
+    /// alone, cut short, until the next keyframe, as it does for a GOP
+    /// that outgrew it, so no joiner sends frames past the hole.
+    #[test]
+    fn a_frame_dropped_over_max_frame_bytes_cuts_the_gop_cache_back_to_its_keyframe() {
+        let track = video_track(TrackLimits {
+            max_frame_bytes: 100,
+            ..TrackLimits::default()
+        });
+        assert!(!track.publish_frame(frame(false, 101)));
+        assert!(track.gop().is_none(), "no keyframe yet: nothing to cut");
+        assert!(track.publish_frame(frame(true, 10)));
+        assert!(track.publish_frame(frame(false, 20)));
+        assert!(!track.publish_frame(frame(false, 101)), "dropped");
+        let sizes = |gop: &GopSnapshot| gop.frames().map(|f| f.payload.len()).collect::<Vec<_>>();
+        let gop = track.gop().unwrap();
+        assert!(gop.truncated());
+        assert_eq!(
+            (sizes(&gop), gop.frame_count(), gop.bytes()),
+            (vec![10], 1, 10)
+        );
+        assert!(track.publish_frame(frame(false, 30)));
+        let gop = track.gop().unwrap();
+        assert!(
+            gop.truncated(),
+            "the frames after the hole may reference it"
+        );
+        assert_eq!(sizes(&gop), [10]);
+        assert!(track.publish_frame(frame(true, 40)));
+        assert!(track.publish_frame(frame(false, 50)));
+        let gop = track.gop().unwrap();
+        assert!(!gop.truncated(), "the next keyframe starts a whole GOP");
+        assert_eq!(sizes(&gop), [40, 50]);
+    }
+
+    /// A join after a codec family or clock-rate change and before the
+    /// next keyframe gets no GOP: the cached one's frames are of the old
+    /// family or timed at the old rate (RFC 3550 §5.1), and the descriptor
+    /// it comes with is the new one. A change within the family keeps the
+    /// GOP, whose keyframe carries its parameter sets in band.
+    #[test]
+    fn rfc3550_5_1_a_codec_family_or_clock_rate_change_empties_the_gop_cache() {
+        let track = Arc::new(video_track(TrackLimits::default()));
+        let joined = |track: &Arc<Track>| {
+            let (_sub, gop, codec, rate) = track.subscribe_from_gop();
+            let sizes = gop.map(|gop| gop.frames().map(|f| f.payload.len()).collect::<Vec<_>>());
+            (sizes, codec.family().name(), rate)
+        };
+        assert!(track.publish_frame(frame(true, 10)));
+        assert!(track.publish_frame(frame(false, 20)));
+        track.set_codec(Codec::H264 {
+            profile_level_id: None,
+            sps: Some(Bytes::from_static(&[0x67])),
+            pps: None,
+        });
+        assert_eq!(
+            joined(&track),
+            (Some(vec![10, 20]), "h264", 90_000),
+            "the same family keeps it"
+        );
+        track.set_codec(Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        });
+        assert_eq!(joined(&track), (None, "h265", 90_000), "another family");
+        assert!(track.publish_frame(frame(false, 30)));
+        assert!(
+            track.gop().is_none(),
+            "nothing to decode from before a keyframe"
+        );
+        assert!(track.publish_frame(frame(true, 40)));
+        assert_eq!(joined(&track), (Some(vec![40]), "h265", 90_000));
+        track.redeclare((*track.codec()).clone(), 45_000);
+        assert_eq!(joined(&track), (None, "h265", 45_000), "another clock rate");
     }
 
     #[test]
@@ -3269,7 +3428,7 @@ mod tests {
         let lines = logs.lines(tracing::Level::INFO, "track codec changed");
         assert_eq!(
             lines[0].fields,
-            " track=v0 codec=\"h265\" prerecord_cleared=true count=1"
+            " track=v0 codec=\"h265\" prerecord_cleared=true gop_cleared=true count=1"
         );
 
         assert!(track.publish_frame(timed(t0, 1000, true, 10)));
@@ -3338,7 +3497,7 @@ mod tests {
         let lines = logs.lines(tracing::Level::INFO, "track codec changed");
         assert_eq!(
             lines[0].fields,
-            " track=a0 codec=\"aac_lc\" prerecord_cleared=true count=1"
+            " track=a0 codec=\"aac_lc\" prerecord_cleared=true gop_cleared=false count=1"
         );
         assert!(track.publish_frame(timed(t0, 128, true, 10)));
         assert_eq!(prerecord(&track, t0), [128]);
@@ -3393,7 +3552,7 @@ mod tests {
         );
         assert_eq!(
             lines[0].fields,
-            " track=a0 codec=\"aac_lc\" was=16000 now=32000 epoch=1 prerecord_cleared=true"
+            " track=a0 codec=\"aac_lc\" was=16000 now=32000 epoch=1 prerecord_cleared=true gop_cleared=false"
         );
         assert!(
             logs.lines(tracing::Level::INFO, "track codec changed")
@@ -3448,7 +3607,7 @@ mod tests {
         let lines = logs.lines(tracing::Level::INFO, "track codec changed");
         assert_eq!(
             lines[0].fields,
-            " track=v0 codec=\"h265\" prerecord_cleared=false count=1"
+            " track=v0 codec=\"h265\" prerecord_cleared=false gop_cleared=false count=1"
         );
     }
 

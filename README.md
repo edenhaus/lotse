@@ -3,7 +3,8 @@
 A small, fast, memory-safe media daemon built for Home Assistant. It takes
 camera streams (RTSP, HLS or MPEG-TS over HTTP, and WebRTC cameras such as
 Nest, Ring and Matter ones, whose signaling its client relays) and serves them to
-browsers over WebRTC, with two-way audio designed in from the start, and
+browsers over WebRTC, with two-way audio designed in from the start, as
+live fMP4 over HTTP where WebRTC cannot connect, and
 as event recordings: fragmented MP4 that starts before the event, from the
 seconds it keeps in memory, for its client to store. It does nothing
 else.
@@ -161,6 +162,145 @@ With no host address found, or without a subscribed client, the source
 reports `source_unreachable`.
 The dev viewer does not relay signaling, so such a source needs a client
 that does.
+
+## Live fMP4 over HTTP
+
+WebRTC is the main path to a browser. Where it cannot connect (UDP
+blocked, no TURN server), a client falls back to live fMP4 over HTTP, which
+a browser plays through Media Source Extensions about half a second behind
+the camera:
+
+```json
+{ "id": 7, "type": "live/create", "stream_id": "front", "audio": true }
+```
+
+The result names the output, its MIME type with the RFC 6381 `codecs`
+parameter, for the client's `MediaSource.isTypeSupported`, and where its
+bytes are:
+
+```json
+{ "live_id": "01JD…", "mime": "video/mp4; codecs=\"avc1.640028,mp4a.40.2\"", "url": "/v0/live/01JD…" }
+```
+
+`GET /v0/live/{live_id}` on the same socket (or the mTLS listener) takes the
+bytes once, in the chunked transfer coding: the init segment, then one
+`moof`+`mdat` per video frame with the audio up to it, from the stream's
+cached keyframe on. The client proxies it to the browser; the daemon refuses
+a request that carries `Origin`. The command waits for the worker's init
+segment, at most `limits.live_start_timeout_ms` (10 s), since the MIME type
+needs the camera's parameter sets. The connection goes on reading and
+answering other commands meanwhile, so the result may come after theirs: an
+on-demand WebRTC camera starts for the output and sends its offer to the
+`signaling/subscribe` subscription, and the client's `signaling/answer` on
+the same connection is what lets the create finish. A waiting create counts
+against the connection's subscription cap from the start.
+
+- **Join.** The output starts at the stream's cached GOP and sends it at
+  once, so its first frame is as old as that GOP: up to the camera's
+  keyframe interval behind live. A player appends the burst and jumps to the
+  end of what it buffered.
+- **A slow reader.** A frame is out one frame interval after it arrived
+  (each waits for the next to know its duration). When the body is read
+  slower than the camera sends and more than `limits.live_buffer_bytes`
+  (1 MiB) wait in the worker, the output drops every frame up to the next
+  keyframe and goes on from where its video ended, so the player's timeline
+  has no hole; `closed` counts the drops. A client that reads nothing for
+  10 s is dropped.
+- **Audio.** AAC-LC and Opus go in as the camera sends them; anything else
+  (G.711, G.722) is left out with an `audio_omitted` warning, never
+  transcoded: `"audio": false` asks for video alone, for a player that
+  cannot play the stream's audio.
+- **The end.** `closed` names why: `closed` (`live/close`), `client_gone`,
+  `session_closed` (the control connection that created it closed or
+  unsubscribed), `not_fetched` (no `GET` within
+  `limits.live_fetch_timeout_ms`, 10 s), `stream_deleted`, `stream_changed`,
+  `codec_changed` (another codec, profile, level or picture size: create a
+  new output, whose init segment describes it), `no_video_track`,
+  `source_not_live`, `worker_crashed`, `shutting_down`, `internal_error`.
+  The body ends with its last chunk when the output ends.
+- **Limits.** `limits.max_live` (16) outputs at once and
+  `limits.max_live_per_stream` (8) per stream; one more is `limit_reached`.
+
+## LL-HLS
+
+Where a player wants a playlist rather than one fMP4 body (a native HLS
+player, one without Media Source Extensions), a client plays the stream as
+Low-Latency HLS (draft-pantos-hls-rfc8216bis-22):
+
+```json
+{ "id": 8, "type": "hls/create", "stream_id": "front", "audio": true }
+```
+
+The result names the session, the MIME type of its segments with their
+`codecs`, and its Media Playlist:
+
+```json
+{ "hls_id": "01JE…", "mime": "video/mp4; codecs=\"avc1.640028,mp4a.40.2\"", "playlist": "/v0/hls/01JE…/index.m3u8" }
+```
+
+`GET /v0/hls/{hls_id}/index.m3u8` on the same socket (or the mTLS listener)
+is the playlist; it names `init.mp4`, the segments `seg{msn}.m4s` and the
+parts `part{msn}.{index}.m4s` relative to itself. The client proxies them to
+the player; the daemon refuses a request that carries `Origin`.
+
+- **One window per stream.** The sessions of one stream and `audio` choice
+  share one live output, which the daemon reads itself into a window of
+  segments and parts: the first `hls/create` starts it and waits, as
+  `live/create` does, for the init segment; later ones join at once. A
+  segment starts with a keyframe and lasts `limits.hls_segment_target_ms`
+  (1 s) or the camera's keyframe interval if that is longer; a part is the
+  whole frames that fit `limits.hls_part_target_ms` (200 ms). The playlist
+  lists 6 segments and the parts of the last three Target Durations.
+- **Latency.** A player starts three parts behind the playlist's end
+  (`PART-HOLD-BACK`, three Part Target Durations: about 600 ms with the
+  default), so it plays a little under a second behind the camera, one
+  frame interval more since a frame waits for the next to know its
+  duration. Lower part targets lower it at the price of more requests: a
+  player makes a blocking playlist request and a part request per part.
+- **Blocking requests.** `index.m3u8?_HLS_msn=M&_HLS_part=N` is held until
+  the playlist holds that part (a Blocking Playlist Reload), and so is a
+  request for the part the playlist's `EXT-X-PRELOAD-HINT` names, or any
+  request before the first segment completes. A held request is answered
+  503 `source_timeout` after three Target Durations; `limits.max_hls_blocked_per_session`
+  (4: the reload and the part a player holds, twice) and
+  `limits.max_hls_blocked` (128) bound how many wait at once, past which a
+  request is 429 `limit_reached`. A directive asking too far ahead is 400.
+- **Requests in flight.** A request counts from its arrival until its
+  response's connection ends (the client took the last byte, through TLS
+  too) or its client goes, a held one included:
+  `limits.max_hls_requests_per_session` (8: the two held, a download and
+  the init segment, twice) and `limits.max_hls_requests` (256) bound how
+  many are in flight at once, past which a request is 429 `limit_reached`.
+  A client taking a response slowly keeps its place, so these bound the
+  connections LL-HLS keeps open and the media its responses hold.
+- **Answers.** The playlist is `application/vnd.apple.mpegurl` with
+  `Cache-Control: no-cache`, a segment or part `video/mp4` with
+  `max-age=60`; each has its `Content-Length`, and each response closes its
+  connection: a player holds a few at once. A name the window no longer
+  holds is 404 `hls_resource_not_found`, a session that is gone 404
+  `hls_not_found`.
+- **The end.** A session ends on `hls/close` (`closed`), when the control
+  connection that created it closes or unsubscribes (`session_closed`),
+  without a request for `limits.hls_idle_timeout_ms` (30 s: a player asks
+  several times a second; `idle`), counted from the `hls/create`'s answer,
+  so a slow start does not end it, or with its output, whose `closed`
+  carries the live output's reasons, or `window_full` when the stream sends
+  no keyframe within `limits.hls_window_bytes`. The output ends when its
+  last session leaves.
+- **Limits.** `limits.max_hls_outputs` (8, each also a live output under
+  `limits.max_live`) windows of at most `limits.hls_window_bytes` (32 MiB:
+  seven 2 s segments of a 16 Mbit/s stream) each, so at most 256 MiB of
+  media in the windows, and one segment or part more for each request in
+  flight; `limits.max_hls_sessions` (32) and
+  `limits.max_hls_sessions_per_stream` (8) sessions; one more is
+  `limit_reached` naming the limit.
+- **Deviations from the draft.** The Target Duration and Part Target
+  Duration rise when a camera's keyframe interval grows or its frame rate
+  falls, where §6.2.1 says they never change (the alternative breaks their
+  upper bounds); the window's segment count and byte cap drop a segment
+  even when the playlist then lasts less than three Target Durations
+  (§6.2.2); and the playlist has no `EXT-X-PROGRAM-DATE-TIME` (Appendix
+  B.1), there being one rendition and no wall clock in the window.
 
 ## Running in a container
 

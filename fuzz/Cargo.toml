@@ -21,6 +21,7 @@ lotse-api.workspace = true
 lotse-api-types.workspace = true
 lotse-codec = { workspace = true, features = ["test-util"] }
 lotse-core = { workspace = true, features = ["test-util"] }
+lotse-hls.workspace = true
 lotse-http.workspace = true
 lotse-ipc.workspace = true
 lotse-mux.workspace = true
@@ -263,6 +264,41 @@ bench = false
 [[bin]]
 name = "webrtc_ingest"
 path = "fuzz_targets/webrtc_ingest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fmp4_live"
+path = "fuzz_targets/fmp4_live.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hls_request"
+path = "fuzz_targets/hls_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hls_route"
+path = "fuzz_targets/hls_route.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "live_path"
+path = "fuzz_targets/live_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "live_records"
+path = "fuzz_targets/live_records.rs"
 test = false
 doc = false
 bench = false

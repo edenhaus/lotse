@@ -29,6 +29,7 @@ use lotse_core::clock::Clock;
 use lotse_core::connection::{ConnectionError, ConnectionState};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
+use lotse_core::throttle::Throttle;
 use lotse_ipc::{
     PrerecordStats, SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats,
     TrackInfo as IpcTrackInfo, WorkerStats,
@@ -40,6 +41,7 @@ use crate::connect::ConnectPermits;
 use crate::driver::{Demand, DriverCommand, DriverSpec};
 use crate::gather::Relayed;
 use crate::host_cache::HostCache;
+use crate::live::{LiveEntry, LiveLimits};
 use crate::memory::MemoryProbe;
 use crate::millis;
 use crate::net::demux::{DatagramSink, Registrations};
@@ -399,6 +401,17 @@ pub(crate) struct State {
     pub(crate) last_recording: u64,
     /// The limits on recordings and the pre-record window.
     pub(crate) recording_limits: RecordingLimits,
+    /// Live outputs that are open, by id.
+    pub(crate) lives: BTreeMap<String, LiveEntry>,
+    /// The serial of the last live output created.
+    pub(crate) last_live: u64,
+    /// The limits on live outputs.
+    pub(crate) live_limits: LiveLimits,
+    /// The warning of a `live/create` refused at a limit, which a client
+    /// can repeat: the first, then a summary per interval.
+    pub(crate) full_lives: Throttle,
+    /// The LL-HLS outputs and sessions.
+    pub(crate) hls: crate::hls::Hls,
     /// The demux's sessions; `None` without a front door (tests).
     pub(crate) registrations: Option<Arc<Registrations>>,
     /// The signaled sources' signaling: subscriptions, opens and signals.
@@ -575,6 +588,8 @@ impl State {
             tracing::info!(connection.id = id, "connection released");
             self.connections.remove(id);
             self.forget_stopping_recordings(id);
+            // Its driver goes, and the workers' reports with it.
+            self.lives_connection_released(id);
             self.signals_ended(
                 id,
                 SignalCloseCode::SourceStopped,
@@ -587,7 +602,8 @@ impl State {
             .iter()
             .filter(|stream| streams.get(*stream).is_some_and(|s| s.preload))
             .count();
-        // A recording is a viewer: it keeps the connection up while it runs.
+        // A recording and a live output are viewers: each keeps the
+        // connection up while it runs.
         let viewers = self
             .sessions
             .values()
@@ -597,6 +613,12 @@ impl State {
                 self.recordings
                     .values()
                     .filter(|recording| recording.connection == id)
+                    .count(),
+            )
+            .saturating_add(
+                self.lives
+                    .values()
+                    .filter(|live| live.connection == id)
                     .count(),
             );
         let demand = Demand {

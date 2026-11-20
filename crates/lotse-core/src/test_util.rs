@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::clock::Clock;
 use crate::codec::{Codec, CodecFamily, Kind};
+use crate::live::{LiveFragment, LiveInit, LiveMuxer, LiveMuxerFactory, LiveStep};
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
 use crate::orientation::Orientation;
 use crate::output::{OutputFactory, TalkbackRequest, TrackRequest};
@@ -1390,6 +1391,168 @@ impl RecordingMuxer for FakeRecordingMuxer {
             ));
         }
         Ok(vec![bytes::Bytes::from_static(b"end\n")])
+    }
+}
+
+/// Where a [`FakeLiveMuxerFactory`]'s writers fail, if anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeLiveFailure {
+    /// `start` refuses the video's codec.
+    Start,
+    /// `push` fails on the first frame it takes.
+    Push,
+    /// `skip` fails, as at a hole.
+    Skip,
+}
+
+/// A live container that writes lines a reader can parse instead of
+/// fragments, as [`FakeRecordingMuxerFactory`] does: `init video=<codec>[
+/// audio=<codec>]` at the start, its MIME type `video/fake;
+/// codecs="<codec>[,<codec>]"`; per frame taken `frame <v|a> <epoch> <ts>
+/// <k|-> <bytes>` and the payload, each a fragment of its own at once
+/// that says it lasts [`Self::duration`] (it holds nothing back, but a
+/// frame without a payload, which it takes and writes nothing for,
+/// [`LiveStep::Held`]); `skip` for a hole. As the real one, it starts at a
+/// video keyframe and, after a hole, leaves out every frame up to the next
+/// one; a frame of another epoch needs no keyframe. It carries H.264, H.265,
+/// AAC-LC and Opus whatever their parameters, and an output continues while
+/// a track's codec family and clock rate are the ones it started with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FakeLiveMuxerFactory {
+    /// Where its writers fail.
+    pub fail: Option<FakeLiveFailure>,
+    /// How long each frame's fragment says it lasts: zero by default, more
+    /// for a camera whose timestamps jumped.
+    pub duration: Duration,
+}
+
+impl LiveMuxerFactory for FakeLiveMuxerFactory {
+    fn accepts(&self, codec: &Codec) -> bool {
+        matches!(
+            codec.family(),
+            CodecFamily::H264 | CodecFamily::H265 | CodecFamily::AacLc | CodecFamily::Opus
+        )
+    }
+
+    fn muxer(&self) -> Box<dyn LiveMuxer> {
+        Box::new(FakeLiveMuxer {
+            fail: self.fail,
+            duration: self.duration,
+            entries: None,
+            waiting: true,
+            origin: None,
+        })
+    }
+}
+
+/// A [`FakeLiveMuxerFactory`]'s writer.
+#[derive(Debug)]
+struct FakeLiveMuxer {
+    /// Where it fails.
+    fail: Option<FakeLiveFailure>,
+    /// How long each frame's fragment says it lasts.
+    duration: Duration,
+    /// The tracks it started with.
+    entries: Option<(RecordingTrack, Option<RecordingTrack>)>,
+    /// Whether it waits for a video keyframe.
+    waiting: bool,
+    /// The first keyframe's capture time: decode time 0.
+    origin: Option<Instant>,
+}
+
+impl LiveMuxer for FakeLiveMuxer {
+    fn start(
+        &mut self,
+        video: &RecordingTrack,
+        audio: Option<&RecordingTrack>,
+    ) -> Result<LiveInit, RecordingError> {
+        if self.fail == Some(FakeLiveFailure::Start) {
+            return Err(RecordingError::Unsupported(video.codec.family()));
+        }
+        self.entries = Some((video.clone(), audio.cloned()));
+        let (audio_line, audio_codec) = audio.map_or((String::new(), String::new()), |audio| {
+            let name = audio.codec.name();
+            (format!(" audio={name}"), format!(",{name}"))
+        });
+        let video_name = video.codec.name();
+        Ok(LiveInit {
+            bytes: format!("init video={video_name}{audio_line}\n").into(),
+            mime: format!("video/fake; codecs=\"{video_name}{audio_codec}\""),
+        })
+    }
+
+    fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<LiveStep, RecordingError> {
+        if self.fail == Some(FakeLiveFailure::Push) {
+            return Err(RecordingError::Failed(
+                "the fake live writer fails every push".into(),
+            ));
+        }
+        if self.waiting {
+            if track == Kind::Audio || !frame.keyframe {
+                return Ok(LiveStep::Dropped);
+            }
+            self.waiting = false;
+        }
+        if frame.payload.is_empty() {
+            return Ok(LiveStep::Held);
+        }
+        let origin = *self.origin.get_or_insert(frame.wallclock);
+        let kind = if track == Kind::Video { 'v' } else { 'a' };
+        let key = if frame.keyframe { 'k' } else { '-' };
+        let line = format!(
+            "frame {kind} {} {} {key} {}\n",
+            frame.epoch,
+            frame.ts.ticks(),
+            frame.payload.len()
+        );
+        Ok(LiveStep::Fragment(LiveFragment {
+            bytes: vec![line.into(), frame.payload.clone()],
+            independent: track == Kind::Video && frame.keyframe,
+            decode_time: frame.wallclock.saturating_duration_since(origin),
+            duration: self.duration,
+        }))
+    }
+
+    /// The family, the clock rate and, for H.264, the `profile-level-id`,
+    /// as the real container's `codecs` entry tells a change it cannot
+    /// carry apart.
+    fn continues(&self, track: Kind, entry: &RecordingTrack) -> bool {
+        let profile = |codec: &Codec| match codec {
+            Codec::H264 {
+                profile_level_id, ..
+            } => *profile_level_id,
+            _ => None,
+        };
+        let written = self
+            .entries
+            .as_ref()
+            .and_then(|(video, audio)| match track {
+                Kind::Video => Some(video),
+                Kind::Audio => audio.as_ref(),
+            });
+        written.is_some_and(|written| {
+            written.codec.family() == entry.codec.family()
+                && written.clock_rate == entry.clock_rate
+                && profile(&written.codec) == profile(&entry.codec)
+        })
+    }
+
+    fn skip(&mut self) -> Result<Option<LiveFragment>, RecordingError> {
+        if self.fail == Some(FakeLiveFailure::Skip) {
+            return Err(RecordingError::Failed(
+                "the fake live writer fails every skip".into(),
+            ));
+        }
+        if self.waiting {
+            return Ok(None);
+        }
+        self.waiting = true;
+        Ok(Some(LiveFragment {
+            bytes: vec![bytes::Bytes::from_static(b"skip\n")],
+            independent: false,
+            decode_time: Duration::ZERO,
+            duration: Duration::ZERO,
+        }))
     }
 }
 
@@ -3453,6 +3616,127 @@ mod tests {
             epoch: 1,
             payload: Bytes::from_static(payload),
         })
+    }
+
+    /// The fake live container carries what the recording one does, starts
+    /// at a video keyframe, writes each frame as a fragment of its own at
+    /// once, leaves out what follows a skip up to the next keyframe,
+    /// continues while a track's entry is the one it started with, and
+    /// fails where it is told to.
+    #[test]
+    fn the_fake_live_container_writes_a_line_per_frame_from_a_keyframe() {
+        let factory = FakeLiveMuxerFactory::default();
+        assert!(factory.accepts(&fake_aac()));
+        assert!(!factory.accepts(&Codec::Pcmu));
+        let video = RecordingTrack {
+            codec: Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            clock_rate: 90_000,
+        };
+        let audio = RecordingTrack {
+            codec: fake_aac(),
+            clock_rate: 16_000,
+        };
+        let mut writer = factory.muxer();
+        assert!(!writer.continues(Kind::Video, &video), "not started");
+        let init = writer.start(&video, Some(&audio)).unwrap();
+        assert_eq!(
+            init.bytes,
+            Bytes::from_static(b"init video=h264 audio=aac_lc\n")
+        );
+        assert_eq!(init.mime, "video/fake; codecs=\"h264,aac_lc\"");
+        assert!(writer.continues(Kind::Video, &video));
+        assert!(writer.continues(Kind::Audio, &audio));
+        assert!(!writer.continues(Kind::Audio, &video));
+        let with_sets = RecordingTrack {
+            codec: Codec::H264 {
+                profile_level_id: None,
+                sps: Some(Bytes::from_static(b"s")),
+                pps: None,
+            },
+            clock_rate: 90_000,
+        };
+        assert!(writer.continues(Kind::Video, &with_sets), "the same family");
+        let faster = RecordingTrack {
+            clock_rate: 1_000,
+            ..with_sets
+        };
+        assert!(!writer.continues(Kind::Video, &faster));
+        assert_eq!(writer.skip(), Ok(None), "nothing started");
+        let t0 = SystemClock.now();
+        let step = |writer: &mut Box<dyn LiveMuxer>, kind, ms, key| {
+            writer
+                .push(kind, recording_frame(t0, ms, 0, key, b"x"))
+                .unwrap()
+        };
+        assert_eq!(step(&mut writer, Kind::Audio, 0, true), LiveStep::Dropped);
+        assert_eq!(step(&mut writer, Kind::Video, 0, false), LiveStep::Dropped);
+        crate::let_assert!(LiveStep::Fragment(first) = step(&mut writer, Kind::Video, 40, true));
+        assert_eq!(
+            first.bytes,
+            [
+                Bytes::from_static(b"frame v 1 0 k 1\n"),
+                Bytes::from_static(b"x")
+            ]
+        );
+        assert!(first.independent);
+        assert_eq!(first.decode_time, Duration::ZERO);
+        crate::let_assert!(
+            LiveStep::Fragment(audio_fragment) = step(&mut writer, Kind::Audio, 60, true)
+        );
+        assert!(!audio_fragment.independent);
+        assert_eq!(audio_fragment.decode_time, Duration::from_millis(20));
+        assert_eq!(
+            writer.push(Kind::Video, recording_frame(t0, 70, 0, false, b"")),
+            Ok(LiveStep::Held),
+            "nothing to write"
+        );
+        let skipped = writer.skip().unwrap().unwrap();
+        assert_eq!(skipped.bytes, [Bytes::from_static(b"skip\n")]);
+        assert_eq!(step(&mut writer, Kind::Video, 80, false), LiveStep::Dropped);
+    }
+
+    /// The fake live container fails where it is told to.
+    #[test]
+    fn the_fake_live_container_fails_where_it_is_told_to() {
+        let video = RecordingTrack {
+            codec: Codec::H264 {
+                profile_level_id: None,
+                sps: None,
+                pps: None,
+            },
+            clock_rate: 90_000,
+        };
+        let t0 = SystemClock.now();
+        let mut failing = FakeLiveMuxerFactory {
+            fail: Some(FakeLiveFailure::Push),
+            ..FakeLiveMuxerFactory::default()
+        }
+        .muxer();
+        let mut writer = FakeLiveMuxerFactory {
+            fail: Some(FakeLiveFailure::Start),
+            ..FakeLiveMuxerFactory::default()
+        }
+        .muxer();
+        assert_eq!(
+            writer.start(&video, None),
+            Err(RecordingError::Unsupported(CodecFamily::H264))
+        );
+        let init = failing.start(&video, None).unwrap();
+        assert_eq!(init.mime, "video/fake; codecs=\"h264\"");
+        assert!(matches!(
+            failing.push(Kind::Video, recording_frame(t0, 0, 0, true, b"x")),
+            Err(RecordingError::Failed(_))
+        ));
+        let mut skipping = FakeLiveMuxerFactory {
+            fail: Some(FakeLiveFailure::Skip),
+            ..FakeLiveMuxerFactory::default()
+        }
+        .muxer();
+        assert!(matches!(skipping.skip(), Err(RecordingError::Failed(_))));
     }
 
     /// The fake recording container carries H.264, H.265, AAC-LC and Opus and

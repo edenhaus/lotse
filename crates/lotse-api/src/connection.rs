@@ -8,10 +8,18 @@
 //! not for web pages) and the RFC 6455 §7.4.1 close codes: `1001` going
 //! away on shutdown, `1003` for a binary frame, `1008` policy violation on
 //! an overflowed outbound queue or a removed client. Commands are processed
-//! one at a time per connection; the handler's never wait on a camera, and
-//! one the handler is still awaiting when the connection's client is
-//! removed or the daemon shuts down is dropped and refused, so it never
-//! holds up the close. The ones about the TLS listener's clients may wait
+//! one at a time per connection, but for the ones that wait on a camera,
+//! `live/create` and `hls/create`: the connection reads and answers further
+//! commands while one waits (a signaled source's `signaling/answer` may be
+//! what releases it), each holding its subscription slot from the start, so
+//! `max_subscriptions` bounds them. `unsubscribe` of one still waiting
+//! cancels it: the handler hears the unsubscribe at once, so its output
+//! ends and the command is answered as that end makes it, and no
+//! subscription opens for it, whatever the answer. One the handler is still awaiting when
+//! the connection's client is removed or the daemon shuts down is dropped
+//! and refused, so it never holds up the close; one still waiting when the
+//! peer leaves is dropped with the connection, before the handler hears it
+//! closed. The ones about the TLS listener's clients may wait
 //! for the disk, so each runs as a task of its own: the connection reads no
 //! further command until its answer is queued, but still closes on shutdown
 //! or an overflow meanwhile. A removal or a shutdown is seen before any
@@ -35,6 +43,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::OptionFuture;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt as _, StreamExt as _};
 use lotse_api_types::clients::{ClientList, ClientRole};
 use lotse_api_types::command::Command;
@@ -392,9 +401,29 @@ struct Connection<H> {
     /// any: no further command is read until it ends. Left to finish when
     /// the connection closes first, so a change it began is still logged.
     pending: Option<JoinHandle<()>>,
+    /// The commands that wait on a camera ([`waits`]) still being
+    /// answered, polled by the connection's own loop beside the frames it
+    /// reads. Each holds a subscription slot until answered
+    /// ([`Self::subscription_slot_free`]); dropped when the connection
+    /// closes.
+    waiting: FuturesUnordered<BoxFuture<'static, Answered>>,
+    /// The ids of the commands in [`Self::waiting`], each with whether
+    /// `unsubscribe` cancelled it: a cancelled one opens no subscription
+    /// when it is answered.
+    waiting_ids: HashMap<u64, bool>,
     /// The warning of each limit a command was refused at, by
     /// [`RefusalKey`]: fixed in the code, so the map stays small.
     refusals: HashMap<RefusalKey, Throttle>,
+}
+
+/// The handler's outcome of command `id`, of type `name`, to answer.
+struct Answered {
+    /// The command id.
+    id: u64,
+    /// The command's type.
+    name: &'static str,
+    /// The handler's answer, or the refusal [`unless_closing`] made.
+    outcome: Outcome,
 }
 
 /// What a refusal at a limit is throttled by on one connection: its code
@@ -449,6 +478,8 @@ async fn serve<H: Handler>(
         peer,
         removed,
         pending: None,
+        waiting: FuturesUnordered::new(),
+        waiting_ids: HashMap::new(),
         refusals: HashMap::new(),
     };
     connection.send(Class::Signaling, &connection.state.handler.hello());
@@ -461,6 +492,12 @@ async fn serve<H: Handler>(
             // task, once the answer is queued, so it goes out before the
             // close.
             biased;
+            // First, so a command waiting on a camera is answered once
+            // the handler is done with it, and the handler's synchronous
+            // part of one just started runs before the next frame is read.
+            // A removal or a shutdown refuses it here, through
+            // [`unless_closing`], before the branches below close.
+            Some(answered) = connection.waiting.next() => connection.answer(answered),
             // One line: the removal's break counts as covered in a copy of
             // this loop whose connection is never removed (the coverage gate
             // takes the best single copy of a generic function).
@@ -497,6 +534,17 @@ async fn serve<H: Handler>(
 
     for (_, task) in connection.subscriptions.drain() {
         task.abort();
+    }
+    // Before the handler hears the connection closed: whatever a command
+    // still waiting opened belongs to the connection, and ends with it.
+    if !connection.waiting.is_empty() {
+        let waiting = connection.waiting.len();
+        tracing::info!(
+            closed_by,
+            waiting,
+            "commands still waiting dropped with the connection"
+        );
+        connection.waiting.clear();
     }
     connection.outbox.close(CLOSE_GOING_AWAY, "closed");
     // Nothing below waits on the peer before the deadline is set: its
@@ -651,10 +699,13 @@ impl<H: Handler> Connection<H> {
     /// Whether another subscription fits under `max_subscriptions`, after
     /// forgetting the ones that ended (a session's `closed`, a handler that
     /// dropped the channel), so a long-lived connection does not
-    /// accumulate them.
+    /// accumulate them. A command still waiting ([`waits`]) holds the slot
+    /// of the subscription it opens, so commands at once cannot pass the
+    /// cap, and the cap bounds the commands waiting on one connection.
     fn subscription_slot_free(&mut self) -> bool {
         self.subscriptions.retain(|_, task| !task.is_finished());
-        let open = u32::try_from(self.subscriptions.len()).unwrap_or(u32::MAX);
+        let open = self.subscriptions.len().saturating_add(self.waiting.len());
+        let open = u32::try_from(open).unwrap_or(u32::MAX);
         open < self.state.config.max_subscriptions
     }
 
@@ -691,10 +742,75 @@ impl<H: Handler> Connection<H> {
     }
 
     /// The handler's answer to `command`, whose id is `id`; see
-    /// [`unless_closing`].
-    async fn handled(&self, id: u64, command: Command) -> Outcome {
-        let handling = Box::pin(self.state.handler.handle(self.id, command));
-        unless_closing(id, handling, &self.removed, &self.state.shutdown).await
+    /// [`unless_closing`]. Borrows nothing of the connection, so it can
+    /// wait beside the connection's loop ([`Self::wait_for`]).
+    fn handled(&self, id: u64, command: Command) -> BoxFuture<'static, Outcome> {
+        let handler = Arc::clone(&self.state.handler);
+        let connection = self.id;
+        let removed = self.removed.clone();
+        let shutdown = self.state.shutdown.clone();
+        Box::pin(async move {
+            let handling = Box::pin(handler.handle(connection, command));
+            unless_closing(id, handling, &removed, &shutdown).await
+        })
+    }
+
+    /// Starts answering `command`, of type `name` and id `id`, one that
+    /// waits on a camera ([`waits`]), beside the connection's loop, which
+    /// polls it first ([`Self::waiting`]): the handler's synchronous part
+    /// runs before the next frame is read, its wait while they are, and
+    /// [`Self::answer`] answers it once the handler, or [`unless_closing`],
+    /// is done.
+    fn wait_for(&mut self, id: u64, name: &'static str, command: Command) {
+        let handling = self.handled(id, command);
+        tracing::debug!(id, command = name, "command waits; reading on");
+        self.waiting_ids.insert(id, false);
+        self.waiting.push(Box::pin(async move {
+            let outcome = handling.await;
+            Answered { id, name, outcome }
+        }));
+    }
+
+    /// Answers a command with the handler's outcome: its result, its
+    /// refusal, or a result and the subscription it opened.
+    fn answer(&mut self, answered: Answered) {
+        let Answered { id, name, outcome } = answered;
+        let cancelled = self.waiting_ids.remove(&id) == Some(true);
+        match outcome {
+            Outcome::Result(result) => self.send(Class::Signaling, &Success::new(id, result)),
+            Outcome::Error(error) => self.refuse(Some(id), Some(name), error),
+            Outcome::Subscribed(events) => {
+                self.send(Class::Signaling, &Success::new(id, Empty::default()));
+                self.open(id, name, events, cancelled);
+            }
+            Outcome::SubscribedWith { result, events } => {
+                self.send(Class::Signaling, &Success::new(id, result));
+                self.open(id, name, events, cancelled);
+            }
+        }
+    }
+
+    /// Opens subscription `id`, of command `name`, for `events`, unless
+    /// `unsubscribe` cancelled the command while it waited: then no
+    /// forwarder starts, and its events are dropped unread, so none of
+    /// them goes out after the unsubscribe's answer.
+    fn open(
+        &mut self,
+        id: u64,
+        name: &'static str,
+        events: mpsc::Receiver<Event>,
+        cancelled: bool,
+    ) {
+        if cancelled {
+            tracing::debug!(
+                id,
+                command = name,
+                "unsubscribed command answered; its subscription does not open"
+            );
+            drop(events);
+            return;
+        }
+        self.subscribe(id, events);
     }
 
     /// One text frame: parse, check the id, dispatch, answer.
@@ -735,6 +851,19 @@ impl<H: Handler> Connection<H> {
                 Class::Signaling,
                 &Success::new(id, lotse_api_types::schema::committed()),
             ),
+            Command::Unsubscribe(unsubscribe)
+                if self
+                    .waiting_ids
+                    .get(&unsubscribe.subscription)
+                    .is_some_and(|cancelled| !cancelled) =>
+            {
+                let subscription = unsubscribe.subscription;
+                self.waiting_ids.insert(subscription, true);
+                tracing::debug!(subscription, "unsubscribe of a command still waiting");
+                // No subscription opened, so a last event has nowhere to go.
+                let _last = self.state.handler.unsubscribed(self.id, subscription);
+                self.send(Class::Signaling, &Success::new(id, Empty::default()));
+            }
             Command::Unsubscribe(unsubscribe) => {
                 match self.subscriptions.remove(&unsubscribe.subscription) {
                     Some(task) => {
@@ -769,18 +898,11 @@ impl<H: Handler> Connection<H> {
                     .with_detail("limit", "max_subscriptions"),
                 );
             }
-            other => match self.handled(id, other).await {
-                Outcome::Result(result) => self.send(Class::Signaling, &Success::new(id, result)),
-                Outcome::Error(error) => self.refuse(Some(id), Some(name), error),
-                Outcome::Subscribed(events) => {
-                    self.send(Class::Signaling, &Success::new(id, Empty::default()));
-                    self.subscribe(id, events);
-                }
-                Outcome::SubscribedWith { result, events } => {
-                    self.send(Class::Signaling, &Success::new(id, result));
-                    self.subscribe(id, events);
-                }
-            },
+            other if waits(&other) => self.wait_for(id, name, other),
+            other => {
+                let outcome = self.handled(id, other).await;
+                self.answer(Answered { id, name, outcome });
+            }
         }
     }
 
@@ -804,8 +926,25 @@ const fn opens_subscription(command: &Command) -> bool {
             | Command::WebrtcOffer(_)
             | Command::SessionAdopt(_)
             | Command::RecordingCreate(_)
+            | Command::LiveCreate(_)
+            | Command::HlsCreate(_)
             | Command::SignalingSubscribe(_)
     )
+}
+
+/// Whether the handler's answer to `command` waits on a camera, so the
+/// connection reads and answers further commands meanwhile
+/// ([`Connection::wait_for`]): `live/create` waits for the worker's init
+/// segment and `hls/create` for its output's start, which a signaled source
+/// gives only once its client relayed the camera's answer, on this
+/// connection as like as not. Each opens a subscription
+/// ([`opens_subscription`]), whose slot it holds while it waits. Every
+/// other command is answered before the next is read: `webrtc/reoffer`
+/// waits too, but on the session's worker alone and for a bounded time,
+/// and the candidates of its new offer that follow it must reach the
+/// handler after it.
+const fn waits(command: &Command) -> bool {
+    matches!(command, Command::LiveCreate(_) | Command::HlsCreate(_))
 }
 
 /// Forwards a subscription's events as frames until it ends or the queue
@@ -850,6 +989,20 @@ mod tests {
 
     fn command(text: &str) -> Command {
         lotse_api_types::parse_command(text).unwrap()
+    }
+
+    #[test]
+    fn only_live_and_hls_create_wait_and_each_holds_a_subscription_slot_meanwhile() {
+        for text in [
+            r#"{"id":1,"type":"live/create","stream_id":"a"}"#,
+            r#"{"id":1,"type":"hls/create","stream_id":"a"}"#,
+        ] {
+            let create = command(text);
+            assert!(waits(&create), "{text}");
+            assert!(opens_subscription(&create), "{text}");
+        }
+        let reoffer = command(r#"{"id":1,"type":"webrtc/reoffer","session_id":"s","sdp":"v=0"}"#);
+        assert!(!waits(&reoffer));
     }
 
     #[tokio::test]

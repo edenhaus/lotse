@@ -3,7 +3,7 @@
 //! client relays opens at each attempt, factory registries, source
 //! supervision (backoff, stall watchdog, hot swap), clock mapping and its
 //! skew watchdog, fan-out, the pre-record ring, a recording's reliable queue
-//! and interleaver and its container contract, track negotiation and a
+//! and interleaver and its container contract, the live container contract, track negotiation and a
 //! session's uplink track for talk-back, and the path of the viewers'
 //! keyframe requests to the source feeding a track.
 //!
@@ -31,6 +31,7 @@ pub mod ingest;
 pub mod interleave;
 pub mod keyframe;
 pub mod lateness;
+pub mod live;
 pub mod media;
 pub mod negotiate;
 pub mod orientation;

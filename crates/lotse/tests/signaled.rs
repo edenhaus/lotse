@@ -66,6 +66,8 @@ fn supervisor() -> Supervisor {
             worker_threads: 1,
             worker_address_space: 1 << 30,
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
+            live: lotse_supervisor::LiveLimits::DEFAULT,
+            hls: None,
         },
         linger: Duration::from_millis(200),
         connect_concurrency: lotse_supervisor::DEFAULT_CONNECT_CONCURRENCY,
@@ -87,6 +89,7 @@ fn supervisor() -> Supervisor {
             worker_address_space: 1 << 30,
             max_sessions: 16,
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
+            live: lotse_supervisor::LiveLimits::DEFAULT,
         },
         udp: None,
         front_door: Some(FrontDoor {
