@@ -7,9 +7,9 @@ GOP cache), trickles its candidates, plays, and returns what it measured; `check
 the same way in every browser. One test per case (`harness.CASES`, `--case`): the camera's audio,
 and what happens to the stream between a first window and the one the checks take (a keyframe
 request, a camera reconnect, a worker crash), or whether the page also plays the stream as live
-fMP4 through the browser's Media Source Extensions beside the WebRTC session, with the two
-latencies reported side by side. The report goes to `report.json` in the case's directory in
-`--out` either way.
+fMP4 through the browser's Media Source Extensions, or as LL-HLS through hls.js, beside the WebRTC
+session, with the two latencies reported side by side. The report goes to `report.json` in the
+case's directory in `--out` either way.
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ def _ms(value: float | None) -> str:
 def test_the_browser_plays_and_hears_the_camera(
     settings: Settings, case: Case, out: Path, served: Served, driver: WebDriver
 ) -> None:
-    user_agent, page = play(driver, served, settings.play_s, case.disrupt, mse=case.mse)
-    verdict = check(page, served.stream, case.disrupt, settings.engine, mse=case.mse)
+    user_agent, page = play(driver, served, settings.play_s, case.disrupt, player=case.player)
+    verdict = check(page, served.stream, case.disrupt, settings.engine, player=case.player)
     report = {
         "engine": settings.engine,
         "case": case.name,

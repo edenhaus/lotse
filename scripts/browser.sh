@@ -8,7 +8,7 @@
 #
 # Builds `lotse` and `lotse-browser` in release and runs the test with uv (the Python and the
 # packages pinned in tests/browser/uv.lock); the test starts the daemon, `lotse-browser` and the
-# browser once per case (`--case join|aac|pli|reconnect|crash|mse|mse-pcmu|mse-opus|all`,
+# browser once per case (`--case join|aac|pli|reconnect|crash|mse|mse-pcmu|mse-opus|llhls|llhls-opus|all`,
 # repeatable, default all; tests/browser/harness.py), and writes
 # target/browser-<engine>/<case>/report.json with the daemon's, the example's and the driver's
 # logs. `mise run browser` calls it.
@@ -18,6 +18,9 @@
 # Selenium Manager fetch that browser instead. Chrome and Firefox run headless unless
 # LOTSE_BROWSER_HEADFUL=1; Safari has no headless mode, and its driver must be enabled once
 # (`sudo safaridriver --enable`). $LOTSE_BROWSER_ARGS adds browser arguments (space-separated).
+# The LL-HLS cases' page loads hls.js, an exact release, from jsDelivr, which the browser runs only
+# if its bytes match the page's Subresource Integrity hash (crates/lotse-testing/src/browser/page.html);
+# the other cases reach nothing beyond the machine.
 # scripts/compare.sh runs the go2rtc comparison through it: $LOTSE_BROWSER_TEST names the test file
 # (test_browser.py) and $LOTSE_BROWSER_OUT the report's directory (target/browser-<engine>).
 set -eu

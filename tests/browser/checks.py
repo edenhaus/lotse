@@ -27,16 +27,21 @@ crash) plays two windows; the checks take the one after the recovery, check that
 happened as the case says (`disruption_failures`), and report the skew of the window before it
 too.
 
-An MSE case (`harness.Case.mse`) plays the stream as live fMP4 through the browser's Media Source
-Extensions beside the WebRTC session, which is checked as in any case. Of the MSE player only that
-it plays is gated (`mse_checks`): its frames advance, it shows the flashes, it reports no error
-and stalls no longer than `MSE_STALL_MS`, and the daemon's output carries the camera's audio where
-the container can (AAC, Opus) and leaves it out with `audio_omitted` where it cannot (PCMU). Its
-latency is a report, never a gate (`latency`): glass to glass, the WebRTC frames' capture to render
-(from `captureTimestamp`, as `capture_times`), and each MSE flash that much plus how much later it
-was shown than the same second's WebRTC flash; without capture times, the difference alone. So is
-what the browser's MSE says it plays (`isTypeSupported`) and whether the MSE element's sound was
-heard.
+An MSE case (`harness.Case.player` `mse`) plays the stream as live fMP4 through the browser's
+Media Source Extensions beside the WebRTC session, which is checked as in any case. Of the MSE
+player only that it plays is gated (`mse_checks`): its frames advance, it shows the flashes, it
+reports no error and stalls no longer than `MSE_STALL_MS`, and the daemon's output carries the
+camera's audio where the container can (AAC, Opus) and leaves it out with `audio_omitted` where it
+cannot (PCMU). Its latency is a report, never a gate (`latency`): glass to glass, the WebRTC
+frames' capture to render (from `captureTimestamp`, as `capture_times`), and each MSE flash that
+much plus how much later it was shown than the same second's WebRTC flash; without capture times,
+the difference alone. So is what the browser's MSE says it plays (`isTypeSupported`) and whether
+the MSE element's sound was heard.
+
+An LL-HLS case (`player` `llhls`) does the same with an LL-HLS session played by hls.js (or the
+browser's own HLS where hls.js has no MSE) in place of the MSE player: gated alike
+(`llhls_checks`), no fatal hls.js error among them, and its latency reported alike, beside
+hls.js's own estimate of it and its target, the playlist's `PART-HOLD-BACK`.
 """
 
 from __future__ import annotations
@@ -139,20 +144,21 @@ EBU_R37_LAG_MS = 60.0
 """EBU R37 (2007): sound may lag the picture by at most 60 ms."""
 
 TWO_ELEMENTS_FRAMES_SHOWN_SHARE = 0.6
-"""Frames shown over the play time by each element of an MSE case, the WebRTC one and the MSE one:
+"""Frames shown over the play time by each element of an MSE or LL-HLS case, the WebRTC one and the
+other player's:
 at least this share of what the camera sends, in place of `FRAMES_SHOWN_SHARE`, so each picture
-moves on at the camera's pace, not in slow motion; that the MSE one never stops is
+moves on at the camera's pace, not in slow motion; that the other one never stops is
 `MSE_STALL_MS`'s and the flashes' to check. Headless Chrome skips more frames of each element
 when two play on one page, every frame decoded: 432-500 of 600 from WebRTC beside 468-506 from
 MSE, against 521 from WebRTC alone, on a busy 4-core host (Chrome 153, 2026-11-15)."""
 
 MSE_STALL_MS = 2_000.0
-"""The longest the MSE element may show no new frame within the play time: a player that waits for
-data longer than this has stalled (the camera sends a frame every 33 ms)."""
+"""The longest the MSE or LL-HLS element may show no new frame within the play time: a player that
+waits for data longer than this has stalled (the camera sends a frame every 33 ms)."""
 
 MSE_PAIR_WITHIN_MS = 500.0
-"""An MSE flash is the same second's as the WebRTC flash nearest to where its distance from the end
-of the MSE buffer puts it, within this; the flashes are a second apart."""
+"""An MSE or LL-HLS flash is the same second's as the WebRTC flash nearest to where its distance
+from the end of its element's buffer puts it, within this; the flashes are a second apart."""
 
 LATENCY_PERCENTILE = 0.9
 """The high percentile of the latencies the report gives beside the median."""
@@ -282,8 +288,11 @@ class Verdict:
     """With a disruption, the A/V sync of the window before it."""
     mse: dict[str, Json] | None = None
     """In an MSE case, the MSE player's report (`mse_checks`)."""
+    llhls: dict[str, Json] | None = None
+    """In an LL-HLS case, the LL-HLS player's report (`llhls_checks`)."""
     latency: dict[str, Json] | None = None
-    """In an MSE case, WebRTC's and MSE's glass-to-glass latency (`latency`); a report."""
+    """In an MSE or LL-HLS case, WebRTC's and that player's glass-to-glass latency (`latency`); a
+    report."""
 
     def as_json(self) -> dict[str, Json]:
         """The verdict for the report."""
@@ -578,10 +587,34 @@ def _window(page: Json) -> tuple[float, float]:
     return float(start.get("at", 0.0)), float(end.get("at", math.inf))
 
 
-def _mse_flashes(page: Json) -> list[dict[str, Json]]:
-    """The flashes the MSE element showed within the play window."""
+@dataclass(frozen=True, kw_only=True)
+class Player:
+    """A player the page runs beside the WebRTC session, as its checks and report name it."""
+
+    key: str
+    """Its part of the page's result, and the prefix of its measurements (`mse`, `llhls`)."""
+    label: str
+    """Its name in a sentence."""
+    output: str
+    """What the daemon serves it, in a sentence."""
+    close: str
+    """The command that ends that output."""
+
+
+MSE = Player(key="mse", label="MSE", output="the live output", close="live/close")
+"""Live fMP4 through the browser's Media Source Extensions (`live/create`)."""
+
+LLHLS = Player(key="llhls", label="LL-HLS", output="the LL-HLS session", close="hls/close")
+"""LL-HLS through hls.js, or the browser's own HLS (`hls/create`)."""
+
+PLAYERS = {player.key: player for player in (MSE, LLHLS)}
+"""Each player by its key."""
+
+
+def _player_flashes(page: Json, player: Player) -> list[dict[str, Json]]:
+    """The flashes `player`'s element showed within the play window."""
     low, high = _window(page)
-    flashes = ((page.get("mse") or {}).get("video") or {}).get("flashes") or []
+    flashes = ((page.get(player.key) or {}).get("video") or {}).get("flashes") or []
     return [
         f
         for f in flashes
@@ -589,23 +622,30 @@ def _mse_flashes(page: Json) -> list[dict[str, Json]]:
     ]
 
 
-def latency(page: Json, stream: Stream) -> dict[str, Json]:
-    """Glass-to-glass latency of WebRTC and of MSE, side by side on one page; a report.
+def latency(page: Json, stream: Stream, player: Player = MSE) -> dict[str, Json]:
+    """Glass-to-glass latency of WebRTC and of `player`, side by side on one page; a report.
 
     WebRTC's is each frame's capture to render (`capture_times`), over the frames the page sampled:
     from the moment the daemon took the frame in, the capture time it stamps, so the camera's own
     encoder and MediaMTX are not in it, for either path.
-    Each MSE flash within the play window is paired with the WebRTC flash of the same second: the
-    one nearest to where the flash's distance from the end of the MSE buffer (`behind_ms`) and the
-    one frame the output holds each frame put it, within `MSE_PAIR_WITHIN_MS`, since the flashes
-    are a second apart and the MSE picture is later than WebRTC's by some fraction of one. Its
-    latency is that WebRTC flash's capture to render plus how much later the MSE flash was shown.
-    Without `captureTimestamp` (Firefox and Safari do not report it), only the difference.
-    The flash's display time less `behind_ms` is when its bytes reached the buffer, so the pairing
-    holds while those bytes arrive within `MSE_PAIR_WITHIN_MS` of one frame after the WebRTC
-    flash; bytes a second late are paired with the next second's, which nothing on the page
-    tells apart from the identical flash of that second. Only a marker that names its second, or
-    a source time both outputs carry, would remove that; latency is a report, so it is left.
+    Each flash `player` showed within the play window is paired with the WebRTC flash of the same
+    second: the one nearest to where the flash's distance from the end of its buffer
+    (`behind_ms`) and the one frame the output holds each frame put it, within
+    `MSE_PAIR_WITHIN_MS`, since the flashes are a second apart and the player's picture is later
+    than WebRTC's by some fraction of one or more. An LL-HLS part reaches the buffer whole, a part
+    after its first frame, and the buffer's end is then that part's end, so the two cancel. Its
+    latency is that WebRTC flash's capture to render plus how much later the player's flash was
+    shown. Without `captureTimestamp` (Firefox and Safari do not report it), only the difference.
+    Where the player knows the live edge (`live_ms`, hls.js's `latency`: the playlist's edge aged
+    by the time since it loaded), that distance places the flash instead: a buffer whose end lags
+    the live edge, a part that came late, would put a flash a second or more late at the next
+    second's WebRTC flash and report a second too little. The browser's own HLS knows no edge and
+    keeps the buffer's.
+    For MSE, the flash's display time less `behind_ms` is when its bytes reached the buffer, so
+    the pairing holds while those bytes arrive within `MSE_PAIR_WITHIN_MS` of one frame after the
+    WebRTC flash; bytes a second late are paired with the next second's, which nothing on the page
+    tells apart from the identical flash of that second. Only a marker that names its second, or a
+    source time both outputs carry, would remove that; latency is a report, so it is left.
     """
     clock = page.get("clock") or {}
     origin = (clock.get("time_origin") or 0.0) + (clock.get("t0") or 0.0)
@@ -620,9 +660,10 @@ def latency(page: Json, stream: Stream) -> dict[str, Json]:
         at for at in (page.get("video") or {}).get("flashes") or [] if isinstance(at, int | float)
     ]
     held_ms = 1000 / stream.fps
-    differences, mse = [], []
-    for flash in _mse_flashes(page):
-        behind = flash.get("behind_ms")
+    differences, delays = [], []
+    for flash in _player_flashes(page, player):
+        live = flash.get("live_ms")
+        behind = live if isinstance(live, int | float) else flash.get("behind_ms")
         expected = flash["at"] - (behind if isinstance(behind, int | float) else 0.0) - held_ms
         near = [w for w in webrtc_flashes if abs(w - expected) <= MSE_PAIR_WITHIN_MS]
         if not near:
@@ -634,21 +675,23 @@ def latency(page: Json, stream: Stream) -> dict[str, Json]:
         shown = origin + paired
         own = next((d for at, d in by_shown.items() if abs(at - shown) < 1.0), None)
         if own is not None:
-            mse.append(own + difference)
+            delays.append(own + difference)
     return {
-        "method": "glass to glass: WebRTC by captureTimestamp, MSE by its flashes against "
-        "WebRTC's on the same page"
+        "player": player.key,
+        "method": f"glass to glass: WebRTC by captureTimestamp, {player.label} by its flashes "
+        "against WebRTC's on the same page"
         if webrtc
-        else "MSE minus WebRTC only: the browser reports no captureTimestamp",
+        else f"{player.label} minus WebRTC only: the browser reports no captureTimestamp",
         "webrtc_ms": _spread(webrtc) if webrtc else None,
-        "mse_ms": _spread(mse) if mse else None,
-        "mse_minus_webrtc_ms": _spread(differences),
-        "mse_flashes": len(_mse_flashes(page)),
+        f"{player.key}_ms": _spread(delays) if delays else None,
+        f"{player.key}_minus_webrtc_ms": _spread(differences),
+        f"{player.key}_flashes": len(_player_flashes(page, player)),
     }
 
 
 def latency_summary(report: dict[str, Json]) -> str:
     """The latency report in a few words: each path's median and p90, in ms."""
+    player = PLAYERS[report.get("player") or MSE.key]
 
     def spread(name: str) -> str:
         value = report.get(name)
@@ -657,18 +700,19 @@ def latency_summary(report: dict[str, Json]) -> str:
         return f"{value['median']:.0f} ms (p90 {value['p90']:.0f}, {value['count']})"
 
     return (
-        f"WebRTC {spread('webrtc_ms')}, MSE {spread('mse_ms')}, "
-        f"MSE minus WebRTC {spread('mse_minus_webrtc_ms')}"
+        f"WebRTC {spread('webrtc_ms')}, {player.label} {spread(f'{player.key}_ms')}, "
+        f"{player.label} minus WebRTC {spread(f'{player.key}_minus_webrtc_ms')}"
     )
 
 
 def _expected_mime(stream: Stream) -> tuple[str | None, bool]:
-    """The audio codec the live output's type must name, and whether `audio_omitted` is due.
+    """The audio codec the output's type must name, and whether `audio_omitted` is due.
 
     The codec as it names the camera's audio, `None` for none.
 
-    The live container carries AAC-LC (RFC 6381 `mp4a.40.2`) and Opus (its sample entry `Opus`,
-    Opus in ISOBMFF §4.3) as the camera sends them and leaves anything else out with the warning.
+    The live container, which an LL-HLS session's segments are cut from, carries AAC-LC (RFC 6381
+    `mp4a.40.2`) and Opus (its sample entry `Opus`, Opus in ISOBMFF §4.3) as the camera sends them
+    and leaves anything else out with the warning.
     """
     match stream.audio_codec:
         case "MPEG4-GENERIC":
@@ -687,6 +731,92 @@ def _codecs(mime: str) -> list[str]:
     return [c.strip() for c in match.group(1).split(",")] if match else []
 
 
+def _player_gates(
+    page: Json, stream: Stream, player: Player, first_mime: str
+) -> tuple[dict[str, Json], list[str]]:
+    """What every player beside the WebRTC session is gated on: what is measured, and each failure.
+
+    That the picture plays (its frames advance at `TWO_ELEMENTS_FRAMES_SHOWN_SHARE` of the camera's
+    or more, never stalling longer than `MSE_STALL_MS`, with the flashes), that the page reports
+    no error of it, that the type the daemon first gave (`first_mime`, before any retry without
+    the audio) names the camera's audio as the container takes it, and that the output ended by
+    its close command.
+    """
+    played = page.get(player.key) or {}
+    failures = [f"{player.label}: {error}" for error in played.get("errors") or []]
+    low, high = _window(page)
+    play_s = (high - low) / 1000 if math.isfinite(high) else 0.0
+    camera_frames = stream.fps * play_s
+    frames = [
+        at
+        for at in (played.get("video") or {}).get("frames") or []
+        if isinstance(at, int | float) and low <= at <= high
+    ]
+    edges = [low, *frames, high] if math.isfinite(high) else frames
+    gap = max((b - a for a, b in itertools.pairwise(edges)), default=None)
+    flashes = _player_flashes(page, player)
+    measured: dict[str, Json] = {
+        f"{player.key}_frames_shown": len(frames),
+        f"{player.key}_longest_gap_ms": gap,
+        f"{player.key}_flashes": len(flashes),
+    }
+    if len(frames) < TWO_ELEMENTS_FRAMES_SHOWN_SHARE * camera_frames or not frames:
+        failures.append(
+            f"{player.label} frames shown at {TWO_ELEMENTS_FRAMES_SHOWN_SHARE:.0%} of the camera's "
+            f"{camera_frames:.0f} or more (got {len(frames)})"
+        )
+    if gap is None or gap > MSE_STALL_MS:
+        failures.append(
+            f"{player.label} never without a new frame for over {MSE_STALL_MS:.0f} ms (got {gap})"
+        )
+    wanted = math.floor(play_s * FLASH_SHARE)
+    if len(flashes) < wanted or not flashes:
+        failures.append(
+            f"a flash a second seen through {player.label}, {wanted} or more (got {len(flashes)})"
+        )
+    codecs = [c.lower() for c in _codecs(first_mime)]
+    audio, omitted = _expected_mime(stream)
+    warnings = played.get("warnings") or []
+    if audio is not None and audio not in codecs[1:]:
+        failures.append(f"{player.output}'s type names the camera's {audio} (got {first_mime!r})")
+    if audio is None and len(codecs) != 1:
+        failures.append(f"{player.output}'s type names the video alone (got {first_mime!r})")
+    if omitted != ("audio_omitted" in warnings):
+        failures.append(
+            f"an audio_omitted warning {'' if omitted else 'not '}sent (got {warnings})"
+        )
+    closed = played.get("closed") or {}
+    if closed.get("reason") != "closed":
+        failures.append(f"{player.output} closed by {player.close} (got {closed or None})")
+    return measured, failures
+
+
+def _sound(page: Json, player: Player) -> dict[str, Json]:
+    """What the page heard of `player`'s element: a report, with its A/V skew."""
+    played = page.get(player.key) or {}
+    sound = played.get("audio") or {}
+    beeps = [b for b in sound.get("beeps") or [] if isinstance(b, int | float)]
+    sync = av_sync(
+        [f["at"] for f in _player_flashes(page, player)],
+        beeps,
+        (page.get("timings") or {}).get("first_frame", 0.0),
+        None,
+    )
+    end = played.get("end") or {}
+    return {
+        "in_output": len(_codecs(played.get("mime") or "")) > 1,
+        "tap": sound.get("tap"),
+        "heard": (sound.get("peak") or 0.0) > BEEP_PEAK,
+        "peak": sound.get("peak"),
+        "beeps": len(beeps),
+        "av_sync_median_ms": sync.median_ms,
+        "av_sync_pairs": sync.pairs,
+        "decoded_bytes": end.get("audio_decoded_bytes"),
+        "moz_has_audio": end.get("moz_has_audio"),
+        "audio_tracks": end.get("audio_tracks"),
+    }
+
+
 def mse_checks(page: Json, stream: Stream) -> tuple[dict[str, Json], dict[str, Json], list[str]]:
     """The MSE player's checks: what is measured, the report, and each failure as a sentence.
 
@@ -696,52 +826,8 @@ def mse_checks(page: Json, stream: Stream) -> tuple[dict[str, Json], dict[str, J
     mse = page.get("mse")
     if not isinstance(mse, dict):
         return {}, {}, ["the page played no live fMP4 through MSE"]
-    failures = [f"MSE: {error}" for error in mse.get("errors") or []]
-    low, high = _window(page)
-    play_s = (high - low) / 1000 if math.isfinite(high) else 0.0
-    camera_frames = stream.fps * play_s
-    frames = [
-        at
-        for at in (mse.get("video") or {}).get("frames") or []
-        if isinstance(at, int | float) and low <= at <= high
-    ]
-    edges = [low, *frames, high] if math.isfinite(high) else frames
-    gap = max((b - a for a, b in itertools.pairwise(edges)), default=None)
-    flashes = _mse_flashes(page)
-    measured: dict[str, Json] = {
-        "mse_frames_shown": len(frames),
-        "mse_longest_gap_ms": gap,
-        "mse_flashes": len(flashes),
-    }
-    if len(frames) < TWO_ELEMENTS_FRAMES_SHOWN_SHARE * camera_frames or not frames:
-        failures.append(
-            f"MSE frames shown at {TWO_ELEMENTS_FRAMES_SHOWN_SHARE:.0%} of the camera's "
-            f"{camera_frames:.0f} or more (got {len(frames)})"
-        )
-    if gap is None or gap > MSE_STALL_MS:
-        failures.append(f"MSE never without a new frame for over {MSE_STALL_MS:.0f} ms (got {gap})")
-    wanted = math.floor(play_s * FLASH_SHARE)
-    if len(flashes) < wanted or not flashes:
-        failures.append(f"a flash a second seen through MSE, {wanted} or more (got {len(flashes)})")
-    mime = mse.get("refused_mime") or mse.get("mime") or ""
-    codecs = [c.lower() for c in _codecs(mime)]
-    audio, omitted = _expected_mime(stream)
-    warnings = mse.get("warnings") or []
-    if audio is not None and audio not in codecs[1:]:
-        failures.append(f"the live output's type names the camera's {audio} (got {mime!r})")
-    if audio is None and len(codecs) != 1:
-        failures.append(f"the live output's type names the video alone (got {mime!r})")
-    if omitted != ("audio_omitted" in warnings):
-        failures.append(
-            f"an audio_omitted warning {'' if omitted else 'not '}sent (got {warnings})"
-        )
-    closed = mse.get("closed") or {}
-    if closed.get("reason") != "closed":
-        failures.append(f"the live output closed by live/close (got {closed or None})")
-    sound = mse.get("audio") or {}
-    beeps = [b for b in sound.get("beeps") or [] if isinstance(b, int | float)]
-    sync = av_sync(
-        [f["at"] for f in flashes], beeps, (page.get("timings") or {}).get("first_frame", 0.0), None
+    measured, failures = _player_gates(
+        page, stream, MSE, mse.get("refused_mime") or mse.get("mime") or ""
     )
     report = {
         "api": mse.get("api"),
@@ -749,19 +835,8 @@ def mse_checks(page: Json, stream: Stream) -> tuple[dict[str, Json], dict[str, J
         "refused_mime": mse.get("refused_mime"),
         "content_type": mse.get("content_type"),
         "is_type_supported": mse.get("support"),
-        "warnings": warnings,
-        "audio": {
-            "in_output": len(_codecs(mse.get("mime") or "")) > 1,
-            "tap": sound.get("tap"),
-            "heard": (sound.get("peak") or 0.0) > BEEP_PEAK,
-            "peak": sound.get("peak"),
-            "beeps": len(beeps),
-            "av_sync_median_ms": sync.median_ms,
-            "av_sync_pairs": sync.pairs,
-            "decoded_bytes": (mse.get("end") or {}).get("audio_decoded_bytes"),
-            "moz_has_audio": (mse.get("end") or {}).get("moz_has_audio"),
-            "audio_tracks": (mse.get("end") or {}).get("audio_tracks"),
-        },
+        "warnings": mse.get("warnings") or [],
+        "audio": _sound(page, MSE),
         "frame_callback": (mse.get("video") or {}).get("frame_callback"),
         "appends": mse.get("appends"),
         "bytes": mse.get("bytes"),
@@ -774,6 +849,71 @@ def mse_checks(page: Json, stream: Stream) -> tuple[dict[str, Json], dict[str, J
         "jumped_to": mse.get("jumped_to"),
         "end": mse.get("end"),
         "closed": mse.get("closed"),
+    }
+    return measured, report, failures
+
+
+def _seconds_spread(page: Json, samples: list[Json], name: str) -> dict[str, Json]:
+    """The spread (`_spread`) of field `name` of the samples taken within the play window."""
+    low, high = _window(page)
+    values = [
+        sample[name]
+        for sample in samples
+        if isinstance(sample, dict)
+        and isinstance(sample.get("at"), int | float)
+        and low <= sample["at"] <= high
+        and isinstance(sample.get(name), int | float)
+    ]
+    return _spread(values)
+
+
+def llhls_checks(page: Json, stream: Stream) -> tuple[dict[str, Json], dict[str, Json], list[str]]:
+    """The LL-HLS player's checks: what is measured, the report, and each failure as a sentence.
+
+    Gated as the MSE player is (`_player_gates`): no fatal hls.js error, the picture plays, the
+    session's type names the camera's audio, `closed` after `hls/close`. The rest is the report:
+    which path played (hls.js, or the browser's own HLS), what hls.js and the browser said of the
+    type, the playlist's part target and hold-back as hls.js read them, its own latency estimate
+    and target over the play window, its stalls and non-fatal errors, a refused `play()` (the
+    frames tell whether it played), and whether the sound was heard.
+    """
+    llhls = page.get("llhls")
+    if not isinstance(llhls, dict):
+        return {}, {}, ["the page played no LL-HLS"]
+    refused_by_hlsjs = llhls.get("refused_by_hlsjs") or {}
+    first_mime = (
+        llhls.get("refused_mime") or refused_by_hlsjs.get("mime") or llhls.get("mime") or ""
+    )
+    measured, failures = _player_gates(page, stream, LLHLS, first_mime)
+    samples = llhls.get("samples") or []
+    report = {
+        "path": llhls.get("path"),
+        "hlsjs": llhls.get("hlsjs"),
+        "native": llhls.get("native"),
+        "api": llhls.get("api"),
+        "levels": llhls.get("levels"),
+        "buffer_codecs": llhls.get("buffer_codecs"),
+        "playlist": llhls.get("playlist"),
+        "mime": llhls.get("mime"),
+        "refused_mime": llhls.get("refused_mime"),
+        "refused_by_hlsjs": llhls.get("refused_by_hlsjs"),
+        "is_type_supported": llhls.get("support"),
+        "warnings": llhls.get("warnings") or [],
+        "audio": _sound(page, LLHLS),
+        "frame_callback": (llhls.get("video") or {}).get("frame_callback"),
+        "hls_latency_s": _seconds_spread(page, samples, "latency_s"),
+        "target_latency_s": _seconds_spread(page, samples, "target_latency_s"),
+        "samples": samples,
+        "stalls": llhls.get("stalls"),
+        "waiting": llhls.get("waiting"),
+        "hls_errors": llhls.get("hls_errors") or [],
+        "play_errors": llhls.get("play_errors") or [],
+        "parts": llhls.get("parts"),
+        "segments": llhls.get("segments"),
+        "playlist_loads": llhls.get("playlist_loads"),
+        "timings": llhls.get("timings"),
+        "end": llhls.get("end"),
+        "closed": llhls.get("closed"),
     }
     return measured, report, failures
 
@@ -805,13 +945,14 @@ def check(  # noqa: PLR0915 -- one check after another
     disrupt: str | None = None,
     engine: str | None = None,
     *,
-    mse: bool = False,
+    player: str | None = None,
 ) -> Verdict:
     """The checks on what the page measured; each failed one as a sentence.
 
     With `disrupt`, the case's disruption (`harness.Case.disrupt`), the window after the recovery;
-    `engine` is the browser (`chrome`, `firefox`, `safari`) where a bound depends on it; with `mse`
-    (`harness.Case.mse`), the MSE player's checks and the latency report as well.
+    `engine` is the browser (`chrome`, `firefox`, `safari`) where a bound depends on it; with
+    `player` (`harness.Case.player`), that player's checks (`mse_checks`, `llhls_checks`) and the
+    latency report as well.
     """
     failures = [f"the page: {error}" for error in page.get("errors", [])]
     failures += disruption_failures(page, disrupt)
@@ -842,7 +983,7 @@ def check(  # noqa: PLR0915 -- one check after another
     camera_frames = stream.fps * play_s
     shown = (video_page.get("presented_at_end") or 0) - (video_page.get("presented_at_start") or 0)
     measured["frames_shown"] = shown
-    share = TWO_ELEMENTS_FRAMES_SHOWN_SHARE if mse else FRAMES_SHOWN_SHARE
+    share = TWO_ELEMENTS_FRAMES_SHOWN_SHARE if player else FRAMES_SHOWN_SHARE
     expect(
         shown > 0 and shown >= share * camera_frames,
         f"frames shown at {share:.0%} of the camera's {camera_frames:.0f} or more (got {shown})",
@@ -977,18 +1118,21 @@ def check(  # noqa: PLR0915 -- one check after another
         energy is not None and energy >= energy_wanted,
         f"totalAudioEnergy of the beeps, {energy_wanted:.4f} or more (got {energy})",
     )
-    mse_report = latencies = None
-    if mse:
-        mse_measured, mse_report, mse_failures = mse_checks(page, stream)
-        measured |= mse_measured
-        failures += mse_failures
-        latencies = latency(page, stream)
+    reports: dict[str, Json] = {}
+    latencies = None
+    if player is not None:
+        player_checks = {MSE.key: mse_checks, LLHLS.key: llhls_checks}[player]
+        player_measured, reports[player], player_failures = player_checks(page, stream)
+        measured |= player_measured
+        failures += player_failures
+        latencies = latency(page, stream, PLAYERS[player])
     return Verdict(
         measured=measured,
         diagnostics=diagnostics(page),
         av_sync=sync,
         failures=failures,
         av_sync_before=sync_before,
-        mse=mse_report,
+        mse=reports.get(MSE.key),
+        llhls=reports.get(LLHLS.key),
         latency=latencies,
     )
