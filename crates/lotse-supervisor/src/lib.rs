@@ -4,12 +4,16 @@
 //! the event recordings (their pipes' read ends until fetched, the workers'
 //! reports checked and passed on, the counters, the pre-record window each
 //! connection keeps), the UDP receive and demux, ICE-TCP accept and srflx
-//! gathering with the STUN client, the TURN client (the codec, the
+//! gathering with the STUN client, the advertised addresses' candidates
+//! (`webrtc.advertise`) and the host candidates they hide, the host
+//! addresses re-read at an offer, the TURN client (the codec, the
 //! long-term credential and
-//! the shared allocations over UDP and TCP, whose servers' relayed
-//! datagrams the demux or the TCP allocation's task unwraps as the peers',
-//! and the TCP allocations' writing of what workers frame); later snapshot
-//! orchestration.
+//! the shared allocations over UDP, TCP and TLS over TCP (`turns:`, the
+//! handshake through `lotse-tls`), whose servers' relayed datagrams the
+//! demux or the TCP allocation's task unwraps as the peers', and the TCP
+//! allocations' writing of what workers frame), the LL-HLS sessions (the
+//! windows it fills from framed live outputs and the requests it answers
+//! from them); later snapshot orchestration.
 //!
 //! The network front door. Parses no camera bytes: only JSON, STUN, TURN
 //! and `ChannelData`, RFC 4571 framing and IPC, all fuzzed. Implements the
@@ -22,7 +26,9 @@
 //! Standards: RFC 8489 (with Errata 6268 and 6290), RFC 8656, RFC 7983, RFC 4648 §4,
 //! RFC 4571, RFC 6544, RFC 8445 §5.1 and §7.2.5.2.1, RFC 8839 §5.1 and §5.4, RFC 8866 §5
 //! and §9, RFC 5888 §4, RFC 3542 §6.1,
-//! RFC 4291 §2.5.1 and §2.5.5.2, RFC 6724 §5, RFC 7064, RFC 7065, the ULID spec,
+//! RFC 4291 §2.5.1 and §2.5.5.2, RFC 6724 §5, RFC 7064, RFC 7065, RFC 7350 (only to
+//! refuse `turns:` over DTLS), draft-pantos-hls-rfc8216bis-22 §6.2.5.2 (the
+//! blocked LL-HLS requests, in `hls`), RFC 6585 §4, the ULID spec,
 //! `getaddrinfo(3)`, `getifaddrs(3)`.
 
 use std::future::Future;
@@ -38,23 +44,33 @@ use lotse_core::task::spawn_named;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+mod advertise;
 mod connect;
 mod driver;
 mod gather;
 mod handler;
+mod hls;
+mod host_cache;
+mod live;
 pub mod memory;
 pub mod net;
 mod recording;
 mod registry;
 mod resolve;
 mod session;
+mod signaling;
 pub mod worker;
 mod worker_text;
 
+pub use advertise::{AdvertiseError, AdvertisedAddress, MAX_ADVERTISED};
 pub use handler::{Environment, FrontDoor, Identity, Supervisor};
+pub use hls::HlsLimits;
+pub use host_cache::HostScan;
+pub use live::LiveLimits;
+pub use lotse_api::Owners;
 pub use lotse_api::Server as ApiServer;
 pub use lotse_api::TlsConfig as ControlTls;
-pub use lotse_api::identity::{IdentityError, ServerIdentity};
+pub use lotse_api::identity::{IdentityError, SERVER_NAME as CONTROL_SERVER_NAME, ServerIdentity};
 pub use recording::RecordingLimits;
 
 use crate::net::demux::Demux;
@@ -99,6 +115,13 @@ pub struct Limits {
     /// event recordings. Without a recording output the supervisor holds
     /// [`RecordingLimits::NONE`] instead.
     pub recordings: RecordingLimits,
+    /// `limits.live_*`, `limits.max_live` and `limits.max_live_per_stream`:
+    /// the live outputs. Without a live container the supervisor holds
+    /// [`LiveLimits::NONE`] instead.
+    pub live: LiveLimits,
+    /// `limits.*hls*`: the LL-HLS outputs and sessions; `None` in a build
+    /// without LL-HLS, and held as `None` without a live container.
+    pub hls: Option<HlsLimits>,
 }
 
 /// The supervisor's effective settings, resolved by the binary.
@@ -106,9 +129,10 @@ pub struct Limits {
 pub struct Settings {
     /// The control socket path.
     pub socket: PathBuf,
-    /// The uid the daemon started as: owns the socket directory and may
-    /// always connect.
-    pub owner_uid: u32,
+    /// The uid the daemon started as, which may always connect, and the
+    /// one it drops to: who may own the socket directory and the data
+    /// directory ([`Owners`]).
+    pub owners: Owners,
     /// The peer uid allowed on the control socket.
     pub allow_uid: u32,
     /// The control API's mutual-TLS listener, if configured.
@@ -117,6 +141,11 @@ pub struct Settings {
     pub udp_listen: SocketAddr,
     /// The ICE-TCP listener, or `None` for `off`.
     pub tcp_listen: Option<SocketAddr>,
+    /// `webrtc.advertise`: the addresses a NAT in front of the daemon
+    /// forwards to its host addresses, told to browsers in place of the
+    /// host candidates; at most [`MAX_ADVERTISED`], each once. Empty
+    /// advertises nothing and hides nothing.
+    pub advertise: Vec<AdvertisedAddress>,
     /// The limits.
     pub limits: Limits,
     /// `stream.linger`.
@@ -217,19 +246,27 @@ pub fn bind(settings: &Settings) -> Result<Listeners, BindError> {
     };
     let api = ApiServer::bind(lotse_api::Config {
         socket: settings.socket.clone(),
-        owner_uid: settings.owner_uid,
+        owners: settings.owners,
         allow_uid: settings.allow_uid,
         max_connections: settings.limits.max_connections,
-        // One per session, one `stream/subscribe` per stream and one for
-        // every stream: the cap never refuses what the other limits allow.
-        max_subscriptions: settings
-            .limits
-            .max_sessions
-            .saturating_add(settings.limits.max_streams)
-            .saturating_add(1),
+        max_subscriptions: max_subscriptions(&settings.limits),
         tls: settings.control_tls.clone(),
     })?;
     Ok(Listeners { api, udp, tcp })
+}
+
+/// The control API's `max_subscriptions`, the subscriptions one control
+/// connection may hold: one per WebRTC session, one per live output, one
+/// per LL-HLS session, one `stream/subscribe` and one
+/// `signaling/subscribe` per stream and one of each for every stream, so
+/// the cap never refuses what the other limits allow.
+fn max_subscriptions(limits: &Limits) -> u32 {
+    let hls = limits.hls.map_or(0, |hls| hls.max_sessions);
+    limits
+        .max_sessions
+        .saturating_add(limits.live.max_live)
+        .saturating_add(hls)
+        .saturating_add(limits.max_streams.saturating_add(1).saturating_mul(2))
 }
 
 /// Serves until `shutdown` resolves, then tears down in order (stop
@@ -353,8 +390,8 @@ async fn api_stopped(
 }
 
 /// What sessions need from the front door: the demux's registrations, the
-/// host addresses for UDP and ICE-TCP, and a STUN and a TURN client on the
-/// shared socket.
+/// host addresses for UDP and ICE-TCP and how to read them again, and a
+/// STUN and a TURN client on the shared socket.
 fn front_door(
     udp: &BoundUdp,
     tcp_local: Option<SocketAddr>,
@@ -365,6 +402,12 @@ fn front_door(
         registrations: demux.registrations(),
         hosts: udp.hosts.clone(),
         tcp_hosts: tcp_hosts(&udp.hosts, tcp_local),
+        scan: Some(HostScan::system(
+            udp.local,
+            udp.dual_stack,
+            tcp_local,
+            udp.enumeration_failed,
+        )),
         stun: Some(Arc::new(net::stun_client::StunClient::new(
             Arc::clone(&udp.socket),
             demux.responses(),
@@ -384,7 +427,7 @@ fn front_door(
 /// The passive ICE-TCP candidates' addresses: the listener's own address
 /// when it names one, else each host address at the listener's port;
 /// none with the listener off.
-fn tcp_hosts(hosts: &[SocketAddr], listener: Option<SocketAddr>) -> Vec<SocketAddr> {
+pub(crate) fn tcp_hosts(hosts: &[SocketAddr], listener: Option<SocketAddr>) -> Vec<SocketAddr> {
     match listener {
         None => Vec::new(),
         Some(local) if !local.ip().is_unspecified() => {
@@ -454,7 +497,7 @@ pub(crate) mod test_support {
 
     use lotse_api_types::info::{BuildInfo, LandlockInfo, SandboxInfo};
     use lotse_core::registry::Registries;
-    use lotse_core::test_util::FakeSourceFactory;
+    use lotse_core::test_util::{FakeSignaledSourceFactory, FakeSourceFactory};
 
     use super::*;
     use crate::worker::WorkerConfig;
@@ -481,11 +524,12 @@ pub(crate) mod test_support {
             .map_or(0, |meta| meta.uid());
         Settings {
             socket,
-            owner_uid: uid,
+            owners: Owners::only(uid),
             allow_uid: uid,
             control_tls: None,
             udp_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             tcp_listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            advertise: Vec::new(),
             limits: Limits {
                 max_connections: 8,
                 max_streams: 2,
@@ -495,6 +539,8 @@ pub(crate) mod test_support {
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
                 recordings: RecordingLimits::DEFAULT,
+                live: LiveLimits::DEFAULT,
+                hls: Some(HlsLimits::DEFAULT),
             },
             linger: Duration::from_secs(5),
             connect_concurrency: DEFAULT_CONNECT_CONCURRENCY,
@@ -541,13 +587,53 @@ pub(crate) mod test_support {
         }
     }
 
-    /// An environment whose workers are `binary`, with the fake source.
+    /// What `future` gives within `real` time on the system clock, `None`
+    /// while it is still pending then: a write to a worker waits on its
+    /// socket, which no fake clock moves.
+    pub(crate) async fn settled<F: Future + Unpin>(
+        future: &mut F,
+        real: Duration,
+    ) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            output = future => Some(output),
+            () = SystemClock.sleep(real) => None,
+        }
+    }
+
+    /// Fills the control socket of `worker`, which never reads it, until a
+    /// write waits for room: 16 KiB messages until one is still pending
+    /// after 200 ms. That write is dropped, maybe mid-frame, which a worker
+    /// that never reads cannot tell. The socket's send buffer holds about
+    /// 208 KiB (`net.core.wmem_default`, observed on Linux 6.18,
+    /// 2026-11-08), so a few dozen do; more than a thousand fail the test.
+    pub(crate) async fn fill_control(worker: &mut worker::Worker) {
+        let filler = "x".repeat(16 * 1024);
+        for sent in 0.. {
+            assert!(
+                sent < 1000,
+                "the socket took {sent} messages without a wait"
+            );
+            let mut write = std::pin::pin!(worker.candidate("s1", &filler));
+            match settled(&mut write, Duration::from_millis(200)).await {
+                Some(written) => written.unwrap(),
+                None => return,
+            }
+        }
+    }
+
+    /// An environment whose workers are `binary`, with the fake source and
+    /// the signaled fake source (`fake-signaled`).
     pub(crate) fn environment(binary: &str) -> Environment {
         let mut registries = Registries::default();
         registries
             .sources
             .register(Arc::new(FakeSourceFactory::new(&["fake"])))
             .expect("the fake source registers");
+        registries
+            .sources
+            .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
+            .expect("the signaled fake source registers");
         Environment {
             registries,
             worker: WorkerConfig {
@@ -559,6 +645,7 @@ pub(crate) mod test_support {
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
                 recordings: RecordingLimits::DEFAULT,
+                live: LiveLimits::DEFAULT,
             },
             udp: None,
             front_door: None,
@@ -603,6 +690,24 @@ mod tests {
     /// instantiation of `serve` runs every path the tests take.
     fn requested() -> std::future::Ready<ShutdownReason> {
         std::future::ready(ShutdownReason::Requested)
+    }
+
+    #[test]
+    fn the_subscription_cap_holds_every_session_live_output_hls_session_and_stream_subscription() {
+        let mut limits = settings(PathBuf::from("/nonexistent")).limits;
+        limits.max_sessions = 5;
+        limits.live.max_live = 11;
+        limits.max_streams = 3;
+        limits.hls = None;
+        // 5 sessions, 11 live outputs, 2 × (3 streams + every stream).
+        assert_eq!(max_subscriptions(&limits), 5 + 11 + 8);
+        limits.hls = Some(HlsLimits {
+            max_sessions: 7,
+            ..HlsLimits::DEFAULT
+        });
+        assert_eq!(max_subscriptions(&limits), 5 + 11 + 7 + 8);
+        limits.max_streams = u32::MAX;
+        assert_eq!(max_subscriptions(&limits), u32::MAX);
     }
 
     #[tokio::test]

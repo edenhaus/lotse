@@ -181,7 +181,7 @@ pub(crate) fn offered(sdp: &str) -> Vec<OfferedH265> {
 /// calls the Main tier stream consistent with the High tier type). The
 /// Main tier (0) otherwise.
 ///
-/// One entry per profile, never two in different tiers: str0m 0.24 matches
+/// One entry per profile, never two in different tiers: str0m 0.25 matches
 /// an offered type that lacks one of `profile-id`, `tier-flag` and
 /// `level-id` by profile alone, and two entries of its profile would both
 /// lock it, which panics (an open str0m issue).
@@ -215,7 +215,7 @@ fn answered(params: &PayloadParams) -> (u8, u8) {
 /// the engine only matches when the profile is one of `profiles`. A High
 /// tier stream goes only under a High tier type (ITU-T H.265 A.4.1). A
 /// type whose answer would not keep the offered profile and tier is passed
-/// over: str0m 0.24 reads an `fmtp` with `tier-flag` or `level-id` but not
+/// over: str0m 0.25 reads an `fmtp` with `tier-flag` or `level-id` but not
 /// all three it knows as none, matches it as Main and answers it without
 /// one (an open str0m issue). Returns the offered type.
 fn choose_pt(rtc: &Rtc, offer: &str, profiles: &[u8], high_tier: bool) -> Option<OfferedH265> {
@@ -332,7 +332,7 @@ mod tests {
                 },
             ]
         );
-        assert!(offered("v=0\r\n").is_empty());
+        assert_eq!(offered("v=0\r\n"), []);
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
         // A profile str0m does not know is left out.
         assert_eq!(profiles(Some(&h265_info(11, 0x0010_0000))), [11]);
         assert_eq!(profiles(Some(&h265_info(12, 0x4008_0000))), [1]);
-        assert!(profiles(Some(&h265_info(0, 0))).is_empty());
+        assert_eq!(profiles(Some(&h265_info(0, 0))), b"");
     }
 
     #[test]
@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn rfc7798_7_2_2_str0m_0_24_matches_a_partial_fmtp_across_tiers_and_drops_its_tier() {
+    fn rfc7798_7_2_2_str0m_0_25_matches_a_partial_fmtp_across_tiers_and_drops_its_tier() {
         use lotse_core::clock::{Clock as _, SystemClock};
 
         // The engine with two Main entries, Main and High tier, against an

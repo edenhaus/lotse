@@ -6,15 +6,23 @@
 //! A worker's messages are untrusted: every field is mapped onto a known
 //! value here (an error code onto a `SourceError` variant, for example)
 //! and never used as a path or a command, and what is kept is bounded
-//! here: at most 32 tracks and track counters with short names, error
-//! text cut and on one line. The frame cap alone would let a
+//! here: at most 32 tracks and track counters with short names, a
+//! backchannel codec and talk-back session ids that are short names, error
+//! text and a signal's close cut and on one line, signal ids short. The frame cap alone would let a
 //! worker hand the API a quarter MiB per `stream/get`. A trim is logged
 //! once per worker, so a worker repeating an over-long message cannot
 //! flood the log either.
+//!
+//! The worker must not hold the supervisor up either: every message to it
+//! goes out within [`CONTROL_WRITE_DEADLINE`] or not at all. A worker that stops reading its control channel
+//! fills the socket's send buffer, and a write would then wait for good;
+//! one that waited out the deadline gives up on the channel, so every later
+//! write fails at once, and kills the worker, whose exit runs the crash
+//! path. Whoever sends to a worker is thus held up by at most the deadline.
 
 use std::io;
 use std::net::UdpSocket;
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -30,7 +38,8 @@ use lotse_core::task::spawn_named;
 use lotse_core::text::plain;
 use lotse_ipc::{Channel, IpcError, Receiver, Sender, SourceState, ToSupervisor, ToWorker};
 pub use lotse_ipc::{
-    RecordingReport, RecordingSpec, SessionEvent, SessionSpec, SourceSpec, TrackInfo, WorkerStats,
+    LiveReport, LiveSpec, RecordingReport, RecordingSpec, SessionEvent, SessionSpec, SignalCommand,
+    SignalReport, SourceSpec, TrackInfo, WorkerStats,
 };
 use tokio::process::Child;
 use tokio::sync::mpsc;
@@ -46,6 +55,26 @@ use crate::worker_text::{MAX_MESSAGE_BYTES, MAX_NAME_BYTES};
 /// a camera declares a handful, a derived audio track adds one, and the
 /// API copies each into every `stream/get` and `stream/list`.
 pub(crate) const MAX_TRACKS: usize = 32;
+
+/// How long one message to a worker may wait for room in its control
+/// socket before the supervisor gives up on the worker: the write fails
+/// with [`IpcError::Stalled`], as does every later one, and the worker is
+/// killed.
+///
+/// A healthy worker takes its control messages as its loop turns, and the
+/// socket's send buffer holds a few hundred of the usual ones (about
+/// 208 KiB, `net.core.wmem_default`, observed on Linux 6.18, 2026-11-08),
+/// so a write waits only once that much went unread: the worker's loop
+/// stopped turning, or it never reads. The deadline only has to cover a
+/// scheduling hiccup or a worker's start, not a slow peer, and two seconds
+/// is far beyond either. It is the default shutdown budget
+/// ([`SHUTDOWN_BUDGET`](crate::SHUTDOWN_BUDGET)), the time a healthy worker
+/// is given to take its `Shutdown` and finish everything, so a driver held
+/// up by a write still stops within the time the supervisor waits for its
+/// drivers at shutdown; and a fifth of the ten seconds after which a
+/// worker that sends nothing is taken for hung (the driver's
+/// `WORKER_SILENCE_LIMIT`).
+pub const CONTROL_WRITE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How a worker is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +98,10 @@ pub struct WorkerConfig {
     /// supervisor checks against: `--max-prerecord-bytes`, `--max-recording-ms`,
     /// `--recording-queue-bytes`, `--recording-start-timeout-ms` and `--max-recordings`.
     pub recordings: RecordingLimits,
+    /// The worker's share of the live limits: `--live-start-timeout-ms` and
+    /// `--max-live`, the per-stream bound, one worker running one stream's
+    /// connection.
+    pub live: crate::LiveLimits,
 }
 
 /// What a worker tells the supervisor, mapped onto trusted types.
@@ -118,6 +151,9 @@ pub enum WorkerEvent {
         /// When, on the worker's wall clock.
         at: SystemTime,
     },
+    /// A signaled source's signaling, its signal id short and its close's
+    /// code and message plain; the driver checks the rest.
+    Signal(SignalReport),
     /// An event recording reported something, as the worker wrote it: checked
     /// against the recording the supervisor holds under `recording_id`, as a
     /// session's report is against its session.
@@ -126,6 +162,13 @@ pub enum WorkerEvent {
         recording_id: String,
         /// What happened.
         event: RecordingReport,
+    },
+    /// A live output reported something, as the worker wrote it.
+    Live {
+        /// The live output.
+        live_id: String,
+        /// What happened.
+        event: LiveReport,
     },
     /// The worker closed its channel cleanly.
     ChannelClosed,
@@ -163,6 +206,8 @@ pub enum SpawnError {
 pub struct WorkerManager {
     /// How workers are started.
     config: WorkerConfig,
+    /// The clock every worker's write deadline and stop budget run on.
+    clock: Arc<dyn Clock>,
     /// The shared WebRTC UDP socket every worker gets a duplicate of;
     /// `None` in tests that run no sessions.
     udp: Option<Arc<UdpSocket>>,
@@ -172,10 +217,16 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
-    /// A manager starting workers as `config` says, handing each `udp`.
-    pub const fn new(config: WorkerConfig, udp: Option<Arc<UdpSocket>>) -> Self {
+    /// A manager starting workers as `config` says, handing each `udp`,
+    /// their write deadlines and stop budgets running on `clock`.
+    pub const fn new(
+        config: WorkerConfig,
+        udp: Option<Arc<UdpSocket>>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             config,
+            clock,
             udp,
             turn: None,
         }
@@ -239,7 +290,11 @@ impl WorkerManager {
             .arg("--recording-start-timeout-ms")
             .arg(recordings.start_timeout.as_millis().to_string())
             .arg("--max-recordings")
-            .arg(recordings.max_recordings.to_string());
+            .arg(recordings.max_recordings.to_string())
+            .arg("--live-start-timeout-ms")
+            .arg(self.config.live.start_timeout.as_millis().to_string())
+            .arg("--max-live")
+            .arg(self.config.live.max_live_per_stream.to_string());
         if !connect_ports.is_empty() {
             let ports: Vec<String> = connect_ports.iter().map(u16::to_string).collect();
             command.arg("--connect-ports").arg(ports.join(","));
@@ -270,6 +325,8 @@ impl WorkerManager {
             pid,
             child,
             control,
+            stalled: false,
+            clock: Arc::clone(&self.clock),
             events,
             reader,
             _uplink: uplink,
@@ -375,6 +432,7 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
             recording_id,
             event,
         },
+        ToSupervisor::Live { live_id, event } => WorkerEvent::Live { live_id, event },
         ToSupervisor::ProbeConnecting { probe } => WorkerEvent::ProbeConnecting(probe),
         ToSupervisor::ProbeEnded { probe } => WorkerEvent::ProbeEnded(probe),
         ToSupervisor::Talker(change) => match TalkerReason::parse(&change.reason) {
@@ -390,7 +448,51 @@ fn map_message(message: ToSupervisor, memory: Option<OwnedFd>, trims: &mut Trims
                 change.reason
             )),
         },
+        ToSupervisor::Signal(report) => signal(report),
     }
+}
+
+/// A worker's signal report as the driver takes it: a close's code and
+/// message made [`plain`]. A signal id the supervisor never gives (its
+/// ids are ULIDs): empty, over [`MAX_NAME_BYTES`] or with a byte outside
+/// [`is_signal_id`]'s set, fails the channel, as a broken protocol does;
+/// so an id is safe to log as it is, with no line break or control
+/// character to forge a log line with.
+fn signal(report: SignalReport) -> WorkerEvent {
+    let signal_id = match &report {
+        SignalReport::Open { .. } | SignalReport::Cancel { .. } => None,
+        SignalReport::Offer { signal_id, .. }
+        | SignalReport::Candidate { signal_id, .. }
+        | SignalReport::Closed { signal_id, .. } => Some(signal_id),
+    };
+    if let Some(signal_id) = signal_id.filter(|id| !is_signal_id(id)) {
+        return WorkerEvent::ChannelError(format!(
+            "signal report with a malformed {}-byte signal id",
+            signal_id.len()
+        ));
+    }
+    WorkerEvent::Signal(match report {
+        SignalReport::Closed {
+            signal_id,
+            code,
+            message,
+        } => SignalReport::Closed {
+            signal_id,
+            code: plain(&code, MAX_NAME_BYTES),
+            message: plain(&message, MAX_MESSAGE_BYTES),
+        },
+        report => report,
+    })
+}
+
+/// Whether `id` could be a signal id the supervisor gave: 1 to
+/// [`MAX_NAME_BYTES`] bytes of ASCII letters, digits, `.`, `_` and `-`, a
+/// superset of a ULID's Crockford base32.
+fn is_signal_id(id: &str) -> bool {
+    (1..=MAX_NAME_BYTES).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// The tracks of a worker's declaration the supervisor keeps: the first
@@ -420,18 +522,27 @@ fn declared(tracks: Vec<TrackInfo>, logged: &mut bool) -> Vec<TrackInfo> {
 }
 
 /// A worker's counters with at most [`MAX_TRACKS`] tracks whose ids fit
-/// [`MAX_NAME_BYTES`]. A trim is logged unless `logged` says one was
-/// already, and sets it.
+/// [`MAX_NAME_BYTES`], and a backchannel codec and talk-back session ids
+/// that are short names ([`is_signal_id`]): the codec goes into
+/// `stream/get` as it is, so one that is no name is dropped whole. A trim
+/// is logged unless `logged` says one was already, and sets it.
 fn counted(mut stats: WorkerStats, logged: &mut bool) -> WorkerStats {
     let reported = stats.tracks.len();
     stats.tracks.retain(|(id, _)| id.len() <= MAX_NAME_BYTES);
     stats.tracks.truncate(MAX_TRACKS);
-    if stats.tracks.len() < reported && !std::mem::replace(logged, true) {
+    let sessions = stats.talkback.len();
+    stats.talkback.retain(|(id, _)| is_signal_id(id));
+    let unnamed = sessions.saturating_sub(stats.talkback.len());
+    let codec = stats.backchannel.take_if(|codec| !is_signal_id(codec));
+    let trimmed = stats.tracks.len() < reported || unnamed > 0 || codec.is_some();
+    if trimmed && !std::mem::replace(logged, true) {
         tracing::warn!(
             reported,
             kept = stats.tracks.len(),
             limit = MAX_TRACKS,
-            "a worker counted too many tracks or over-long ids; the rest dropped, and later ones without a log"
+            talkback_dropped = unnamed,
+            backchannel_dropped = codec.is_some(),
+            "a worker counted too many tracks or over-long ids, or named a talk-back session or a backchannel codec with no short name; the rest dropped, and later ones without a log"
         );
     }
     stats
@@ -458,8 +569,14 @@ pub struct Worker {
     pid: u32,
     /// The process.
     child: Child,
-    /// The sending half of the control channel.
+    /// The sending half of the control channel, written only through
+    /// [`Worker::send`].
     control: Sender,
+    /// A write waited out [`CONTROL_WRITE_DEADLINE`]: the channel is given
+    /// up on, and nothing is written to it any more ([`IpcError::Stalled`]).
+    stalled: bool,
+    /// The clock the write deadline and the stop budget run on.
+    clock: Arc<dyn Clock>,
     /// The relayed events.
     events: mpsc::Receiver<WorkerEvent>,
     /// The relay task.
@@ -496,12 +613,47 @@ impl Worker {
         Arc::clone(&self.datagrams)
     }
 
+    /// Sends `message` with `fds`: the one way anything reaches the
+    /// worker, within [`CONTROL_WRITE_DEADLINE`] or not at all.
+    ///
+    /// The write waits only while the socket's send buffer is full, which
+    /// a worker that reads nothing makes it (a non-blocking `sendmsg(2)` on
+    /// a full `AF_UNIX` stream socket fails with `EAGAIN` and the runtime
+    /// waits for room; observed on Linux 6.18, 2026-11-08). One that waits
+    /// out the deadline is abandoned, possibly mid-frame, so the channel is
+    /// given up on: this and every later write fail with
+    /// [`IpcError::Stalled`] without touching the socket, and the worker,
+    /// which can no longer be told anything, is killed. Its exit arrives
+    /// as [`WorkerEvent::Exited`], which counts as a crash. A caller is
+    /// thus held up by at most the deadline.
+    async fn send(&mut self, message: &ToWorker, fds: &[BorrowedFd<'_>]) -> Result<(), IpcError> {
+        let deadline_ms = crate::millis(CONTROL_WRITE_DEADLINE);
+        if self.stalled {
+            return Err(IpcError::Stalled { deadline_ms });
+        }
+        let deadline = self.clock.sleep(CONTROL_WRITE_DEADLINE);
+        tokio::select! {
+            biased;
+            sent = self.control.send_msg(message, fds) => sent,
+            () = deadline => {
+                self.stalled = true;
+                tracing::warn!(
+                    pid = self.pid,
+                    kind = message.name(),
+                    deadline_ms,
+                    "worker took no control message within the deadline; its channel is given up on"
+                );
+                self.kill("control write timed out");
+                Err(IpcError::Stalled { deadline_ms })
+            }
+        }
+    }
+
     /// Hands the worker its sockets with the first message it gets, so
     /// they are there whatever comes first.
     async fn send_pending_sockets(&mut self) -> Result<(), IpcError> {
         if let Some((udp, theirs)) = self.pending_sockets.take() {
-            self.control
-                .send_msg(&ToWorker::Sockets, &[udp.as_fd(), theirs.as_fd()])
+            self.send(&ToWorker::Sockets, &[udp.as_fd(), theirs.as_fd()])
                 .await?;
         }
         Ok(())
@@ -510,41 +662,33 @@ impl Worker {
     /// Tells the worker which source to run.
     pub async fn run_source(&mut self, spec: &SourceSpec) -> Result<(), IpcError> {
         self.send_pending_sockets().await?;
-        self.control
-            .send_msg(&ToWorker::RunSource(spec.clone()), &[])
-            .await
+        self.send(&ToWorker::RunSource(spec.clone()), &[]).await
     }
 
     /// Lets the connection attempt the worker announced go ahead: the
     /// driver holds a connect permit for it.
     pub async fn grant_connect(&mut self) -> Result<(), IpcError> {
-        self.control.send_msg(&ToWorker::ConnectGranted, &[]).await
+        self.send(&ToWorker::ConnectGranted, &[]).await
     }
 
     /// Tells the worker to connect `spec` as the standby of its source and
     /// switch to it at its first keyframe.
     pub async fn switch_source(&mut self, spec: &SourceSpec) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::SwitchSource(spec.clone()), &[])
-            .await
+        self.send(&ToWorker::SwitchSource(spec.clone()), &[]).await
     }
 
     /// Tells the worker whether its connection asks for the camera's
     /// backchannel from now on (`asks`): its sources turn their probe on
     /// or off, and nothing restarts.
     pub async fn backchannel(&mut self, asks: bool) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::Backchannel { asks }, &[])
-            .await
+        self.send(&ToWorker::Backchannel { asks }, &[]).await
     }
 
     /// Tells the worker its connection's pre-record window is `ms` from now
     /// on, 0 for none: its tracks keep or free their rings, and nothing
     /// reconnects.
     pub async fn prerecord(&mut self, ms: u32) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::Prerecord { ms }, &[])
-            .await
+        self.send(&ToWorker::Prerecord { ms }, &[]).await
     }
 
     /// Starts the event recording `spec` on the worker's tracks, its bytes going
@@ -558,8 +702,7 @@ impl Worker {
         spec: &RecordingSpec,
         pipe: OwnedFd,
     ) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::StartRecording(spec.clone()), &[pipe.as_fd()])
+        self.send(&ToWorker::StartRecording(spec.clone()), &[pipe.as_fd()])
             .await
     }
 
@@ -569,20 +712,39 @@ impl Worker {
         let message = ToWorker::StopRecording {
             recording_id: recording_id.to_owned(),
         };
-        self.control.send_msg(&message, &[]).await
+        self.send(&message, &[]).await
+    }
+
+    /// Starts live output `spec`, its bytes going into `pipe`'s write end.
+    pub async fn start_live(&mut self, spec: &LiveSpec, pipe: OwnedFd) -> Result<(), IpcError> {
+        self.send(&ToWorker::StartLive(spec.clone()), &[pipe.as_fd()])
+            .await
+    }
+
+    /// Tells the worker a reader took live output `live_id`'s body.
+    pub async fn fetch_live(&mut self, live_id: &str) -> Result<(), IpcError> {
+        let message = ToWorker::FetchLive {
+            live_id: live_id.to_owned(),
+        };
+        self.send(&message, &[]).await
+    }
+
+    /// Ends live output `live_id`; the worker ignores one it does not run.
+    pub async fn stop_live(&mut self, live_id: &str) -> Result<(), IpcError> {
+        let message = ToWorker::StopLive {
+            live_id: live_id.to_owned(),
+        };
+        self.send(&message, &[]).await
     }
 
     /// Lets the standby's announced attempt go ahead.
     pub async fn grant_switch_connect(&mut self) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::SwitchConnectGranted, &[])
-            .await
+        self.send(&ToWorker::SwitchConnectGranted, &[]).await
     }
 
     /// Lets the probe `probe` the worker announced go ahead.
     pub async fn grant_probe_connect(&mut self, probe: u64) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::ProbeConnectGranted { probe }, &[])
+        self.send(&ToWorker::ProbeConnectGranted { probe }, &[])
             .await
     }
 
@@ -600,43 +762,39 @@ impl Worker {
             peer,
             first_frame,
         };
-        self.control.send_msg(&message, &[stream.as_fd()]).await
+        self.send(&message, &[stream.as_fd()]).await
     }
 
     /// Opens a viewer session on the worker's source; the answer and the
     /// rest arrive as [`WorkerEvent::Session`] events.
     pub async fn open_session(&mut self, spec: &SessionSpec) -> Result<(), IpcError> {
         self.send_pending_sockets().await?;
-        self.control
-            .send_msg(&ToWorker::OpenSession(spec.clone()), &[])
-            .await
+        self.send(&ToWorker::OpenSession(spec.clone()), &[]).await
     }
 
     /// Passes a trickled remote candidate to a session.
     pub async fn candidate(&mut self, session_id: &str, candidate: &str) -> Result<(), IpcError> {
-        self.control
-            .send_msg(
-                &ToWorker::RemoteCandidate {
-                    session_id: session_id.to_owned(),
-                    candidate: candidate.to_owned(),
-                },
-                &[],
-            )
-            .await
+        self.send(
+            &ToWorker::RemoteCandidate {
+                session_id: session_id.to_owned(),
+                candidate: candidate.to_owned(),
+            },
+            &[],
+        )
+        .await
     }
 
-    /// A re-offer for a session (`webrtc/renegotiate`); the worker
-    /// answers with a `Renegotiated` or `RenegotiateRefused` report.
-    pub async fn renegotiate(&mut self, session_id: &str, sdp: &str) -> Result<(), IpcError> {
-        self.control
-            .send_msg(
-                &ToWorker::Renegotiate {
-                    session_id: session_id.to_owned(),
-                    sdp: sdp.to_owned(),
-                },
-                &[],
-            )
-            .await
+    /// A re-offer for a session (`webrtc/reoffer`); the worker
+    /// answers with a `ReofferAnswered` or `ReofferRefused` report.
+    pub async fn reoffer(&mut self, session_id: &str, sdp: &str) -> Result<(), IpcError> {
+        self.send(
+            &ToWorker::Reoffer {
+                session_id: session_id.to_owned(),
+                sdp: sdp.to_owned(),
+            },
+            &[],
+        )
+        .await
     }
 
     /// Hands a session the relay candidate at `relayed`, on the
@@ -658,7 +816,7 @@ impl Worker {
             local,
             tcp,
         };
-        self.control.send_msg(&message, &[]).await
+        self.send(&message, &[]).await
     }
 
     /// Hands a session the channel bound to `peer` on its relay candidate
@@ -676,7 +834,7 @@ impl Worker {
             peer,
             channel,
         };
-        self.control.send_msg(&message, &[]).await
+        self.send(&message, &[]).await
     }
 
     /// Tells a session its stream's orientation changed to the one
@@ -690,7 +848,7 @@ impl Worker {
             session_id: session_id.to_owned(),
             orientation,
         };
-        self.control.send_msg(&message, &[]).await
+        self.send(&message, &[]).await
     }
 
     /// Frees the connection's backchannel from its talker, or only from
@@ -699,9 +857,14 @@ impl Worker {
         &mut self,
         session_id: Option<String>,
     ) -> Result<(), IpcError> {
-        self.control
-            .send_msg(&ToWorker::ReleaseBackchannel { session_id }, &[])
+        self.send(&ToWorker::ReleaseBackchannel { session_id }, &[])
             .await
+    }
+
+    /// Tells the worker what the supervisor answers its signaled source's
+    /// signaling with: an open's answer, or what the client relays.
+    pub async fn signal(&mut self, command: &SignalCommand) -> Result<(), IpcError> {
+        self.send(&ToWorker::Signal(command.clone()), &[]).await
     }
 
     /// Closes a session with this `closed` code.
@@ -711,16 +874,15 @@ impl Worker {
         code: &str,
         message: &str,
     ) -> Result<(), IpcError> {
-        self.control
-            .send_msg(
-                &ToWorker::CloseSession {
-                    session_id: session_id.to_owned(),
-                    code: code.to_owned(),
-                    message: message.to_owned(),
-                },
-                &[],
-            )
-            .await
+        self.send(
+            &ToWorker::CloseSession {
+                session_id: session_id.to_owned(),
+                code: code.to_owned(),
+                message: message.to_owned(),
+            },
+            &[],
+        )
+        .await
     }
 
     /// The next event: a relayed message, or the exit. After `Exited`, every
@@ -736,8 +898,9 @@ impl Worker {
         }
     }
 
-    /// Kills the process for `reason`, once: one whose channel ended, or
-    /// that went silent, can no longer be told to stop. Its exit arrives as
+    /// Kills the process for `reason`, once: one whose channel ended, that
+    /// went silent, or that took no message within the write deadline
+    /// ([`CONTROL_WRITE_DEADLINE`]) can no longer be told to stop. Its exit arrives as
     /// [`WorkerEvent::Exited`], which counts as a crash.
     pub fn kill(&mut self, reason: &'static str) {
         if self.killed {
@@ -751,18 +914,28 @@ impl Worker {
 
     /// Asks the worker to shut down within `budget`, then kills it if it is
     /// still there. Returns how it exited.
-    pub async fn stop(mut self, budget: Duration, clock: &Arc<dyn Clock>) -> ExitStatus {
+    ///
+    /// The budget covers the whole stop, the `Shutdown` message included:
+    /// a worker that takes no message is killed when the budget or the
+    /// write's own deadline ([`CONTROL_WRITE_DEADLINE`]) runs out,
+    /// whichever comes first, and one whose channel was given up on gets no
+    /// message at all.
+    pub async fn stop(mut self, budget: Duration) -> ExitStatus {
         let deadline_ms = u32::try_from(budget.as_millis()).unwrap_or(u32::MAX);
-        if let Err(err) = self
-            .control
-            .send_msg(&ToWorker::Shutdown { deadline_ms }, &[])
-            .await
-        {
-            tracing::debug!(pid = self.pid, error = %err, "worker unreachable for shutdown; killing");
-        }
+        let pid = self.pid;
+        let over = self.clock.sleep(budget);
         let status = tokio::select! {
-            status = self.child.wait() => status,
-            () = clock.sleep(budget) => {
+            status = async {
+                if let Err(err) = self.send(&ToWorker::Shutdown { deadline_ms }, &[]).await {
+                    tracing::debug!(
+                        pid,
+                        error = %err,
+                        "worker unreachable for shutdown; killed unless it exits within the budget"
+                    );
+                }
+                self.child.wait().await
+            } => status,
+            () = over => {
                 tracing::warn!(pid = self.pid, budget_ms = deadline_ms, "worker missed the shutdown budget; killing");
                 let _already_gone = self.child.start_kill();
                 self.child.wait().await
@@ -1050,6 +1223,69 @@ mod tests {
         );
     }
 
+    /// Regression: `counted` trimmed the track counters alone, so the
+    /// backchannel codec, which `stream/get` reports as the worker gave
+    /// it, could be a quarter MiB of any characters, and so could a
+    /// talk-back session's id.
+    #[test]
+    fn a_worker_s_backchannel_codec_and_talkback_sessions_are_short_names() {
+        let talkback = lotse_ipc::TalkbackStats::default();
+        let stats = |codec: Option<&str>, sessions: &[&str]| WorkerStats {
+            talkback: sessions
+                .iter()
+                .map(|id| ((*id).to_owned(), talkback))
+                .collect(),
+            backchannel: codec.map(str::to_owned),
+            ..WorkerStats::default()
+        };
+        let long = "x".repeat(MAX_NAME_BYTES + 1);
+        let named = "x".repeat(MAX_NAME_BYTES);
+        let captured = Captured::default();
+        let _logs = captured.install();
+
+        let kept = stats(Some("pcmu"), &["01JD0000000000000000000000", &named]);
+        assert_eq!(counted(kept.clone(), &mut false), kept);
+        assert_eq!(
+            counted(stats(Some(&named), &[]), &mut false),
+            stats(Some(&named), &[])
+        );
+        assert_eq!(captured.lines("counted too many tracks"), [""; 0]);
+
+        for codec in [long.as_str(), "", "pcmu\nlevel=ERROR forged", "pc mu"] {
+            let mut logged = false;
+            assert_eq!(
+                counted(stats(Some(codec), &["s1"]), &mut logged),
+                stats(None, &["s1"]),
+                "{codec:?}"
+            );
+            assert!(logged, "{codec:?}");
+        }
+        let lines = captured.lines("backchannel_dropped=true");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].contains("talkback_dropped=0"), "{lines:?}");
+
+        let mut logged = false;
+        assert_eq!(
+            counted(
+                stats(Some("opus"), &["s1", &long, "", "s 2", "s2"]),
+                &mut logged
+            ),
+            stats(Some("opus"), &["s1", "s2"])
+        );
+        assert!(logged);
+        let lines = captured.lines("talkback_dropped=3");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("backchannel_dropped=false"), "{lines:?}");
+
+        // Once per worker, as for the tracks.
+        let mut logged = true;
+        assert_eq!(
+            counted(stats(Some(&long), &[&long]), &mut logged),
+            stats(None, &[])
+        );
+        assert_eq!(captured.lines("talkback_dropped=1").len(), 0);
+    }
+
     /// Regression for SUP-30: every trimmed declaration or counter report
     /// was a `warn` line, so a worker repeating one grew the log at its
     /// own rate.
@@ -1135,6 +1371,112 @@ mod tests {
     }
 
     #[test]
+    fn a_signal_report_maps_with_its_close_plain_and_a_long_signal_id_fails_the_channel() {
+        let passed = [
+            SignalReport::Open { request: 1 },
+            SignalReport::Cancel { request: 1 },
+            SignalReport::Offer {
+                signal_id: "s".repeat(MAX_NAME_BYTES),
+                sdp: "v=0\r\n".into(),
+            },
+            SignalReport::Candidate {
+                signal_id: "01JSIG".into(),
+                candidate: String::new(),
+                mid: None,
+                mline_index: Some(0),
+            },
+        ];
+        for report in passed {
+            assert_eq!(
+                mapped(ToSupervisor::Signal(report.clone()), None),
+                WorkerEvent::Signal(report)
+            );
+        }
+        assert_eq!(
+            mapped(
+                ToSupervisor::Signal(SignalReport::Closed {
+                    signal_id: "01JSIG".into(),
+                    code: format!("ice_failed\n{}", "x".repeat(MAX_NAME_BYTES)),
+                    message: format!("line\none{}", "y".repeat(MAX_MESSAGE_BYTES)),
+                }),
+                None
+            ),
+            WorkerEvent::Signal(SignalReport::Closed {
+                signal_id: "01JSIG".into(),
+                code: plain(
+                    &format!("ice_failed {}", "x".repeat(MAX_NAME_BYTES)),
+                    MAX_NAME_BYTES
+                ),
+                message: plain(
+                    &format!("line one{}", "y".repeat(MAX_MESSAGE_BYTES)),
+                    MAX_MESSAGE_BYTES
+                ),
+            })
+        );
+        let long = "s".repeat(MAX_NAME_BYTES + 1);
+        for report in [
+            SignalReport::Offer {
+                signal_id: long.clone(),
+                sdp: String::new(),
+            },
+            SignalReport::Candidate {
+                signal_id: long.clone(),
+                candidate: String::new(),
+                mid: None,
+                mline_index: None,
+            },
+            SignalReport::Closed {
+                signal_id: long,
+                code: String::new(),
+                message: String::new(),
+            },
+        ] {
+            assert_eq!(
+                mapped(ToSupervisor::Signal(report), None),
+                WorkerEvent::ChannelError(
+                    "signal report with a malformed 65-byte signal id".into()
+                )
+            );
+        }
+    }
+
+    /// A signal id is logged as it is, so one that could forge a log line
+    /// (a line break, a control character) or that the supervisor never
+    /// gives fails the channel.
+    #[test]
+    fn a_signal_id_outside_the_supervisor_s_charset_fails_the_channel() {
+        for id in [
+            "",
+            "sig\nlevel=ERROR forged",
+            "sig\r",
+            "sig\u{1b}[31m",
+            "sig id",
+            "sig\"",
+            "sigé",
+            "sig/1",
+        ] {
+            assert_eq!(
+                mapped(
+                    ToSupervisor::Signal(SignalReport::Offer {
+                        signal_id: id.into(),
+                        sdp: String::new(),
+                    }),
+                    None
+                ),
+                WorkerEvent::ChannelError(format!(
+                    "signal report with a malformed {}-byte signal id",
+                    id.len()
+                )),
+                "{id:?}"
+            );
+        }
+        for id in ["01JSIGABCDEFGHJKMNPQRSTVWX", "sig-1", "a.b_c-D9", "x"] {
+            assert!(is_signal_id(id), "{id:?}");
+        }
+        assert!(is_signal_id(&"s".repeat(MAX_NAME_BYTES)));
+    }
+
+    #[test]
     fn a_session_message_maps_onto_its_session_s_event() {
         let event = SessionEvent::Answer {
             sdp: "v=0".into(),
@@ -1172,6 +1514,29 @@ mod tests {
             ),
             WorkerEvent::Recording {
                 recording_id: "k1".into(),
+                event
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_report_is_passed_on_as_the_worker_wrote_it() {
+        let event = LiveReport::Closed {
+            reason: "client_gone".into(),
+            bytes: 10,
+            dropped_frames: 0,
+            drops: 0,
+        };
+        assert_eq!(
+            mapped(
+                ToSupervisor::Live {
+                    live_id: "l1".into(),
+                    event: event.clone(),
+                },
+                None
+            ),
+            WorkerEvent::Live {
+                live_id: "l1".into(),
                 event
             }
         );
@@ -1252,12 +1617,17 @@ mod tests {
             max_recordings: 3,
             ..RecordingLimits::DEFAULT
         };
+        config.live = crate::LiveLimits {
+            start_timeout: Duration::from_millis(3_500),
+            max_live_per_stream: 4,
+            ..crate::LiveLimits::DEFAULT
+        };
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
-        let manager = WorkerManager::new(config, Some(udp));
+        let manager = WorkerManager::new(config, Some(udp), Arc::new(SystemClock));
         let mut worker = manager.spawn(&[554, 8554]).unwrap();
         let spec = SourceSpec {
             connection_id: "c1".into(),
-            url: "fake://cam/".into(),
+            target: lotse_ipc::SourceTarget::Url("fake://cam/".into()),
             options: "{}".into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
@@ -1281,8 +1651,11 @@ mod tests {
             .await
             .unwrap();
         worker.stop_recording("k1").await.unwrap();
+        let candidate = "candidate:1 1 udp 2130706431 192.0.2.1 9 typ host";
+        worker.candidate("s1", candidate).await.unwrap();
+        worker.close_session("s1", "gone", "bye").await.unwrap();
         assert_eq!(
-            received(&dir, 8).await,
+            received(&dir, 10).await,
             [
                 ToWorker::Sockets,
                 ToWorker::RunSource(spec),
@@ -1294,6 +1667,15 @@ mod tests {
                 ToWorker::StopRecording {
                     recording_id: "k1".into()
                 },
+                ToWorker::RemoteCandidate {
+                    session_id: "s1".into(),
+                    candidate: candidate.into(),
+                },
+                ToWorker::CloseSession {
+                    session_id: "s1".into(),
+                    code: "gone".into(),
+                    message: "bye".into(),
+                },
             ],
             "the sockets ride on the first message, once"
         );
@@ -1302,15 +1684,16 @@ mod tests {
         // read end ends.
         let mut rest = Vec::new();
         io::Read::read_to_end(&mut recording_bytes, &mut rest).unwrap();
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
         let args = std::fs::read_to_string(dir.join("args")).unwrap();
         assert!(args.contains("--connect-ports\n554,8554\n"), "{args}");
         assert!(
             args.contains(
                 "--max-prerecord-bytes\n1048576\n--max-recording-ms\n45000\n--recording-queue-bytes\n65536\n\
-                 --recording-start-timeout-ms\n2500\n--max-recordings\n3\n"
+                 --recording-start-timeout-ms\n2500\n--max-recordings\n3\n\
+                 --live-start-timeout-ms\n3500\n--max-live\n4\n"
             ),
-            "the recording limits as the supervisor holds them: {args}"
+            "the recording and live limits as the supervisor holds them: {args}"
         );
         // A kill is sent once, however often it is asked for.
         let captured = Captured::default();
@@ -1358,7 +1741,7 @@ mod tests {
         let mut config = crate::test_support::environment("/bin/sh").worker;
         config.binary = script;
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
-        let manager = WorkerManager::new(config, Some(udp));
+        let manager = WorkerManager::new(config, Some(udp), Arc::new(SystemClock));
         let worker = manager.spawn(&[554]).unwrap();
         let proc = PathBuf::from(format!("/proc/{}", worker.pid()));
         // The shell holds its script open until it `exec`s `sleep`: look
@@ -1438,9 +1821,11 @@ mod tests {
     #[tokio::test]
     async fn a_worker_reaped_elsewhere_is_a_channel_error_and_stops_without_a_status() {
         use rustix::process::{Pid, WaitOptions, waitpid};
+        // The fake clock never moves: the failed wait ends the stop.
         let manager = WorkerManager::new(
             crate::test_support::environment("/usr/bin/true").worker,
             None,
+            Arc::new(FakeClock::default()),
         );
         let mut worker = manager.spawn(&[]).unwrap();
         // Reaped before the runtime looks: its wait fails with `ECHILD`.
@@ -1458,9 +1843,7 @@ mod tests {
         );
         let captured = Captured::default();
         let _logs = captured.install();
-        // The fake clock never moves: the failed wait ends the stop.
-        let clock: Arc<dyn Clock> = Arc::new(FakeClock::default());
-        let status = worker.stop(Duration::from_secs(1), &clock).await;
+        let status = worker.stop(Duration::from_secs(1)).await;
         assert_eq!(status, ExitStatus::default());
         assert_eq!(
             captured.lines("worker unreachable for shutdown").len(),
@@ -1468,6 +1851,173 @@ mod tests {
             "its channel is gone"
         );
         assert_eq!(captured.lines("worker exit could not be observed").len(), 1);
+    }
+
+    /// A worker at `dir/worker.sh` that never reads its control channel,
+    /// started on `clock`.
+    fn deaf_worker(dir: &std::path::Path, clock: Arc<dyn Clock>) -> Worker {
+        let script = dir.join("worker.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut config = crate::test_support::environment("/bin/sh").worker;
+        config.binary = script;
+        WorkerManager::new(config, None, clock).spawn(&[]).unwrap()
+    }
+
+    /// Regression: a worker that stopped reading its control channel held
+    /// every write to it, and so its driver, for good. Once the socket's
+    /// send buffer is full a write waits for room (a non-blocking
+    /// `sendmsg(2)` on a full `AF_UNIX` stream socket fails with `EAGAIN`,
+    /// observed on Linux 6.18, 2026-11-08); the deadline, on the injected
+    /// clock, now ends the wait, kills the worker and gives its channel up,
+    /// so every later write fails at once.
+    #[tokio::test]
+    async fn a_write_to_a_worker_that_reads_nothing_ends_at_its_deadline_and_kills_the_worker() {
+        use crate::test_support::{fill_control, settled};
+        let dir = crate::test_support::private_dir("worker-deaf");
+        let clock = Arc::new(FakeClock::default());
+        let mut worker = deaf_worker(&dir, clock.clone());
+        fill_control(&mut worker).await;
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let deadline_ms = 2_000;
+        assert_eq!(CONTROL_WRITE_DEADLINE, Duration::from_millis(deadline_ms));
+        {
+            let mut write = std::pin::pin!(worker.grant_connect());
+            let real = Duration::from_millis(200);
+            assert!(settled(&mut write, real).await.is_none(), "the write waits");
+            clock.advance(
+                CONTROL_WRITE_DEADLINE
+                    .checked_sub(Duration::from_millis(1))
+                    .unwrap(),
+            );
+            assert!(
+                settled(&mut write, real).await.is_none(),
+                "not before the deadline"
+            );
+            clock.advance(Duration::from_millis(1));
+            let err = settled(&mut write, Duration::from_secs(5))
+                .await
+                .expect("the deadline ends the write")
+                .unwrap_err();
+            assert!(
+                matches!(err, IpcError::Stalled { deadline_ms: 2_000 }),
+                "{err}"
+            );
+        }
+        let lines = captured.lines("worker took no control message within the deadline");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let pid = worker.pid();
+        for field in [
+            format!("pid={pid}"),
+            "kind=\"connect_granted\"".to_owned(),
+            "deadline_ms=2000".to_owned(),
+        ] {
+            assert!(lines[0].contains(&field), "{field}: {lines:?}");
+        }
+        let killed = captured.lines("worker killed");
+        assert_eq!(killed.len(), 1, "{killed:?}");
+        assert!(killed[0].contains("control write timed out"), "{killed:?}");
+        // Every later write fails at once, the clock standing still, and
+        // the worker is killed only once.
+        let signal = SignalCommand::Gone {
+            signal_id: "01JSIG".into(),
+        };
+        {
+            let mut write = std::pin::pin!(worker.signal(&signal));
+            let err = settled(&mut write, Duration::from_secs(5))
+                .await
+                .expect("at once")
+                .unwrap_err();
+            assert!(
+                matches!(err, IpcError::Stalled { deadline_ms: 2_000 }),
+                "{err}"
+            );
+        }
+        let err = worker.prerecord(0).await.unwrap_err();
+        assert!(matches!(err, IpcError::Stalled { .. }), "{err}");
+        assert_eq!(captured.lines("worker killed").len(), 1);
+        assert_eq!(
+            captured
+                .lines("worker took no control message within the deadline")
+                .len(),
+            1
+        );
+        // Its exit counts as a crash.
+        let mut event = WorkerEvent::ChannelClosed;
+        while event == WorkerEvent::ChannelClosed {
+            event = worker.next_event().await;
+        }
+        assert!(
+            matches!(&event, WorkerEvent::Exited(status) if status.signal() == Some(9)),
+            "{event:?}"
+        );
+        // A stop sends nothing on the given-up channel.
+        let status = worker.stop(Duration::from_secs(1)).await;
+        assert_eq!(status.signal(), Some(9));
+        let unreachable = captured.lines("worker unreachable for shutdown");
+        assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+        assert!(unreachable[0].contains("abandoned"), "{unreachable:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A stop's budget covers its `Shutdown` too: a worker that reads
+    /// nothing is killed when the budget runs out, or the write's own
+    /// deadline when that comes first, and the stop ends then.
+    #[tokio::test]
+    async fn a_stop_of_a_worker_that_reads_nothing_ends_within_its_budget() {
+        use crate::test_support::{fill_control, settled};
+        let dir = crate::test_support::private_dir("worker-deaf-stop");
+        let captured = Captured::default();
+        let _logs = captured.install();
+        // A budget shorter than the write's deadline.
+        let clock = Arc::new(FakeClock::default());
+        let mut worker = deaf_worker(&dir, clock.clone());
+        fill_control(&mut worker).await;
+        let budget = Duration::from_millis(500);
+        let mut stop = std::pin::pin!(worker.stop(budget));
+        let real = Duration::from_millis(200);
+        assert!(settled(&mut stop, real).await.is_none(), "the write waits");
+        clock.advance(budget.checked_sub(Duration::from_millis(1)).unwrap());
+        assert!(
+            settled(&mut stop, real).await.is_none(),
+            "within the budget"
+        );
+        clock.advance(Duration::from_millis(1));
+        let status = settled(&mut stop, Duration::from_secs(5))
+            .await
+            .expect("the budget ends the stop");
+        assert_eq!(status.signal(), Some(9));
+        let missed = captured.lines("worker missed the shutdown budget");
+        assert_eq!(missed.len(), 1, "{missed:?}");
+        assert!(missed[0].contains("budget_ms=500"), "{missed:?}");
+        assert!(
+            captured.lines("worker killed").is_empty(),
+            "the stop's own kill"
+        );
+        // A budget longer than it: the write's deadline kills the worker.
+        let clock = Arc::new(FakeClock::default());
+        let mut worker = deaf_worker(&dir, clock.clone());
+        fill_control(&mut worker).await;
+        let mut stop = std::pin::pin!(worker.stop(Duration::from_secs(5)));
+        assert!(settled(&mut stop, real).await.is_none(), "the write waits");
+        clock.advance(CONTROL_WRITE_DEADLINE);
+        let status = settled(&mut stop, Duration::from_secs(5))
+            .await
+            .expect("the write's deadline ends the stop");
+        assert_eq!(status.signal(), Some(9));
+        let killed = captured.lines("worker killed");
+        assert_eq!(killed.len(), 1, "{killed:?}");
+        assert!(killed[0].contains("control write timed out"), "{killed:?}");
+        let unreachable = captured.lines("worker unreachable for shutdown");
+        assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+        assert_eq!(
+            captured.lines("worker missed the shutdown budget").len(),
+            1,
+            "the second budget did not run out"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -1482,8 +2032,10 @@ mod tests {
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
                 recordings: RecordingLimits::DEFAULT,
+                live: crate::LiveLimits::DEFAULT,
             },
             None,
+            Arc::new(SystemClock),
         );
         let err = manager.spawn(&[554]).unwrap_err();
         assert!(matches!(err, SpawnError::Spawn { .. }), "{err}");

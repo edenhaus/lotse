@@ -15,14 +15,24 @@
 //! queue that sheds low-value traffic and disconnects a client that still
 //! overflows it, and a deadline on the closing handshake, so a peer that
 //! stops reading cannot hold a connection or its slot. Beside the upgrade
-//! it serves event recordings' bytes, `GET /v0/recording/{recording_id}`, as chunked
-//! response bodies the handler hands over ([`Handler::recording_body`]),
+//! it serves event recordings' bytes, `GET /v0/recording/{recording_id}`, and
+//! live outputs' bytes, `GET /v0/live/{live_id}`, as chunked
+//! response bodies the handler hands over ([`Handler::recording_body`],
+//! [`Handler::live_body`]), and LL-HLS sessions' playlists and segments,
+//! `GET /v0/hls/{hls_id}/{name}`, as the handler answers them
+//! ([`Handler::hls`], [`hls`]),
 //! bounded by the client taking them and, over TLS, by its client staying
-//! enrolled.
+//! enrolled. Beside them it serves the daemon's metrics, `GET /v0/metrics`,
+//! in OpenMetrics or the Prometheus text format as the scraper negotiates
+//! ([`exporter`]). A TLS client's role
+//! decides which routes it reaches (the `access` module): a `metrics`
+//! client only the metrics.
 //!
 //! Standards: RFC 6455 (WebSocket, close codes §7.4.1, `Origin` §10.2),
 //! RFC 9110 (HTTP), RFC 9112 (HTTP/1.1, the chunked transfer coding §7.1
-//! of a recording's body), RFC 6585 §5 (431 for an oversized request head),
+//! of a recording's body), RFC 6585 §5 (431 for an oversized request head)
+//! and §4 (429 for too many blocked LL-HLS requests),
+//! draft-pantos-hls-rfc8216bis-22 (LL-HLS, in [`hls`]),
 //! unix(7) `SO_PEERCRED`, RFC 8446 (TLS 1.3, in [`tls`]).
 
 use std::future::Future;
@@ -42,27 +52,36 @@ use lotse_api_types::command::Command;
 use lotse_api_types::error::ApiError;
 use lotse_api_types::frame::Hello;
 use lotse_core::clock::Clock;
-use lotse_core::id::RecordingId;
+use lotse_core::id::{HlsId, LiveId, RecordingId};
 use lotse_core::task::{BoxFuture, spawn_named};
+use lotse_core::throttle::CallSites;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 
+mod access;
 mod clients;
 mod connection;
+pub mod exporter;
+pub mod hls;
 pub mod identity;
 mod listener;
+mod live;
 mod outbox;
+mod owners;
 pub mod pairing;
 mod recording;
 #[cfg(feature = "test-util")]
 pub mod test_util;
 pub mod tls;
 
-pub use clients::ClientsError;
+pub use clients::{ClientsError, PinsError, RoleName, parse_pins, render_pins};
+pub use hls::{HlsAnswer, HlsError, HlsReply, HlsRequest, InFlight};
 pub use listener::{BindError, PeerInfo};
+pub use live::{LiveBody, LiveBodyError, live_id_of};
+pub use owners::Owners;
 pub use recording::{RecordingBody, RecordingBodyError};
 pub use tls::TlsConfig;
 
@@ -120,10 +139,42 @@ pub const BODY_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// reports as it closes its pipe.
 pub const RECORDING_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The route of a recording's bytes, as the router has it.
+const RECORDING_ROUTE: &str = "/v0/recording/{recording_id}";
+
+/// The route of a live output's bytes, as the router has it.
+const LIVE_ROUTE: &str = "/v0/live/{live_id}";
+
+/// The route of an LL-HLS session's playlist and resources, as the router
+/// has it.
+const HLS_ROUTE: &str = "/v0/hls/{hls_id}/{name}";
+
 /// Connections accepted and not yet upgraded, at once: 8. One more is
 /// closed at accept, without a response. A TLS connection takes its place
 /// when it authenticates, and holds it while it waits for the serve loop.
 pub const MAX_PENDING_UPGRADES: u16 = 8;
+
+/// A limit whose warning a peer can make again and again, once per
+/// connection; each has its own rate limit in [`LimitLines`]. A command
+/// refused at a limit is warned about by the connection that refused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Limit {
+    /// [`Config::max_connections`]: an upgrade refused.
+    Connections,
+    /// [`MAX_PENDING_UPGRADES`]: a connection closed at accept.
+    PendingUpgrades,
+    /// [`UPGRADE_TIMEOUT`]: a connection closed before its upgrade.
+    UpgradeDeadline,
+    /// [`exporter::MAX_EXPORTED_STREAMS`] or
+    /// [`exporter::MAX_EXPORTED_WORKERS`]: a metrics exposition capped.
+    ExportedSeries,
+}
+
+/// The rate limits of the [`Limit`] warnings, one for both listeners and
+/// every connection: the first of each is logged, then one summary per
+/// [`SUMMARY_INTERVAL`](lotse_core::throttle::SUMMARY_INTERVAL) with the
+/// count, so neither a local nor a TLS client floods the log.
+type LimitLines = CallSites<Limit>;
 
 /// A control connection, numbered from one for the daemon's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -182,16 +233,22 @@ pub enum Outcome {
 }
 
 /// What the supervisor implements. `ping`, `schema`, `unsubscribe`,
-/// `pairing/create`, `clients/list` and `clients/remove` are answered by
+/// `pairing/create`, `clients/list`, `clients/remove` and `clients/add` are answered by
 /// the server itself; everything else goes here, and so do the requests
 /// for recordings' bytes.
 pub trait Handler: Send + Sync + 'static {
     /// The `hello` frame's content.
     fn hello(&self) -> Hello;
 
-    /// Handles one command of `connection`. Never waits on a camera. The
-    /// future is dropped at an await point when the connection's client is
-    /// removed or the daemon shuts down before it ends, so what it changes
+    /// Handles one command of `connection`. Never waits on a camera but
+    /// for `live/create` and `hls/create`, bounded, which the connection
+    /// answers while it reads and answers its further commands, so one that
+    /// releases the wait (a signaled source's `signaling/answer`) is not
+    /// held up behind it; every other command is answered before the next
+    /// is read. The future is dropped at an await point when the
+    /// connection's client is removed or the daemon shuts down before it
+    /// ends, or, for `live/create` and `hls/create`, when the connection
+    /// closes, always before [`Self::connection_closed`]; so what it changes
     /// it changes between two awaits, never across one.
     fn handle(
         &self,
@@ -213,6 +270,15 @@ pub trait Handler: Send + Sync + 'static {
         let _ = connection;
     }
 
+    /// `GET /v0/metrics`, from any peer either listener admits (over TLS,
+    /// a `control` or a `metrics` client still allowed): the snapshot
+    /// `metrics/get` returns, the one source of the exposition
+    /// ([`exporter`]). Never waits on a camera. `None` without metrics,
+    /// answered 503.
+    fn metrics_snapshot(&self) -> impl Future<Output = Option<lotse_api_types::Metrics>> + Send {
+        std::future::ready(None)
+    }
+
     /// `GET /v0/recording/{recording_id}` in HTTP/1.1, from any peer either listener
     /// admits (over TLS, one whose client is still allowed): the bytes of
     /// recording `recording_id`, handed over once, so a second request
@@ -227,22 +293,51 @@ pub trait Handler: Send + Sync + 'static {
         let _ = recording_id;
         Err(RecordingBodyError::NotFound)
     }
+
+    /// `GET /v0/live/{live_id}` in HTTP/1.1, from any peer either listener
+    /// admits (over TLS, one whose client is still allowed): the bytes of
+    /// live output `live_id` and their MIME type, handed over once, so a
+    /// second request is [`LiveBodyError::AlreadyFetched`]. The server sends
+    /// them as the response body until the reader ends. Never waits.
+    /// Without live outputs, every id is [`LiveBodyError::NotFound`].
+    fn live_body(&self, live_id: &LiveId) -> Result<LiveBody, LiveBodyError> {
+        let _ = live_id;
+        Err(LiveBodyError::NotFound)
+    }
+
+    /// `GET /v0/hls/{hls_id}/{name}`, from any peer either listener admits
+    /// (over TLS, one whose client is still allowed), parsed: the playlist
+    /// or a resource of LL-HLS session `hls_id`. May wait, bounded: a
+    /// Blocking Playlist Reload or a request for a hinted part is held until
+    /// the window can answer it (draft-pantos-hls-rfc8216bis-22 §6.2.5.2,
+    /// §4.4.5.3), at most three Target Durations, then
+    /// [`HlsError::Timeout`]. The future is dropped when the client goes.
+    /// The answer's [`InFlight`], a refusal's too, is held until its
+    /// response's connection ends ([`HlsAnswer`]). Without LL-HLS, every id
+    /// is [`HlsError::NotFound`].
+    fn hls(&self, hls_id: &HlsId, request: HlsRequest) -> impl Future<Output = HlsAnswer> + Send {
+        let _ = (hls_id, request);
+        std::future::ready(Err((HlsError::NotFound, InFlight::default())))
+    }
 }
 
 /// The server's settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The socket path; its directory must be 0700 and owned by `owner_uid`.
+    /// The socket path; its directory must be 0700 and owned by one of
+    /// `owners`.
     pub socket: PathBuf,
-    /// The uid the daemon started as: owns the socket directory and may
-    /// always connect.
-    pub owner_uid: u32,
+    /// The uid the daemon started as, which may always connect, and the
+    /// one it drops to: who may own the socket's directory and the data
+    /// directory.
+    pub owners: Owners,
     /// A second uid allowed to connect (`--allow-uid`).
     pub allow_uid: u32,
     /// Control connections at once.
     pub max_connections: u32,
     /// Open subscriptions per connection (`stream/subscribe`,
-    /// `webrtc/offer`, `session/adopt`, `recording/create`); one more is answered
+    /// `webrtc/offer`, `session/adopt`, `recording/create`, `live/create`,
+    /// `hls/create`, `signaling/subscribe`); one more is answered
     /// `limit_reached` before the handler sees it. Ended ones do not count.
     pub max_subscriptions: u32,
     /// The mutual-TLS listener, if one is configured.
@@ -263,6 +358,8 @@ struct AppState<H> {
     shutdown: CancellationToken,
     /// Times the closing handshake ([`CLOSE_TIMEOUT`]).
     clock: Arc<dyn Clock>,
+    /// The rate limits of the limit warnings.
+    limit_lines: Arc<LimitLines>,
     /// The TLS listener's pairing, for `pairing/create`; `None` without a
     /// listener.
     pairing: Option<Arc<pairing::Pairing>>,
@@ -286,6 +383,7 @@ impl<H> Clone for AppState<H> {
             next_id: Arc::clone(&self.next_id),
             shutdown: self.shutdown.clone(),
             clock: Arc::clone(&self.clock),
+            limit_lines: Arc::clone(&self.limit_lines),
             pairing: self.pairing.clone(),
             clients: self.clients.clone(),
             serving: self.serving.clone(),
@@ -317,15 +415,16 @@ pub enum ServeError {
 
 impl Server {
     /// Binds the Unix socket synchronously, with the control plane's checks:
-    /// no abstract namespace, a 0700 directory owned by `owner_uid`, umask
+    /// no abstract namespace, a 0700 directory owned by one of
+    /// [`Config::owners`], umask
     /// 0177 around the bind. With [`Config::tls`], also loads or makes the
     /// server identity and binds the TLS listener ([`tls`]).
     pub fn bind(config: Config) -> Result<Self, BindError> {
-        let unix = listener::bind_unix(&config.socket, config.owner_uid)?;
+        let unix = listener::bind_unix(&config.socket, config.owners)?;
         let tls = config
             .tls
             .as_ref()
-            .map(|settings| tls::bind(settings, config.owner_uid))
+            .map(|settings| tls::bind(settings, config.owners))
             .transpose()?;
         Ok(Self { unix, tls, config })
     }
@@ -359,13 +458,14 @@ impl Server {
         clock: Arc<dyn Clock>,
         shutdown: CancellationToken,
     ) -> Result<(), ServeError> {
-        let allowed = [self.config.owner_uid, self.config.allow_uid];
+        let allowed = [self.config.owners.starting, self.config.allow_uid];
         let mut unix = listener::CheckedUnix::new(self.unix, allowed, Arc::clone(&clock))
             .map_err(ServeError::Register)?;
         let pending = Arc::new(Semaphore::new(usize::from(MAX_PENDING_UPGRADES)));
         // Each queued connection holds one of `pending`'s permits, so the
         // queue never fills and a handshake task never waits to send.
         let (admitted, mut authenticated) = mpsc::channel(usize::from(MAX_PENDING_UPGRADES));
+        let limit_lines = Arc::new(LimitLines::new(Arc::clone(&clock)));
         let (tls, pairing, clients) = match self.tls {
             Some(bound) => {
                 let pairing = bound.pairing(Arc::clone(&clock));
@@ -386,6 +486,7 @@ impl Server {
                             clock: Arc::clone(&clock),
                             shutdown: shutdown.clone(),
                             upgrades: Arc::clone(&pending),
+                            limit_lines: Arc::clone(&limit_lines),
                             admitted,
                             store: bound.store,
                             pairing: Arc::clone(&pairing),
@@ -404,6 +505,7 @@ impl Server {
             next_id: Arc::new(AtomicU64::new(1)),
             shutdown: shutdown.clone(),
             clock: Arc::clone(&clock),
+            limit_lines,
             pairing,
             clients,
             serving: serving.token(),
@@ -455,6 +557,8 @@ struct Admission {
     pending: Arc<Semaphore>,
     /// Times the upgrade deadline.
     clock: Arc<dyn Clock>,
+    /// The rate limits of the limit warnings.
+    limit_lines: Arc<LimitLines>,
     /// Cancelled on graceful shutdown.
     shutdown: CancellationToken,
     /// Held by every connection's task until it ends, so the server's
@@ -473,17 +577,53 @@ impl Admission {
     /// upgrades.
     fn new<H: Handler>(state: AppState<H>, pending: Arc<Semaphore>) -> Self {
         let clock = Arc::clone(&state.clock);
+        let limit_lines = Arc::clone(&state.limit_lines);
         let shutdown = state.shutdown.clone();
         let serving = state.serving.clone();
         let clients = state.clients.clone();
         let next_id = Arc::clone(&state.next_id);
+        let lines = Arc::new(access::RefusalLines::new(Arc::clone(&clock)));
+        // A layer of each route's own, so every method of it, its
+        // fallback's too, is checked, and the log names the route.
+        let control_only = |route: &'static str| {
+            axum::middleware::from_fn_with_state(
+                access::ControlOnly {
+                    clients: clients.clone(),
+                    lines: Arc::clone(&lines),
+                    route,
+                },
+                access::control_only,
+            )
+        };
         let app = Router::new()
-            .route(lotse_api_types::WS_PATH, get(connection::upgrade::<H>))
             .route(
-                &format!("{}/{{recording_id}}", lotse_api_types::RECORDING_PATH),
+                lotse_api_types::WS_PATH,
+                get(connection::upgrade::<H>).layer(control_only(lotse_api_types::WS_PATH)),
+            )
+            .route(
+                lotse_api_types::METRICS_PATH,
+                get(exporter::fetch::<H>).fallback(exporter::not_allowed),
+            )
+            .route(
+                RECORDING_ROUTE,
                 get(recording::fetch::<H>)
                     .head(recording::not_allowed)
-                    .fallback(recording::not_allowed),
+                    .fallback(recording::not_allowed)
+                    .layer(control_only(RECORDING_ROUTE)),
+            )
+            .route(
+                LIVE_ROUTE,
+                get(live::fetch::<H>)
+                    .head(live::not_allowed)
+                    .fallback(live::not_allowed)
+                    .layer(control_only(LIVE_ROUTE)),
+            )
+            .route(
+                HLS_ROUTE,
+                get(hls::fetch::<H>)
+                    .head(hls::not_allowed)
+                    .fallback(hls::not_allowed)
+                    .layer(control_only(HLS_ROUTE)),
             )
             .with_state(state);
         let mut http = http1::Builder::new();
@@ -497,6 +637,7 @@ impl Admission {
             http,
             pending,
             clock,
+            limit_lines,
             shutdown,
             serving,
             clients,
@@ -511,7 +652,7 @@ impl Admission {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let Some(slot) = upgrade_slot(&self.pending, &peer) else {
+        let Some(slot) = upgrade_slot(&self.pending, &peer, &self.limit_lines) else {
             return;
         };
         let body = recording::BodyWatch::new();
@@ -556,6 +697,7 @@ impl Admission {
                     slot,
                     body,
                     clock: Arc::clone(&self.clock),
+                    limit_lines: Arc::clone(&self.limit_lines),
                     serving: self.serving.clone(),
                     clients: self.clients.clone(),
                     next_id: Arc::clone(&self.next_id),
@@ -566,17 +708,22 @@ impl Admission {
 }
 
 /// A place among the [`MAX_PENDING_UPGRADES`] connections awaiting their
-/// upgrade, from `pending`, for `peer`; `None`, logged, when there is none
-/// and the connection is to be closed without a response.
+/// upgrade, from `pending`, for `peer`; `None`, logged rate-limited on
+/// `limit_lines`, when there is none and the connection is to be closed
+/// without a response.
 pub(crate) fn upgrade_slot(
     pending: &Arc<Semaphore>,
     peer: &PeerInfo,
+    limit_lines: &LimitLines,
 ) -> Option<OwnedSemaphorePermit> {
     let slot = Arc::clone(pending).try_acquire_owned().ok();
-    if slot.is_none() {
+    if slot.is_none()
+        && let Some(refused) = limit_lines.hit(Limit::PendingUpgrades)
+    {
         tracing::warn!(
             %peer,
             max = MAX_PENDING_UPGRADES,
+            refused,
             "control connection refused: too many connections awaiting the upgrade"
         );
     }
@@ -595,6 +742,8 @@ struct Accepted {
     body: recording::BodyWatch,
     /// Times a recording body's waits.
     clock: Arc<dyn Clock>,
+    /// The rate limits of the limit warnings.
+    limit_lines: Arc<LimitLines>,
     /// Held until the connection ends.
     serving: TaskTrackerToken,
     /// The TLS listener's clients, to close a recording body's connection once
@@ -622,6 +771,7 @@ async fn handshake(
         slot,
         body,
         clock,
+        limit_lines,
         serving: _serving,
         clients,
         next_id,
@@ -635,12 +785,7 @@ async fn handshake(
             false
         }
         () = deadline => {
-            let timeout_ms = UPGRADE_TIMEOUT.as_millis();
-            tracing::warn!(
-                %peer,
-                timeout_ms,
-                "control connection closed: no upgrade before the deadline"
-            );
+            warn_upgrade_deadline(&limit_lines, &peer);
             false
         }
         () = shutdown.cancelled() => {
@@ -670,6 +815,21 @@ async fn handshake(
     }
     // The body's sender, which `send_body`'s receiver needs, lives until here.
     drop(body);
+}
+
+/// Logs `peer`'s connection closed at [`UPGRADE_TIMEOUT`], rate-limited
+/// on `limit_lines`. A function of its own, not generic, so the unit
+/// tests' copy runs both the line that is due and the one that is not.
+fn warn_upgrade_deadline(limit_lines: &LimitLines, peer: &PeerInfo) {
+    if let Some(closed) = limit_lines.hit(Limit::UpgradeDeadline) {
+        let timeout_ms = UPGRADE_TIMEOUT.as_millis();
+        tracing::warn!(
+            %peer,
+            timeout_ms,
+            closed,
+            "control connection closed: no upgrade before the deadline"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -708,6 +868,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_recording_route_is_the_recording_path_and_its_id() {
+        assert_eq!(
+            RECORDING_ROUTE,
+            format!("{}/{{recording_id}}", lotse_api_types::RECORDING_PATH)
+        );
+    }
+
+    #[test]
+    fn the_hls_route_is_the_hls_path_its_id_and_a_name() {
+        assert_eq!(
+            HLS_ROUTE,
+            format!("{}/{{hls_id}}/{{name}}", lotse_api_types::HLS_PATH)
+        );
+    }
+
+    #[test]
+    fn the_live_route_is_the_live_path_and_its_id() {
+        assert_eq!(
+            LIVE_ROUTE,
+            format!("{}/{{live_id}}", lotse_api_types::LIVE_PATH)
+        );
+    }
+
+    #[test]
+    fn the_inbound_message_cap_is_64_kib_and_the_outbound_budget_1_mib() {
+        assert_eq!(MAX_MESSAGE_BYTES, 65_536);
+        assert_eq!(OUTBOUND_BUDGET_BYTES, 1_048_576);
+        assert_eq!(MAX_UPGRADE_HEADER_BYTES, 16_384);
+    }
+
     #[tokio::test]
     async fn the_default_hooks_have_no_last_word_and_no_side_effect() {
         let handler = Minimal;
@@ -717,6 +908,7 @@ mod tests {
             Outcome::Result(serde_json::Value::Null)
         ));
         assert!(handler.unsubscribed(ConnectionId(1), 2).is_none());
+        assert!(handler.metrics_snapshot().await.is_none());
         handler.connection_closed(ConnectionId(1));
         assert_eq!(handler.hello().api, lotse_api_types::API_VERSION);
         // Without recordings, no id has a body.
@@ -755,11 +947,12 @@ mod tests {
         if shutting_down {
             shutdown.cancel();
         }
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
         AppState {
             handler: Arc::new(Minimal),
             config: Config {
                 socket: PathBuf::from("/run/lotse/lotse.sock"),
-                owner_uid: 0,
+                owners: Owners::only(0),
                 allow_uid: 0,
                 max_connections,
                 max_subscriptions: 1,
@@ -768,7 +961,8 @@ mod tests {
             connections: Arc::new(AtomicU32::new(0)),
             next_id: Arc::new(AtomicU64::new(1)),
             shutdown,
-            clock: Arc::new(lotse_core::clock::FakeClock::default()),
+            limit_lines: Arc::new(LimitLines::new(clock.clone())),
+            clock,
             pairing: None,
             clients: None,
             serving: TaskTracker::new().token(),
@@ -837,6 +1031,101 @@ mod tests {
             answer(state(1, false)).await,
             (101, serde_json::Value::Null)
         );
+    }
+
+    /// The lines logged to `logs` so far that contain `message`.
+    fn logged(logs: &pairing::test_support::Captured, message: &str) -> Vec<String> {
+        logs.text()
+            .lines()
+            .filter(|line| line.contains(message))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A client can ask past `max_connections` again and again: each
+    /// upgrade is refused, logged as the first, then one summary per
+    /// interval on the clock with the count since the last line.
+    #[tokio::test]
+    async fn upgrades_past_the_connection_limit_are_logged_rate_limited() {
+        let (logs, _guard) = pairing::test_support::capture();
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let state = AppState {
+            clock: Arc::<lotse_core::clock::FakeClock>::clone(&clock),
+            limit_lines: Arc::new(LimitLines::new(clock.clone())),
+            ..state(0, false)
+        };
+        let refused = (503, ErrorCode::LimitReached.as_str().into());
+        assert_eq!(answer(state.clone()).await, refused);
+        assert_eq!(answer(state.clone()).await, refused);
+        let lines = logged(&logs, "control connection refused: limit reached");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("refused=1"), "{lines:?}");
+        clock.advance(lotse_core::throttle::SUMMARY_INTERVAL);
+        assert_eq!(answer(state).await, refused);
+        let lines = logged(&logs, "control connection refused: limit reached");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].ends_with("refused=2"), "{lines:?}");
+    }
+
+    /// Any client of either listener can connect past
+    /// [`MAX_PENDING_UPGRADES`] again and again: each is closed, logged as
+    /// the first, then one summary per interval with the count.
+    #[test]
+    fn connections_past_the_pending_upgrades_are_logged_rate_limited() {
+        let (logs, _guard) = pairing::test_support::capture();
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let limit_lines = LimitLines::new(clock.clone());
+        let full = Arc::new(Semaphore::new(0));
+        let peer = PeerInfo::Unix { uid: 0, pid: None };
+        assert!(upgrade_slot(&full, &peer, &limit_lines).is_none());
+        assert!(upgrade_slot(&full, &peer, &limit_lines).is_none());
+        let message = "too many connections awaiting the upgrade";
+        let lines = logged(&logs, message);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("refused=1"), "{lines:?}");
+        clock.advance(lotse_core::throttle::SUMMARY_INTERVAL);
+        assert!(upgrade_slot(&full, &peer, &limit_lines).is_none());
+        let lines = logged(&logs, message);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].ends_with("refused=2"), "{lines:?}");
+    }
+
+    /// Any client can connect and never send its upgrade, again and again:
+    /// each is closed at the deadline, logged as the first, then one
+    /// summary per interval with the count. The deadline is the interval
+    /// long, so the third connection's is a summary's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connections_past_the_upgrade_deadline_are_logged_rate_limited() {
+        let (logs, _guard) = pairing::test_support::capture();
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let (reader, _producer) = tokio::io::duplex(64);
+        let (_report, written) = tokio::sync::oneshot::channel::<u64>();
+        let recording = RecordingBody {
+            reader: Box::new(reader),
+            written,
+        };
+        let (admission, _pending) = admission(&clock, recording).await;
+        let silent = || {
+            let (client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client
+        };
+        let message = "control connection closed: no upgrade before the deadline";
+        let _first = (silent(), silent());
+        settle().await;
+        clock.advance(UPGRADE_TIMEOUT);
+        settle().await;
+        let lines = logged(&logs, message);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("closed=1"), "{lines:?}");
+        assert_eq!(UPGRADE_TIMEOUT, lotse_core::throttle::SUMMARY_INTERVAL);
+        let _third = silent();
+        settle().await;
+        clock.advance(UPGRADE_TIMEOUT);
+        settle().await;
+        let lines = logged(&logs, message);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].ends_with("closed=2"), "{lines:?}");
     }
 
     /// A handler with one recording, whatever its id, whose body it hands out
@@ -917,7 +1206,6 @@ mod tests {
         clock: &Arc<lotse_core::clock::FakeClock>,
         recording: RecordingBody,
     ) -> (Admission, Arc<Semaphore>) {
-        let state = state(1, false);
         let handler = OneRecording(std::sync::Mutex::new(Some(recording)));
         assert_eq!(handler.hello(), Minimal.hello());
         let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
@@ -925,6 +1213,16 @@ mod tests {
             handler.handle(ConnectionId(1), info).await,
             Outcome::Result(serde_json::Value::Null)
         ));
+        admission_with(clock, handler)
+    }
+
+    /// The admission both listeners use, for `handler`, on `clock`, and its
+    /// pending upgrades.
+    fn admission_with<H: Handler>(
+        clock: &Arc<lotse_core::clock::FakeClock>,
+        handler: H,
+    ) -> (Admission, Arc<Semaphore>) {
+        let state = state(1, false);
         let state = AppState {
             handler: Arc::new(handler),
             config: state.config,
@@ -932,6 +1230,7 @@ mod tests {
             next_id: state.next_id,
             shutdown: state.shutdown,
             clock: Arc::<lotse_core::clock::FakeClock>::clone(clock),
+            limit_lines: Arc::new(LimitLines::new(clock.clone())),
             pairing: None,
             clients: None,
             serving: state.serving,
@@ -952,6 +1251,319 @@ mod tests {
         let (client, server) = tokio::io::duplex(SOCKET_BYTES);
         admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
         (client, admission)
+    }
+
+    /// A handler with one live output, whatever its id, whose body it hands
+    /// out once; it answers commands as [`Minimal`] does.
+    struct OneLive(std::sync::Mutex<Option<LiveBody>>);
+
+    impl Handler for OneLive {
+        fn hello(&self) -> Hello {
+            Minimal.hello()
+        }
+
+        fn handle(
+            &self,
+            connection: ConnectionId,
+            command: Command,
+        ) -> impl Future<Output = Outcome> + Send {
+            Minimal.handle(connection, command)
+        }
+
+        fn live_body(&self, live_id: &LiveId) -> Result<LiveBody, LiveBodyError> {
+            let _ = live_id;
+            let body = self.0.lock().unwrap().take();
+            body.ok_or(LiveBodyError::AlreadyFetched)
+        }
+    }
+
+    /// A live output's body goes through the router as a chunked `200` of
+    /// its MIME type, ends with its last chunk once its producer ends, and
+    /// any other method is 405; the default handler has no live output.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rfc9112_7_1_a_live_body_is_routed_and_ends_with_its_last_chunk() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let (reader, mut producer) = tokio::io::duplex(64 * 1024);
+        let live = LiveBody {
+            reader: Box::new(reader),
+            mime: "video/mp4; codecs=\"avc1.42c028\"".into(),
+        };
+        let handler = OneLive(std::sync::Mutex::new(Some(live)));
+        assert_eq!(handler.hello(), Minimal.hello());
+        let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
+        assert!(matches!(
+            handler.handle(ConnectionId(1), info).await,
+            Outcome::Result(serde_json::Value::Null)
+        ));
+        let (admission, _pending) = admission_with(&clock, handler);
+        let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+        admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+        client
+            .write_all(b"GET /v0/live/01JL HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .await
+            .unwrap();
+        producer.write_all(b"ftyp-and-moov").await.unwrap();
+        settle().await;
+        drop(producer);
+        let seen = finish(&mut client).await;
+        let text = String::from_utf8_lossy(&seen);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(
+            text.contains("content-type: video/mp4; codecs=\"avc1.42c028\"\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("transfer-encoding: chunked\r\n"), "{text}");
+        assert!(text.contains("x-live-id: 01JL\r\n"), "{text}");
+        assert!(text.contains("ftyp-and-moov"), "{text}");
+        assert!(text.ends_with("0\r\n\r\n"), "the last chunk: {text}");
+
+        for (handler, request, status) in [
+            (
+                OneLive(std::sync::Mutex::new(None)),
+                &b"HEAD /v0/live/01JL HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "405",
+            ),
+            (
+                OneLive(std::sync::Mutex::new(None)),
+                &b"GET /v0/live/01JL HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "409",
+            ),
+        ] {
+            let (admission, _pending) = admission_with(&clock, handler);
+            let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client.write_all(request).await.unwrap();
+            let head = String::from_utf8_lossy(&take(&mut client, 12).await).into_owned();
+            assert_eq!(head, format!("HTTP/1.1 {status}"));
+        }
+        let (admission, _pending) = admission_with(&clock, Minimal);
+        let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+        admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+        client
+            .write_all(b"GET /v0/live/01JL HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .await
+            .unwrap();
+        let head = String::from_utf8_lossy(&take(&mut client, 12).await).into_owned();
+        assert_eq!(head, "HTTP/1.1 404", "no live output without a handler's");
+    }
+
+    /// A handler with LL-HLS sessions of any id whose answers wait until
+    /// `release` is notified: a playlist, an init segment, else not found;
+    /// a part is not found at once, before the handler takes any place.
+    struct HeldHls {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Handler for HeldHls {
+        fn hello(&self) -> Hello {
+            Minimal.hello()
+        }
+
+        fn handle(
+            &self,
+            connection: ConnectionId,
+            command: Command,
+        ) -> impl Future<Output = Outcome> + Send {
+            Minimal.handle(connection, command)
+        }
+
+        fn hls(
+            &self,
+            hls_id: &HlsId,
+            request: HlsRequest,
+        ) -> impl Future<Output = HlsAnswer> + Send {
+            let release = Arc::clone(&self.release);
+            let id = hls_id.clone();
+            async move {
+                if let HlsRequest::Media(lotse_hls::Resource::Part { .. }) = request {
+                    return Err((HlsError::ResourceNotFound, InFlight::default()));
+                }
+                release.notified().await;
+                let reply = match request {
+                    HlsRequest::Playlist(_) => HlsReply::Playlist(format!("#EXTM3U\n#{id}\n")),
+                    HlsRequest::Media(lotse_hls::Resource::Init) => HlsReply::Media(
+                        lotse_hls::Chunks::from(axum::body::Bytes::from_static(b"init")),
+                    ),
+                    HlsRequest::Media(_) => {
+                        return Err((HlsError::ResourceNotFound, InFlight::default()));
+                    }
+                };
+                Ok((reply, InFlight::default()))
+            }
+        }
+    }
+
+    /// An LL-HLS request goes through the router to the handler, leaves the
+    /// pending upgrades while the handler holds it (a blocked request is no
+    /// upgrade), and is answered with its length on a closing connection;
+    /// any other method is 405, and the default handler has no session.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rfc8216bis_6_2_5_2_an_hls_request_held_by_its_handler_leaves_the_pending_upgrades() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = HeldHls {
+            release: Arc::clone(&release),
+        };
+        assert_eq!(handler.hello(), Minimal.hello());
+        let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
+        assert!(matches!(
+            handler.handle(ConnectionId(1), info).await,
+            Outcome::Result(serde_json::Value::Null)
+        ));
+        let (admission, pending) = admission_with(&clock, handler);
+        for (request, expected) in [
+            (
+                &b"GET /v0/hls/01JH/index.m3u8?_HLS_msn=3 HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "content-type: application/vnd.apple.mpegurl\r\n",
+            ),
+            (
+                &b"GET /v0/hls/01JH/init.mp4 HTTP/1.0\r\n\r\n"[..],
+                "content-length: 4\r\n",
+            ),
+            (
+                &b"GET /v0/hls/01JH/seg9.m4s HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "hls_resource_not_found",
+            ),
+        ] {
+            let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client.write_all(request).await.unwrap();
+            settle().await;
+            assert_eq!(
+                pending.available_permits(),
+                usize::from(MAX_PENDING_UPGRADES),
+                "a held request holds no pending upgrade"
+            );
+            clock.advance(UPGRADE_TIMEOUT);
+            settle().await;
+            release.notify_one();
+            let seen = finish(&mut client).await;
+            let text = String::from_utf8_lossy(&seen);
+            assert!(text.contains("connection: close\r\n"), "{text}");
+            assert!(text.contains(expected), "{text}");
+        }
+        for (request, status) in [
+            (
+                &b"HEAD /v0/hls/01JH/index.m3u8 HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "405",
+            ),
+            // Refused by the route before the handler is asked, which would
+            // hold it: the name is no resource's.
+            (
+                &b"GET /v0/hls/01JH/nothing HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "404",
+            ),
+            // Refused by the handler at once, holding no place: answered
+            // as a pending upgrade, never held.
+            (
+                &b"GET /v0/hls/01JH/part0.1.m4s HTTP/1.1\r\nHost: lotse\r\n\r\n"[..],
+                "404",
+            ),
+        ] {
+            let (admission, _pending) = admission_with(
+                &clock,
+                HeldHls {
+                    release: Arc::new(tokio::sync::Notify::new()),
+                },
+            );
+            let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client.write_all(request).await.unwrap();
+            let head = String::from_utf8_lossy(&take(&mut client, 12).await).into_owned();
+            assert_eq!(head, format!("HTTP/1.1 {status}"));
+        }
+        let (admission, _pending) = admission_with(&clock, Minimal);
+        let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+        admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+        client
+            .write_all(b"GET /v0/hls/01JH/index.m3u8 HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .await
+            .unwrap();
+        let seen = finish(&mut client).await;
+        let text = String::from_utf8_lossy(&seen);
+        assert!(text.starts_with("HTTP/1.1 404"), "{text}");
+        assert!(text.contains("hls_not_found"), "{text}");
+    }
+
+    /// A handler with LL-HLS sessions of any id that answers every request
+    /// with `bytes` of media, at once, holding one of `places`.
+    struct BigHls {
+        places: Arc<Semaphore>,
+        bytes: usize,
+    }
+
+    impl Handler for BigHls {
+        fn hello(&self) -> Hello {
+            Minimal.hello()
+        }
+
+        fn handle(
+            &self,
+            connection: ConnectionId,
+            command: Command,
+        ) -> impl Future<Output = Outcome> + Send {
+            Minimal.handle(connection, command)
+        }
+
+        fn hls(
+            &self,
+            _hls_id: &HlsId,
+            _request: HlsRequest,
+        ) -> impl Future<Output = HlsAnswer> + Send {
+            let permit = Arc::clone(&self.places).try_acquire_owned().unwrap();
+            let media = axum::body::Bytes::from(vec![7_u8; self.bytes]);
+            let reply = HlsReply::Media(lotse_hls::Chunks::from(media));
+            std::future::ready(Ok((reply, InFlight::new(vec![permit]))))
+        }
+    }
+
+    /// An LL-HLS response holds the handler's place among the requests in
+    /// flight while its client takes it, past the handler's answer, and
+    /// gives it back once the client took it all, or once the client went
+    /// before it did.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_hls_response_holds_its_place_in_flight_until_it_is_sent_or_its_client_goes() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let places = Arc::new(Semaphore::new(1));
+        let handler = BigHls {
+            places: Arc::clone(&places),
+            bytes: 64 * 1024,
+        };
+        assert_eq!(handler.hello(), Minimal.hello());
+        let info = lotse_api_types::parse_command(r#"{"id":1,"type":"info"}"#).unwrap();
+        assert!(matches!(
+            handler.handle(ConnectionId(1), info).await,
+            Outcome::Result(serde_json::Value::Null)
+        ));
+        let (admission, _pending) = admission_with(&clock, handler);
+        let request = b"GET /v0/hls/01JH/seg0.m4s HTTP/1.1\r\nHost: lotse\r\n\r\n";
+        for client_goes in [false, true] {
+            let (mut client, server) = tokio::io::duplex(SOCKET_BYTES);
+            admission.admit(server, PeerInfo::Unix { uid: 0, pid: None });
+            client.write_all(request).await.unwrap();
+            let head = String::from_utf8_lossy(&take(&mut client, 12).await).into_owned();
+            assert_eq!(head, "HTTP/1.1 200");
+            settle().await;
+            assert_eq!(places.available_permits(), 0, "64 KiB do not fit the pipe");
+            if client_goes {
+                drop(client);
+            } else {
+                let rest = finish(&mut client).await;
+                assert!(rest.ends_with(&[7_u8; 1024]), "the body to its end");
+            }
+            let mut tries = 0;
+            while places.available_permits() == 0 {
+                tries += 1;
+                assert!(tries < 100, "the place is given back");
+                settle().await;
+            }
+        }
     }
 
     /// The socket here is a pipe the client empties 4 KiB a second, so the
@@ -1229,6 +1841,62 @@ mod tests {
             bytes.len(),
             "every byte of the recording"
         );
+        drop(admission);
+    }
+
+    /// Over TLS, hyper hands a response that fits the session's buffer to
+    /// the session at once and ends its body, while the socket has taken
+    /// only 4 KiB of it: the connection, flushing, still holds the
+    /// response's place among the requests in flight, and gives it back once
+    /// the client took the rest and the connection ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tls_hls_response_holds_its_place_in_flight_while_the_session_flushes_it() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let clock = Arc::new(lotse_core::clock::FakeClock::default());
+        let places = Arc::new(Semaphore::new(1));
+        let handler = BigHls {
+            places: Arc::clone(&places),
+            bytes: 16 * 1024,
+        };
+        let (admission, pending) = admission_with(&clock, handler);
+        let (acceptor, config) = tls_pair();
+        let (client, server) = tokio::io::duplex(SOCKET_BYTES);
+        let body = recording::BodyWatch::new();
+        let server = recording::Watched::new(
+            Box::new(server),
+            body.clone(),
+            Arc::<lotse_core::clock::FakeClock>::clone(&clock),
+        );
+        let name = rustls::pki_types::ServerName::try_from("lotse").unwrap();
+        let (session, client) = tokio::join!(
+            acceptor.accept(server),
+            tokio_rustls::TlsConnector::from(config).connect(name, client)
+        );
+        admission.serve(
+            session.unwrap(),
+            body,
+            PeerInfo::Unix { uid: 0, pid: None },
+            Arc::clone(&pending).try_acquire_owned().unwrap(),
+            clock.sleep(UPGRADE_TIMEOUT),
+        );
+        let mut client = client.unwrap();
+        client
+            .write_all(b"GET /v0/hls/01JH/seg0.m4s HTTP/1.1\r\nHost: lotse\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let (mut socket, mut session) = client.into_inner();
+        for _ in 0..8 {
+            settle().await;
+        }
+        assert_eq!(places.available_permits(), 0, "the session still flushes");
+        let cipher = finish(&mut socket).await;
+        let (plain, closed) = decrypt(&mut session, &cipher);
+        assert!(closed, "the session ends with close_notify");
+        assert!(plain.ends_with(&[7_u8; 16 * 1024]), "the whole response");
+        settle().await;
+        assert_eq!(places.available_permits(), 1, "the connection ended");
         drop(admission);
     }
 }

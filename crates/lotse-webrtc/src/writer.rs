@@ -671,6 +671,10 @@ mod tests {
         assert!(ts_after(0, u32::MAX));
         assert!(!ts_after(0, 0));
         assert!(!ts_after(0, 1));
+        // Half the clock apart, neither is after the other (RFC 1982 §3.2:
+        // the comparison is undefined there).
+        assert!(!ts_after(1 << 31, 0));
+        assert!(!ts_after(0, 1 << 31));
     }
 
     /// An engine with a send stream on mid `v` (video) and on `a`
@@ -708,6 +712,34 @@ mod tests {
             lateness: Duration::ZERO,
             payload: Arc::from(&[0x65_u8, 0x88][..]),
         }
+    }
+
+    #[test]
+    fn a_video_packet_exactly_max_packet_age_old_is_still_sent() {
+        let now = SystemClock.now();
+        let mut rtc = engine(now);
+        let limits = SessionLimits::default();
+        let mut packet = keyframe_start(now);
+        packet.arrival = now.checked_sub(limits.max_packet_age).unwrap();
+        let mut video = VideoWriter::new(
+            Pt::from(96),
+            Mid::from("v"),
+            lotse_codec::h264::packetize,
+            limits,
+            false,
+            None,
+        );
+        assert!(!video.write(&mut rtc, now, &packet, now));
+        assert_eq!((video.stats.packets, video.stats.dropped_old), (1, 0));
+        // A moment older is dropped.
+        let later = now + Duration::from_millis(1);
+        let mut next = keyframe_start(now);
+        next.rtp.seq = 2;
+        next.arrival = later
+            .checked_sub(limits.max_packet_age + Duration::from_millis(1))
+            .unwrap();
+        video.write(&mut rtc, later, &next, later);
+        assert_eq!(video.stats.dropped_old, 1);
     }
 
     #[test]

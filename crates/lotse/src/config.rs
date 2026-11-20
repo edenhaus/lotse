@@ -9,7 +9,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -19,7 +19,8 @@ use clap::parser::ValueSource;
 use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::{Mode, SandboxConfig};
 use lotse_supervisor::{
-    ControlTls, DEFAULT_CONNECT_CONCURRENCY, Limits, RecordingLimits, SHUTDOWN_BUDGET,
+    AdvertisedAddress, ControlTls, DEFAULT_CONNECT_CONCURRENCY, HlsLimits, Limits, LiveLimits,
+    MAX_ADVERTISED, RecordingLimits, SHUTDOWN_BUDGET,
 };
 use serde::Deserialize;
 
@@ -123,7 +124,7 @@ impl fmt::Display for TcpListen {
 
 /// Why a string is not a [`TcpListen`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("tcp listen must be `off` or an address like `[::]:18556`, not {0:?}")]
+#[error("tcp listen must be `off` or an address like `[::]:30415`, not {0:?}")]
 pub(crate) struct ParseTcpListenError(String);
 
 impl FromStr for TcpListen {
@@ -143,6 +144,48 @@ impl<'de> Deserialize<'de> for TcpListen {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// An entry of `webrtc.advertise` in the file, a string parsed as the
+/// flag's entries are.
+#[derive(Debug)]
+struct FileAdvertised(AdvertisedAddress);
+
+impl<'de> Deserialize<'de> for FileAdvertised {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map(Self).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `webrtc.advertise`, each address once, in the order first given;
+/// printed comma-separated for the provenance log.
+#[derive(Debug, Default)]
+struct Advertised(Vec<AdvertisedAddress>);
+
+impl Advertised {
+    /// `addresses` without the repeats.
+    fn new(addresses: impl IntoIterator<Item = AdvertisedAddress>) -> Self {
+        let mut unique = Vec::new();
+        for address in addresses {
+            if !unique.contains(&address) {
+                unique.push(address);
+            }
+        }
+        Self(unique)
+    }
+}
+
+impl fmt::Display for Advertised {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, address) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{address}")?;
+        }
+        Ok(())
     }
 }
 
@@ -234,6 +277,9 @@ pub(crate) enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// More advertised addresses than a session's candidates take.
+    #[error("webrtc.advertise takes at most {max} addresses, not {0}", max = MAX_ADVERTISED)]
+    TooManyAdvertised(usize),
     /// The config file is not valid.
     #[error("config file {path}: {source}")]
     Parse {
@@ -262,6 +308,9 @@ struct FileConfig {
     /// `[control]`.
     #[serde(default)]
     control: ControlFile,
+    /// `[metrics]`.
+    #[serde(default)]
+    metrics: MetricsFile,
     /// `sandbox`.
     sandbox: Option<Mode>,
     /// `[webrtc]`.
@@ -291,6 +340,14 @@ struct ControlFile {
     clients: Option<Vec<Fingerprint>>,
 }
 
+/// `[metrics]` in the file.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsFile {
+    /// `metrics.clients`.
+    clients: Option<Vec<Fingerprint>>,
+}
+
 /// `[webrtc]` in the file.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,6 +356,8 @@ struct WebrtcFile {
     udp_listen: Option<SocketAddr>,
     /// `webrtc.tcp_listen`.
     tcp_listen: Option<TcpListen>,
+    /// `webrtc.advertise`.
+    advertise: Option<Vec<FileAdvertised>>,
 }
 
 /// `[limits]` in the file.
@@ -333,6 +392,38 @@ struct LimitsFile {
     max_recordings: Option<u32>,
     /// `limits.max_recordings_per_stream`.
     max_recordings_per_stream: Option<u32>,
+    /// `limits.live_buffer_bytes`.
+    live_buffer_bytes: Option<u32>,
+    /// `limits.live_fetch_timeout_ms`.
+    live_fetch_timeout_ms: Option<u64>,
+    /// `limits.live_start_timeout_ms`.
+    live_start_timeout_ms: Option<u64>,
+    /// `limits.max_live`.
+    max_live: Option<u32>,
+    /// `limits.max_live_per_stream`.
+    max_live_per_stream: Option<u32>,
+    /// `limits.max_hls_outputs`.
+    max_hls_outputs: Option<u32>,
+    /// `limits.max_hls_sessions`.
+    max_hls_sessions: Option<u32>,
+    /// `limits.max_hls_sessions_per_stream`.
+    max_hls_sessions_per_stream: Option<u32>,
+    /// `limits.hls_window_bytes`; zero is refused.
+    hls_window_bytes: Option<NonZeroU32>,
+    /// `limits.hls_part_target_ms`; zero is refused.
+    hls_part_target_ms: Option<NonZeroU64>,
+    /// `limits.hls_segment_target_ms`.
+    hls_segment_target_ms: Option<u64>,
+    /// `limits.hls_idle_timeout_ms`; zero is refused.
+    hls_idle_timeout_ms: Option<NonZeroU64>,
+    /// `limits.max_hls_blocked_per_session`.
+    max_hls_blocked_per_session: Option<u32>,
+    /// `limits.max_hls_blocked`.
+    max_hls_blocked: Option<u32>,
+    /// `limits.max_hls_requests_per_session`.
+    max_hls_requests_per_session: Option<u32>,
+    /// `limits.max_hls_requests`.
+    max_hls_requests: Option<u32>,
 }
 
 /// `[stream]` in the file.
@@ -498,10 +589,156 @@ impl Resolver<'_> {
                 lotse_sandbox::DEFAULT_WORKER_ADDRESS_SPACE,
             ),
             recordings: RecordingLimits::NONE,
+            live: LiveLimits::NONE,
+            hls: None,
         };
+        let hls = self.hls_limits(args, file);
         Limits {
             recordings: self.recording_limits(args, file, limits.worker_address_space),
+            live: self.live_limits(args, file),
+            // Resolved, and so reported, in every build; held only in one
+            // with LL-HLS.
+            hls: cfg!(feature = "output-hls").then_some(hls),
             ..limits
+        }
+    }
+
+    /// The LL-HLS limits of the `[limits]` group, defaults
+    /// [`HlsLimits::DEFAULT`]; the supervisor holds them when the build has
+    /// LL-HLS and a live container.
+    fn hls_limits(&mut self, args: &ServeArgs, file: &LimitsFile) -> HlsLimits {
+        let default = HlsLimits::DEFAULT;
+        let nonzero = |value: u64| NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN);
+        HlsLimits {
+            max_outputs: self.pick(
+                "limits.max_hls_outputs",
+                "max_hls_outputs",
+                args.max_hls_outputs,
+                file.max_hls_outputs,
+                default.max_outputs,
+            ),
+            max_sessions: self.pick(
+                "limits.max_hls_sessions",
+                "max_hls_sessions",
+                args.max_hls_sessions,
+                file.max_hls_sessions,
+                default.max_sessions,
+            ),
+            max_sessions_per_stream: self.pick(
+                "limits.max_hls_sessions_per_stream",
+                "max_hls_sessions_per_stream",
+                args.max_hls_sessions_per_stream,
+                file.max_hls_sessions_per_stream,
+                default.max_sessions_per_stream,
+            ),
+            window_bytes: self
+                .pick(
+                    "limits.hls_window_bytes",
+                    "hls_window_bytes",
+                    args.hls_window_bytes,
+                    file.hls_window_bytes,
+                    NonZeroU32::new(default.window_bytes).unwrap_or(NonZeroU32::MIN),
+                )
+                .get(),
+            part_target: Duration::from_millis(
+                self.pick(
+                    "limits.hls_part_target_ms",
+                    "hls_part_target_ms",
+                    args.hls_part_target_ms,
+                    file.hls_part_target_ms,
+                    nonzero(millis(default.part_target)),
+                )
+                .get(),
+            ),
+            segment_target: Duration::from_millis(self.pick(
+                "limits.hls_segment_target_ms",
+                "hls_segment_target_ms",
+                args.hls_segment_target_ms,
+                file.hls_segment_target_ms,
+                millis(default.segment_target),
+            )),
+            idle_timeout: Duration::from_millis(
+                self.pick(
+                    "limits.hls_idle_timeout_ms",
+                    "hls_idle_timeout_ms",
+                    args.hls_idle_timeout_ms,
+                    file.hls_idle_timeout_ms,
+                    nonzero(millis(default.idle_timeout)),
+                )
+                .get(),
+            ),
+            max_blocked_per_session: self.pick(
+                "limits.max_hls_blocked_per_session",
+                "max_hls_blocked_per_session",
+                args.max_hls_blocked_per_session,
+                file.max_hls_blocked_per_session,
+                default.max_blocked_per_session,
+            ),
+            max_blocked: self.pick(
+                "limits.max_hls_blocked",
+                "max_hls_blocked",
+                args.max_hls_blocked,
+                file.max_hls_blocked,
+                default.max_blocked,
+            ),
+            max_requests_per_session: self.pick(
+                "limits.max_hls_requests_per_session",
+                "max_hls_requests_per_session",
+                args.max_hls_requests_per_session,
+                file.max_hls_requests_per_session,
+                default.max_requests_per_session,
+            ),
+            max_requests: self.pick(
+                "limits.max_hls_requests",
+                "max_hls_requests",
+                args.max_hls_requests,
+                file.max_hls_requests,
+                default.max_requests,
+            ),
+        }
+    }
+
+    /// The live output limits of the `[limits]` group, defaults
+    /// [`LiveLimits::DEFAULT`]; the supervisor holds them when the build has
+    /// a live container, and passes the worker's share to every worker.
+    fn live_limits(&mut self, args: &ServeArgs, file: &LimitsFile) -> LiveLimits {
+        let default = LiveLimits::DEFAULT;
+        LiveLimits {
+            buffer_bytes: self.pick(
+                "limits.live_buffer_bytes",
+                "live_buffer_bytes",
+                args.live_buffer_bytes,
+                file.live_buffer_bytes,
+                default.buffer_bytes,
+            ),
+            fetch_timeout: Duration::from_millis(self.pick(
+                "limits.live_fetch_timeout_ms",
+                "live_fetch_timeout_ms",
+                args.live_fetch_timeout_ms,
+                file.live_fetch_timeout_ms,
+                millis(default.fetch_timeout),
+            )),
+            start_timeout: Duration::from_millis(self.pick(
+                "limits.live_start_timeout_ms",
+                "live_start_timeout_ms",
+                args.live_start_timeout_ms,
+                file.live_start_timeout_ms,
+                millis(default.start_timeout),
+            )),
+            max_live: self.pick(
+                "limits.max_live",
+                "max_live",
+                args.max_live,
+                file.max_live,
+                default.max_live,
+            ),
+            max_live_per_stream: self.pick(
+                "limits.max_live_per_stream",
+                "max_live_per_stream",
+                args.max_live_per_stream,
+                file.max_live_per_stream,
+                default.max_live_per_stream,
+            ),
         }
     }
 
@@ -571,8 +808,8 @@ impl Resolver<'_> {
         }
     }
 
-    /// The control TLS listener, from `control.listen`, `control.clients`
-    /// and `data_dir`: none without a listen address, and an error without
+    /// The control TLS listener, from `control.listen`, `control.clients`,
+    /// `metrics.clients` and `data_dir`: none without a listen address, and an error without
     /// a data directory for its identity. No `control.clients` is no
     /// error: the listener then admits the clients enrolled by pairing,
     /// and until there is one, only a client that pairs.
@@ -581,6 +818,7 @@ impl Resolver<'_> {
         args: &ServeArgs,
         data_dir: Option<PathBuf>,
         file: ControlFile,
+        metrics: MetricsFile,
         state_owner: (u32, u32),
     ) -> Result<Option<ControlTls>, ConfigError> {
         let data_dir = self.pick_required(
@@ -604,12 +842,40 @@ impl Resolver<'_> {
             file.clients.map(Pins),
             Pins(Vec::new()),
         );
+        let metrics_clients = self.pick(
+            "metrics.clients",
+            "metrics_clients",
+            args.metrics_clients.clone().map(Pins),
+            metrics.clients.map(Pins),
+            Pins(Vec::new()),
+        );
         Ok(Some(ControlTls {
             listen,
             clients: clients.0,
+            metrics_clients: metrics_clients.0,
             data_dir: data_dir.ok_or(ConfigError::MissingDataDir)?.0,
             state_owner,
         }))
+    }
+
+    /// `webrtc.advertise`, each address once; more than
+    /// [`MAX_ADVERTISED`] is an error.
+    fn advertise(
+        &mut self,
+        args: &ServeArgs,
+        file: Option<Vec<FileAdvertised>>,
+    ) -> Result<Vec<AdvertisedAddress>, ConfigError> {
+        let Advertised(advertise) = self.pick(
+            "webrtc.advertise",
+            "webrtc_advertise",
+            args.webrtc_advertise.clone().map(Advertised::new),
+            file.map(|list| Advertised::new(list.into_iter().map(|entry| entry.0))),
+            Advertised::default(),
+        );
+        if advertise.len() > MAX_ADVERTISED {
+            return Err(ConfigError::TooManyAdvertised(advertise.len()));
+        }
+        Ok(advertise)
     }
 
     /// The `[log]` group. A valid `RUST_LOG` beats every other source of
@@ -728,8 +994,8 @@ pub(crate) fn load(
     );
     let own_gid = rustix::process::getgid().as_raw();
     let state_owner = state_owner(starting_uid, (uid, gid), own_gid);
-    let control_tls = r.control(args, file.data_dir, file.control, state_owner)?;
-    let mode = r.pick("sandbox", "sandbox", args.sandbox, file.sandbox, Mode::On);
+    let control_tls = r.control(args, file.data_dir, file.control, file.metrics, state_owner)?;
+    let mode = r.pick("sandbox", "sandbox", args.sandbox, file.sandbox, SANDBOX);
     let udp_listen = r.pick(
         "webrtc.udp_listen",
         "webrtc_udp_listen",
@@ -744,6 +1010,7 @@ pub(crate) fn load(
         file.webrtc.tcp_listen,
         TcpListen::On(DEFAULT_LISTEN),
     );
+    let advertise = r.advertise(args, file.webrtc.advertise)?;
     let limits = r.limits(args, &file.limits);
     let linger = Duration::from_millis(r.pick(
         "stream.linger_ms",
@@ -771,11 +1038,12 @@ pub(crate) fn load(
         log,
         supervisor: lotse_supervisor::Settings {
             socket,
-            owner_uid: starting_uid,
+            owners: lotse_supervisor::Owners::new(starting_uid, uid),
             allow_uid,
             control_tls,
             udp_listen,
             tcp_listen: tcp_listen.address(),
+            advertise,
             limits,
             linger,
             connect_concurrency,
@@ -786,7 +1054,10 @@ pub(crate) fn load(
 }
 
 /// Who owns what the daemon writes at runtime: the ids it drops to
-/// (`drop_to`) when started as root, else its own.
+/// (`drop_to`) when started as root, else its own. Its uid is always one
+/// the directories checked before the drop may belong to
+/// ([`lotse_supervisor::Owners`]), and a start that is not root makes
+/// what it writes its own, which needs no capability.
 const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u32, u32) {
     if starting_uid == 0 {
         drop_to
@@ -795,12 +1066,18 @@ const fn state_owner(starting_uid: u32, drop_to: (u32, u32), own_gid: u32) -> (u
     }
 }
 
+/// The default of `sandbox`: the sandbox crate's, `require`, so a host
+/// without every layer refuses to start unless `on` is chosen.
+const SANDBOX: Mode = Mode::Require;
+
 /// The default of `webrtc.udp_listen` and `webrtc.tcp_listen`: dual-stack,
-/// port 18556, so the daemon can run beside another WebRTC server that
-/// holds 18555 on the same host.
+/// port 30415. IANA has not assigned it (30401–30831 are unassigned), it
+/// needs no privilege (above 1023), and it is below Linux's ephemeral range
+/// (32768–60999, `net.ipv4.ip_local_port_range`'s default), so no outgoing
+/// connection holds it when the daemon binds.
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(
     std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-    18_556,
+    30_415,
 );
 
 /// Logs every effective setting with its source, at startup, and a
@@ -853,14 +1130,6 @@ mod tests {
         let (settings, provenance) =
             resolve(&["lotse", "serve", "--socket", "/run/z.sock"]).unwrap();
         assert_eq!(settings.supervisor.socket, PathBuf::from("/run/z.sock"));
-        assert_eq!(
-            settings.supervisor.udp_listen,
-            "[::]:18556".parse().unwrap()
-        );
-        assert_eq!(
-            settings.supervisor.tcp_listen,
-            Some("[::]:18556".parse().unwrap())
-        );
         assert_eq!(settings.supervisor.limits.max_connections, 8);
         assert_eq!(settings.supervisor.limits.max_streams, 256);
         assert_eq!(settings.supervisor.limits.max_sessions, 256);
@@ -880,7 +1149,12 @@ mod tests {
             settings.supervisor.allow_uid,
             rustix::process::getuid().as_raw()
         );
-        assert_eq!(settings.sandbox.mode, Mode::On);
+        assert_eq!(settings.sandbox.mode, Mode::Require);
+        assert_eq!(SANDBOX, Mode::default(), "the sandbox crate's default");
+        assert_eq!(
+            source_of(&provenance, "sandbox"),
+            ("require".into(), Source::Default)
+        );
         assert_eq!((settings.sandbox.uid, settings.sandbox.gid), (65534, 65534));
         assert_eq!(settings.log.format, LogFormat::Json);
         assert_eq!(settings.log.level, "info");
@@ -897,10 +1171,292 @@ mod tests {
             source_of(&provenance, "limits.max_streams"),
             ("256".into(), Source::Default)
         );
+    }
+
+    /// The `webrtc` rows of the table, apart so that neither test grows
+    /// past clippy's cognitive-complexity limit.
+    #[test]
+    fn webrtc_defaults_follow_the_documented_table() {
+        let (settings, provenance) =
+            resolve(&["lotse", "serve", "--socket", "/run/z.sock"]).unwrap();
+        assert_eq!(
+            settings.supervisor.udp_listen,
+            "[::]:30415".parse().unwrap()
+        );
+        assert_eq!(
+            settings.supervisor.tcp_listen,
+            Some("[::]:30415".parse().unwrap())
+        );
         assert_eq!(
             source_of(&provenance, "webrtc.tcp_listen"),
-            ("[::]:18556".into(), Source::Default)
+            ("[::]:30415".into(), Source::Default)
         );
+        assert_eq!(settings.supervisor.advertise, []);
+        assert_eq!(
+            source_of(&provenance, "webrtc.advertise"),
+            (String::new(), Source::Default)
+        );
+    }
+
+    #[test]
+    fn advertised_addresses_come_once_each_from_flags_over_the_file_and_are_capped() {
+        let addrs = |list: &[&str]| -> Vec<AdvertisedAddress> {
+            list.iter().map(|text| text.parse().unwrap()).collect()
+        };
+        let (settings, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/s",
+            "--webrtc-advertise",
+            "203.0.113.7,[2001:db8::7]:40000,203.0.113.7",
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.supervisor.advertise,
+            addrs(&["203.0.113.7", "[2001:db8::7]:40000"])
+        );
+        assert_eq!(
+            source_of(&provenance, "webrtc.advertise"),
+            ("203.0.113.7,[2001:db8::7]:40000".into(), Source::Flag)
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("lotse-config-advertise-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lotse.toml");
+        std::fs::write(
+            &path,
+            "socket = \"/s\"\n[webrtc]\nadvertise = [\"198.51.100.1:18556\", \"198.51.100.1:18556\"]\n",
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+        let (settings, provenance) = resolve(&["lotse", "serve", "--config", config]).unwrap();
+        assert_eq!(
+            settings.supervisor.advertise,
+            addrs(&["198.51.100.1:18556"])
+        );
+        assert_eq!(
+            source_of(&provenance, "webrtc.advertise"),
+            ("198.51.100.1:18556".into(), Source::File)
+        );
+        let (flagged, _) = resolve(&[
+            "lotse",
+            "serve",
+            "--config",
+            config,
+            "--webrtc-advertise",
+            "192.0.2.9",
+        ])
+        .unwrap();
+        assert_eq!(flagged.supervisor.advertise, addrs(&["192.0.2.9"]));
+
+        // A file entry is checked as a flag's is.
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "[webrtc]\nadvertise = [\"cam.example\"]\n").unwrap();
+        let err = resolve(&["lotse", "serve", "--config", bad.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        assert!(
+            err.to_string().contains("hostnames are not resolved"),
+            "{err}"
+        );
+
+        // The cap counts each address once.
+        let nine: Vec<String> = (1..=9).map(|n| format!("192.0.2.{n}")).collect();
+        let err = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/s",
+            "--webrtc-advertise",
+            &nine.join(","),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::TooManyAdvertised(9)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "webrtc.advertise takes at most 8 addresses, not 9"
+        );
+        let repeated = format!("{},192.0.2.1", nine[..8].join(","));
+        let (settings, _) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/s",
+            "--webrtc-advertise",
+            &repeated,
+        ])
+        .unwrap();
+        assert_eq!(settings.supervisor.advertise.len(), MAX_ADVERTISED);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_live_limits_come_from_flags_over_the_file_over_the_defaults() {
+        let (settings, provenance) = resolve(&["lotse", "serve", "--socket", "/s"]).unwrap();
+        assert_eq!(settings.supervisor.limits.live, LiveLimits::DEFAULT);
+        assert_eq!(
+            source_of(&provenance, "limits.live_fetch_timeout_ms"),
+            ("10000".into(), Source::Default)
+        );
+        let dir = std::env::temp_dir().join(format!("lotse-config-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lotse.toml");
+        std::fs::write(
+            &path,
+            "socket = \"/s\"\n[limits]\nlive_buffer_bytes = 65536\nlive_fetch_timeout_ms = 3000\n\
+             live_start_timeout_ms = 4000\nmax_live = 5\nmax_live_per_stream = 2\n",
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+        let (settings, provenance) = resolve(&["lotse", "serve", "--config", config]).unwrap();
+        assert_eq!(
+            settings.supervisor.limits.live,
+            LiveLimits {
+                buffer_bytes: 1 << 16,
+                fetch_timeout: Duration::from_secs(3),
+                start_timeout: Duration::from_secs(4),
+                max_live: 5,
+                max_live_per_stream: 2,
+            }
+        );
+        for (name, value) in [
+            ("limits.live_buffer_bytes", "65536"),
+            ("limits.live_fetch_timeout_ms", "3000"),
+            ("limits.live_start_timeout_ms", "4000"),
+            ("limits.max_live", "5"),
+            ("limits.max_live_per_stream", "2"),
+        ] {
+            assert_eq!(
+                source_of(&provenance, name),
+                (value.into(), Source::File),
+                "{name}"
+            );
+        }
+        let (flagged, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--config",
+            config,
+            "--live-buffer-bytes",
+            "1024",
+            "--max-live-per-stream",
+            "1",
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                flagged.supervisor.limits.live.buffer_bytes,
+                flagged.supervisor.limits.live.max_live_per_stream,
+                flagged.supervisor.limits.live.max_live
+            ),
+            (1024, 1, 5)
+        );
+        assert_eq!(
+            source_of(&provenance, "limits.live_buffer_bytes"),
+            ("1024".into(), Source::Flag)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_hls_limits_come_from_flags_over_the_file_over_the_defaults() {
+        let (settings, provenance) = resolve(&["lotse", "serve", "--socket", "/s"]).unwrap();
+        assert_eq!(
+            settings.supervisor.limits.hls,
+            cfg!(feature = "output-hls").then_some(HlsLimits::DEFAULT)
+        );
+        assert_eq!(
+            source_of(&provenance, "limits.hls_idle_timeout_ms"),
+            ("30000".into(), Source::Default)
+        );
+        let dir = std::env::temp_dir().join(format!("lotse-config-hls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lotse.toml");
+        std::fs::write(
+            &path,
+            "socket = \"/s\"\n[limits]\nmax_hls_outputs = 2\nmax_hls_sessions = 6\n\
+             max_hls_sessions_per_stream = 3\nhls_window_bytes = 1048576\n\
+             hls_part_target_ms = 300\nhls_segment_target_ms = 2000\n\
+             hls_idle_timeout_ms = 5000\nmax_hls_blocked_per_session = 2\nmax_hls_blocked = 12\n\
+             max_hls_requests_per_session = 3\nmax_hls_requests = 20\n",
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+        let (settings, provenance) = resolve(&["lotse", "serve", "--config", config]).unwrap();
+        let expected = HlsLimits {
+            max_outputs: 2,
+            max_sessions: 6,
+            max_sessions_per_stream: 3,
+            window_bytes: 1 << 20,
+            part_target: Duration::from_millis(300),
+            segment_target: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(5),
+            max_blocked_per_session: 2,
+            max_blocked: 12,
+            max_requests_per_session: 3,
+            max_requests: 20,
+        };
+        assert_eq!(
+            settings.supervisor.limits.hls,
+            cfg!(feature = "output-hls").then_some(expected)
+        );
+        for (name, value) in [
+            ("limits.max_hls_outputs", "2"),
+            ("limits.max_hls_sessions", "6"),
+            ("limits.max_hls_sessions_per_stream", "3"),
+            ("limits.hls_window_bytes", "1048576"),
+            ("limits.hls_part_target_ms", "300"),
+            ("limits.hls_segment_target_ms", "2000"),
+            ("limits.hls_idle_timeout_ms", "5000"),
+            ("limits.max_hls_blocked_per_session", "2"),
+            ("limits.max_hls_blocked", "12"),
+            ("limits.max_hls_requests_per_session", "3"),
+            ("limits.max_hls_requests", "20"),
+        ] {
+            assert_eq!(
+                source_of(&provenance, name),
+                (value.into(), Source::File),
+                "{name}"
+            );
+        }
+        let (_flagged, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--config",
+            config,
+            "--hls-part-target-ms",
+            "100",
+            "--max-hls-blocked",
+            "1",
+            "--max-hls-requests",
+            "7",
+        ])
+        .unwrap();
+        for (name, value) in [
+            ("limits.hls_part_target_ms", "100"),
+            ("limits.max_hls_blocked", "1"),
+            ("limits.max_hls_requests", "7"),
+        ] {
+            assert_eq!(
+                source_of(&provenance, name),
+                (value.into(), Source::Flag),
+                "{name}"
+            );
+        }
+        for zero in [
+            "--hls-part-target-ms",
+            "--hls-window-bytes",
+            "--hls-idle-timeout-ms",
+        ] {
+            assert!(
+                Cli::command()
+                    .try_get_matches_from(["lotse", "serve", "--socket", "/s", zero, "0"])
+                    .is_err(),
+                "{zero} 0 is refused"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1076,6 +1632,34 @@ mod tests {
     fn runtime_state_belongs_to_the_ids_the_daemon_runs_as() {
         assert_eq!(state_owner(0, (65534, 65533), 0), (65534, 65533));
         assert_eq!(state_owner(1000, (65534, 65533), 100), (1000, 100));
+        // The directories checked before the drop may belong to them too.
+        for starting in [0, 1000] {
+            let owners = lotse_supervisor::Owners {
+                starting,
+                drop_to: 65534,
+            };
+            assert!(owners.accepts(state_owner(starting, (65534, 65533), 100).0));
+        }
+    }
+
+    #[test]
+    fn the_private_directories_may_belong_to_the_starting_uid_or_the_drop_target() {
+        let (settings, _) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/lotse/lotse.sock",
+            "--user",
+            "4242",
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.supervisor.owners,
+            lotse_supervisor::Owners {
+                starting: rustix::process::getuid().as_raw(),
+                drop_to: 4242,
+            }
+        );
     }
 
     #[test]
@@ -1101,10 +1685,55 @@ mod tests {
         let control = settings.supervisor.control_tls.unwrap();
         assert_eq!(control.listen, "[::]:18557".parse().unwrap());
         assert_eq!(control.clients, [Fingerprint::of(b"abc")]);
+        assert_eq!(control.metrics_clients, []);
         assert_eq!(
             source_of(&provenance, "control.clients"),
             (PIN_ABC_PAIRS.into(), Source::File)
         );
+        assert_eq!(
+            source_of(&provenance, "metrics.clients"),
+            (String::new(), Source::Default)
+        );
+
+        // `[metrics] clients` from the file, `--metrics-clients` over it.
+        std::fs::write(
+            &path,
+            format!("data_dir = \"/data\"\n[control]\nlisten = \"[::]:18557\"\n[metrics]\nclients = [\"{PIN_ABC}\"]\n"),
+        )
+        .unwrap();
+        let (settings, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/z.sock",
+            "--config",
+            config,
+        ])
+        .unwrap();
+        let control = settings.supervisor.control_tls.unwrap();
+        assert_eq!(control.metrics_clients, [Fingerprint::of(b"abc")]);
+        assert_eq!(control.clients, []);
+        assert_eq!(
+            source_of(&provenance, "metrics.clients"),
+            (PIN_ABC_PAIRS.into(), Source::File)
+        );
+        let other = Fingerprint::of(b"other");
+        let (settings, provenance) = resolve(&[
+            "lotse",
+            "serve",
+            "--socket",
+            "/run/z.sock",
+            "--config",
+            config,
+            "--metrics-clients",
+            &format!("{PIN_ABC},{}", other.to_hex()),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.supervisor.control_tls.unwrap().metrics_clients,
+            [Fingerprint::of(b"abc"), other]
+        );
+        assert_eq!(source_of(&provenance, "metrics.clients").1, Source::Flag);
 
         // Without pins the listener is configured, and refused when it binds.
         let (settings, _) = resolve(&[
@@ -1118,7 +1747,7 @@ mod tests {
             "/data",
         ])
         .unwrap();
-        assert!(settings.supervisor.control_tls.unwrap().clients.is_empty());
+        assert_eq!(settings.supervisor.control_tls.unwrap().clients, []);
 
         let err = resolve(&[
             "lotse",

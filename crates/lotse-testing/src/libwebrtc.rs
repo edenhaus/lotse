@@ -916,7 +916,7 @@ mod tests {
         let mut rx = H265Receiver::new();
         // A delta frame before any VPS starts nothing.
         rx.insert(9, 0, true, &trail());
-        assert!(rx.frames().is_empty());
+        assert_eq!(rx.frames(), []);
         rx.insert(10, 100, false, &sets());
         rx.insert(11, 100, false, &fu(true, 19));
         rx.insert(12, 100, true, &fu(false, 19));
@@ -966,7 +966,7 @@ mod tests {
         for seq in 1..=BUFFER_SIZE {
             rx.insert(u16::try_from(seq).unwrap(), 100, seq == BUFFER_SIZE, &idr());
         }
-        assert!(rx.frames().is_empty());
+        assert_eq!(rx.frames(), []);
     }
 
     #[test]

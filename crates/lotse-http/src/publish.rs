@@ -880,7 +880,7 @@ mod tests {
         assert_video_packets(&packets(&mut video_packets), &video);
         assert_audio_frames(&frames(&mut audio_frames));
         assert_eq!(tracks[0].epoch(), 0, "no epoch on a steady program");
-        assert!(logs.lines("new epoch").is_empty());
+        assert_eq!(logs.lines("new epoch"), Vec::<String>::new());
     }
 
     #[test]
@@ -1240,7 +1240,7 @@ mod tests {
             None
         );
         assert_eq!(frames(&mut audio_frames).len(), 1);
-        assert!(frames(&mut video_frames).is_empty());
+        assert_eq!(frames(&mut video_frames), []);
         assert_eq!(
             f.publisher.due(
                 &Unit {

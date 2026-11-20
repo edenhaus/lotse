@@ -1309,6 +1309,38 @@ mod tests {
     }
 
     #[test]
+    fn stop_returns_once_the_receive_thread_has_ended() {
+        let bound = super::super::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let socket = Arc::downgrade(&bound.socket);
+        let demux = Demux::start(
+            bound.socket,
+            bound.local,
+            bound.hosts,
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        assert!(socket.upgrade().is_some(), "the thread holds the socket");
+        demux.stop();
+        assert!(socket.upgrade().is_none(), "the thread ended with it");
+    }
+
+    #[test]
+    fn a_dropped_demux_stops_its_receive_thread() {
+        let bound = super::super::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let socket = Arc::downgrade(&bound.socket);
+        let demux = Demux::start(
+            bound.socket,
+            bound.local,
+            bound.hosts,
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        drop(demux);
+        // Within a receive timeout, the thread sees the stop and ends.
+        assert!(wait_for(|| socket.upgrade().is_none()));
+    }
+
+    #[test]
     fn an_ipv4_peer_of_a_dual_stack_socket_is_forwarded_as_ipv4() {
         let bound = bind_dual_stack();
         let port = bound.local.port();
@@ -1506,6 +1538,7 @@ mod tests {
         let sink = Arc::new(MemorySink::default());
         let registrations = demux.registrations();
         registrations.register("abcd", b"the-password".to_vec(), sink.clone());
+        assert!(!registrations.is_empty());
         assert_eq!(registrations.len(), 1);
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         let stats = demux.stats();

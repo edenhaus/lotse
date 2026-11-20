@@ -8,7 +8,12 @@
 //! viewer from the warm GOP cache without a new camera connection, and the
 //! linger keeps the connection for a viewer that comes back. A viewer the
 //! daemon reaches only through a TURN relay plays through the fake TURN
-//! server's loopback relay, allocated over UDP and over TCP.
+//! server's loopback relay, allocated over UDP and over TCP; a `turns:`
+//! server whose certificate is not trusted is never sent the credential.
+//! With an address
+//! advertised (`webrtc.advertise`), a viewer told no host candidate plays
+//! through a loopback port forward playing the NAT in front of the daemon,
+//! over UDP and over passive ICE-TCP.
 //! Needs the `source-rtsp` and `output-webrtc` features (the defaults).
 
 #![cfg(all(feature = "source-rtsp", feature = "output-webrtc"))]
@@ -26,6 +31,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lotse_api_types::command::parse_command;
@@ -42,13 +48,15 @@ use lotse_supervisor::net::tcp::{IceTcpConfig, IceTcpStats, accept_loop};
 use lotse_supervisor::net::turn_client::TurnClient;
 use lotse_supervisor::net::udp::{bind_tcp, bind_udp};
 use lotse_supervisor::worker::WorkerConfig;
-use lotse_supervisor::{Environment, FrontDoor, Identity, Limits, Settings, Supervisor};
-use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel, Stats};
+use lotse_supervisor::{
+    AdvertisedAddress, Environment, FrontDoor, Identity, Limits, Settings, Supervisor,
+};
+use lotse_testing::fake_camera::{BackchannelCodec, CameraBackchannel, CameraTls, Stats};
 use lotse_testing::fake_turn::{FakeTurn, FakeTurnServer};
 use lotse_testing::viewer::{Outgoing, TalkbackOffer, Viewer};
 use lotse_testing::{CameraConfig, FakeCamera};
 use serde_json::{Value, json};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -62,6 +70,7 @@ fn clock() -> Arc<dyn Clock> {
 struct Daemon {
     supervisor: Supervisor,
     demux: Demux,
+    udp: SocketAddr,
     tcp: SocketAddr,
     tcp_stats: Arc<IceTcpStats>,
     stop_tcp: CancellationToken,
@@ -73,6 +82,19 @@ fn supervisor() -> Daemon {
 
 /// [`supervisor`] with this `stream.linger`.
 fn supervisor_with(linger: Duration) -> Daemon {
+    daemon(linger, Vec::new())
+}
+
+/// [`supervisor`] with this `webrtc.advertise`.
+fn supervisor_advertising(advertise: &[&str]) -> Daemon {
+    daemon(
+        Duration::from_millis(200),
+        advertise.iter().map(|a| a.parse().unwrap()).collect(),
+    )
+}
+
+/// The daemon with this `stream.linger` and `webrtc.advertise`.
+fn daemon(linger: Duration, advertise: Vec<AdvertisedAddress>) -> Daemon {
     let bound = bind_udp("127.0.0.1:0".parse().unwrap()).expect("the shared socket");
     let demux = Demux::start(
         Arc::clone(&bound.socket),
@@ -88,7 +110,7 @@ fn supervisor_with(linger: Duration) -> Daemon {
     lotse_core::task::spawn_named(
         "test.ice_tcp",
         accept_loop(
-            tokio::net::TcpListener::from_std(listener).unwrap(),
+            TcpListener::from_std(listener).unwrap(),
             demux.registrations(),
             IceTcpConfig::default(),
             clock(),
@@ -98,11 +120,12 @@ fn supervisor_with(linger: Duration) -> Daemon {
     );
     let settings = Settings {
         socket: PathBuf::from("/nonexistent/lotse.sock"),
-        owner_uid: 0,
+        owners: lotse_supervisor::Owners::only(0),
         allow_uid: 0,
         control_tls: None,
         udp_listen: bound.local,
         tcp_listen: None,
+        advertise,
         limits: Limits {
             max_connections: 8,
             max_streams: 8,
@@ -112,6 +135,8 @@ fn supervisor_with(linger: Duration) -> Daemon {
             worker_threads: 1,
             worker_address_space: 1 << 30,
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
+            live: lotse_supervisor::LiveLimits::DEFAULT,
+            hls: None,
         },
         linger,
         connect_concurrency: lotse_supervisor::DEFAULT_CONNECT_CONCURRENCY,
@@ -137,12 +162,14 @@ fn supervisor_with(linger: Duration) -> Daemon {
             worker_address_space: 1 << 30,
             max_sessions: 256,
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
+            live: lotse_supervisor::LiveLimits::DEFAULT,
         },
         udp: Some(Arc::clone(&bound.socket)),
         front_door: Some(FrontDoor {
             registrations: demux.registrations(),
             hosts: bound.hosts,
             tcp_hosts: vec![tcp],
+            scan: None,
             stun: Some(Arc::new(StunClient::new(
                 Arc::clone(&bound.socket),
                 demux.responses(),
@@ -181,6 +208,7 @@ fn supervisor_with(linger: Duration) -> Daemon {
     Daemon {
         supervisor: Supervisor::new(settings, environment, clock()),
         demux,
+        udp: bound.local,
         tcp,
         tcp_stats,
         stop_tcp,
@@ -325,7 +353,7 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
         call(
             &s,
             1,
-            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [{ "url": cam.url() }] }),
+            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&cam.url(), json!({}))] }),
         )
         .await,
     );
@@ -351,11 +379,7 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
     )
     .await;
     let before = viewer.packets().len();
-    let describes = || {
-        cam.stats()
-            .describes
-            .load(std::sync::atomic::Ordering::Relaxed)
-    };
+    let describes = || cam.stats().describes.load(Ordering::Relaxed);
     assert_eq!(describes(), 1);
 
     let other = format!("{}/other", cam.url().trim_end_matches("/stream"));
@@ -363,7 +387,7 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
         call(
             &s,
             1,
-            &json!({ "id": 3, "type": "stream/put", "stream_id": "front", "sources": [{ "url": other }] }),
+            &json!({ "id": 3, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&other, json!({}))] }),
         )
         .await,
     );
@@ -395,7 +419,7 @@ async fn a_put_that_changes_the_source_url_switches_the_playing_session_to_it() 
     // `stream/get` shows the URL's origin only, its path redacted; the
     // second DESCRIBE above is what tells the new path was connected.
     assert_eq!(
-        front["sources"][0]["url"],
+        front["sources"][0]["source"]["url"],
         SourceUrl::parse(&other).unwrap().to_string()
     );
     assert_eq!(front["state"], "live");
@@ -478,7 +502,7 @@ async fn onvif_5_3_1_opting_in_probes_beside_the_viewing_session_without_restart
     } = supervisor();
     let put = |id: u64, options: Value| {
         json!({ "id": id, "type": "stream/put", "stream_id": "door", "preload": true,
-                "sources": [{ "url": cam.url(), "options": options }] })
+                "sources": [lotse_testing::source(&cam.url(), options)] })
     };
     let stats = cam.stats();
     result(call(&s, 1, &put(1, json!({}))).await);
@@ -635,7 +659,7 @@ async fn onvif_5_3_1_an_offer_right_after_the_opt_in_waits_for_the_probe_and_neg
     } = supervisor();
     let put = |id: u64, options: Value| {
         json!({ "id": id, "type": "stream/put", "stream_id": "door",
-                "sources": [{ "url": cam.url(), "options": options }] })
+                "sources": [lotse_testing::source(&cam.url(), options)] })
     };
     result(call(&s, 1, &put(1, json!({}))).await);
     let mut before = Talker::offer(&s, "door", "before", TalkbackOffer::Dedicated).await;
@@ -731,7 +755,7 @@ async fn onvif_5_3_1_a_talk_back_request_the_stream_cannot_serve_is_declined_nev
     } = supervisor();
     let put = |id: u64, stream_id: &str, cam: &FakeCamera, options: Value| {
         json!({ "id": id, "type": "stream/put", "stream_id": stream_id,
-                "sources": [{ "url": cam.url(), "options": options }] })
+                "sources": [lotse_testing::source(&cam.url(), options)] })
     };
     let opted_in = json!({ "backchannel": true });
     result(call(&s, 1, &put(1, "talking", &talking, opted_in.clone())).await);
@@ -788,7 +812,7 @@ async fn a_viewer_plays_through_the_control_api_and_survives_a_control_reconnect
         call(
             &s,
             1,
-            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [{ "url": cam.url() }] }),
+            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&cam.url(), json!({}))] }),
         )
         .await,
     );
@@ -1135,7 +1159,7 @@ async fn a_preloaded_stream_serves_the_first_frame_from_its_gop_cache_and_linger
     );
     let put = |preload: bool| {
         json!({ "id": 1, "type": "stream/put", "stream_id": "front",
-                "sources": [{ "url": cam.url() }], "preload": preload })
+                "sources": [lotse_testing::source(&cam.url(), json!({}))], "preload": preload })
     };
     let get = json!({ "id": 3, "type": "stream/get", "stream_id": "front" });
     // `preload` connects at put, with no viewer.
@@ -1273,7 +1297,7 @@ async fn a_viewer_behind_a_udp_block_plays_over_ice_tcp() {
         call(
             s,
             1,
-            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [{ "url": cam.url() }] }),
+            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&cam.url(), json!({}))] }),
         )
         .await,
     );
@@ -1430,7 +1454,7 @@ async fn relayed_viewer(tcp: bool) {
             .any(|(_, peer)| *peer == viewer_addr),
         "a channel to the browser's candidate: {allocations:?}"
     );
-    close_relayed(s, relayed.events).await;
+    close_session(s, "relay-1", relayed.events).await;
     // The last session's lease went with it: the allocation is deleted.
     let mut waited = clock().sleep(Duration::from_secs(5));
     while !turn.allocations().is_empty() {
@@ -1442,13 +1466,90 @@ async fn relayed_viewer(tcp: bool) {
     stop(daemon, cam).await;
 }
 
+/// A `turns:` server whose certificate no embedded root vouches for (RFC
+/// 8489 §6.2.3): the handshake fails before any request, so the server
+/// never sees the credential, and the viewer plays over its host pair
+/// with no relay candidate, end-of-candidates still sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc8489_6_2_3_an_untrusted_turns_server_gets_no_credential_and_no_relay_candidate() {
+    let cam = FakeCamera::start(CameraConfig::default(), clock())
+        .await
+        .expect("camera");
+    let turn = Arc::new(FakeTurn::new(
+        clock(),
+        "lotse.test",
+        Duration::from_secs(600),
+    ));
+    turn.add_user("ha-cloud", "secret");
+    let tls = CameraTls::self_signed(&["127.0.0.1"]).expect("a certificate");
+    let server = FakeTurnServer::start_tls(Arc::clone(&turn), 1, &tls)
+        .await
+        .expect("the turn server");
+    let daemon = supervisor();
+    let s = &daemon.supervisor;
+    put_front(s, &cam).await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("viewer socket");
+    let viewer_addr = socket.local_addr().unwrap();
+    lotse_webrtc::install_crypto_provider();
+    let mut viewer = Viewer::new(viewer_addr, clock().now()).expect("a viewer");
+    let url = format!("turns:{}", server.tls_addr().unwrap());
+    let mut events = subscription(
+        call(
+            s,
+            1,
+            &json!({ "id": 2, "type": "webrtc/offer", "stream_id": "front", "session_id": "tls-1",
+                     "sdp": viewer.offer(),
+                     "ice_servers": [{ "urls": [url], "username": "ha-cloud", "credential": "secret" }] }),
+        )
+        .await,
+    );
+    let mut seen = Vec::new();
+    drive(
+        &mut viewer,
+        &socket,
+        &mut events,
+        &mut seen,
+        |event, viewer, out| match event["type"].as_str() {
+            Some("answer") => {
+                viewer
+                    .accept_answer(event["sdp"].as_str().unwrap(), out)
+                    .expect("the answer applies");
+            }
+            Some("candidate") => {
+                viewer.add_remote_candidate(event["candidate"].as_str().unwrap(), out);
+            }
+            _ => {}
+        },
+        |seen, viewer| {
+            seen.iter()
+                .any(|e| e["type"] == "candidate" && e["candidate"] == "")
+                && viewer.is_connected()
+                && viewer.packets().len() >= 20
+        },
+    )
+    .await;
+    assert!(
+        seen.iter().all(|e| e["type"] != "warning"),
+        "turns: over TLS is supported: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|e| e["type"] != "candidate"
+            || relay_address(e["candidate"].as_str().unwrap()).is_none()),
+        "no relay candidate: {seen:?}"
+    );
+    assert_eq!(turn.requests(), Vec::new());
+    assert_eq!(turn.allocations(), Vec::new());
+    close_session(s, "tls-1", events).await;
+    stop(daemon, cam).await;
+}
+
 /// Puts the stream `front` on `cam`.
 async fn put_front(s: &Supervisor, cam: &FakeCamera) {
     result(
         call(
             s,
             1,
-            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [{ "url": cam.url() }] }),
+            &json!({ "id": 1, "type": "stream/put", "stream_id": "front", "sources": [lotse_testing::source(&cam.url(), json!({}))] }),
         )
         .await,
     );
@@ -1586,14 +1687,14 @@ async fn play_relayed(
     Relayed { events, relays }
 }
 
-/// Closes session `relay-1` and checks that its events end with
+/// Closes session `session_id` and checks that its events end with
 /// `session_closed`.
-async fn close_relayed(s: &Supervisor, mut events: mpsc::Receiver<Event>) {
+async fn close_session(s: &Supervisor, session_id: &str, mut events: mpsc::Receiver<Event>) {
     result(
         call(
             s,
             1,
-            &json!({ "id": 4, "type": "session/close", "session_id": "relay-1" }),
+            &json!({ "id": 4, "type": "session/close", "session_id": session_id }),
         )
         .await,
     );
@@ -1602,6 +1703,257 @@ async fn close_relayed(s: &Supervisor, mut events: mpsc::Receiver<Event>) {
         closed = Some(event.payload);
     }
     assert_eq!(closed.unwrap()["code"], "session_closed");
+}
+
+/// A NAT's UDP port forward in front of the daemon, as a container
+/// bridge's published port or slirp4netns' port forwarder relays: every
+/// datagram to `public` goes on to `target` from one upstream socket of the
+/// forward's own, so the daemon sees the forward's address and never the
+/// viewer's, and every datagram back leaves `public` for the last viewer
+/// address that sent. Counts the datagrams it relays back.
+async fn forward_udp(public: UdpSocket, target: SocketAddr) -> Arc<AtomicUsize> {
+    let upstream = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("upstream socket");
+    upstream
+        .connect(target)
+        .await
+        .expect("upstream to the daemon");
+    let back = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&back);
+    lotse_core::task::spawn_named("test.udp_forward", async move {
+        let mut inbound = vec![0_u8; 2_000];
+        let mut outbound = vec![0_u8; 2_000];
+        let mut viewer = None;
+        loop {
+            tokio::select! {
+                received = public.recv_from(&mut inbound) => {
+                    let Ok((len, from)) = received else { continue };
+                    viewer = Some(from);
+                    let _sent = upstream.send(&inbound[..len]).await;
+                }
+                received = upstream.recv(&mut outbound) => {
+                    let (Ok(len), Some(viewer)) = (received, viewer) else { continue };
+                    if public.send_to(&outbound[..len], viewer).await.is_ok() {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+    back
+}
+
+/// A NAT's TCP port forward in front of the daemon's ICE-TCP listener:
+/// every connection to `public` gets one of its own to `target`, and the
+/// two are copied both ways, so the daemon sees the forward's address.
+/// Counts the connections it accepted.
+fn forward_tcp(public: TcpListener, target: SocketAddr) -> Arc<AtomicUsize> {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&accepted);
+    lotse_core::task::spawn_named("test.tcp_forward", async move {
+        while let Ok((mut inbound, _)) = public.accept().await {
+            counted.fetch_add(1, Ordering::Relaxed);
+            lotse_core::task::spawn_named("test.tcp_forward_copy", async move {
+                if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                    let _copied = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    accepted
+}
+
+/// Checks that the viewer was told no host candidate, in the answer's
+/// `a=candidate` lines or trickled, and that its server-reflexive ones are
+/// exactly the advertised address's UDP and passive TCP candidate at `udp`
+/// and `tcp`, their related address withheld (RFC 8839 §5.1).
+fn told_only_the_advertised_candidates(seen: &[Value], udp: SocketAddr, tcp: SocketAddr) {
+    let answer = seen
+        .iter()
+        .find(|e| e["type"] == "answer")
+        .and_then(|e| e["sdp"].as_str())
+        .unwrap_or_else(|| panic!("an answer: {seen:?}"));
+    let candidates = candidate_lines(seen);
+    assert!(
+        !answer.contains(" typ host") && !candidates.iter().any(|c| c.contains(" typ host")),
+        "no host candidate told: {answer} {candidates:?}"
+    );
+    let srflx: Vec<(&str, SocketAddr, String)> = candidates
+        .iter()
+        .filter(|c| c.contains(" typ srflx "))
+        .map(|c| {
+            let fields: Vec<&str> = c.split_whitespace().collect();
+            let addr = format!("{}:{}", fields[4], fields[5]).parse().unwrap();
+            (fields[2], addr, fields[8..].join(" "))
+        })
+        .collect();
+    assert_eq!(
+        srflx,
+        [
+            ("udp", udp, "raddr 0.0.0.0 rport 9".to_owned()),
+            (
+                "tcp",
+                tcp,
+                "raddr 0.0.0.0 rport 9 tcptype passive".to_owned()
+            ),
+        ],
+        "{candidates:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc8445_5_1_1_2_a_viewer_told_no_host_candidate_plays_through_an_advertised_udp_port_forward()
+ {
+    let cam = FakeCamera::start(CameraConfig::default(), clock())
+        .await
+        .expect("camera");
+    // The forward's port differs from the daemon's, so the entry names it.
+    let public = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("forward socket");
+    let forward = public.local_addr().unwrap();
+    let daemon = supervisor_advertising(&[&forward.to_string()]);
+    let back = forward_udp(public, daemon.udp).await;
+    let s = &daemon.supervisor;
+    put_front(s, &cam).await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("viewer socket");
+    lotse_webrtc::install_crypto_provider();
+    let mut viewer = Viewer::new(socket.local_addr().unwrap(), clock().now()).expect("a viewer");
+    let mut events = subscription(
+        call(
+            s,
+            1,
+            &json!({ "id": 2, "type": "webrtc/offer", "stream_id": "front", "session_id": "advertised-udp",
+                     "sdp": viewer.offer() }),
+        )
+        .await,
+    );
+    // The network between the two: the viewer reaches the daemon only
+    // through the forward, and what the daemon sends it directly (its
+    // checks to the viewer's host candidate) is dropped.
+    let mut out = Vec::new();
+    let mut seen: Vec<Value> = Vec::new();
+    let mut buf = vec![0_u8; 2_000];
+    let mut deadline = clock().sleep(Duration::from_secs(20));
+    while !(viewer.is_connected() && viewer.packets().len() >= 20) {
+        let next_timeout = viewer
+            .next_timeout()
+            .map_or(Duration::from_millis(20), |at| {
+                at.saturating_duration_since(clock().now())
+            });
+        tokio::select! {
+            event = events.recv() => {
+                let event = event.expect("the subscription is open").payload;
+                relay_signaling(&event, &mut viewer, &mut out);
+                seen.push(event);
+            }
+            received = socket.recv_from(&mut buf) => {
+                let (len, source) = received.expect("viewer recv");
+                if source == forward {
+                    viewer.receive(clock().now(), source, &buf[..len], &mut out);
+                }
+            }
+            () = clock().sleep(next_timeout) => viewer.timeout(clock().now(), &mut out),
+            () = &mut deadline => panic!("timed out; {} packets, events {seen:?}", viewer.packets().len()),
+        }
+        for datagram in out.drain(..) {
+            assert_eq!(
+                datagram.destination, forward,
+                "the viewer knows only the advertised address"
+            );
+            socket
+                .send_to(&datagram.payload, datagram.destination)
+                .await
+                .expect("viewer send");
+        }
+    }
+    told_only_the_advertised_candidates(&seen, forward, forward);
+    assert!(
+        back.load(Ordering::Relaxed) >= 20,
+        "the media came back through the forward"
+    );
+    assert!(viewer.keyframe_starts() >= 1);
+    close_session(s, "advertised-udp", events).await;
+    stop(daemon, cam).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc6544_4_5_a_viewer_behind_a_udp_block_told_no_host_candidate_plays_through_an_advertised_ice_tcp_port_forward()
+ {
+    let cam = FakeCamera::start(CameraConfig::default(), clock())
+        .await
+        .expect("camera");
+    // A bridge's published ports: another address, the daemon's ports, so
+    // the entry names no port and each candidate takes its listener's.
+    let daemon = supervisor_advertising(&["127.0.0.2"]);
+    let forward = SocketAddr::new("127.0.0.2".parse().unwrap(), daemon.tcp.port());
+    let accepted = forward_tcp(
+        TcpListener::bind(forward).await.expect("forward listener"),
+        daemon.tcp,
+    );
+    let s = &daemon.supervisor;
+    put_front(s, &cam).await;
+    lotse_webrtc::install_crypto_provider();
+    let mut viewer =
+        Viewer::new_tcp("127.0.0.1:9".parse().unwrap(), clock().now()).expect("a viewer");
+    let mut events = subscription(
+        call(
+            s,
+            1,
+            &json!({ "id": 2, "type": "webrtc/offer", "stream_id": "front", "session_id": "advertised-tcp",
+                     "sdp": viewer.offer() }),
+        )
+        .await,
+    );
+    let (incoming_tx, mut incoming) = mpsc::channel(256);
+    let mut side = TcpSide {
+        writers: std::collections::HashMap::new(),
+        incoming: incoming_tx,
+    };
+    let mut out = Vec::new();
+    let mut seen: Vec<Value> = Vec::new();
+    let mut deadline = clock().sleep(Duration::from_secs(20));
+    while !(viewer.is_connected() && viewer.packets().len() >= 20) {
+        let next_timeout = viewer
+            .next_timeout()
+            .map_or(Duration::from_millis(20), |at| {
+                at.saturating_duration_since(clock().now())
+            });
+        tokio::select! {
+            event = events.recv() => {
+                let event = event.expect("the subscription is open").payload;
+                relay_signaling(&event, &mut viewer, &mut out);
+                seen.push(event);
+            }
+            Some((from, frame)) = incoming.recv() => viewer.receive(clock().now(), from, &frame, &mut out),
+            () = clock().sleep(next_timeout) => viewer.timeout(clock().now(), &mut out),
+            () = &mut deadline => panic!("timed out; {} packets, events {seen:?}", viewer.packets().len()),
+        }
+        assert!(
+            out.iter().all(|datagram| datagram.destination == forward),
+            "the viewer knows only the advertised address"
+        );
+        side.send(&mut out).await;
+    }
+    told_only_the_advertised_candidates(
+        &seen,
+        SocketAddr::new(forward.ip(), daemon.udp.port()),
+        forward,
+    );
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "one connection through the forward"
+    );
+    assert_eq!(
+        IceTcpStats::get(&daemon.tcp_stats.handed_off),
+        1,
+        "the acceptor verified the forwarded connection's first request and handed it over"
+    );
+    assert!(viewer.keyframe_starts() >= 1);
+    close_session(s, "advertised-tcp", events).await;
+    stop(daemon, cam).await;
 }
 
 // Against a real coturn: `mise run turn-e2e` starts it in Docker
@@ -1718,7 +2070,7 @@ async fn coturn_viewer(ice_servers: Value, stun: SocketAddr, metrics: SocketAddr
     .await;
     assert_eq!(relayed.relays.len(), 1, "{:?}", relayed.relays);
     assert_eq!(coturn_allocations(metrics).await, 1);
-    close_relayed(s, relayed.events).await;
+    close_session(s, "relay-1", relayed.events).await;
     let mut waited = clock().sleep(Duration::from_secs(5));
     while coturn_allocations(metrics).await > 0 {
         tokio::select! {

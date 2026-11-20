@@ -270,14 +270,14 @@ mod tests {
         let mut aligner = Aligner::default();
         // Two packets and the third's sync byte missing: nothing is
         // confirmed yet.
-        assert!(run(&mut aligner, &[&stream[..2 * PACKET]]).is_empty());
+        assert_eq!(run(&mut aligner, &[&stream[..2 * PACKET]]), b"");
         assert_eq!(aligner.buffered(), 2 * PACKET);
         assert_eq!(run(&mut aligner, &[&stream[2 * PACKET..]]), stream);
         // Out of sync, a sync byte without its successors is skipped.
         let mut aligner = Aligner::default();
         let mut input = vec![SYNC; 1];
         input.extend_from_slice(&[0; PACKET]);
-        assert!(run(&mut aligner, &[&input]).is_empty());
+        assert_eq!(run(&mut aligner, &[&input]), b"");
         assert_eq!(aligner.stats().skipped_bytes, PACKET as u64 + 1);
         assert_eq!(aligner.buffered(), 0);
     }
@@ -290,7 +290,7 @@ mod tests {
         let mut aligner = Aligner::default();
         let mut first = vec![SYNC];
         first.extend_from_slice(&[9; 10]);
-        assert!(run(&mut aligner, &[&first]).is_empty());
+        assert_eq!(run(&mut aligner, &[&first]), b"");
         assert_eq!(aligner.buffered(), 11);
         let mut second = vec![9; WINDOW + 3];
         second.extend_from_slice(&stream);
@@ -305,7 +305,7 @@ mod tests {
         let stream = packets(3);
         let mut aligner = Aligner::default();
         let chunks: Vec<&[u8]> = stream[..WINDOW - 1].chunks(1).collect();
-        assert!(run(&mut aligner, &chunks).is_empty());
+        assert_eq!(run(&mut aligner, &chunks), b"");
         assert_eq!(aligner.buffered(), WINDOW - 1);
         assert_eq!(aligner.stats().skipped_bytes, 0);
     }

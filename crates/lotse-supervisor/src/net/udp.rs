@@ -22,7 +22,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::hosts;
 
-/// The socket buffer size asked for; the kernel caps it at
+/// The socket buffer size asked for, 4 MiB; the kernel caps it at
 /// `net.core.rmem_max` / `wmem_max` without `CAP_NET_ADMIN`.
 pub const REQUESTED_BUFFER: usize = 4 << 20;
 
@@ -51,6 +51,10 @@ pub struct BoundUdp {
     /// The addresses datagrams arrive on, the default-route one of each
     /// family first: the host candidates' addresses.
     pub hosts: Vec<SocketAddr>,
+    /// The interfaces failed to enumerate when [`Self::hosts`] was read,
+    /// which was warned about: `host_cache` does not warn again while the
+    /// failure lasts, and says when it ends.
+    pub enumeration_failed: bool,
 }
 
 /// Binds the shared UDP socket.
@@ -73,7 +77,8 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<BoundUdp> {
     let send_buffer = socket.send_buffer_size().unwrap_or(0);
     // An empty list means sessions answer without a host candidate; the
     // `ready` event shows it too.
-    let hosts = hosts::host_addresses(local, dual_stack, &hosts::probe, &hosts::interfaces);
+    let (hosts, enumeration_failed) =
+        hosts::host_addresses(local, dual_stack, &hosts::probe, &hosts::interfaces);
     tracing::info!(
         %local,
         dual_stack,
@@ -90,6 +95,7 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<BoundUdp> {
         send_buffer,
         dual_stack,
         hosts,
+        enumeration_failed,
     })
 }
 
@@ -187,6 +193,13 @@ mod tests {
 
     use super::test_support::bind_dual_stack;
     use super::*;
+
+    #[test]
+    fn the_socket_buffers_asked_for_are_4_mib_and_dscp_is_af41() {
+        assert_eq!(REQUESTED_BUFFER, 4 * 1024 * 1024);
+        // RFC 2597: AF41 is DSCP 34, the TOS byte's upper six bits.
+        assert_eq!(DSCP_AF41_TOS, 0x88);
+    }
 
     /// What `bind_dual_stack` relies on: a dual-stack bind by number
     /// refuses a port an IPv4 socket holds, on macOS too, where the

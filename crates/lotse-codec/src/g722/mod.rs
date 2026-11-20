@@ -115,7 +115,7 @@ mod tests {
     fn itu_t_g722_1_4_4_every_octet_decodes_to_two_samples() {
         let every: Vec<u8> = (0..=255).collect();
         assert_eq!(decode(&every).len(), 512);
-        assert!(decode(&[]).is_empty());
+        assert_eq!(decode(&[]), Vec::<i16>::new());
     }
 
     #[test]

@@ -8,10 +8,18 @@
 //! not for web pages) and the RFC 6455 §7.4.1 close codes: `1001` going
 //! away on shutdown, `1003` for a binary frame, `1008` policy violation on
 //! an overflowed outbound queue or a removed client. Commands are processed
-//! one at a time per connection; the handler's never wait on a camera, and
-//! one the handler is still awaiting when the connection's client is
-//! removed or the daemon shuts down is dropped and refused, so it never
-//! holds up the close. The ones about the TLS listener's clients may wait
+//! one at a time per connection, but for the ones that wait on a camera,
+//! `live/create` and `hls/create`: the connection reads and answers further
+//! commands while one waits (a signaled source's `signaling/answer` may be
+//! what releases it), each holding its subscription slot from the start, so
+//! `max_subscriptions` bounds them. `unsubscribe` of one still waiting
+//! cancels it: the handler hears the unsubscribe at once, so its output
+//! ends and the command is answered as that end makes it, and no
+//! subscription opens for it, whatever the answer. One the handler is still awaiting when
+//! the connection's client is removed or the daemon shuts down is dropped
+//! and refused, so it never holds up the close; one still waiting when the
+//! peer leaves is dropped with the connection, before the handler hears it
+//! closed. The ones about the TLS listener's clients may wait
 //! for the disk, so each runs as a task of its own: the connection reads no
 //! further command until its answer is queued, but still closes on shutdown
 //! or an overflow meanwhile. A removal or a shutdown is seen before any
@@ -19,7 +27,10 @@
 //! gets its answer before the close. On close the sessions are
 //! orphaned and the slot released first; the writer then gets
 //! [`CLOSE_TIMEOUT`] to deliver the queue and the close frame, after which
-//! the socket is dropped (RFC 6455 §7.1.1).
+//! the socket is dropped (RFC 6455 §7.1.1). A command refused at a limit
+//! is logged as a warning, throttled per connection and limit
+//! ([`lotse_core::throttle`]), so a client repeating it cannot flood the
+//! log and every limit stays visible.
 
 use std::collections::HashMap;
 use std::io;
@@ -32,25 +43,27 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::OptionFuture;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt as _, StreamExt as _};
-use lotse_api_types::clients::ClientList;
+use lotse_api_types::clients::{ClientList, ClientRole};
 use lotse_api_types::command::Command;
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Empty, EventFrame, Failure, Pong, Shutdown, Success};
 use lotse_api_types::pairing::PairingCreateResult;
 use lotse_core::fingerprint::Fingerprint;
 use lotse_core::task::{BoxFuture, spawn_blocking_named};
+use lotse_core::throttle::Throttle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::clients::{ClientStore, Removal};
+use crate::clients::{Addition, ClientStore, Removal};
 use crate::listener::PeerInfo;
 use crate::outbox::{Class, Outbox, Outgoing, Overflow};
 use crate::pairing::Pairing;
 use crate::{
-    AppState, CLOSE_TIMEOUT, ConnectionId, Event, Handler, MAX_MESSAGE_BYTES,
+    AppState, CLOSE_TIMEOUT, ConnectionId, Event, Handler, Limit, MAX_MESSAGE_BYTES,
     OUTBOUND_BUDGET_BYTES, Outcome,
 };
 
@@ -97,11 +110,14 @@ pub(crate) async fn upgrade<H: Handler>(
     let open = state.connections.fetch_add(1, Ordering::AcqRel);
     if open >= state.config.max_connections {
         state.connections.fetch_sub(1, Ordering::AcqRel);
-        tracing::warn!(
-            open,
-            max = state.config.max_connections,
-            "control connection refused: limit reached"
-        );
+        if let Some(refused) = state.limit_lines.hit(Limit::Connections) {
+            tracing::warn!(
+                open,
+                max = state.config.max_connections,
+                refused,
+                "control connection refused: limit reached"
+            );
+        }
         return refuse(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::LimitReached,
@@ -118,7 +134,7 @@ pub(crate) async fn upgrade<H: Handler>(
 }
 
 /// The answer to a command about the TLS listener's clients
-/// (`pairing/create`, `clients/list`, `clients/remove`), which the server
+/// (`pairing/create`, `clients/list`, `clients/remove`, `clients/add`), which the server
 /// answers itself, asked by connection `by`; and whether `by` closes once
 /// it has sent the answer: its client removed itself. Not generic over the
 /// handler, so every handler's connection shares this one function.
@@ -139,6 +155,9 @@ async fn listener_answer(
             leaving = removed.is_ok() && matches!(peer, PeerInfo::Tls { .. });
             removed.map(to_json)
         }
+        Command::ClientsAdd(add) => clients_add(clients, peer, &add.pin, add.role)
+            .await
+            .map(to_json),
         _ => pairing_create(pairing, peer).map(to_json),
     };
     let frame = match outcome {
@@ -165,6 +184,78 @@ fn clients_list(clients: Option<&Arc<ClientStore>>) -> Result<ClientList, ApiErr
         .ok_or_else(listener_off)
 }
 
+/// `invalid_request` for a `pin` field that is no certificate pin.
+fn invalid_pin() -> ApiError {
+    ApiError::new(
+        ErrorCode::InvalidRequest,
+        "`pin` must be a certificate's SHA-256 as 64 hex digits, optionally with a colon between each pair",
+    )
+    .with_detail("field", "pin")
+}
+
+/// `clients/add`: enrolls `pin` with `role` (see [`ClientStore::add`]),
+/// for a client that cannot pair. Only a peer on the Unix socket may ask,
+/// as for `pairing/create`: an enrolled TLS client must not enroll
+/// others. A pin that has the other role is refused, `not_permitted`: its
+/// role changes only by removing it first.
+async fn clients_add(
+    clients: Option<&Arc<ClientStore>>,
+    peer: &PeerInfo,
+    pin: &str,
+    role: ClientRole,
+) -> Result<Empty, ApiError> {
+    if matches!(peer, PeerInfo::Tls { .. }) {
+        tracing::warn!(%peer, "clients/add refused: not on the control socket");
+        return Err(ApiError::new(
+            ErrorCode::NotPermitted,
+            "clients are added on the control socket only",
+        ));
+    }
+    let pin = Fingerprint::parse(pin).map_err(|_| invalid_pin())?;
+    let Some(clients) = clients else {
+        return Err(listener_off());
+    };
+    let store = Arc::clone(clients);
+    let added = spawn_blocking_named("api.clients_add", move || store.add(pin, role));
+    let role_name = role.as_str();
+    match added
+        .await
+        .map_err(io::Error::other)
+        .and_then(|addition| addition)
+    {
+        Ok(Addition::Added) => {
+            tracing::info!(
+                event = "control_client_added",
+                client_pin = %pin,
+                role = role_name,
+                by = %peer,
+                "control client added"
+            );
+            Ok(Empty::default())
+        }
+        Ok(Addition::Already) => {
+            tracing::info!(client_pin = %pin, role = role_name, by = %peer, "clients/add: the pin already has the role, nothing to add");
+            Ok(Empty::default())
+        }
+        Ok(Addition::OtherRole(other)) => {
+            let other = other.as_str();
+            tracing::warn!(%peer, client_pin = %pin, role = role_name, has = other, "clients/add refused: the pin has the other role");
+            Err(ApiError::new(
+                ErrorCode::NotPermitted,
+                format!("the pin is a {other} client; remove it before adding it as a {role_name} client"),
+            )
+            .with_detail("role", other))
+        }
+        Err(err) => {
+            tracing::error!(%peer, client_pin = %pin, error = %err, "adding the control client failed");
+            Err(ApiError::new(
+                ErrorCode::InternalError,
+                "the client list could not be stored",
+            ))
+        }
+    }
+}
+
 /// `clients/remove`, asked by connection `by`: removes an enrolled pin and
 /// closes its connections but `by` (see [`ClientStore::remove`]). Over the
 /// TLS listener a client may remove only itself; a fixed pin stays; a pin
@@ -175,13 +266,7 @@ async fn clients_remove(
     by: ConnectionId,
     pin: &str,
 ) -> Result<Empty, ApiError> {
-    let Ok(pin) = Fingerprint::parse(pin) else {
-        return Err(ApiError::new(
-            ErrorCode::InvalidRequest,
-            "`pin` must be a certificate's SHA-256 as 64 hex digits, optionally with a colon between each pair",
-        )
-        .with_detail("field", "pin"));
-    };
+    let pin = Fingerprint::parse(pin).map_err(|_| invalid_pin())?;
     let Some(clients) = clients else {
         return Err(listener_off());
     };
@@ -316,6 +401,39 @@ struct Connection<H> {
     /// any: no further command is read until it ends. Left to finish when
     /// the connection closes first, so a change it began is still logged.
     pending: Option<JoinHandle<()>>,
+    /// The commands that wait on a camera ([`waits`]) still being
+    /// answered, polled by the connection's own loop beside the frames it
+    /// reads. Each holds a subscription slot until answered
+    /// ([`Self::subscription_slot_free`]); dropped when the connection
+    /// closes.
+    waiting: FuturesUnordered<BoxFuture<'static, Answered>>,
+    /// The ids of the commands in [`Self::waiting`], each with whether
+    /// `unsubscribe` cancelled it: a cancelled one opens no subscription
+    /// when it is answered.
+    waiting_ids: HashMap<u64, bool>,
+    /// The warning of each limit a command was refused at, by
+    /// [`RefusalKey`]: fixed in the code, so the map stays small.
+    refusals: HashMap<RefusalKey, Throttle>,
+}
+
+/// The handler's outcome of command `id`, of type `name`, to answer.
+struct Answered {
+    /// The command id.
+    id: u64,
+    /// The command's type.
+    name: &'static str,
+    /// The handler's answer, or the refusal [`unless_closing`] made.
+    outcome: Outcome,
+}
+
+/// What a refusal at a limit is throttled by on one connection: its code
+/// and its `limit` and `field` details, each named in the code, never a
+/// value of the request.
+type RefusalKey = (ErrorCode, Option<String>, Option<String>);
+
+/// Detail `key` of `error`, when it is text.
+fn text_detail<'e>(error: &'e ApiError, key: &str) -> Option<&'e str> {
+    error.details.get(key).and_then(serde_json::Value::as_str)
 }
 
 /// Serves one connection until the peer leaves, the queue overflows or the
@@ -360,6 +478,9 @@ async fn serve<H: Handler>(
         peer,
         removed,
         pending: None,
+        waiting: FuturesUnordered::new(),
+        waiting_ids: HashMap::new(),
+        refusals: HashMap::new(),
     };
     connection.send(Class::Signaling, &connection.state.handler.hello());
 
@@ -371,6 +492,12 @@ async fn serve<H: Handler>(
             // task, once the answer is queued, so it goes out before the
             // close.
             biased;
+            // First, so a command waiting on a camera is answered once
+            // the handler is done with it, and the handler's synchronous
+            // part of one just started runs before the next frame is read.
+            // A removal or a shutdown refuses it here, through
+            // [`unless_closing`], before the branches below close.
+            Some(answered) = connection.waiting.next() => connection.answer(answered),
             // One line: the removal's break counts as covered in a copy of
             // this loop whose connection is never removed (the coverage gate
             // takes the best single copy of a generic function).
@@ -407,6 +534,17 @@ async fn serve<H: Handler>(
 
     for (_, task) in connection.subscriptions.drain() {
         task.abort();
+    }
+    // Before the handler hears the connection closed: whatever a command
+    // still waiting opened belongs to the connection, and ends with it.
+    if !connection.waiting.is_empty() {
+        let waiting = connection.waiting.len();
+        tracing::info!(
+            closed_by,
+            waiting,
+            "commands still waiting dropped with the connection"
+        );
+        connection.waiting.clear();
     }
     connection.outbox.close(CLOSE_GOING_AWAY, "closed");
     // Nothing below waits on the peer before the deadline is set: its
@@ -514,13 +652,60 @@ impl<H: Handler> Connection<H> {
         queue(&self.outbox, class, frame);
     }
 
+    /// Answers command `id`, of type `command`, with `error`, warning first
+    /// when it is a refusal at a limit ([`Self::warn_at_limit`]).
+    fn refuse(&mut self, id: Option<u64>, command: Option<&str>, error: ApiError) {
+        self.warn_at_limit(id, command, &error);
+        self.send(Class::Signaling, &Failure::new(id, error));
+    }
+
+    /// Warns that command `id` was refused at a limit, when `error` is
+    /// `limit_reached` or names the `limit` it hit (an input over its cap,
+    /// a recording longer than allowed). `command` is its type, else the
+    /// `type` detail a refusal of [`lotse_api_types::parse_command`]
+    /// carries, a command's name. The first refusal of each
+    /// [`RefusalKey`] is logged, then at most one line per
+    /// [`lotse_core::throttle::SUMMARY_INTERVAL`] with the count since the
+    /// last one. Only names are logged, never a value of the request,
+    /// which may hold a secret.
+    fn warn_at_limit(&mut self, id: Option<u64>, command: Option<&str>, error: &ApiError) {
+        let limit = text_detail(error, "limit");
+        if error.code != ErrorCode::LimitReached && limit.is_none() {
+            return;
+        }
+        let field = text_detail(error, "field");
+        let command = command.or_else(|| text_detail(error, "type"));
+        let key = (
+            error.code,
+            limit.map(str::to_owned),
+            field.map(str::to_owned),
+        );
+        let now = self.state.clock.now();
+        let Some(refused) = self.refusals.entry(key).or_default().hit(now) else {
+            return;
+        };
+        tracing::warn!(
+            connection = self.id.0,
+            id,
+            command,
+            code = error.code.as_str(),
+            limit,
+            field,
+            refused,
+            "command refused: a limit was reached"
+        );
+    }
+
     /// Whether another subscription fits under `max_subscriptions`, after
     /// forgetting the ones that ended (a session's `closed`, a handler that
     /// dropped the channel), so a long-lived connection does not
-    /// accumulate them.
+    /// accumulate them. A command still waiting ([`waits`]) holds the slot
+    /// of the subscription it opens, so commands at once cannot pass the
+    /// cap, and the cap bounds the commands waiting on one connection.
     fn subscription_slot_free(&mut self) -> bool {
         self.subscriptions.retain(|_, task| !task.is_finished());
-        let open = u32::try_from(self.subscriptions.len()).unwrap_or(u32::MAX);
+        let open = self.subscriptions.len().saturating_add(self.waiting.len());
+        let open = u32::try_from(open).unwrap_or(u32::MAX);
         open < self.state.config.max_subscriptions
     }
 
@@ -557,10 +742,75 @@ impl<H: Handler> Connection<H> {
     }
 
     /// The handler's answer to `command`, whose id is `id`; see
-    /// [`unless_closing`].
-    async fn handled(&self, id: u64, command: Command) -> Outcome {
-        let handling = Box::pin(self.state.handler.handle(self.id, command));
-        unless_closing(id, handling, &self.removed, &self.state.shutdown).await
+    /// [`unless_closing`]. Borrows nothing of the connection, so it can
+    /// wait beside the connection's loop ([`Self::wait_for`]).
+    fn handled(&self, id: u64, command: Command) -> BoxFuture<'static, Outcome> {
+        let handler = Arc::clone(&self.state.handler);
+        let connection = self.id;
+        let removed = self.removed.clone();
+        let shutdown = self.state.shutdown.clone();
+        Box::pin(async move {
+            let handling = Box::pin(handler.handle(connection, command));
+            unless_closing(id, handling, &removed, &shutdown).await
+        })
+    }
+
+    /// Starts answering `command`, of type `name` and id `id`, one that
+    /// waits on a camera ([`waits`]), beside the connection's loop, which
+    /// polls it first ([`Self::waiting`]): the handler's synchronous part
+    /// runs before the next frame is read, its wait while they are, and
+    /// [`Self::answer`] answers it once the handler, or [`unless_closing`],
+    /// is done.
+    fn wait_for(&mut self, id: u64, name: &'static str, command: Command) {
+        let handling = self.handled(id, command);
+        tracing::debug!(id, command = name, "command waits; reading on");
+        self.waiting_ids.insert(id, false);
+        self.waiting.push(Box::pin(async move {
+            let outcome = handling.await;
+            Answered { id, name, outcome }
+        }));
+    }
+
+    /// Answers a command with the handler's outcome: its result, its
+    /// refusal, or a result and the subscription it opened.
+    fn answer(&mut self, answered: Answered) {
+        let Answered { id, name, outcome } = answered;
+        let cancelled = self.waiting_ids.remove(&id) == Some(true);
+        match outcome {
+            Outcome::Result(result) => self.send(Class::Signaling, &Success::new(id, result)),
+            Outcome::Error(error) => self.refuse(Some(id), Some(name), error),
+            Outcome::Subscribed(events) => {
+                self.send(Class::Signaling, &Success::new(id, Empty::default()));
+                self.open(id, name, events, cancelled);
+            }
+            Outcome::SubscribedWith { result, events } => {
+                self.send(Class::Signaling, &Success::new(id, result));
+                self.open(id, name, events, cancelled);
+            }
+        }
+    }
+
+    /// Opens subscription `id`, of command `name`, for `events`, unless
+    /// `unsubscribe` cancelled the command while it waited: then no
+    /// forwarder starts, and its events are dropped unread, so none of
+    /// them goes out after the unsubscribe's answer.
+    fn open(
+        &mut self,
+        id: u64,
+        name: &'static str,
+        events: mpsc::Receiver<Event>,
+        cancelled: bool,
+    ) {
+        if cancelled {
+            tracing::debug!(
+                id,
+                command = name,
+                "unsubscribed command answered; its subscription does not open"
+            );
+            drop(events);
+            return;
+        }
+        self.subscribe(id, events);
     }
 
     /// One text frame: parse, check the id, dispatch, answer.
@@ -569,7 +819,7 @@ impl<H: Handler> Connection<H> {
             Ok(command) => command,
             Err(err) => {
                 tracing::debug!(id = ?err.id, code = err.error.code.as_str(), "command rejected");
-                self.send(Class::Signaling, &Failure::new(err.id, err.error));
+                self.refuse(err.id, None, err.error);
                 return;
             }
         };
@@ -589,16 +839,31 @@ impl<H: Handler> Connection<H> {
             return;
         }
         self.last_id = Some(id);
-        tracing::debug!(id, command = command.name(), "command");
+        let name = command.name();
+        tracing::debug!(id, command = name, "command");
         match command {
             Command::Ping(_) => self.send(Class::Signaling, &Pong::new(id)),
             command @ (Command::PairingCreate(_)
             | Command::ClientsList(_)
-            | Command::ClientsRemove(_)) => self.listener_command(command),
+            | Command::ClientsRemove(_)
+            | Command::ClientsAdd(_)) => self.listener_command(command),
             Command::Schema(_) => self.send(
                 Class::Signaling,
                 &Success::new(id, lotse_api_types::schema::committed()),
             ),
+            Command::Unsubscribe(unsubscribe)
+                if self
+                    .waiting_ids
+                    .get(&unsubscribe.subscription)
+                    .is_some_and(|cancelled| !cancelled) =>
+            {
+                let subscription = unsubscribe.subscription;
+                self.waiting_ids.insert(subscription, true);
+                tracing::debug!(subscription, "unsubscribe of a command still waiting");
+                // No subscription opened, so a last event has nowhere to go.
+                let _last = self.state.handler.unsubscribed(self.id, subscription);
+                self.send(Class::Signaling, &Success::new(id, Empty::default()));
+            }
             Command::Unsubscribe(unsubscribe) => {
                 match self.subscriptions.remove(&unsubscribe.subscription) {
                     Some(task) => {
@@ -623,37 +888,21 @@ impl<H: Handler> Connection<H> {
                 }
             }
             other if opens_subscription(&other) && !self.subscription_slot_free() => {
-                tracing::warn!(
-                    id,
-                    command = other.name(),
-                    max = self.state.config.max_subscriptions,
-                    "command refused: subscription limit of the connection reached"
-                );
-                self.send(
-                    Class::Signaling,
-                    &Failure::new(
-                        Some(id),
-                        ApiError::new(
-                            ErrorCode::LimitReached,
-                            "too many open subscriptions on this connection",
-                        ),
-                    ),
+                self.refuse(
+                    Some(id),
+                    Some(name),
+                    ApiError::new(
+                        ErrorCode::LimitReached,
+                        "too many open subscriptions on this connection",
+                    )
+                    .with_detail("limit", "max_subscriptions"),
                 );
             }
-            other => match self.handled(id, other).await {
-                Outcome::Result(result) => self.send(Class::Signaling, &Success::new(id, result)),
-                Outcome::Error(error) => {
-                    self.send(Class::Signaling, &Failure::new(Some(id), error));
-                }
-                Outcome::Subscribed(events) => {
-                    self.send(Class::Signaling, &Success::new(id, Empty::default()));
-                    self.subscribe(id, events);
-                }
-                Outcome::SubscribedWith { result, events } => {
-                    self.send(Class::Signaling, &Success::new(id, result));
-                    self.subscribe(id, events);
-                }
-            },
+            other if waits(&other) => self.wait_for(id, name, other),
+            other => {
+                let outcome = self.handled(id, other).await;
+                self.answer(Answered { id, name, outcome });
+            }
         }
     }
 
@@ -677,7 +926,25 @@ const fn opens_subscription(command: &Command) -> bool {
             | Command::WebrtcOffer(_)
             | Command::SessionAdopt(_)
             | Command::RecordingCreate(_)
+            | Command::LiveCreate(_)
+            | Command::HlsCreate(_)
+            | Command::SignalingSubscribe(_)
     )
+}
+
+/// Whether the handler's answer to `command` waits on a camera, so the
+/// connection reads and answers further commands meanwhile
+/// ([`Connection::wait_for`]): `live/create` waits for the worker's init
+/// segment and `hls/create` for its output's start, which a signaled source
+/// gives only once its client relayed the camera's answer, on this
+/// connection as like as not. Each opens a subscription
+/// ([`opens_subscription`]), whose slot it holds while it waits. Every
+/// other command is answered before the next is read: `webrtc/reoffer`
+/// waits too, but on the session's worker alone and for a bounded time,
+/// and the candidates of its new offer that follow it must reach the
+/// handler after it.
+const fn waits(command: &Command) -> bool {
+    matches!(command, Command::LiveCreate(_) | Command::HlsCreate(_))
 }
 
 /// Forwards a subscription's events as frames until it ends or the queue
@@ -722,6 +989,20 @@ mod tests {
 
     fn command(text: &str) -> Command {
         lotse_api_types::parse_command(text).unwrap()
+    }
+
+    #[test]
+    fn only_live_and_hls_create_wait_and_each_holds_a_subscription_slot_meanwhile() {
+        for text in [
+            r#"{"id":1,"type":"live/create","stream_id":"a"}"#,
+            r#"{"id":1,"type":"hls/create","stream_id":"a"}"#,
+        ] {
+            let create = command(text);
+            assert!(waits(&create), "{text}");
+            assert!(opens_subscription(&create), "{text}");
+        }
+        let reoffer = command(r#"{"id":1,"type":"webrtc/reoffer","session_id":"s","sdp":"v=0"}"#);
+        assert!(!waits(&reoffer));
     }
 
     #[tokio::test]
@@ -860,6 +1141,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clients_add_needs_the_socket_a_listener_a_pin_and_a_disk() {
+        let (logs, _guard) = crate::pairing::test_support::capture();
+        let enrolled = Fingerprint::of(b"enrolled");
+        let (store, dir) = store_with("add", &[], enrolled, |_| Ok(()));
+        let clients = Some(&store);
+        let unix = PeerInfo::Unix { uid: 0, pid: None };
+        let scraper = Fingerprint::of(b"scraper");
+        let code = |result: Result<Empty, ApiError>| result.unwrap_err().code;
+        let text = scraper.to_string();
+        assert_eq!(
+            code(clients_add(clients, &tls_peer(enrolled, 1), &text, ClientRole::Metrics).await),
+            ErrorCode::NotPermitted
+        );
+        assert_eq!(
+            code(clients_add(None, &unix, &text, ClientRole::Metrics).await),
+            ErrorCode::InvalidRequest
+        );
+        let refused = clients_add(clients, &unix, "zz", ClientRole::Metrics)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.details["field"], "pin");
+        let blocker = dir.join(crate::clients::CLIENTS_DIR).join("pins.partial");
+        std::fs::create_dir(&blocker).unwrap();
+        assert_eq!(
+            code(clients_add(clients, &unix, &text, ClientRole::Metrics).await),
+            ErrorCode::InternalError
+        );
+        assert_eq!(store.role(&scraper), None, "nothing changed");
+        std::fs::remove_dir(&blocker).unwrap();
+        let add = command(&format!(
+            r#"{{"id":5,"type":"clients/add","pin":"{}","role":"metrics"}}"#,
+            scraper.to_hex()
+        ));
+        let (answer, leaving) = listener_answer(None, clients, &unix, ConnectionId(2), add).await;
+        assert_eq!(answer["success"], true, "{answer}");
+        assert!(!leaving);
+        assert_eq!(store.role(&scraper), Some(ClientRole::Metrics));
+        assert!(
+            clients_add(clients, &unix, &text, ClientRole::Metrics)
+                .await
+                .is_ok(),
+            "idempotent"
+        );
+        let refused = clients_add(clients, &unix, &text, ClientRole::Control)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::NotPermitted);
+        assert_eq!(refused.details["role"], "metrics");
+        assert_eq!(store.role(&scraper), Some(ClientRole::Metrics));
+        let text = logs.text();
+        for line in [
+            "clients/add refused: not on the control socket",
+            "adding the control client failed",
+            "clients/add refused: the pin has the other role",
+            "clients/add: the pin already has the role, nothing to add",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        let added = text
+            .lines()
+            .find(|line| line.contains("control client added"))
+            .unwrap();
+        assert!(added.contains(&format!("client_pin={scraper}")), "{added}");
+        assert!(added.contains("role=\"metrics\""), "{added}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn only_a_client_that_removed_itself_leaves_and_only_after_the_answer() {
         let (own, other) = (Fingerprint::of(b"own"), Fingerprint::of(b"other"));
         let (store, dir) = store_with("leaving", &[], own, |_| Ok(()));
@@ -924,8 +1273,12 @@ mod tests {
             rustix::process::getuid().as_raw(),
             rustix::process::getgid().as_raw(),
         );
+        let fixed: Vec<_> = fixed
+            .iter()
+            .map(|pin| (*pin, ClientRole::Control))
+            .collect();
         let store =
-            ClientStore::open(&std::fs::File::open(&dir).unwrap(), &dir, fixed, runtime).unwrap();
+            ClientStore::open(&std::fs::File::open(&dir).unwrap(), &dir, &fixed, runtime).unwrap();
         store.enroll(pin).unwrap();
         (Arc::new(store.with_sync_dir(sync_dir)), dir)
     }

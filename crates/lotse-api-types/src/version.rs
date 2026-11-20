@@ -11,8 +11,8 @@
 //! client: before that no client exists to be incompatible with, so an
 //! API change does not bump it.
 
-/// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`], [`RECORDING_PATH`] and
-/// [`PAIR_PATH`]
+/// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`], [`RECORDING_PATH`],
+/// [`LIVE_PATH`], [`HLS_PATH`], [`PAIR_PATH`] and [`METRICS_PATH`]
 /// from one `major, minor, patch`, so they cannot disagree.
 macro_rules! api_version {
     ($major:literal, $minor:literal, $patch:literal) => {
@@ -33,11 +33,25 @@ macro_rules! api_version {
         /// recording at `/v<major>/recording/{recording_id}` ([`crate::recording::recording_path`]).
         pub const RECORDING_PATH: &str = concat!("/v", $major, "/recording");
 
+        /// Where live outputs' bytes are served: `/v<major>/live`, each at
+        /// `/v<major>/live/{live_id}` ([`crate::live::live_path`]).
+        pub const LIVE_PATH: &str = concat!("/v", $major, "/live");
+
+        /// Where LL-HLS sessions' playlists and segments are served:
+        /// `/v<major>/hls`, each resource of a session at
+        /// `/v<major>/hls/{hls_id}/{name}` ([`crate::hls::hls_playlist_path`]).
+        pub const HLS_PATH: &str = concat!("/v", $major, "/hls");
+
         /// Where a pairing connection sends its secret: `POST
         /// /v<major>/pair`. Versioned with the API like every other path;
         /// the pairing code's `LOTSE1` prefix versions the code's format,
         /// not the route.
         pub const PAIR_PATH: &str = concat!("/v", $major, "/pair");
+
+        /// Where the daemon's metrics are read, in OpenMetrics or the
+        /// Prometheus text format: `GET /v<major>/metrics`, by any client of either
+        /// listener, a `metrics` client of the TLS listener included.
+        pub const METRICS_PATH: &str = concat!("/v", $major, "/metrics");
     };
 }
 
@@ -115,6 +129,9 @@ mod tests {
         assert_eq!(WS_PATH, "/v0/ws");
         assert_eq!(PAIR_PATH, "/v0/pair");
         assert_eq!(RECORDING_PATH, "/v0/recording");
+        assert_eq!(LIVE_PATH, "/v0/live");
+        assert_eq!(HLS_PATH, "/v0/hls");
+        assert_eq!(METRICS_PATH, "/v0/metrics");
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
     }
 

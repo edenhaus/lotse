@@ -14,7 +14,7 @@
 # build.rs (a feature or dependency change changes the code it builds) and a file deleted from a
 # crate (it is in no dep-info of HEAD; a rename counts as one, its old path deleted) select every
 # target that links a source of that crate. A file that changes how every target builds or runs
-# selects them all: the root's and the fuzz workspace's Cargo.toml and Cargo.lock (a dependency's
+# selects them all: the root's and the fuzz crate's Cargo.toml and the Cargo.lock (a dependency's
 # version, or a workspace dependency's features, changes code no crate's own files show), the
 # toolchain, cargo's config, the fuzz scripts and CI's workflow; so does a missing base. A crate's
 # Cargo.toml that turns on a feature of a dependency shared with other crates changes that
@@ -27,7 +27,7 @@ base=${2?usage: scripts/fuzz-select.sh <dir> <base> <target>...}
 shift 2
 
 if [ -z "$base" ] || ! git diff --quiet "$base" HEAD -- \
-  Cargo.toml Cargo.lock fuzz/Cargo.toml fuzz/Cargo.lock rust-toolchain.toml .cargo/config.toml \
+  Cargo.toml Cargo.lock fuzz/Cargo.toml rust-toolchain.toml .cargo/config.toml \
   scripts/fuzz.sh scripts/fuzz-parallel.sh scripts/fuzz-select.sh .github/workflows/ci.yml; then
   printf '%s\n' "$@"
   exit 0

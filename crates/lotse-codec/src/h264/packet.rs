@@ -714,8 +714,8 @@ mod tests {
         assert_eq!(out.len(), 2, "STAP-A inserted before the first slice");
         // The repeats before the second slice are dropped, and noted: a new
         // SPS still counts.
-        assert!(run(&mut n, 1000, false, &sps(1280, 720)).is_empty());
-        assert!(run(&mut n, 1000, false, &pps()).is_empty());
+        assert_eq!(run(&mut n, 1000, false, &sps(1280, 720)), []);
+        assert_eq!(run(&mut n, 1000, false, &pps()), []);
         assert_eq!(n.parameter_sets().sps.as_deref(), Some(&sps(1280, 720)[..]));
         assert_eq!(n.stats().misplaced_sets_dropped, 2);
         // The second slice: no insertion, no keyframe start of its own.
@@ -761,7 +761,7 @@ mod tests {
         assert!(parts.len() >= 2, "{}", parts.len());
         let before = n.stats().misplaced_sets_dropped;
         for part in &parts[..parts.len() - 1] {
-            assert!(run(&mut n, 3000, false, part).is_empty());
+            assert_eq!(run(&mut n, 3000, false, part), []);
         }
         let out = run(&mut n, 3000, true, parts.last().unwrap());
         assert_eq!(out.len(), 1);
@@ -906,6 +906,43 @@ mod tests {
         sets.observe(&sps(640, 480));
         sets.observe(&pps());
         sets
+    }
+
+    /// The resplits counted when a STAP-A loses a late PPS and is repacked
+    /// to `max_payload`, which is `delta` bytes off the STAP-A's size.
+    fn resplit_of_a_shrunk_stap_a(delta: isize) -> u64 {
+        let stap = nal::stap_a(&[&pps(), &idr(10), &idr(12)]);
+        let max_payload = stap.len().checked_add_signed(delta).unwrap();
+        let mut n = PacketNormalizer::new(max_payload, known_sets());
+        run(&mut n, 1000, false, &idr(8));
+        let before = n.stats().resplit;
+        let out = run(&mut n, 1000, false, &stap);
+        assert_eq!(n.stats().misplaced_sets_dropped, 1);
+        assert_ne!(out, [], "the slices go on");
+        n.stats().resplit - before
+    }
+
+    #[test]
+    fn a_stap_a_that_lost_units_is_resplit_only_when_too_large_rfc6184_5_7_1() {
+        assert_eq!(
+            resplit_of_a_shrunk_stap_a(100),
+            0,
+            "smaller than the target"
+        );
+        assert_eq!(resplit_of_a_shrunk_stap_a(0), 0, "exactly the target");
+        assert_eq!(resplit_of_a_shrunk_stap_a(-1), 1, "larger than the target");
+    }
+
+    #[test]
+    fn units_that_fill_the_target_exactly_share_one_stap_a_rfc6184_5_7_1() {
+        let (a, b) = (idr(10), idr(12));
+        let target = 1 + (a.len() + 2) + (b.len() + 2);
+        let mut n = PacketNormalizer::new(target, known_sets());
+        run(&mut n, 1000, false, &idr(8));
+        // The late PPS goes, the two slices are repacked into the target.
+        let out = run(&mut n, 1000, false, &nal::stap_a(&[&pps(), &a, &b]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload, nal::stap_a(&[&a, &b]));
     }
 
     #[test]
@@ -1086,7 +1123,7 @@ mod tests {
     #[test]
     fn filler_is_dropped_and_violations_are_errors() {
         let mut n = PacketNormalizer::new(DEFAULT_MAX_PAYLOAD, ParameterSets::default());
-        assert!(run(&mut n, 1, false, &[0x0c, 0xff, 0xff]).is_empty());
+        assert_eq!(run(&mut n, 1, false, &[0x0c, 0xff, 0xff]), []);
         let stap = nal::stap_a(&[&[0x0c, 0xff], &slice(4)]);
         let out = run(&mut n, 2, true, &stap);
         assert_eq!(out.len(), 1);
@@ -1096,7 +1133,7 @@ mod tests {
             "rebuilt without filler"
         );
         let only_filler = nal::stap_a(&[&[0x0c, 0xff]]);
-        assert!(run(&mut n, 3, false, &only_filler).is_empty());
+        assert_eq!(run(&mut n, 3, false, &only_filler), []);
         assert_eq!(n.stats().filler_dropped, 3);
         let mut out = Vec::new();
         assert_eq!(
@@ -1112,7 +1149,7 @@ mod tests {
             ),
             Err(PayloadError::Truncated)
         );
-        assert!(out.is_empty());
+        assert_eq!(out, []);
         assert_eq!(n.stats().violations, 2);
         assert_eq!(n.stats().packets, 5);
     }

@@ -25,6 +25,7 @@ tracing = { workspace = true }
 tracing-core = { workspace = true } # retina's events written as events of the source's own (`retina_log`)
 tracing-subscriber = { workspace = true } # `retina_log`: the layer between retina's events and the one that writes the lines
 url = { workspace = true } # the URL of retina's requests: the source URL itself
+lotse-api-types = { workspace = true } # the `rtsp` and `rtsps` sources' fields (`RtspOptions`, `RtspsOptions`), declared with the API's `stream/put` variants
 lotse-codec = { workspace = true }
 lotse-core = { workspace = true }
 lotse-tls = { workspace = true } # `rtsps`: the certificate check and the TLS stream to the camera

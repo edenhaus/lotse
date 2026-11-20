@@ -35,10 +35,13 @@ mod generator {
     use crate::clients::ClientList;
     use crate::command::Command;
     use crate::frame::{Empty, EventFrame, Failure, Hello, Pong, Shutdown, Success};
+    use crate::hls::{HlsCreateResult, HlsEvent};
     use crate::info::{InfoResult, Metrics};
+    use crate::live::{LiveCreateResult, LiveEvent};
     use crate::pairing::PairingCreateResult;
     use crate::recording::{RecordingCreateResult, RecordingEvent};
-    use crate::session::{Session, SessionEvent, SessionList, WebrtcRenegotiateResult};
+    use crate::session::{Session, SessionEvent, SessionList, WebrtcReofferResult};
+    use crate::signaling::SignalingEvent;
     use crate::stream::{
         BackchannelReleaseResult, Stream, StreamEvent, StreamList, StreamPutResult,
     };
@@ -48,44 +51,37 @@ mod generator {
         serde_json::to_value(generator.subschema_for::<T>()).unwrap_or(Value::Null)
     }
 
-    /// The bundle: frames, commands, their results, and events, each a `$ref`
-    /// into one shared `$defs`, so the bundle is a single valid JSON Schema
-    /// document that tools (the Python client's generator) read as it is.
-    pub fn bundle() -> Value {
-        let mut generator = SchemaSettings::draft2020_12().into_generator();
+    /// Every command's result schema by the command's name, each a `$ref`
+    /// into `generator`'s definitions.
+    fn results(generator: &mut SchemaGenerator) -> Map<String, Value> {
         let mut results = Map::new();
-        results.insert("ping".into(), reference::<Pong>(&mut generator));
-        results.insert(
-            "info".into(),
-            reference::<Success<InfoResult>>(&mut generator),
-        );
+        results.insert("ping".into(), reference::<Pong>(generator));
+        results.insert("info".into(), reference::<Success<InfoResult>>(generator));
         results.insert(
             "metrics/get".into(),
-            reference::<Success<Metrics>>(&mut generator),
+            reference::<Success<Metrics>>(generator),
         );
-        results.insert("schema".into(), reference::<Success<Value>>(&mut generator));
+        results.insert("schema".into(), reference::<Success<Value>>(generator));
         results.insert(
             "pairing/create".into(),
-            reference::<Success<PairingCreateResult>>(&mut generator),
+            reference::<Success<PairingCreateResult>>(generator),
         );
         results.insert(
             "clients/list".into(),
-            reference::<Success<ClientList>>(&mut generator),
+            reference::<Success<ClientList>>(generator),
         );
         results.insert(
             "stream/put".into(),
-            reference::<Success<StreamPutResult>>(&mut generator),
+            reference::<Success<StreamPutResult>>(generator),
         );
-        results.insert(
-            "stream/get".into(),
-            reference::<Success<Stream>>(&mut generator),
-        );
+        results.insert("stream/get".into(), reference::<Success<Stream>>(generator));
         results.insert(
             "stream/list".into(),
-            reference::<Success<StreamList>>(&mut generator),
+            reference::<Success<StreamList>>(generator),
         );
         for name in [
             "clients/remove",
+            "clients/add",
             "stream/delete",
             "stream/subscribe",
             "unsubscribe",
@@ -93,29 +89,52 @@ mod generator {
             "webrtc/candidate",
             "session/close",
             "session/adopt",
+            "signaling/subscribe",
+            "signaling/answer",
+            "signaling/candidate",
+            "signaling/error",
+            "live/close",
+            "hls/close",
         ] {
-            results.insert(name.into(), reference::<Success<Empty>>(&mut generator));
+            results.insert(name.into(), reference::<Success<Empty>>(generator));
         }
         results.insert(
-            "webrtc/renegotiate".into(),
-            reference::<Success<WebrtcRenegotiateResult>>(&mut generator),
+            "webrtc/reoffer".into(),
+            reference::<Success<WebrtcReofferResult>>(generator),
         );
         results.insert(
             "session/get".into(),
-            reference::<Success<Session>>(&mut generator),
+            reference::<Success<Session>>(generator),
         );
         results.insert(
             "session/list".into(),
-            reference::<Success<SessionList>>(&mut generator),
+            reference::<Success<SessionList>>(generator),
         );
         results.insert(
             "backchannel/release".into(),
-            reference::<Success<BackchannelReleaseResult>>(&mut generator),
+            reference::<Success<BackchannelReleaseResult>>(generator),
         );
         results.insert(
             "recording/create".into(),
-            reference::<Success<RecordingCreateResult>>(&mut generator),
+            reference::<Success<RecordingCreateResult>>(generator),
         );
+        results.insert(
+            "live/create".into(),
+            reference::<Success<LiveCreateResult>>(generator),
+        );
+        results.insert(
+            "hls/create".into(),
+            reference::<Success<HlsCreateResult>>(generator),
+        );
+        results
+    }
+
+    /// The bundle: frames, commands, their results, and events, each a `$ref`
+    /// into one shared `$defs`, so the bundle is a single valid JSON Schema
+    /// document that tools (the Python client's generator) read as it is.
+    pub fn bundle() -> Value {
+        let mut generator = SchemaSettings::draft2020_12().into_generator();
+        let results = results(&mut generator);
         let hello = reference::<Hello>(&mut generator);
         let shutdown = reference::<Shutdown>(&mut generator);
         let command = reference::<Command>(&mut generator);
@@ -123,6 +142,9 @@ mod generator {
         let stream_events = reference::<EventFrame<StreamEvent>>(&mut generator);
         let session_events = reference::<EventFrame<SessionEvent>>(&mut generator);
         let recording_events = reference::<EventFrame<RecordingEvent>>(&mut generator);
+        let signaling_events = reference::<EventFrame<SignalingEvent>>(&mut generator);
+        let live_events = reference::<EventFrame<LiveEvent>>(&mut generator);
+        let hls_events = reference::<EventFrame<HlsEvent>>(&mut generator);
         json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "lotse control API",
@@ -137,6 +159,9 @@ mod generator {
                 "webrtc/offer": session_events,
                 "session/adopt": session_events,
                 "recording/create": recording_events,
+                "live/create": live_events,
+                "hls/create": hls_events,
+                "signaling/subscribe": signaling_events,
             },
             "$defs": generator.take_definitions(true),
         })
@@ -263,6 +288,9 @@ mod tests {
             "webrtc/offer",
             "session/adopt",
             "recording/create",
+            "live/create",
+            "hls/create",
+            "signaling/subscribe",
         ] {
             assert_eq!(tag_of(&bundle, &bundle["events"][name]), "event", "{name}");
         }

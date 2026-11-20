@@ -12,18 +12,19 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+lotse-api-types = { workspace = true } # `TlsTrust`, the sources' `tls` field this crate maps to a `Trust`
 lotse-core = { workspace = true } # `SourceError`, what a failed handshake becomes
 rustls = { workspace = true } # the client configuration and the certificate verifier
 thiserror = { workspace = true }
 tokio = { workspace = true } # `AsyncRead`/`AsyncWrite` of the stream the caller connected
 tokio-rustls = { workspace = true } # the TLS stream over it
-tracing = { workspace = true } # the `insecure_tls` warning and the established connection
+tracing = { workspace = true } # the `insecure` warning and the established connection
 webpki-roots = { workspace = true } # the embedded roots a server is verified against without a pin
 
 [dev-dependencies]
 lotse-testing = { workspace = true } # the fake camera's TLS mode, the server of the handshake tests
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] } # the handshake tests' runtime and TCP connections
-tracing-subscriber = { workspace = true } # captures the `insecure_tls` warning
+tracing-subscriber = { workspace = true } # captures the `insecure` warning
 
 [lints]
 workspace = true

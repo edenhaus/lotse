@@ -6,8 +6,10 @@ The page puts the stream with `preload`, offers once it is live (the first frame
 GOP cache), trickles its candidates, plays, and returns what it measured; `checks.check` decides,
 the same way in every browser. One test per case (`harness.CASES`, `--case`): the camera's audio,
 and what happens to the stream between a first window and the one the checks take (a keyframe
-request, a camera reconnect, a worker crash). The report goes to `report.json` in the case's
-directory in `--out` either way.
+request, a camera reconnect, a worker crash), or whether the page also plays the stream as live
+fMP4 through the browser's Media Source Extensions, or as LL-HLS through hls.js, beside the WebRTC
+session, with the two latencies reported side by side. The report goes to `report.json` in the
+case's directory in `--out` either way.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-from checks import check
+from checks import check, latency_summary
 from harness import versions
 from servers import play
 
@@ -35,8 +37,8 @@ def _ms(value: float | None) -> str:
 def test_the_browser_plays_and_hears_the_camera(
     settings: Settings, case: Case, out: Path, served: Served, driver: WebDriver
 ) -> None:
-    user_agent, page = play(driver, served, settings.play_s, case.disrupt)
-    verdict = check(page, served.stream, case.disrupt)
+    user_agent, page = play(driver, served, settings.play_s, case.disrupt, player=case.player)
+    verdict = check(page, served.stream, case.disrupt, settings.engine, player=case.player)
     report = {
         "engine": settings.engine,
         "case": case.name,
@@ -60,5 +62,7 @@ def test_the_browser_plays_and_hears_the_camera(
             f", before the {case.disrupt} {_ms(before.median_ms)} over {before.pairs} pairs; "
             f"{json.dumps(verdict.diagnostics['disruption'])}"
         )
+    if verdict.latency is not None:
+        summary += f"; latency {latency_summary(verdict.latency)}"
     print(summary)  # noqa: T201 -- the run's one line, shown by `-rA`
     assert not verdict.failures, summary + "\n" + "\n".join(verdict.failures)

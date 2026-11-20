@@ -259,8 +259,8 @@ impl PrerecordShared {
     fn add(&self, bytes: usize) {
         let _previous = self
             .held
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                Some(held.saturating_add(bytes))
+            .update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.saturating_add(bytes)
             });
     }
 
@@ -268,8 +268,8 @@ impl PrerecordShared {
     fn sub(&self, bytes: usize) {
         let _previous = self
             .held
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                Some(held.saturating_sub(bytes))
+            .update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.saturating_sub(bytes)
             });
     }
 }
@@ -2008,7 +2008,7 @@ mod tests {
         let mut ring = ring(true, 1000);
         gop(&mut ring, &recording, 0, 1000, usize::MAX);
         assert!(ring.clear(), "frames were held");
-        assert!(held(&ring).is_empty());
+        assert_eq!(held(&ring), Vec::<i64>::new());
         assert_eq!(ring.stats(), Some(PrerecordStats::default()));
         assert!(!ring.clear(), "nothing held");
         assert_eq!(ring.window(), Some(Duration::from_secs(1)));
@@ -2034,7 +2034,7 @@ mod tests {
         );
         assert_eq!(held(&ring), [2000, 2250], "a new window keeps what is held");
         assert_eq!(ring.set_window(None), Some(Duration::from_secs(2)));
-        assert!(held(&ring).is_empty());
+        assert_eq!(held(&ring), Vec::<i64>::new());
         assert_eq!(ring.frames.capacity(), 0, "the allocation is freed");
         assert_eq!(ring.stats(), None);
         assert!(ring.snapshot(recording.at(0)).is_none());

@@ -332,6 +332,16 @@ mod tests {
     }
 
     #[test]
+    fn jitter_is_xorshift64_star() {
+        // Vigna, "An experimental exploration of Marsaglia's xorshift generators, scrambled"
+        // (2016): shifts 12, 25 and 27, then the multiplier; reference values computed apart.
+        let mut jitter = Jitter::new(0x0123_4567_89AB_CDEF);
+        assert_eq!(jitter.next_u64(), 0x7C94_8247_2CB6_708C);
+        assert_eq!(jitter.next_u64(), 0xD570_5692_BF1F_28DE);
+        assert_eq!(jitter.next_u64(), 0x88B7_1E3B_A5E0_05C0);
+    }
+
+    #[test]
     fn jitter_differs_between_seeds_and_never_leaves_the_band() {
         let a = ReconnectBackoff::new(1).next_delay(false);
         let b = ReconnectBackoff::new(2).next_delay(false);

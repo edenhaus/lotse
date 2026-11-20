@@ -26,24 +26,30 @@ pub enum ErrorCode {
     /// No such stream.
     StreamNotFound,
     /// No such session, or its grace expired; for `webrtc/candidate` and
-    /// `webrtc/renegotiate`, also a session this connection does not own.
+    /// `webrtc/reoffer`, also a session this connection does not own.
     SessionNotFound,
     /// The session id is already open.
     SessionIdInUse,
     /// `unsubscribe` of an unknown subscription.
     SubscriptionNotFound,
-    /// Streams, sessions, sessions per stream or connections.
+    /// Streams, sessions, sessions per stream or connections; over HTTP
+    /// (429), LL-HLS requests blocked at once. `details.limit` names the
+    /// limit.
     LimitReached,
-    /// The source URL scheme is not in `info.schemes`.
-    SchemeUnsupported,
+    /// The source's protocol is one the API defines but this build did
+    /// not register: not in `info.protocols`. A protocol the API does not
+    /// define is `invalid_request`.
+    ProtocolUnsupported,
     /// The source URL, credentials aside, is already another stream's;
     /// `details.stream_id` names it.
     SourceInUse,
     /// The command arrived during graceful shutdown.
     ShuttingDown,
-    /// The command is not allowed on this connection (`pairing/create`
-    /// over the TLS listener, `clients/remove` of another client over it),
-    /// or not for this target (`clients/remove` of a fixed pin).
+    /// The command is not allowed on this connection (`pairing/create` or
+    /// `clients/add` over the TLS listener, `clients/remove` of another
+    /// client over it), or not for this target (`clients/remove` of a
+    /// fixed pin, `clients/add` of a pin that has the other role); or,
+    /// with HTTP 403, a route a `metrics` client may not take.
     NotPermitted,
     /// An invariant failed; a bug, always logged with context.
     InternalError,
@@ -51,7 +57,10 @@ pub enum ErrorCode {
     SourceUnreachable,
     /// The source rejected the credentials.
     SourceAuthFailed,
-    /// The read deadline or stall watchdog hit.
+    /// The read deadline or stall watchdog hit; or an LL-HLS request
+    /// blocked for three Target Durations without what it waits for (HTTP
+    /// 503, draft-pantos-hls-rfc8216bis-22 §6.2.5.2): the source sends no
+    /// media.
     SourceTimeout,
     /// The source violated its protocol.
     SourceProtocolError,
@@ -76,6 +85,29 @@ pub enum ErrorCode {
     /// `GET /v0/recording/{recording_id}` (HTTP 409) of a recording whose bytes another
     /// request already took: a recording has one body.
     RecordingAlreadyFetched,
+    /// `signaling/answer`, `signaling/candidate` or `signaling/error` of a
+    /// signal that is not open, or that another control connection owns.
+    SignalNotFound,
+    /// `GET /v0/live/{live_id}` (HTTP 404) or `live/close` of a live output
+    /// that is not open: never created, already ended, or an id that is no
+    /// live output's; and `live/create` whose subscription was unsubscribed
+    /// before its output started.
+    LiveNotFound,
+    /// `GET /v0/live/{live_id}` (HTTP 409) of a live output whose bytes
+    /// another request already took: a live output has one body.
+    LiveAlreadyFetched,
+    /// `live/create` on a stream whose source showed no video the live
+    /// container carries within `limits.live_start_timeout_ms`.
+    SourceNotLive,
+    /// `GET /v0/hls/{hls_id}/{name}` (HTTP 404) or `hls/close` of an LL-HLS
+    /// session that is not open: never created, already ended, or an id
+    /// that is no session's.
+    HlsNotFound,
+    /// `GET /v0/hls/{hls_id}/{name}` (HTTP 404) of a name that is no
+    /// resource the session's window holds or hints: out of the window,
+    /// never made, or no name the playlist writes
+    /// (draft-pantos-hls-rfc8216bis-22 §6.2.6). The session goes on.
+    HlsResourceNotFound,
 }
 
 impl ErrorCode {
@@ -91,7 +123,7 @@ impl ErrorCode {
             Self::SessionIdInUse => "session_id_in_use",
             Self::SubscriptionNotFound => "subscription_not_found",
             Self::LimitReached => "limit_reached",
-            Self::SchemeUnsupported => "scheme_unsupported",
+            Self::ProtocolUnsupported => "protocol_unsupported",
             Self::SourceInUse => "source_in_use",
             Self::ShuttingDown => "shutting_down",
             Self::NotPermitted => "not_permitted",
@@ -109,6 +141,12 @@ impl ErrorCode {
             Self::RecordingNotFound => "recording_not_found",
             Self::RecordingIdInUse => "recording_id_in_use",
             Self::RecordingAlreadyFetched => "recording_already_fetched",
+            Self::SignalNotFound => "signal_not_found",
+            Self::LiveNotFound => "live_not_found",
+            Self::LiveAlreadyFetched => "live_already_fetched",
+            Self::SourceNotLive => "source_not_live",
+            Self::HlsNotFound => "hls_not_found",
+            Self::HlsResourceNotFound => "hls_resource_not_found",
         }
     }
 
@@ -185,7 +223,7 @@ mod tests {
             ErrorCode::SessionIdInUse,
             ErrorCode::SubscriptionNotFound,
             ErrorCode::LimitReached,
-            ErrorCode::SchemeUnsupported,
+            ErrorCode::ProtocolUnsupported,
             ErrorCode::SourceInUse,
             ErrorCode::ShuttingDown,
             ErrorCode::InternalError,
@@ -202,6 +240,12 @@ mod tests {
             ErrorCode::RecordingNotFound,
             ErrorCode::RecordingIdInUse,
             ErrorCode::RecordingAlreadyFetched,
+            ErrorCode::SignalNotFound,
+            ErrorCode::LiveNotFound,
+            ErrorCode::LiveAlreadyFetched,
+            ErrorCode::SourceNotLive,
+            ErrorCode::HlsNotFound,
+            ErrorCode::HlsResourceNotFound,
         ];
         for code in all {
             let json = serde_json::to_value(code).unwrap();
@@ -216,17 +260,19 @@ mod tests {
         // Nor is a recording event's.
         assert_eq!(ErrorCode::parse("audio_omitted"), None);
         assert_eq!(ErrorCode::parse("not_fetched"), None);
+        // Nor is a signal's.
+        assert_eq!(ErrorCode::parse("camera_error"), None);
     }
 
     #[test]
     fn errors_serialize_like_the_contract_example() {
         let error = ApiError::new(
-            ErrorCode::SchemeUnsupported,
-            "scheme 'http' is not supported",
+            ErrorCode::ProtocolUnsupported,
+            "protocol 'http' is not supported",
         );
         assert_eq!(
             serde_json::to_value(&error).unwrap(),
-            serde_json::json!({ "code": "scheme_unsupported", "message": "scheme 'http' is not supported" })
+            serde_json::json!({ "code": "protocol_unsupported", "message": "protocol 'http' is not supported" })
         );
         let detailed = error.clone().with_detail("protocol", "rtsp");
         assert_eq!(
@@ -235,7 +281,7 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "scheme_unsupported: scheme 'http' is not supported"
+            "protocol_unsupported: protocol 'http' is not supported"
         );
         let parsed: ApiError =
             serde_json::from_str("{\"code\":\"source_timeout\",\"message\":\"m\"}").unwrap();

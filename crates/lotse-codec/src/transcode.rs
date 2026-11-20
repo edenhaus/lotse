@@ -700,6 +700,10 @@ async fn run(mut chain: Chain, mut input: FrameSubscription, stop: CancellationT
     tracing::info!(track = %chain.output.id(), reason, "transcoder stopped");
 }
 
+/// The tests' log capture, shared with the RTP receive path's tests.
+#[cfg(test)]
+pub(crate) use tests::Logs;
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -730,22 +734,22 @@ mod tests {
     /// The events logged on this thread while captured: level and message.
     /// Also makes every field expression of the module's log lines run.
     #[derive(Debug, Clone, Default)]
-    pub(super) struct Logs(Arc<Mutex<Vec<(Level, Message)>>>);
+    pub(crate) struct Logs(Arc<Mutex<Vec<(Level, Message)>>>);
 
     impl Logs {
-        pub(super) fn capture() -> (Self, DefaultGuard) {
+        pub(crate) fn capture() -> (Self, DefaultGuard) {
             let logs = Self::default();
             let guard = tracing::subscriber::set_default(logs.clone());
             (logs, guard)
         }
 
         /// How many events at `level` carried `message`.
-        pub(super) fn count(&self, level: Level, message: &str) -> usize {
+        pub(crate) fn count(&self, level: Level, message: &str) -> usize {
             self.fields(level, message).len()
         }
 
         /// The other fields of each event at `level` with `message`.
-        pub(super) fn fields(&self, level: Level, message: &str) -> Vec<Vec<String>> {
+        pub(crate) fn fields(&self, level: Level, message: &str) -> Vec<Vec<String>> {
             let events = self.0.lock().unwrap();
             events
                 .iter()
@@ -1241,6 +1245,43 @@ mod tests {
         assert_eq!(logs.count(Level::DEBUG, timeline), 1);
     }
 
+    #[test]
+    fn a_new_anchor_where_the_last_packet_ended_continues_the_epoch() {
+        let output = opus_track(1, 48_000);
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::from_system());
+        let mut chain = Chain::new(F48.config, output, clock).unwrap();
+        let ts = 30 * 1024;
+        let next_packet = chain.anchor_at(ts).next_packet;
+        assert_eq!(chain.pending_epoch, None, "nothing sent yet");
+        // Sent up to exactly where the new anchor starts: contiguous.
+        chain.published_end = Some(next_packet);
+        assert_eq!(chain.anchor_at(ts).next_packet, next_packet);
+        assert_eq!(chain.pending_epoch, None);
+        // One sample more sent: the new timeline would overlap it.
+        chain.published_end = Some(next_packet + 1);
+        chain.anchor_at(ts);
+        assert_eq!(chain.pending_epoch, Some("overlap"));
+    }
+
+    #[tokio::test]
+    async fn a_jitter_as_large_as_one_reported_before_is_not_reported_again() {
+        let jitter = "transcoder: camera audio timestamps jitter; following the sample count";
+        let (logs, _guard) = Logs::capture();
+        let mut rig = Rig::of(&F16);
+        // Every third frame 5 samples late: the median stays on time, and
+        // the 5 samples are reported when first seen, not at every repeat.
+        publish_silent(
+            &rig,
+            (0..48).map(|i| i * 1024 + if i % 3 == 2 { 5 } else { 0 }),
+        )
+        .await;
+        let _ = rig.finish().await;
+        assert_eq!(
+            logs.fields(Level::INFO, jitter),
+            vec![vec!["track=a1".to_owned(), "jitter_samples=5".to_owned()]]
+        );
+    }
+
     /// The log line of a re-anchor over a moved timeline.
     const MOVED: &str = "transcoder: camera audio timeline moved; re-anchoring";
 
@@ -1379,7 +1420,7 @@ mod tests {
             i * 1024 + by
         });
         publish_silent(&rig, stamps).await;
-        assert!(jumps(&rig.finish().await).is_empty());
+        assert_eq!(jumps(&rig.finish().await), Vec::<usize>::new());
         assert_eq!(logs.count(Level::DEBUG, MOVED), 0);
         drop(guard);
 
@@ -1411,7 +1452,7 @@ mod tests {
         .await;
         let packets = rig.finish().await;
         assert!(packets.iter().all(|p| p.epoch == 0));
-        assert!(jumps(&packets).is_empty());
+        assert_eq!(jumps(&packets), Vec::<usize>::new());
         assert_eq!(logs.count(Level::DEBUG, started), 0);
         drop(guard);
 
@@ -1466,7 +1507,7 @@ mod tests {
             (0..40).map(|i| i * 1024 + if i > 0 { 1024 } else { 0 }),
         )
         .await;
-        assert!(jumps(&rig.finish().await).is_empty());
+        assert_eq!(jumps(&rig.finish().await), Vec::<usize>::new());
         assert_eq!(logs.count(Level::DEBUG, MOVED), 0);
     }
 
@@ -1485,7 +1526,7 @@ mod tests {
         assert_eq!(before.len(), 8 * 1024 * 3 / 960);
         rig.publish(8 * 1024, &BROKEN_FRAME);
         let later = rig.clock.now() + Duration::from_millis(100);
-        assert!(rig.run_until(later).await.is_empty());
+        assert_eq!(rig.run_until(later).await, []);
         rig.publish(9 * 1024, input[9]);
         // A second failure inside the summary interval is counted quietly.
         rig.publish(10 * 1024, &BROKEN_FRAME);
@@ -1588,7 +1629,7 @@ mod tests {
         rig.publish(2048, frames(SINE_16K_MONO)[2]);
         rig.clock.advance(Duration::from_secs(1));
         settle().await;
-        assert!(rig.drain().is_empty());
+        assert_eq!(rig.drain(), []);
     }
 
     #[tokio::test]

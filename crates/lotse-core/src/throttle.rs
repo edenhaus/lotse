@@ -45,8 +45,9 @@ impl Throttle {
 /// One [`Throttle`] per call site of another crate's log lines: the
 /// daemon's bridge of `log` records and the RTSP source's layer for
 /// retina's `tracing` events, both of which log once per packet or
-/// request a camera, server or browser sent. Call sites are fixed in the
-/// code, so the map stays small.
+/// request a camera, server or browser sent; or per limit whose warning
+/// a client can repeat, shared by the control API's connections. Call
+/// sites and limits are fixed in the code, so the map stays small.
 #[derive(Debug)]
 pub struct CallSites<K> {
     /// The time each line is counted at.

@@ -1,10 +1,11 @@
-//! Reproduction of an open str0m issue: a viewer that
-//! behaves like Safari did against a local daemon (2026-10-01, observed
-//! behavior) never connects, because str0m's controlled ICE agent (`is`
-//! 0.11.1, `IceAgent::evaluate_nomination`) sends on a pair the viewer
-//! nominated before any check of ours on it succeeded, and never moves to the
-//! valid ICE-TCP pair the viewer nominates next. RFC 8445 §7.3.1.5 and §8.1.1
-//! select only valid (succeeded) nominated pairs.
+//! A viewer that behaves like Safari did against a local daemon
+//! (2026-10-01, observed behavior) connects over ICE-TCP: RFC 8445 §7.3.1.5
+//! and §8.1.1 select only valid (succeeded) nominated pairs. str0m 0.24's
+//! controlled ICE agent (`is` 0.11.1, `IceAgent::evaluate_nomination`) sent
+//! on a pair the viewer nominated before any check of ours on it succeeded,
+//! and never moved to the valid ICE-TCP pair the viewer nominates next, so
+//! that viewer never connected; str0m 0.25 (`is` 0.12.0) selects only a
+//! nominated pair whose check succeeded.
 //!
 //! The daemon side is the real `lotse_webrtc::Session`, in memory, on a clock
 //! the test moves. The viewer side has two halves, as Safari had:
@@ -18,11 +19,8 @@
 //!   real ICE and DTLS peer, so DTLS completes as soon as the daemon sends
 //!   over TCP.
 //!
-//! The nomination test is ignored until str0m is fixed; it lives in `lotse-testing`
-//! so its lines stay out of the coverage gate while it is ignored. Run it
-//! with `cargo nextest run -p lotse-testing --run-ignored only t7_`. The
-//! two control tests run the same harness without the nomination and pass
-//! today, so a failure of the nomination test is str0m's, not the harness's.
+//! The two control tests run the same harness without the nomination, so a
+//! failure of the nomination test is the engine's, not the harness's.
 
 #![allow(
     clippy::missing_docs_in_private_items,
@@ -68,7 +66,7 @@ const UDP_RECHECK: Duration = Duration::from_millis(500);
 /// A minimal STUN Binding request encoder (RFC 8489), the ICE attributes of
 /// RFC 8445 §7.1 included. Independent of the engine under test.
 mod stun {
-    use hmac::{Hmac, Mac as _};
+    use hmac::{Hmac, KeyInit as _, Mac as _};
 
     /// The magic cookie (RFC 8489 §5).
     const MAGIC_COOKIE: u32 = 0x2112_a442;
@@ -497,13 +495,10 @@ impl Safari {
 /// does: Safari never receives our UDP); then it nominates the ICE-TCP pair,
 /// whose checks succeed. A controlled agent must select only the valid
 /// nominated pair (RFC 8445 §7.3.1.5, §8.1.1), so DTLS runs over TCP and the
-/// session connects. With str0m 0.24.0 / `is` 0.11.1 the send path stays on
-/// the first UDP port, DTLS never completes and the session closes
+/// session connects. With str0m 0.24.0 / `is` 0.11.1 the send path stayed
+/// on the first UDP port, DTLS never completed and the session closed
 /// `ice_failed`.
-///
-/// Run: `cargo nextest run -p lotse-testing --run-ignored only t7_`.
 #[test]
-#[ignore = "fails until str0m selects only valid nominated pairs; run with --run-ignored"]
 fn t7_rfc8445_7_3_1_5_a_safari_like_viewer_that_nominates_a_dead_udp_pair_first_connects_over_ice_tcp()
  {
     let (mut safari, answer) = Safari::new(UdpChecks::Nominating);
@@ -514,8 +509,8 @@ fn t7_rfc8445_7_3_1_5_a_safari_like_viewer_that_nominates_a_dead_udp_pair_first_
 /// Control for the nomination test: the same viewer and sequence, but the
 /// UDP checks carry no USE-CANDIDATE. Nothing nominates the dead pairs, so
 /// the ICE-TCP pair the viewer nominates is selected (RFC 8445 §7.3.1.5)
-/// and the session connects today: the harness is sound, and the
-/// nomination test's failure is the nomination's.
+/// and the session connects: the harness is sound, and a failure of the
+/// nomination test is the nomination's.
 #[test]
 fn rfc8445_7_3_1_5_unnominated_udp_checks_leave_the_ice_tcp_pair_to_be_selected() {
     let (mut safari, answer) = Safari::new(UdpChecks::Unnominated);

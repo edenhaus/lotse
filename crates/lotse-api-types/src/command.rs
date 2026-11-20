@@ -8,15 +8,17 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::clients::ClientRole;
 use crate::error::{ApiError, ErrorCode};
 #[cfg(feature = "schema")]
-use crate::limits::{ID_PATTERN, RECORDING_ID_PATTERN};
+use crate::limits::{ID_PATTERN, RECORDING_ID_PATTERN, SIGNAL_ERROR_CODE_PATTERN};
 use crate::limits::{
-    MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_SDP_CHARS, MAX_SOURCES,
-    MAX_TEXT_CHARS, MAX_URL_CHARS,
+    MAX_ICE_SERVERS, MAX_ICE_URLS, MAX_ID_CHARS, MAX_PIN_CHARS, MAX_SDP_CHARS,
+    MAX_SIGNAL_ERROR_CODE_CHARS, MAX_SOURCES, MAX_TEXT_CHARS, MAX_URL_CHARS,
 };
 use crate::session::IceServer;
-use crate::stream::{AudioMode, Orientation, SourceSpec};
+use crate::source::{SourceSpec, TlsTrust};
+use crate::stream::{AudioMode, Orientation};
 
 /// `ping`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +85,21 @@ pub struct ClientsRemove {
     /// colon between each pair.
     #[cfg_attr(feature = "schema", schemars(length(max = MAX_PIN_CHARS)))]
     pub pin: String,
+}
+
+/// `clients/add`; idempotent for a pin already enrolled with the role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ClientsAdd {
+    /// The command id.
+    pub id: u64,
+    /// The client certificate's SHA-256, 64 hex digits, optionally with a
+    /// colon between each pair.
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_PIN_CHARS)))]
+    pub pin: String,
+    /// What the pin may do.
+    pub role: ClientRole,
 }
 
 /// `stream/put`: the idempotent upsert of a stream's desired state.
@@ -244,7 +261,7 @@ pub struct WebrtcCandidate {
     pub sdp_mline_index: Option<u32>,
 }
 
-/// `webrtc/renegotiate`: a re-offer for an answered session, taken only
+/// `webrtc/reoffer`: a re-offer for an answered session, taken only
 /// from the connection that owns it, answered in the result. Only the
 /// audio m-lines may change: one offered `sendonly`, or the downlink one
 /// offered `sendrecv`, asks for talk-back, and the answer says whether
@@ -260,7 +277,7 @@ pub struct WebrtcCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
-pub struct WebrtcRenegotiate {
+pub struct WebrtcReoffer {
     /// The command id.
     pub id: u64,
     /// The session.
@@ -361,6 +378,205 @@ const fn with_audio() -> bool {
     true
 }
 
+/// `live/create`: a live output of a stream, its video and, when asked and
+/// the container carries it, its audio as live fragmented MP4 from the
+/// cached keyframe on, whose bytes `GET /v0/live/{live_id}` serves once (the
+/// result's `url`) for as long as the output runs; the subscription's
+/// events say how it goes, `closed` last.
+///
+/// The command waits for the stream's worker to write the init segment,
+/// which needs the video's parameter sets, for at most
+/// `limits.live_start_timeout_ms`, so the result can carry the MIME type
+/// with its `codecs`. Meanwhile the connection reads and answers further
+/// commands, so the result may follow theirs: a signaled source's
+/// `signaling/answer`, which its output may be waiting for, is never held up
+/// behind it. It holds its subscription's place under the connection's cap
+/// from the start. A running live output keeps the source connected, as a
+/// viewer does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LiveCreate {
+    /// The command id, which becomes the subscription id.
+    pub id: u64,
+    /// The stream to play.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub stream_id: String,
+    /// Take the stream's audio, when the live container carries it as it
+    /// is (AAC-LC, Opus); any other codec is left out with an
+    /// `audio_omitted` warning and nothing is transcoded. `false` makes a
+    /// video-only output, for a player that cannot play the stream's
+    /// audio.
+    #[serde(default = "with_audio")]
+    pub audio: bool,
+}
+
+/// `live/close`: ends a live output, `closed`; its body ends with its last
+/// chunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LiveClose {
+    /// The command id.
+    pub id: u64,
+    /// The live output.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub live_id: String,
+}
+
+/// `hls/create`: an LL-HLS session of a stream, its video and, when asked
+/// and the container carries it, its audio as a Media Playlist of fragmented
+/// MP4 segments and parts (draft-pantos-hls-rfc8216bis-22), whose playlist
+/// `GET /v0/hls/{hls_id}/index.m3u8` serves (the result's `playlist`) for as
+/// long as the session runs; the subscription's events say how it goes,
+/// `closed` last.
+///
+/// The sessions of one stream and audio choice share one live output and its
+/// window: the first one starts it and waits, as `live/create` does, for the
+/// init segment, for at most `limits.live_start_timeout_ms`, so the result
+/// can carry the MIME type with its `codecs`; later ones join it. A session
+/// keeps the source connected, as a viewer does, until it ends: `hls/close`,
+/// its subscription or control connection gone, or no request for
+/// `limits.hls_idle_timeout_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct HlsCreate {
+    /// The command id, which becomes the subscription id.
+    pub id: u64,
+    /// The stream to play.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub stream_id: String,
+    /// Take the stream's audio, as `live/create`'s `audio`: when the live
+    /// container carries it as it is (AAC-LC, Opus); any other codec is left
+    /// out with an `audio_omitted` warning. `false` makes a video-only
+    /// session.
+    #[serde(default = "with_audio")]
+    pub audio: bool,
+}
+
+/// `hls/close`: ends an LL-HLS session, `closed`; its routes answer 404 from
+/// then on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct HlsClose {
+    /// The command id.
+    pub id: u64,
+    /// The session.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub hls_id: String,
+}
+
+/// `signaling/subscribe`: a subscription to the signaling of one stream's
+/// signaled sources, or of every stream's; its events carry each signal's
+/// offer, candidates and close (`SignalingEvent`).
+///
+/// One subscription serves a scope: a later one for the same stream, or
+/// for every stream, supersedes the earlier, which gets `superseded` and
+/// ends, its signals with it. A subscription for one stream takes that
+/// stream's new signals from the one for every stream, which keeps the
+/// signals it already has. A source several streams share offers to the
+/// subscription of the first of them that has its own, else to the one
+/// for every stream; the offer's `stream_id` names the stream it was
+/// taken for. A signal belongs to the subscription that got its offer:
+/// only its control connection may answer, trickle or end it. A source
+/// finding no subscription waits for one up to 10 s, then its attempt
+/// fails `source_unreachable` and it backs off.
+///
+/// When the subscription ends (`unsubscribe`, the control connection's
+/// close, a supersede, or an event queue it let overflow), every signal it
+/// holds ends at once, answered and live ones included, without a
+/// `closed` event: the client is taken to have lost what it kept for
+/// them (the camera's session, a stream extension it renewed), so each
+/// source ends its attempt and connects again after its backoff, offering
+/// to whichever subscription takes its stream then. A client that only
+/// reconnects should subscribe again, and expect new offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignalingSubscribe {
+    /// The command id, which becomes the subscription id.
+    pub id: u64,
+    /// One stream, or all when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub stream_id: Option<String>,
+}
+
+/// `signaling/answer`: the camera's SDP answer (RFC 8829 §5.3) to a
+/// signal's offer, once per signal and not after the client's
+/// `signaling/error` (`invalid_request`), taken only from the control
+/// connection whose subscription got the offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignalingAnswer {
+    /// The command id.
+    pub id: u64,
+    /// The signal, as its `offer` event named it.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub signal_id: String,
+    /// The SDP answer.
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_SDP_CHARS)))]
+    pub sdp: String,
+}
+
+/// `signaling/candidate`: a candidate of the camera's (RFC 8838 §10),
+/// taken only from the control connection that owns the signal; at most
+/// 64 per signal (`limit_reached`), its end-of-candidates aside. An
+/// end-of-candidates ends one media section's candidates (RFC 8838 §8.2,
+/// §13): the section of its `sdp_mid`, else of its `sdp_mline_index`, else
+/// the one unnamed section. It comes once per section, for at most 8
+/// sections (`limit_reached`), and no candidate of a section follows its
+/// end (`invalid_request`); nor does any after the client's
+/// `signaling/error` (`invalid_request`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignalingCandidate {
+    /// The command id.
+    pub id: u64,
+    /// The signal.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub signal_id: String,
+    /// The `candidate:` attribute value; empty is end-of-candidates
+    /// (RFC 8838 §13).
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_TEXT_CHARS)))]
+    pub candidate: String,
+    /// The media section, when the camera named it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_TEXT_CHARS)))]
+    pub sdp_mid: Option<String>,
+    /// The media section's index, when the camera named it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdp_mline_index: Option<u16>,
+}
+
+/// `signaling/error`: the camera or its integration failed the signal;
+/// it ends, closing `camera_error`, and its source connects again after
+/// its backoff. Taken only from the control connection that owns the
+/// signal, once: a second, or an answer or candidate after it, is
+/// `invalid_request`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SignalingError {
+    /// The command id.
+    pub id: u64,
+    /// The signal.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub signal_id: String,
+    /// The client's code, `^[a-z0-9_]{1,64}$`; not `signal_rejected`,
+    /// the supervisor's own for a rejection of the source's signaling
+    /// (`invalid_request`).
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = SIGNAL_ERROR_CODE_PATTERN)))]
+    pub code: String,
+    /// For humans.
+    #[cfg_attr(feature = "schema", schemars(length(max = MAX_TEXT_CHARS)))]
+    pub message: String,
+}
+
 /// Every command, tagged by `type`. Each variant's schema title names the
 /// Python client's class for it (`StreamPutCommand`), and its `type` names
 /// the client's method: `domain/verb` is `client.domain.verb(...)`, a type
@@ -373,7 +589,7 @@ pub enum Command {
     #[serde(rename = "ping")]
     #[cfg_attr(feature = "schema", schemars(title = "PingCommand"))]
     Ping(Ping),
-    /// `info`: version, build, schemes, outputs, codecs, limits and sandbox.
+    /// `info`: version, build, protocols, outputs, codecs, limits and sandbox.
     #[serde(rename = "info")]
     #[cfg_attr(feature = "schema", schemars(title = "InfoCommand"))]
     Info(Info),
@@ -401,6 +617,12 @@ pub enum Command {
     #[serde(rename = "clients/remove")]
     #[cfg_attr(feature = "schema", schemars(title = "ClientsRemoveCommand"))]
     ClientsRemove(ClientsRemove),
+    /// `clients/add`: enrolls a pin with a role, for a client that cannot
+    /// pair (a metrics scraper); only on the Unix socket. A pin enrolled
+    /// or fixed with the other role is refused.
+    #[serde(rename = "clients/add")]
+    #[cfg_attr(feature = "schema", schemars(title = "ClientsAddCommand"))]
+    ClientsAdd(ClientsAdd),
     /// `stream/put`: the idempotent upsert of a stream's desired state.
     #[serde(rename = "stream/put")]
     #[cfg_attr(feature = "schema", schemars(title = "StreamPutCommand"))]
@@ -436,12 +658,12 @@ pub enum Command {
     #[serde(rename = "webrtc/candidate")]
     #[cfg_attr(feature = "schema", schemars(title = "WebrtcCandidateCommand"))]
     WebrtcCandidate(WebrtcCandidate),
-    /// `webrtc/renegotiate`: a re-offer for an answered session, taken
+    /// `webrtc/reoffer`: a re-offer for an answered session, taken
     /// only from the connection that owns it; the result carries the
     /// answer.
-    #[serde(rename = "webrtc/renegotiate")]
-    #[cfg_attr(feature = "schema", schemars(title = "WebrtcRenegotiateCommand"))]
-    WebrtcRenegotiate(WebrtcRenegotiate),
+    #[serde(rename = "webrtc/reoffer")]
+    #[cfg_attr(feature = "schema", schemars(title = "WebrtcReofferCommand"))]
+    WebrtcReoffer(WebrtcReoffer),
     /// `session/get`: one session's state.
     #[serde(rename = "session/get")]
     #[cfg_attr(feature = "schema", schemars(title = "SessionGetCommand"))]
@@ -468,6 +690,45 @@ pub enum Command {
     #[serde(rename = "recording/create")]
     #[cfg_attr(feature = "schema", schemars(title = "RecordingCreateCommand"))]
     RecordingCreate(RecordingCreate),
+    /// `live/create`: a live output of a stream; its bytes are fetched
+    /// with `GET /v0/live/{live_id}`.
+    #[serde(rename = "live/create")]
+    #[cfg_attr(feature = "schema", schemars(title = "LiveCreateCommand"))]
+    LiveCreate(LiveCreate),
+    /// `live/close`: ends a live output.
+    #[serde(rename = "live/close")]
+    #[cfg_attr(feature = "schema", schemars(title = "LiveCloseCommand"))]
+    LiveClose(LiveClose),
+    /// `hls/create`: an LL-HLS session of a stream; its playlist is
+    /// fetched with `GET /v0/hls/{hls_id}/index.m3u8`.
+    #[serde(rename = "hls/create")]
+    #[cfg_attr(feature = "schema", schemars(title = "HlsCreateCommand"))]
+    HlsCreate(HlsCreate),
+    /// `hls/close`: ends an LL-HLS session.
+    #[serde(rename = "hls/close")]
+    #[cfg_attr(feature = "schema", schemars(title = "HlsCloseCommand"))]
+    HlsClose(HlsClose),
+    /// `signaling/subscribe`: a subscription to the offers of one
+    /// stream's signaled sources, or of every stream's. Its end
+    /// (`unsubscribe`, the connection's close, a supersede) ends every
+    /// signal it holds at once, live ones included, without `closed`:
+    /// their sources connect again after their backoff.
+    #[serde(rename = "signaling/subscribe")]
+    #[cfg_attr(feature = "schema", schemars(title = "SignalingSubscribeCommand"))]
+    SignalingSubscribe(SignalingSubscribe),
+    /// `signaling/answer`: the camera's answer to a signal's offer.
+    #[serde(rename = "signaling/answer")]
+    #[cfg_attr(feature = "schema", schemars(title = "SignalingAnswerCommand"))]
+    SignalingAnswer(SignalingAnswer),
+    /// `signaling/candidate`: a candidate of the camera's for a signal.
+    #[serde(rename = "signaling/candidate")]
+    #[cfg_attr(feature = "schema", schemars(title = "SignalingCandidateCommand"))]
+    SignalingCandidate(SignalingCandidate),
+    /// `signaling/error`: the camera failed a signal, which ends; once
+    /// per signal.
+    #[serde(rename = "signaling/error")]
+    #[cfg_attr(feature = "schema", schemars(title = "SignalingErrorCommand"))]
+    SignalingError(SignalingError),
 }
 
 impl Command {
@@ -480,6 +741,7 @@ impl Command {
         "pairing/create",
         "clients/list",
         "clients/remove",
+        "clients/add",
         "stream/put",
         "stream/get",
         "stream/list",
@@ -488,13 +750,21 @@ impl Command {
         "unsubscribe",
         "webrtc/offer",
         "webrtc/candidate",
-        "webrtc/renegotiate",
+        "webrtc/reoffer",
         "session/get",
         "session/list",
         "session/close",
         "session/adopt",
         "backchannel/release",
         "recording/create",
+        "live/create",
+        "live/close",
+        "hls/create",
+        "hls/close",
+        "signaling/subscribe",
+        "signaling/answer",
+        "signaling/candidate",
+        "signaling/error",
     ];
 
     /// The command's id.
@@ -507,6 +777,7 @@ impl Command {
             Self::PairingCreate(c) => c.id,
             Self::ClientsList(c) => c.id,
             Self::ClientsRemove(c) => c.id,
+            Self::ClientsAdd(c) => c.id,
             Self::StreamPut(c) => c.id,
             Self::StreamGet(c) => c.id,
             Self::StreamList(c) => c.id,
@@ -515,11 +786,19 @@ impl Command {
             Self::Unsubscribe(c) => c.id,
             Self::WebrtcOffer(c) => c.id,
             Self::WebrtcCandidate(c) => c.id,
-            Self::WebrtcRenegotiate(c) => c.id,
+            Self::WebrtcReoffer(c) => c.id,
             Self::SessionGet(c) | Self::SessionClose(c) | Self::SessionAdopt(c) => c.id,
             Self::SessionList(c) => c.id,
             Self::BackchannelRelease(c) => c.id,
             Self::RecordingCreate(c) => c.id,
+            Self::LiveCreate(c) => c.id,
+            Self::LiveClose(c) => c.id,
+            Self::HlsCreate(c) => c.id,
+            Self::HlsClose(c) => c.id,
+            Self::SignalingSubscribe(c) => c.id,
+            Self::SignalingAnswer(c) => c.id,
+            Self::SignalingCandidate(c) => c.id,
+            Self::SignalingError(c) => c.id,
         }
     }
 
@@ -533,6 +812,7 @@ impl Command {
             Self::PairingCreate(_) => "pairing/create",
             Self::ClientsList(_) => "clients/list",
             Self::ClientsRemove(_) => "clients/remove",
+            Self::ClientsAdd(_) => "clients/add",
             Self::StreamPut(_) => "stream/put",
             Self::StreamGet(_) => "stream/get",
             Self::StreamList(_) => "stream/list",
@@ -541,13 +821,21 @@ impl Command {
             Self::Unsubscribe(_) => "unsubscribe",
             Self::WebrtcOffer(_) => "webrtc/offer",
             Self::WebrtcCandidate(_) => "webrtc/candidate",
-            Self::WebrtcRenegotiate(_) => "webrtc/renegotiate",
+            Self::WebrtcReoffer(_) => "webrtc/reoffer",
             Self::SessionGet(_) => "session/get",
             Self::SessionList(_) => "session/list",
             Self::SessionClose(_) => "session/close",
             Self::SessionAdopt(_) => "session/adopt",
             Self::BackchannelRelease(_) => "backchannel/release",
             Self::RecordingCreate(_) => "recording/create",
+            Self::LiveCreate(_) => "live/create",
+            Self::LiveClose(_) => "live/close",
+            Self::HlsCreate(_) => "hls/create",
+            Self::HlsClose(_) => "hls/close",
+            Self::SignalingSubscribe(_) => "signaling/subscribe",
+            Self::SignalingAnswer(_) => "signaling/answer",
+            Self::SignalingCandidate(_) => "signaling/candidate",
+            Self::SignalingError(_) => "signaling/error",
         }
     }
 }
@@ -689,6 +977,22 @@ pub fn parse_command(text: &str) -> Result<Command, CommandError> {
     Ok(command)
 }
 
+/// [`check_limits`] of a `recording/create`: its ids capped, a recording of
+/// some time.
+fn check_recording(start: &RecordingCreate) -> Result<(), ApiError> {
+    cap_stream_id(&start.stream_id)?;
+    let recording_id = start.recording_id.as_deref().unwrap_or_default();
+    cap_chars("recording_id", recording_id, MAX_ID_CHARS)?;
+    if start.duration_ms == 0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidRequest,
+            "`duration_ms` must be at least 1",
+        )
+        .with_detail("field", "duration_ms"));
+    }
+    Ok(())
+}
+
 /// Holds a parsed command to the caps of [`crate::limits`], which the
 /// schema advertises; the first field over its cap is named, its value is
 /// not repeated.
@@ -698,7 +1002,13 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             cap_stream_id(&put.stream_id)?;
             cap_items("sources", put.sources.len(), MAX_SOURCES)?;
             for source in &put.sources {
-                cap_chars("sources[].url", &source.url, MAX_URL_CHARS)?;
+                cap_chars(
+                    "sources[].url",
+                    source.url().unwrap_or_default(),
+                    MAX_URL_CHARS,
+                )?;
+                let pin = source.tls().and_then(TlsTrust::pin).unwrap_or_default();
+                cap_chars("sources[].tls.pin", pin, MAX_PIN_CHARS)?;
             }
         }
         Command::WebrtcOffer(offer) => {
@@ -725,9 +1035,9 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             let mid = candidate.sdp_mid.as_deref().unwrap_or_default();
             cap_chars("sdp_mid", mid, MAX_TEXT_CHARS)?;
         }
-        Command::WebrtcRenegotiate(renegotiate) => {
-            cap_chars("session_id", &renegotiate.session_id, MAX_ID_CHARS)?;
-            cap_chars("sdp", &renegotiate.sdp, MAX_SDP_CHARS)?;
+        Command::WebrtcReoffer(reoffer) => {
+            cap_chars("session_id", &reoffer.session_id, MAX_ID_CHARS)?;
+            cap_chars("sdp", &reoffer.sdp, MAX_SDP_CHARS)?;
         }
         Command::SessionGet(session)
         | Command::SessionClose(session)
@@ -743,22 +1053,32 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             let session_id = release.session_id.as_deref().unwrap_or_default();
             cap_chars("session_id", session_id, MAX_ID_CHARS)?;
         }
-        Command::StreamSubscribe(subscribe) => {
-            cap_stream_id(subscribe.stream_id.as_deref().unwrap_or_default())?;
+        Command::StreamSubscribe(StreamSubscribe { stream_id, .. })
+        | Command::SignalingSubscribe(SignalingSubscribe { stream_id, .. }) => {
+            cap_stream_id(stream_id.as_deref().unwrap_or_default())?;
+        }
+        Command::SignalingAnswer(answer) => {
+            cap_chars("signal_id", &answer.signal_id, MAX_ID_CHARS)?;
+            cap_chars("sdp", &answer.sdp, MAX_SDP_CHARS)?;
+        }
+        Command::SignalingCandidate(candidate) => {
+            cap_chars("signal_id", &candidate.signal_id, MAX_ID_CHARS)?;
+            cap_chars("candidate", &candidate.candidate, MAX_TEXT_CHARS)?;
+            let mid = candidate.sdp_mid.as_deref().unwrap_or_default();
+            cap_chars("sdp_mid", mid, MAX_TEXT_CHARS)?;
+        }
+        Command::SignalingError(error) => {
+            cap_chars("signal_id", &error.signal_id, MAX_ID_CHARS)?;
+            check_signal_error_code(&error.code)?;
+            cap_chars("message", &error.message, MAX_TEXT_CHARS)?;
         }
         Command::ClientsRemove(remove) => cap_chars("pin", &remove.pin, MAX_PIN_CHARS)?,
-        Command::RecordingCreate(start) => {
-            cap_stream_id(&start.stream_id)?;
-            let recording_id = start.recording_id.as_deref().unwrap_or_default();
-            cap_chars("recording_id", recording_id, MAX_ID_CHARS)?;
-            if start.duration_ms == 0 {
-                return Err(ApiError::new(
-                    ErrorCode::InvalidRequest,
-                    "`duration_ms` must be at least 1",
-                )
-                .with_detail("field", "duration_ms"));
-            }
-        }
+        Command::LiveCreate(create) => cap_stream_id(&create.stream_id)?,
+        Command::LiveClose(close) => cap_chars("live_id", &close.live_id, MAX_ID_CHARS)?,
+        Command::HlsCreate(create) => cap_stream_id(&create.stream_id)?,
+        Command::HlsClose(close) => cap_chars("hls_id", &close.hls_id, MAX_ID_CHARS)?,
+        Command::ClientsAdd(add) => cap_chars("pin", &add.pin, MAX_PIN_CHARS)?,
+        Command::RecordingCreate(start) => check_recording(start)?,
         Command::Ping(_)
         | Command::Info(_)
         | Command::MetricsGet(_)
@@ -772,7 +1092,9 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// `invalid_request` when `value` is longer than `max` characters.
+/// `invalid_request` when `value` is longer than `max` characters, its
+/// `limit` detail `maxLength`, the schema's keyword for the cap: a refusal
+/// at a limit names the limit it hit, which the server logs.
 fn cap_chars(field: &str, value: &str, max: usize) -> Result<(), ApiError> {
     let len = value.chars().count();
     if len > max {
@@ -780,7 +1102,8 @@ fn cap_chars(field: &str, value: &str, max: usize) -> Result<(), ApiError> {
             ErrorCode::InvalidRequest,
             format!("`{field}` is {len} characters long, the maximum is {max}"),
         )
-        .with_detail("field", field));
+        .with_detail("field", field)
+        .with_detail("limit", "maxLength"));
     }
     Ok(())
 }
@@ -795,14 +1118,38 @@ fn cap_stream_id(stream_id: &str) -> Result<(), ApiError> {
     })
 }
 
-/// `invalid_request` when a list has more than `max` entries.
+/// `invalid_request` when a `signaling/error`'s `code` is not
+/// [`crate::limits::SIGNAL_ERROR_CODE_PATTERN`]:
+/// one to [`MAX_SIGNAL_ERROR_CODE_CHARS`] lowercase ASCII letters, digits
+/// and underscores. Not repeated: it is the client's to log. A longer one
+/// is refused at its cap, its `limit` detail `maxLength` ([`cap_chars`]);
+/// within it, any other character is a shape, with no `limit`.
+fn check_signal_error_code(code: &str) -> Result<(), ApiError> {
+    cap_chars("code", code, MAX_SIGNAL_ERROR_CODE_CHARS)?;
+    let shaped = code
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if code.is_empty() || !shaped {
+        return Err(ApiError::new(
+            ErrorCode::InvalidRequest,
+            "`code` must be 1 to 64 of a-z, 0-9 and _",
+        )
+        .with_detail("field", "code"));
+    }
+    Ok(())
+}
+
+/// `invalid_request` when a list has more than `max` entries, its `limit`
+/// detail `maxItems`, the schema's keyword for the cap, as
+/// [`cap_chars`]'s.
 fn cap_items(field: &str, len: usize, max: usize) -> Result<(), ApiError> {
     if len > max {
         return Err(ApiError::new(
             ErrorCode::InvalidRequest,
             format!("`{field}` has {len} entries, the maximum is {max}"),
         )
-        .with_detail("field", field));
+        .with_detail("field", field)
+        .with_detail("limit", "maxItems"));
     }
     Ok(())
 }
@@ -844,8 +1191,8 @@ mod tests {
     fn stream_put_parses_from_the_contract_shape() {
         let put = parse_command(
             r#"{ "id": 3, "type": "stream/put", "stream_id": "front",
-                 "sources": [ { "url": "rtsp://user:pass@192.168.1.10:554/h264",
-                                "options": { "transport": "tcp" } } ],
+                 "sources": [ { "protocol": "rtsp", "url": "rtsp://user:pass@192.168.1.10:554/h264",
+                                "transport": "udp" } ],
                  "preload": true, "audio": "off", "orientation": "rotate_left" }"#,
         )
         .unwrap();
@@ -855,13 +1202,23 @@ mod tests {
             (put.id, put.stream_id.as_str(), put.preload, put.audio),
             (3, "front", true, AudioMode::Off)
         );
-        assert_eq!(put.sources[0].options["transport"], "tcp");
+        assert_eq!(put.sources[0].options()["transport"], "udp");
         assert_eq!(put.orientation, Orientation::RotateLeft);
     }
 
     #[test]
     fn every_command_parses_from_the_contract_shape() {
-        let cases = [
+        let cases = contract_shapes();
+        for (index, (text, name)) in cases.iter().enumerate() {
+            round_trips(text, name, u64::try_from(index).unwrap() + 1);
+        }
+        assert_eq!(Command::NAMES.len(), cases.len());
+    }
+
+    /// One command of each type, as the contract shapes it, with its name;
+    /// the ids count up from 1.
+    fn contract_shapes() -> Vec<(&'static str, &'static str)> {
+        vec![
             (r#"{"id":1,"type":"ping"}"#, "ping"),
             (r#"{"id":2,"type":"info"}"#, "info"),
             (r#"{"id":3,"type":"metrics/get"}"#, "metrics/get"),
@@ -893,8 +1250,8 @@ mod tests {
                 "webrtc/candidate",
             ),
             (
-                r#"{"id":13,"type":"webrtc/renegotiate","session_id":"01J8ZK","sdp":"v=0"}"#,
-                "webrtc/renegotiate",
+                r#"{"id":13,"type":"webrtc/reoffer","session_id":"01J8ZK","sdp":"v=0"}"#,
+                "webrtc/reoffer",
             ),
             (
                 r#"{"id":14,"type":"session/get","session_id":"s"}"#,
@@ -923,23 +1280,105 @@ mod tests {
                 r#"{"id":22,"type":"recording/create","stream_id":"front","recording_id":"01JB","prerecord_ms":10000,"duration_ms":20000,"audio":true}"#,
                 "recording/create",
             ),
-        ];
-        for (index, (text, name)) in cases.iter().enumerate() {
-            let_assert!(Ok(command) = parse_command(text), "{text}");
-            assert_eq!(command.name(), *name);
-            assert_eq!(command.id(), u64::try_from(index).unwrap() + 1);
-            // Commands serialize back into the same shape, for `lotse ctl`.
-            let json = serde_json::to_value(&command).unwrap();
-            assert_eq!(json["type"], *name);
-            assert_eq!(serde_json::from_value::<Command>(json).unwrap(), command);
+            (
+                r#"{"id":23,"type":"signaling/subscribe","stream_id":"door"}"#,
+                "signaling/subscribe",
+            ),
+            (
+                r#"{"id":24,"type":"signaling/answer","signal_id":"01JSIG","sdp":"v=0"}"#,
+                "signaling/answer",
+            ),
+            (
+                r#"{"id":25,"type":"signaling/candidate","signal_id":"01JSIG","candidate":"candidate:1 1 udp 1 192.0.2.1 5 typ host","sdp_mid":"0","sdp_mline_index":0}"#,
+                "signaling/candidate",
+            ),
+            (
+                r#"{"id":26,"type":"signaling/error","signal_id":"01JSIG","code":"webrtc_offer_failed","message":"offline"}"#,
+                "signaling/error",
+            ),
+            (
+                r#"{"id":27,"type":"live/create","stream_id":"front","audio":false}"#,
+                "live/create",
+            ),
+            (
+                r#"{"id":28,"type":"live/close","live_id":"01JL"}"#,
+                "live/close",
+            ),
+            (
+                r#"{"id":29,"type":"hls/create","stream_id":"front","audio":false}"#,
+                "hls/create",
+            ),
+            (
+                r#"{"id":30,"type":"hls/close","hls_id":"01JH"}"#,
+                "hls/close",
+            ),
+            (
+                r#"{"id":31,"type":"clients/add","pin":"00","role":"metrics"}"#,
+                "clients/add",
+            ),
+        ]
+    }
+
+    /// `text` parses as command `name` with `id`, and serializes back into
+    /// the same shape, for `lotse ctl`.
+    fn round_trips(text: &str, name: &str, id: u64) {
+        let_assert!(Ok(command) = parse_command(text), "{text}");
+        assert_eq!((command.name(), command.id()), (name, id));
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["type"], name);
+        assert_eq!(serde_json::from_value::<Command>(json).unwrap(), command);
+    }
+
+    #[test]
+    fn a_live_output_takes_the_audio_unless_asked_otherwise_and_its_ids_are_capped() {
+        let_assert!(
+            Ok(Command::LiveCreate(create)) =
+                parse_command(r#"{"id":1,"type":"live/create","stream_id":"front"}"#)
+        );
+        assert!(create.audio, "audio by default");
+        let long = "x".repeat(MAX_ID_CHARS + 1);
+        for (text, code) in [
+            (
+                format!(r#"{{"id":2,"type":"live/create","stream_id":"{long}"}}"#),
+                ErrorCode::InvalidStreamId,
+            ),
+            (
+                format!(r#"{{"id":3,"type":"live/close","live_id":"{long}"}}"#),
+                ErrorCode::InvalidRequest,
+            ),
+        ] {
+            let_assert!(Err(err) = parse_command(&text), "{text}");
+            assert_eq!(err.error.code, code, "{text}");
         }
-        assert_eq!(Command::NAMES.len(), cases.len());
+    }
+
+    #[test]
+    fn an_hls_session_takes_the_audio_unless_asked_otherwise_and_its_ids_are_capped() {
+        let_assert!(
+            Ok(Command::HlsCreate(create)) =
+                parse_command(r#"{"id":1,"type":"hls/create","stream_id":"front"}"#)
+        );
+        assert!(create.audio, "audio by default");
+        let long = "x".repeat(MAX_ID_CHARS + 1);
+        for (text, code) in [
+            (
+                format!(r#"{{"id":2,"type":"hls/create","stream_id":"{long}"}}"#),
+                ErrorCode::InvalidStreamId,
+            ),
+            (
+                format!(r#"{{"id":3,"type":"hls/close","hls_id":"{long}"}}"#),
+                ErrorCode::InvalidRequest,
+            ),
+        ] {
+            let_assert!(Err(err) = parse_command(&text), "{text}");
+            assert_eq!(err.error.code, code, "{text}");
+        }
     }
 
     #[test]
     fn the_fields_a_command_leaves_out_take_their_defaults() {
         let minimal = parse_command(
-            r#"{"id":1,"type":"stream/put","stream_id":"x","sources":[{"url":"rtsp://c/"}]}"#,
+            r#"{"id":1,"type":"stream/put","stream_id":"x","sources":[{"protocol":"webrtc"}]}"#,
         )
         .unwrap();
         let_assert!(Command::StreamPut(minimal) = minimal);
@@ -947,7 +1386,7 @@ mod tests {
             !minimal.preload
                 && minimal.audio == AudioMode::Auto
                 && minimal.orientation == Orientation::NoTransform
-                && minimal.sources[0].options.is_empty()
+                && minimal.sources[0].options()["data_channel"].is_null()
                 && minimal.prerecord_ms == 0
         );
         // A client may send only the offer and the stream; the rest defaults.
@@ -967,30 +1406,30 @@ mod tests {
     }
 
     #[test]
-    fn a_renegotiation_names_its_session_and_carries_the_re_offer() {
+    fn a_reoffer_names_its_session_and_carries_its_sdp() {
         let_assert!(
-            Command::WebrtcRenegotiate(renegotiate) = parse_command(
-                r#"{"id":1,"type":"webrtc/renegotiate","session_id":"s1","sdp":"v=0\r\n"}"#
+            Command::WebrtcReoffer(reoffer) = parse_command(
+                r#"{"id":1,"type":"webrtc/reoffer","session_id":"s1","sdp":"v=0\r\n"}"#
             )
             .unwrap()
         );
         assert_eq!(
             (
-                renegotiate.id,
-                renegotiate.session_id.as_str(),
-                renegotiate.sdp.as_str()
+                reoffer.id,
+                reoffer.session_id.as_str(),
+                reoffer.sdp.as_str()
             ),
             (1, "s1", "v=0\r\n")
         );
         // Every field is required: a re-offer is for one session.
         for frame in [
-            r#"{"id":2,"type":"webrtc/renegotiate","sdp":"v=0"}"#,
-            r#"{"id":3,"type":"webrtc/renegotiate","session_id":"s1"}"#,
-            r#"{"id":4,"type":"webrtc/renegotiate","session_id":"s1","sdp":"v=0","stream_id":"x"}"#,
+            r#"{"id":2,"type":"webrtc/reoffer","sdp":"v=0"}"#,
+            r#"{"id":3,"type":"webrtc/reoffer","session_id":"s1"}"#,
+            r#"{"id":4,"type":"webrtc/reoffer","session_id":"s1","sdp":"v=0","stream_id":"x"}"#,
         ] {
             let err = parse_command(frame).unwrap_err();
             assert_eq!(err.error.code, ErrorCode::InvalidRequest, "{frame}");
-            assert_eq!(err.error.details["type"], "webrtc/renegotiate");
+            assert_eq!(err.error.details["type"], "webrtc/reoffer");
         }
     }
 
@@ -1090,10 +1529,120 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_user_agent_or_data_channel_is_not_repeated_in_the_error() {
+        // A value can carry a secret (a URL with credentials pasted into
+        // the wrong field): the refusal names the field's rule, not it.
+        for source in [
+            json!({ "protocol": "rtsp", "url": "rtsp://c/", "user_agent": "rtsp://u:hunter2@cam/\n" }),
+            json!({ "protocol": "webrtc", "data_channel": "hunter2\u{7}" }),
+        ] {
+            let frame =
+                json!({ "id": 9, "type": "stream/put", "stream_id": "a", "sources": [source] })
+                    .to_string();
+            let err = parse_command(&frame).unwrap_err();
+            assert_eq!(err.error.code, ErrorCode::InvalidRequest, "{frame}");
+            let shown = serde_json::to_string(&err.error).unwrap();
+            assert!(
+                !shown.contains("hunter2") && !shown.contains("cam/"),
+                "{shown}"
+            );
+            assert!(
+                shown.contains("user_agent must be") || shown.contains("data_channel must be"),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc8838_signaling_commands_name_their_signal_and_leave_out_what_the_camera_did_not_say() {
+        let_assert!(
+            Command::SignalingSubscribe(subscribe) =
+                parse_command(r#"{"id":1,"type":"signaling/subscribe"}"#).unwrap()
+        );
+        assert_eq!(subscribe.stream_id, None);
+        assert_eq!(
+            serde_json::to_value(Command::SignalingSubscribe(subscribe)).unwrap(),
+            json!({ "id": 1, "type": "signaling/subscribe" })
+        );
+        let_assert!(
+            Command::SignalingCandidate(candidate) = parse_command(
+                r#"{"id":2,"type":"signaling/candidate","signal_id":"s","candidate":""}"#
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            (
+                candidate.signal_id.as_str(),
+                candidate.candidate.as_str(),
+                candidate.sdp_mid.as_deref(),
+                candidate.sdp_mline_index
+            ),
+            ("s", "", None, None)
+        );
+        assert_eq!(
+            serde_json::to_value(Command::SignalingCandidate(candidate)).unwrap(),
+            json!({ "id": 2, "type": "signaling/candidate", "signal_id": "s", "candidate": "" })
+        );
+        let_assert!(
+            Command::SignalingAnswer(answer) = parse_command(
+                r#"{"id":3,"type":"signaling/answer","signal_id":"s","sdp":"v=0\r\n"}"#
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            (answer.signal_id.as_str(), answer.sdp.as_str()),
+            ("s", "v=0\r\n")
+        );
+        let_assert!(
+            Command::SignalingError(error) = parse_command(
+                r#"{"id":4,"type":"signaling/error","signal_id":"s","code":"a_1","message":"m"}"#
+            )
+            .unwrap()
+        );
+        assert_eq!((error.code.as_str(), error.message.as_str()), ("a_1", "m"));
+        for frame in [
+            // Every field but the camera's optional ones is required.
+            r#"{"id":5,"type":"signaling/answer","sdp":"v=0"}"#,
+            r#"{"id":5,"type":"signaling/answer","signal_id":"s"}"#,
+            r#"{"id":5,"type":"signaling/candidate","signal_id":"s"}"#,
+            r#"{"id":5,"type":"signaling/error","signal_id":"s","code":"x"}"#,
+            r#"{"id":5,"type":"signaling/error","signal_id":"s","message":"m"}"#,
+            // An index is a media section's: 16 bits.
+            r#"{"id":5,"type":"signaling/candidate","signal_id":"s","candidate":"","sdp_mline_index":65536}"#,
+            r#"{"id":5,"type":"signaling/subscribe","session_id":"s"}"#,
+        ] {
+            let err = parse_command(frame).unwrap_err();
+            assert_eq!(err.error.code, ErrorCode::InvalidRequest, "{frame}");
+        }
+    }
+
+    #[test]
+    fn a_signaling_error_s_code_is_a_snake_case_word_of_at_most_64() {
+        let error = |code: &str| {
+            json!({ "id": 1, "type": "signaling/error", "signal_id": "s", "code": code,
+                    "message": "m" })
+        };
+        for code in ["a", "camera_offline", "e404", "_", &"x".repeat(64)] {
+            assert!(limited(&error(code)).is_ok(), "{code}");
+        }
+        // Within the cap a shape, with no `limit` (as `limited` asserts),
+        // even when its UTF-8 is longer than 64 bytes.
+        for code in ["", "Camera", "a-b", "a b", "é", "a.b", &"é".repeat(64)] {
+            let (field, message) = limited(&error(code)).unwrap_err();
+            assert_eq!(field, "code", "{code}");
+            assert_eq!(message, "`code` must be 1 to 64 of a-z, 0-9 and _");
+        }
+        // Past it the cap, its `limit` `maxLength`.
+        let (field, message) = limited(&error(&"x".repeat(65))).unwrap_err();
+        assert_eq!(field, "code");
+        assert_eq!(message, "`code` is 65 characters long, the maximum is 64");
+    }
+
+    #[test]
     fn a_put_keeps_a_pre_record_window_only_when_it_asks_for_one() {
         let_assert!(
             Command::StreamPut(put) = parse_command(
-                r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"url":"rtsp://c/"}],"prerecord_ms":30000}"#
+                r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"protocol":"rtsp","url":"rtsp://c/"}],"prerecord_ms":30000}"#
             )
             .unwrap()
         );
@@ -1110,6 +1659,21 @@ mod tests {
             assert_eq!(err.error.code, ErrorCode::InvalidRequest);
             assert_eq!(err.error.details["type"], frame["type"]);
             assert!(!err.error.message.contains("xx"), "{}", err.error.message);
+            // A cap names its limit: a list's is `maxItems`, a text's
+            // `maxLength`, as the schema publishes them; a shape is none.
+            let keyword = if !err.error.message.contains(", the maximum is ") {
+                None
+            } else if err.error.message.contains(" entries, ") {
+                Some("maxItems")
+            } else {
+                Some("maxLength")
+            };
+            let limit = err
+                .error
+                .details
+                .get("limit")
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(limit, keyword, "{}", err.error.message);
             let field = err.error.details["field"].as_str().unwrap().to_owned();
             (field, err.error.message)
         })
@@ -1119,29 +1683,36 @@ mod tests {
     fn every_string_and_list_input_is_capped_at_its_limit_and_no_further() {
         let text = |n: usize| "x".repeat(n);
         let put = |sources: usize, url: usize| {
-            let source = json!({ "url": format!("rtsp://c/{}", text(url - 9)) });
+            let source =
+                json!({ "protocol": "rtsp", "url": format!("rtsp://c/{}", text(url - 9)) });
             json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": vec![source; sources] })
         };
         let server = |urls: usize, url: usize, username: usize, credential: usize| json!({ "urls": vec![text(url); urls], "username": text(username), "credential": text(credential) });
         let offer = |sdp: usize, servers: Vec<serde_json::Value>| json!({ "id": 1, "type": "webrtc/offer", "stream_id": "a", "sdp": text(sdp), "ice_servers": servers });
         let candidate = |session: usize, candidate: usize, mid: usize| json!({ "id": 1, "type": "webrtc/candidate", "session_id": text(session), "candidate": text(candidate), "sdp_mid": text(mid) });
-        let renegotiate = |session: usize, sdp: usize| json!({ "id": 1, "type": "webrtc/renegotiate", "session_id": text(session), "sdp": text(sdp) });
+        let reoffer = |session: usize, sdp: usize| json!({ "id": 1, "type": "webrtc/reoffer", "session_id": text(session), "sdp": text(sdp) });
         let at_cap = server(MAX_ICE_URLS, MAX_TEXT_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS);
         let remove = |pin: usize| json!({ "id": 1, "type": "clients/remove", "pin": text(pin) });
+        let add = |pin: usize| json!({ "id": 1, "type": "clients/add", "pin": text(pin), "role": "metrics" });
+        let pinned = |pin: usize| json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [{ "protocol": "https", "url": "https://c/", "tls": { "pin": text(pin) } }] });
         let accepted = [
             remove(MAX_PIN_CHARS),
+            add(MAX_PIN_CHARS),
             put(MAX_SOURCES, MAX_URL_CHARS),
+            pinned(MAX_PIN_CHARS),
             offer(MAX_SDP_CHARS, vec![at_cap.clone(); MAX_ICE_SERVERS]),
             candidate(MAX_ID_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS),
-            renegotiate(MAX_ID_CHARS, MAX_SDP_CHARS),
+            reoffer(MAX_ID_CHARS, MAX_SDP_CHARS),
         ];
         for frame in &accepted {
             assert!(limited(frame).is_ok(), "{}", frame["type"]);
         }
         let refused = [
             (remove(MAX_PIN_CHARS + 1), "pin"),
+            (add(MAX_PIN_CHARS + 1), "pin"),
             (put(MAX_SOURCES + 1, 10), "sources"),
             (put(1, MAX_URL_CHARS + 1), "sources[].url"),
+            (pinned(MAX_PIN_CHARS + 1), "sources[].tls.pin"),
             (offer(MAX_SDP_CHARS + 1, vec![]), "sdp"),
             (offer(1, vec![at_cap; MAX_ICE_SERVERS + 1]), "ice_servers"),
             (
@@ -1163,8 +1734,8 @@ mod tests {
             (candidate(MAX_ID_CHARS + 1, 1, 1), "session_id"),
             (candidate(1, MAX_TEXT_CHARS + 1, 1), "candidate"),
             (candidate(1, 1, MAX_TEXT_CHARS + 1), "sdp_mid"),
-            (renegotiate(MAX_ID_CHARS + 1, 1), "session_id"),
-            (renegotiate(1, MAX_SDP_CHARS + 1), "sdp"),
+            (reoffer(MAX_ID_CHARS + 1, 1), "session_id"),
+            (reoffer(1, MAX_SDP_CHARS + 1), "sdp"),
         ];
         for (frame, field) in &refused {
             let (named, message) = limited(frame).unwrap_err();
@@ -1216,6 +1787,39 @@ mod tests {
     }
 
     #[test]
+    fn every_signaling_input_is_capped_at_its_limit_and_no_further() {
+        let text = |n: usize| "x".repeat(n);
+        let answer = |signal: usize, sdp: usize| json!({ "id": 1, "type": "signaling/answer", "signal_id": text(signal), "sdp": text(sdp) });
+        let signal_candidate = |signal: usize, candidate: usize, mid: usize| json!({ "id": 1, "type": "signaling/candidate", "signal_id": text(signal), "candidate": text(candidate), "sdp_mid": text(mid) });
+        let signal_error = |signal: usize, message: usize| json!({ "id": 1, "type": "signaling/error", "signal_id": text(signal), "code": "c", "message": text(message) });
+        for frame in [
+            answer(MAX_ID_CHARS, MAX_SDP_CHARS),
+            signal_candidate(MAX_ID_CHARS, MAX_TEXT_CHARS, MAX_TEXT_CHARS),
+            signal_error(MAX_ID_CHARS, MAX_TEXT_CHARS),
+        ] {
+            assert!(limited(&frame).is_ok(), "{}", frame["type"]);
+        }
+        for (frame, field) in [
+            (answer(MAX_ID_CHARS + 1, 1), "signal_id"),
+            (answer(1, MAX_SDP_CHARS + 1), "sdp"),
+            (signal_candidate(MAX_ID_CHARS + 1, 1, 1), "signal_id"),
+            (signal_candidate(1, MAX_TEXT_CHARS + 1, 1), "candidate"),
+            (signal_candidate(1, 1, MAX_TEXT_CHARS + 1), "sdp_mid"),
+            (signal_error(MAX_ID_CHARS + 1, 1), "signal_id"),
+            (signal_error(1, MAX_TEXT_CHARS + 1), "message"),
+        ] {
+            let (named, message) = limited(&frame).unwrap_err();
+            assert_eq!(named, field, "{message}");
+            assert!(message.starts_with(&format!("`{field}` ")), "{message}");
+        }
+        // Absent, the camera's media section is within its cap.
+        assert!(
+            limited(&json!({ "id": 1, "type": "signaling/candidate", "signal_id": "s", "candidate": "" }))
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn a_recordings_ids_are_capped_like_a_sessions() {
         let text = |n: usize| "x".repeat(n);
         let recording_as = |n| {
@@ -1234,10 +1838,11 @@ mod tests {
         let id = |n: usize| "x".repeat(n);
         let frames = |n: usize| {
             [
-                json!({ "id": 1, "type": "stream/put", "stream_id": id(n), "sources": [{ "url": "rtsp://c/" }] }),
+                json!({ "id": 1, "type": "stream/put", "stream_id": id(n), "sources": [{ "protocol": "rtsp", "url": "rtsp://c/" }] }),
                 json!({ "id": 1, "type": "stream/get", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "stream/delete", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "stream/subscribe", "stream_id": id(n) }),
+                json!({ "id": 1, "type": "signaling/subscribe", "stream_id": id(n) }),
                 json!({ "id": 1, "type": "webrtc/offer", "stream_id": id(n), "sdp": "v=0" }),
                 json!({ "id": 1, "type": "backchannel/release", "stream_id": id(n), "session_id": "s" }),
                 json!({ "id": 1, "type": "recording/create", "stream_id": id(n), "duration_ms": 1 }),
@@ -1253,6 +1858,7 @@ mod tests {
             assert_eq!(err.id, Some(1));
             assert_eq!(err.error.code, ErrorCode::InvalidStreamId, "{kind}");
             assert_eq!(err.error.details["field"], "stream_id");
+            assert_eq!(err.error.details["limit"], "maxLength");
             assert_eq!(err.error.details["type"], frame["type"]);
             assert_eq!(
                 err.error.message,
@@ -1293,7 +1899,7 @@ mod tests {
             "{message}"
         );
         let message = refused(
-            r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"url":"x"}],"audio":"secret"}"#,
+            r#"{"id":1,"type":"stream/put","stream_id":"a","sources":[{"protocol":"rtsp","url":"x"}],"audio":"secret"}"#,
         );
         assert!(
             message.starts_with("unknown variant, expected `auto` or `off`"),
@@ -1406,7 +2012,7 @@ mod tests {
         let err = parse_command(r#"{"id": -1, "type": "ping"}"#).unwrap_err();
         assert_eq!((err.id, err.error.code), (None, ErrorCode::InvalidRequest));
 
-        let err = parse_command(r#"{"id": 8, "type": "stream/put", "stream_id": "x", "sources": [{"url": "rtsp://c/", "opt": 1}]}"#).unwrap_err();
+        let err = parse_command(r#"{"id": 8, "type": "stream/put", "stream_id": "x", "sources": [{"protocol": "rtsp", "url": "rtsp://c/", "opt": 1}]}"#).unwrap_err();
         assert!(err.error.message.contains("opt"), "{}", err.error.message);
         assert_eq!(
             err.error.to_string(),

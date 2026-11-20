@@ -41,10 +41,9 @@ use lotse_core::source::{
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::track::{
-    SubscriptionError, Track, TrackEvent, TrackLimits, TrackSubscription, Unit,
+    SubscriptionError, Track, TrackEvent, TrackId, TrackLimits, TrackSubscription, Unit,
 };
 use lotse_rtsp::RtspFactory;
-use lotse_rtsp::options::RtspOptions;
 use lotse_testing::fake_camera::{CameraAudio, CameraVideo};
 use lotse_testing::{CameraConfig, FakeCamera, Harness};
 use tokio::sync::mpsc;
@@ -136,7 +135,7 @@ async fn h265_flows_cut_through_and_as_frames_with_its_sprop_sets_rfc7798() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let tracks = harness.tracks.tracks();
@@ -198,7 +197,7 @@ async fn h265_with_decoding_order_numbers_is_declared_unsupported_rfc7798_7_2_3(
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let tracks = harness.tracks.tracks();
@@ -220,7 +219,7 @@ async fn h265_with_decoding_order_numbers_is_declared_unsupported_rfc7798_7_2_3(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h264_flows_cut_through_and_as_frames_with_sync_hints_then_tears_down() {
     let cam = camera(CameraConfig::default()).await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let tracks = harness.tracks.tracks();
@@ -339,7 +338,7 @@ async fn credentials_are_checked_and_never_reported() {
         format!("rtsp://{}/stream", cam.addr()),
         format!("rtsp://admin:wrong@{}/stream", cam.addr()),
     ] {
-        let source = make_source(&url, &serde_json::Value::Null);
+        let source = make_source(&url, &serde_json::json!({}));
         let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
         assert!(!harness.wait_ready().await);
         let exit = harness.finish().await;
@@ -347,8 +346,8 @@ async fn credentials_are_checked_and_never_reported() {
     }
     assert!(lotse_testing::fake_camera::Stats::get(&cam.stats().unauthorized) >= 2);
     // The right ones: live, and the description hides them.
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
-    let described = format!("{:?} {}", source.describe(), source.describe().url);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
+    let described = format!("{:?} {}", source.describe(), source.describe().url.unwrap());
     assert!(!described.contains("secret"), "{described}");
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await);
@@ -388,11 +387,7 @@ async fn a_closed_port_is_unreachable_and_a_silent_camera_times_out() {
         ..CameraConfig::default()
     })
     .await;
-    let options = serde_json::to_value(RtspOptions {
-        timeout_ms: 200,
-        ..RtspOptions::default()
-    })
-    .unwrap();
+    let options = serde_json::json!({ "timeout_ms": 200 });
     let source = make_source(&cam.url(), &options);
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(!harness.wait_ready().await);
@@ -411,7 +406,7 @@ async fn a_camera_that_hangs_up_ends_the_source() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await);
     let exit = harness.finish().await;
@@ -432,7 +427,7 @@ async fn an_sdp_retina_cannot_parse_is_refused_as_protocol_rfc8866_5() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let harness = Harness::start(source.as_ref(), peer(&cam), clock());
     let exit = harness.finish().await;
     let SourceError::Protocol(message) = exit else {
@@ -456,7 +451,7 @@ async fn a_describe_answer_over_64_kib_is_refused_as_protocol() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let harness = Harness::start(source.as_ref(), peer(&cam), clock());
     // Read in full, the answer would play: the attempt would never end.
     let exit = tokio::select! {
@@ -480,7 +475,7 @@ async fn an_rtp_media_line_without_a_format_is_skipped_rfc8866_5_14() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await);
     assert_eq!(harness.tracks.tracks().len(), 1);
@@ -499,7 +494,7 @@ async fn rfc8866_5_14_an_application_stream_is_skipped_and_the_video_plays() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await);
     assert_eq!(harness.tracks.tracks().len(), 1);
@@ -521,7 +516,7 @@ async fn rfc8866_5_14_of_two_video_streams_the_first_plays() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await);
     assert_eq!(harness.tracks.tracks().len(), 1);
@@ -617,7 +612,7 @@ async fn scripted(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let camera = spawn_named("test.camera", answer_with(listener, sdp, after_play));
-    let source = make_source(&format!("rtsp://{addr}/stream"), &serde_json::Value::Null);
+    let source = make_source(&format!("rtsp://{addr}/stream"), &serde_json::json!({}));
     let peer = ResolvedPeer {
         host: "127.0.0.1".into(),
         addrs: vec![addr],
@@ -665,7 +660,7 @@ async fn a_camera_without_marker_bits_still_yields_frames() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await);
     let v0 = harness.tracks.tracks()[0].clone();
@@ -699,7 +694,7 @@ async fn next_event(sub: &mut TrackSubscription) -> TrackEvent {
 /// counters. The attempt must still be running when cancelled.
 async fn play_tcp(config: CameraConfig, keyframes: usize) -> (usize, IngestStats) {
     let cam = camera(config).await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "live over TCP");
     let v0 = harness.tracks.tracks()[0].clone();
@@ -776,7 +771,7 @@ async fn a_timestamp_reset_starts_one_epoch_and_forgets_the_clock_fit() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await);
     let v0 = harness.tracks.tracks()[0].clone();
@@ -841,7 +836,7 @@ async fn rfc3550_5_1_timestamps_jumping_on_every_frame_end_the_attempt_after_a_b
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await);
     let v0 = Arc::clone(&harness.tracks.tracks()[0]);
@@ -876,11 +871,12 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
     let (tx, mut events) = mpsc::channel(16);
     let cancel = CancellationToken::new();
     let runner = SourceRunner::new(
-        make_source(&cam.url(), &serde_json::Value::Null),
+        make_source(&cam.url(), &serde_json::json!({})),
         peer(&cam),
         Arc::clone(&tracks),
         Arc::new(ClockMapper::new()),
         BackchannelSlot::default(),
+        None,
         clock(),
         RunnerConfig::default(),
         ReconnectBackoff::new(1),
@@ -907,16 +903,21 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
     assert_eq!(now.len(), 1);
     assert!(Arc::ptr_eq(&now[0], &v0));
     assert_eq!(v0.epoch(), 1);
-    // Subscribers see the loss, the epoch and the restore, then the new
-    // connection's frames, a keyframe first.
+    // Subscribers see the loss and the epoch before the new connection's
+    // frames, a keyframe first, and the restore. The restore is told once
+    // the runner sees the connection ready, which may be after the source
+    // published its first frames (`SourceRunner::run_once`), so it may
+    // come on either side of them.
     let mut control = Vec::new();
-    let first = loop {
+    let mut first = None;
+    while first.is_none() || !control.contains(&TrackEvent::SourceRestored) {
         match next_event(&mut sub).await {
             TrackEvent::Frame(frame) if frame.epoch == 0 => {}
-            TrackEvent::Frame(frame) => break frame,
+            TrackEvent::Frame(frame) => _ = first.get_or_insert(frame),
             event => control.push(event),
         }
-    };
+    }
+    let first = first.unwrap();
     assert_eq!(
         control,
         [
@@ -938,6 +939,131 @@ async fn a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them() {
     cam.stop().await;
 }
 
+/// The runner's next event other than `Stable`, within 10 s.
+async fn next_runner_event(events: &mut mpsc::Receiver<RunnerEvent>) -> RunnerEvent {
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => event.expect("the runner reports"),
+            () = clock().sleep(Duration::from_secs(10)) => panic!("no runner event in 10 s"),
+        };
+        if event != RunnerEvent::Stable {
+            return event;
+        }
+    }
+}
+
+/// Waits for the runner's next `Live`, through the reconnect's reports.
+async fn until_live(events: &mut mpsc::Receiver<RunnerEvent>) {
+    loop {
+        match next_runner_event(events).await {
+            RunnerEvent::Live => return,
+            RunnerEvent::Stopped => panic!("stopped before going live"),
+            _ => {}
+        }
+    }
+}
+
+/// A camera reconfigured between connections: its AAC at 16 kHz (RFC
+/// 3640 §3.3.1) comes back as PCMU at 8000 (RFC 3551 §4.5.14), and `a0`,
+/// the same track, follows the new RTP clock rate (RFC 3550 §5.1) in a
+/// new epoch; then its SDP has no audio, and `a0` stays, silent, while
+/// the video streams on past the audio's stall timeout. Regressions: the
+/// track kept its first rate, and the watchdog timed the left-out audio
+/// out and reconnected in a loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rfc3550_5_1_a_reconnect_follows_the_audio_s_clock_rate_and_one_without_audio_streams_on() {
+    let cam = camera(CameraConfig {
+        audio: Some(CameraAudio::Aac),
+        ..CameraConfig::default()
+    })
+    .await;
+    let tracks = TrackSet::new(TrackLimits::default(), clock().now());
+    let (tx, mut events) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let stall_audio = Duration::from_millis(1_500);
+    let runner = SourceRunner::new(
+        make_source(&cam.url(), &serde_json::json!({})),
+        peer(&cam),
+        Arc::clone(&tracks),
+        Arc::new(ClockMapper::new()),
+        BackchannelSlot::default(),
+        None,
+        clock(),
+        RunnerConfig {
+            stall_audio,
+            stall_check: Duration::from_millis(100),
+            ..RunnerConfig::default()
+        },
+        ReconnectBackoff::new(1),
+        tx,
+        ConnectGate::open(),
+        cancel.clone(),
+    );
+    let runner = spawn_named("test.runner", runner.run());
+    until_live(&mut events).await;
+    let audio_id = TrackId::new(lotse_core::codec::Kind::Audio, 0);
+    let a0 = tracks.get(audio_id).expect("the camera's audio");
+    assert_eq!(
+        (a0.codec().family(), a0.clock_rate()),
+        (lotse_core::codec::CodecFamily::AacLc, 16_000)
+    );
+    let mut sub = a0.subscribe(Unit::Packets);
+
+    cam.set_audio(Some(CameraAudio::Pcmu));
+    cam.drop_connections();
+    until_live(&mut events).await;
+    assert!(
+        Arc::ptr_eq(&tracks.get(audio_id).unwrap(), &a0),
+        "the same track"
+    );
+    assert_eq!(
+        (a0.codec(), a0.clock_rate()),
+        (Arc::new(Codec::Pcmu), 8_000)
+    );
+    // The restore may come on either side of the new epoch's first packet
+    // (see `a_reconnect_keeps_the_tracks_and_starts_one_epoch_for_them`).
+    let mut control = Vec::new();
+    let mut first = None;
+    while first.is_none() || !control.contains(&TrackEvent::SourceRestored) {
+        match next_event(&mut sub).await {
+            TrackEvent::Packet(packet) if packet.epoch < 2 => {}
+            TrackEvent::Packet(packet) => _ = first.get_or_insert(packet),
+            event => control.push(event),
+        }
+    }
+    let first = first.unwrap();
+    assert_eq!(
+        control,
+        [
+            TrackEvent::SourceLost,
+            TrackEvent::EpochStart { epoch: 1 },
+            TrackEvent::TrackChanged {
+                codec: Arc::new(Codec::Pcmu),
+                clock_rate: 8_000,
+            },
+            TrackEvent::EpochStart { epoch: 2 },
+            TrackEvent::SourceRestored,
+        ]
+    );
+    assert_eq!(first.rtp.pt, CameraAudio::Pcmu.payload_type());
+
+    cam.set_audio(None);
+    cam.drop_connections();
+    until_live(&mut events).await;
+    assert_eq!(tracks.tracks().len(), 2, "the audio stays in the set");
+    // Twice the audio's stall timeout: the connection streams on.
+    tokio::select! {
+        event = next_runner_event(&mut events) => panic!("{event:?}"),
+        () = clock().sleep(stall_audio * 2) => {}
+    }
+    assert!(Arc::ptr_eq(&tracks.get(audio_id).unwrap(), &a0));
+
+    cancel.cancel();
+    while next_runner_event(&mut events).await != RunnerEvent::Stopped {}
+    runner.await.unwrap();
+    cam.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_camera_with_pcmu_audio_declares_both_tracks_and_cuts_audio_through() {
     let cam = camera(CameraConfig {
@@ -945,7 +1071,7 @@ async fn a_camera_with_pcmu_audio_declares_both_tracks_and_cuts_audio_through() 
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let tracks = harness.tracks.tracks();
@@ -1004,7 +1130,7 @@ async fn rfc2326_12_33_a_play_answer_without_rtptime_plays_two_streams_on_the_fi
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "live on the first attempt");
     let tracks = harness.tracks.tracks();
@@ -1039,7 +1165,7 @@ async fn rfc3640_aac_audio_is_framed_on_the_side_branch() {
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let a0 = harness
@@ -1119,7 +1245,7 @@ async fn libwebrtc_max_frame_packets_a_larger_keyframe_is_counted_and_warned_abo
         ..CameraConfig::default()
     })
     .await;
-    let source = make_source(&cam.url(), &serde_json::Value::Null);
+    let source = make_source(&cam.url(), &serde_json::json!({}));
     let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
     assert!(harness.wait_ready().await, "ready");
     let v0 = Arc::clone(&harness.tracks.tracks()[0]);
@@ -1203,13 +1329,16 @@ async fn a_urls_path_query_and_password_reach_no_log_error_or_description() {
             "rtsp://admin:{password}@{}/camkey7f3a/live?token=tok9d2e",
             cam.addr()
         );
-        let source = make_source(&url, &serde_json::Value::Null);
+        let source = make_source(&url, &serde_json::json!({}));
         let described = source.describe();
         assert_eq!(
-            described.url.to_string(),
+            described.url.as_ref().unwrap().to_string(),
             format!("rtsp://****@{}/****?****", cam.addr())
         );
-        printed.push(format!("{described:?} {} {source:?}", described.url));
+        printed.push(format!(
+            "{described:?} {} {source:?}",
+            described.url.as_ref().unwrap()
+        ));
         let mut harness = Harness::start(source.as_ref(), peer(&cam), clock());
         assert_eq!(
             harness.wait_ready().await,

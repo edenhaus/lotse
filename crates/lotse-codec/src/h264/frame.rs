@@ -509,11 +509,11 @@ mod tests {
         f.push(4000, false, &parts[0]);
         f.seq = f.seq.wrapping_add(1);
         f.push(4000, true, &parts[2]);
-        assert!(f.take().is_empty());
+        assert_eq!(f.take(), []);
         assert_eq!(f.d.stats().dropped_lost, 1);
         // A fragment without a start is a damaged unit too.
         f.push(7000, true, &parts[1]);
-        assert!(f.take().is_empty());
+        assert_eq!(f.take(), []);
         assert_eq!(f.d.stats().dropped_lost, 2);
         // The next whole unit is fine.
         f.push(10_000, true, &slice(3));
@@ -529,7 +529,7 @@ mod tests {
         f.push(4000, false, &stap_with(&sps(1280, 720)));
         f.seq = f.seq.wrapping_add(1);
         f.push(4000, true, &idr(5));
-        assert!(f.take().is_empty());
+        assert_eq!(f.take(), []);
         // The next keyframe repeats the same SPS: still a new sequence.
         f.push(7000, true, &stap_with(&sps(1280, 720)));
         assert_eq!(f.take()[0].sps.unwrap().width, 1280);
@@ -544,7 +544,7 @@ mod tests {
         let mut f = Feed::new();
         f.push(1, false, &slice(3));
         f.push(1, false, &slice(3));
-        assert!(f.take().is_empty());
+        assert_eq!(f.take(), []);
         f.push(2, false, &slice(3));
         let units = f.take();
         assert_eq!(units.len(), 1);
@@ -570,18 +570,42 @@ mod tests {
     }
 
     #[test]
+    fn an_sei_without_a_recovery_point_makes_no_keyframe_iso14496_10_d_2_7() {
+        // A user_data_unregistered message (payload type 5): a UUID, no recovery point.
+        let mut sei = vec![0x06, 5, 16];
+        sei.extend([0x5a; 16]);
+        sei.push(0x80);
+        let mut f = Feed::new();
+        f.push(1000, false, &sei);
+        f.push(1000, true, &slice(3));
+        assert!(!f.take()[0].keyframe);
+        assert_eq!(f.d.stats().keyframes, 0);
+    }
+
+    #[test]
+    fn access_units_of_one_timestamp_are_no_b_frames() {
+        // Two access units with the same RTP timestamp (RFC 6184 §5.1 lets
+        // them share one): the decode order never went back in time.
+        let mut f = Feed::new();
+        f.push(1000, true, &slice(3));
+        f.push(1000, true, &slice(4));
+        assert_eq!(f.take().len(), 2);
+        assert!(!f.d.stats().b_frames);
+    }
+
+    #[test]
     fn oversize_units_filler_and_violations_are_handled() {
         let mut f = Feed::new();
         f.d = Depacketizer::new(100, ParameterSets::default());
         f.push(1, true, &slice(200));
-        assert!(f.take().is_empty());
+        assert_eq!(f.take(), []);
         assert_eq!(f.d.stats().dropped_oversize, 1);
         f.push(2, false, &[0x0c, 0xff]);
         f.push(2, true, &slice(3));
         assert_eq!(f.take()[0].payload, annex_b(&[&slice(3)]));
         // A unit of filler alone is no frame.
         f.push(10, true, &[0x0c, 0xff]);
-        assert!(f.take().is_empty());
+        assert_eq!(f.take(), []);
         assert_eq!(f.d.stats().frames, 1);
         let mut out = Vec::new();
         assert_eq!(
@@ -638,7 +662,7 @@ mod tests {
         }
         assert_eq!(f.d.buffered(), 0);
         f.push(3, true, parts.last().unwrap());
-        assert!(f.take().is_empty());
+        assert_eq!(f.take(), []);
         assert_eq!(f.d.stats().dropped_oversize, 2);
         assert_eq!(f.d.stats().dropped_lost, 0, "counted as oversize");
         // A fragmented unit within the limit still reassembles, also
@@ -665,7 +689,7 @@ mod tests {
         assert_eq!(f.take()[0].payload.len(), 100);
         // The IDR alone would fit; with the inserted sets it does not.
         f.push(2, true, &idr(95));
-        assert!(f.take().is_empty());
+        assert_eq!(f.take(), []);
         assert_eq!(f.d.stats().dropped_oversize, 1);
         // A fragment start that fills the limit opens, one more byte does not.
         let mut start = vec![0x7c, 0x85];
@@ -680,7 +704,7 @@ mod tests {
         f.push(4, false, &start);
         assert_eq!(f.d.buffered(), 0);
         f.d.flush(&mut f.out);
-        assert!(f.take().is_empty());
+        assert_eq!(f.take(), []);
         assert_eq!(f.d.stats().dropped_oversize, 3);
     }
 

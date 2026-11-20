@@ -1,9 +1,13 @@
-//! TLS to a source's server (an `rtsps://` camera, an `https://` stream):
-//! the client configuration, the certificate check the source options
-//! choose, and how a failed handshake becomes a [`SourceError`].
+//! TLS to a source's server (an `rtsps://` camera, an `https://` stream)
+//! and to a `turns:` TURN server: the client configuration, the
+//! certificate check the source's `tls` chooses, and how a failed
+//! handshake becomes a [`SourceError`].
 //!
-//! Runs in a worker, inside a source crate's connection attempt. Depends on
-//! `lotse-core` only (for [`SourceError`]), never on a source crate or a
+//! Runs in a worker, inside a source crate's connection attempt, and in
+//! the supervisor, whose TURN client connects a TURN allocation over TLS
+//! (always with [`Trust::Roots`]). Depends on
+//! `lotse-core` (for [`SourceError`]) and `lotse-api-types` (for the `tls`
+//! field it maps to a [`Trust`]) only, never on a source crate or a
 //! protocol engine: a source connects its own TCP stream, hands it to
 //! [`connect`] with the ALPN protocols of its scheme, and speaks its
 //! protocol over the stream it gets back.
@@ -14,17 +18,17 @@
 //! when the caller names protocols), RFC 5280 path validation and the
 //! RFC 2818 §3.1 / RFC 6125 host name check through `webpki`. RFC 7826
 //! §19.2 (`rtsps`) and RFC 9110 §4.3.4 (`https`) both take the server's
-//! identity from RFC 2818. rustls with the `ring` provider does the
+//! identity from RFC 2818, and RFC 8489 §6.2.3 (`turns`) from RFC 6125. rustls with the `ring` provider does the
 //! protocol; this crate only decides whom to trust:
 //!
 //! - **Roots** (the default): the chain must end in an embedded
 //!   `webpki-roots` anchor and the certificate must name the URL's host
 //!   (RFC 2818 §3.1, RFC 6125 through `webpki`).
-//! - **Pin** (`tls_fingerprint`): the leaf certificate's SHA-256 must equal
+//! - **Pin** (`{"pin": …}`): the leaf certificate's SHA-256 must equal
 //!   the pin. Chain, validity period and host name are not checked: a
 //!   self-signed camera certificate rarely names the host it is reached
 //!   by, and the pin names exactly one certificate.
-//! - **Insecure** (`insecure_tls`): any certificate.
+//! - **Insecure** (`"insecure"`): any certificate.
 //!
 //! In every mode the handshake signature is verified with the presented
 //! certificate's key, so a peer that copied a certificate without its key
@@ -34,6 +38,7 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
+use lotse_api_types::source::TlsTrust;
 pub use lotse_core::fingerprint::{Fingerprint, FingerprintError};
 use lotse_core::source::SourceError;
 use rustls::client::WebPkiServerVerifier;
@@ -45,21 +50,49 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsConnector;
 pub use tokio_rustls::client::TlsStream;
 
-/// Whom a TLS connection trusts, from the source options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whom a TLS connection trusts: the source's `tls`, its pin parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Trust {
-    /// The embedded roots and the host name.
+    /// The embedded roots and the host name (`"roots"`).
     Roots,
-    /// Exactly the certificate with this fingerprint.
+    /// Exactly the certificate with this fingerprint (`{"pin": …}`).
     Pin(Fingerprint),
-    /// Any certificate (`insecure_tls`).
+    /// Any certificate (`"insecure"`).
     Insecure,
+}
+
+/// The source's `tls`, its pin parsed: one mode for each, so a `stream/put`
+/// whose pin is no SHA-256 in hex fails here, in its factory's check.
+impl TryFrom<&TlsTrust> for Trust {
+    type Error = FingerprintError;
+
+    fn try_from(tls: &TlsTrust) -> Result<Self, Self::Error> {
+        Ok(match tls {
+            TlsTrust::Roots => Self::Roots,
+            TlsTrust::Insecure => Self::Insecure,
+            TlsTrust::Pin(pin) => Self::Pin(Fingerprint::parse(pin)?),
+        })
+    }
+}
+
+/// The trust as the API spells it, a pin in its canonical form (lowercase
+/// pairs joined by colons): every spelling of one pin is one value, as a
+/// connection key needs.
+impl From<Trust> for TlsTrust {
+    fn from(trust: Trust) -> Self {
+        match trust {
+            Trust::Roots => Self::Roots,
+            Trust::Insecure => Self::Insecure,
+            Trust::Pin(pin) => Self::Pin(pin.to_string()),
+        }
+    }
 }
 
 /// Where a TLS connection goes and whom it trusts; built when the source
 /// is validated, so a host that cannot be a TLS server name fails at
-/// `stream/put`.
-#[derive(Debug, Clone)]
+/// `stream/put` (or, for a `turns:` server, at `webrtc/offer`). One value
+/// per name and trust, so a connection may be keyed by it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TlsTarget {
     /// The URL's host: the SNI and the name the certificate must carry
     /// with [`Trust::Roots`].
@@ -89,14 +122,13 @@ fn embedded_roots() -> RootCertStore {
     }
 }
 
-/// Why the certificate check refused the camera, as the message of a
-/// `source_auth_failed` error.
+/// Why the certificate check refused the server (a camera, a stream's
+/// server or a TURN server), as the message of a `source_auth_failed`
+/// error.
 #[derive(Debug, thiserror::Error)]
 enum CertificateRejected {
     /// The pin does not match.
-    #[error(
-        "the camera's certificate does not match tls_fingerprint {expected}; it presented {presented}"
-    )]
+    #[error("the server's certificate does not match its pin {expected}; it presented {presented}")]
     PinMismatch {
         /// The pin.
         expected: Fingerprint,
@@ -105,7 +137,7 @@ enum CertificateRejected {
     },
     /// The chain or the name failed against the embedded roots.
     #[error(
-        "the camera's certificate is not trusted ({reason}); its SHA-256 fingerprint is {presented}"
+        "the server's certificate is not trusted ({reason}); its SHA-256 fingerprint is {presented}"
     )]
     Untrusted {
         /// What `webpki` found wrong.
@@ -160,7 +192,7 @@ impl ServerCertVerifier for CameraVerifier {
                 }
                 .into())
             }
-            // SPEC-DEVIATION(RFC 2818 §3.1): with a pin or `insecure_tls`
+            // SPEC-DEVIATION(RFC 2818 §3.1): with a pin or `insecure`
             // the host name is not checked against the certificate (nor the
             // chain or validity period); the pin names one certificate, and
             // self-signed cameras rarely name the address they are reached
@@ -301,7 +333,7 @@ where
     if target.trust == Trust::Insecure {
         tracing::warn!(
             fingerprint = presented.as_deref(),
-            "tls: insecure_tls: the camera's certificate is not verified; pin it with tls_fingerprint"
+            "tls: insecure: the camera's certificate is not verified; pin it with {{\"tls\": {{\"pin\": …}}}}"
         );
     }
     tracing::info!(
@@ -359,7 +391,7 @@ mod tests {
         let wrapped = io::Error::new(io::ErrorKind::InvalidData, rustls::Error::from(pin));
         let refused = classify(&wrapped);
         assert!(
-            matches!(&refused, SourceError::AuthFailed(m) if m.starts_with("tls: the camera's certificate does not match")),
+            matches!(&refused, SourceError::AuthFailed(m) if m.starts_with("tls: the server's certificate does not match")),
             "{refused:?}"
         );
         let alert = io::Error::new(
@@ -449,7 +481,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, SourceError::AuthFailed(m) if m.contains(&format!("does not match tls_fingerprint {wrong}; it presented {pin}"))),
+            matches!(&err, SourceError::AuthFailed(m) if m.contains(&format!("does not match its pin {wrong}; it presented {pin}"))),
             "{err:?}"
         );
         cam.stop().await;
@@ -503,7 +535,7 @@ mod tests {
         let logs = captured.text();
         let warnings: Vec<&str> = logs
             .lines()
-            .filter(|l| l.contains("insecure_tls"))
+            .filter(|l| l.contains("tls: insecure"))
             .collect();
         assert_eq!(warnings.len(), 1, "{logs}");
         assert!(
@@ -530,7 +562,29 @@ mod tests {
             [b"h2".to_vec(), b"http/1.1".to_vec()]
         );
         let none = client_config(Trust::Insecure, RootCertStore::empty(), &[]).unwrap();
-        assert!(none.alpn_protocols.is_empty());
+        assert_eq!(none.alpn_protocols, Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn the_api_tls_maps_to_a_trust_and_back_with_its_pin_canonical() {
+        const PIN: &str = "BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD";
+        let pin = Fingerprint::parse(PIN).unwrap();
+        for (tls, trust) in [
+            (TlsTrust::Roots, Trust::Roots),
+            (TlsTrust::Insecure, Trust::Insecure),
+            (TlsTrust::Pin(PIN.into()), Trust::Pin(pin)),
+            (TlsTrust::Pin(PIN.replace(':', "")), Trust::Pin(pin)),
+        ] {
+            assert_eq!(Trust::try_from(&tls), Ok(trust), "{tls:?}");
+        }
+        assert_eq!(TlsTrust::from(Trust::Roots), TlsTrust::Roots);
+        assert_eq!(TlsTrust::from(Trust::Insecure), TlsTrust::Insecure);
+        assert_eq!(
+            TlsTrust::from(Trust::Pin(pin)),
+            TlsTrust::Pin(PIN.to_lowercase())
+        );
+        let err = Trust::try_from(&TlsTrust::Pin("ab:cd".into())).unwrap_err();
+        assert!(err.to_string().contains("64 hex digits"), "{err}");
     }
 
     #[test]

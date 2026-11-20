@@ -2,7 +2,8 @@
 # This is the crate dependency graph written down ahead of the code: every direct dependency
 # edge between workspace crates must be listed under [dependents], a restricted external crate
 # may only be a direct dependency of its owners under [external], and a [dev-only] crate may never
-# be a normal or build dependency. Adding an edge means editing this file.
+# be a normal or build dependency. A [harness] crate's own edges are free of these rules, and no
+# crate may depend on it. Adding an edge means editing this file.
 
 [dependents]
 # crate = the workspace crates that may depend on it directly
@@ -10,19 +11,25 @@ lotse-core = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-mux
 lotse-codec = ["lotse-rtsp", "lotse-http", "lotse-mux", "lotse-webrtc", "lotse-snapshot", "lotse-worker", "lotse-testing", "lotse"] # lotse-worker: the picture size of `stream/get`, read from a track's SPS
 lotse-ipc = ["lotse-supervisor", "lotse-worker", "lotse-snapshot", "lotse"] # lotse: dev-only, the talk-back tone test's in-process worker
 lotse-sandbox = ["lotse"]
-lotse-api-types = ["lotse-api", "lotse-supervisor", "lotse", "lotse-testing"] # lotse-testing: the load generator reads `metrics/get`
+lotse-api-types = ["lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-api", "lotse-supervisor", "lotse", "lotse-testing"] # lotse-tls, lotse-rtsp, lotse-http, lotse-webrtc: the `stream/put` source fields, declared once there and parsed by the factories; lotse-testing: the load generator reads `metrics/get`
 lotse-api = ["lotse-supervisor"]
-lotse-tls = ["lotse-rtsp", "lotse-http"] # the sources' TLS client trust
+lotse-tls = ["lotse-rtsp", "lotse-http", "lotse-supervisor"] # the sources' TLS client trust; the supervisor's TURN allocations over TLS (`turns:`)
 lotse-rtsp = ["lotse"]
 lotse-http = ["lotse"] # M6, the factory behind `source-http`
-lotse-mux = ["lotse"] # M6, the recording container behind `output-recording`
-lotse-webrtc = ["lotse", "lotse-testing"] # lotse-testing: dev-only, its reproduction test of an open str0m issue (Safari's ICE)
+lotse-mux = ["lotse"] # M6, the recording container behind `output-recording`, and the live one behind `output-live`
+lotse-hls = ["lotse-api", "lotse-supervisor", "lotse-testing"] # the LL-HLS window of a live output, in the supervisor that serves it; lotse-api: the route parses its names and directives, and sends its chunks; lotse-testing: the dev viewer checks the names it proxies
+lotse-webrtc = ["lotse", "lotse-testing"] # lotse: the factories behind `output-webrtc` and `source-webrtc`; lotse-testing: dev-only, its reproduction test of an open str0m issue (Safari's ICE)
 lotse-snapshot = ["lotse-supervisor", "lotse"] # M5
 lotse-supervisor = ["lotse"]
 lotse-worker = ["lotse"]
 # Never of lotse-core: it depends on core itself, and a dev-dependency cycle compiles two copies of
 # core whose types do not unify. Core's own fakes live behind its `test-util` feature.
 lotse-testing = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-api-types", "lotse-supervisor", "lotse-worker", "lotse"]
+
+[harness]
+# lotse-fuzz: the fuzz targets reach into every crate they fuzz, fakes (lotse-testing) included, as
+# normal dependencies (a bin has no dev-dependencies); nothing depends on them, nothing ships them.
+crates = ["lotse-fuzz"]
 
 [dev-only]
 # allocation-counter: its global allocator replaces the daemon's in whatever links it. divan: the
@@ -42,10 +49,14 @@ dimpl = ["lotse-webrtc"] # DTLS of str0m's crypto provider
 rustls = ["lotse-tls", "lotse-api", "lotse-testing"] # the sources' TLS client; the control API's TLS listener; the fake camera's TLS mode and the TLS listener's test client
 tokio-rustls = ["lotse-tls", "lotse-api", "lotse-testing"]
 webpki-roots = ["lotse-tls"]
+rustls-webpki = ["lotse-api"] # X.509 parsing of the control identity's certificate (rustls verifies through it on its own)
+prometheus-client = ["lotse-api"] # the metrics' exposition encoders
+mediatype = ["lotse-api"] # the metrics' `Accept` media ranges
+pem = ["lotse-api"] # the control identity's certificate as PEM (rcgen writes its own through it)
 rcgen = ["lotse-webrtc", "lotse-api", "lotse-testing"] # the DTLS certificate; the control API's server certificate; the test certificates
 axum = ["lotse-api", "lotse-testing"] # the control API; the dev viewer, a test crate never linked into the binary
-hyper = ["lotse-api", "lotse-http", "lotse"] # the control API's HTTP/1.1 connection, under axum; the HTTP source's client; `lotse ctl recording create`'s GET of the recording's body
-hyper-util = ["lotse-api", "lotse-http", "lotse"]
+hyper = ["lotse-api", "lotse-http", "lotse", "lotse-testing"] # the control API's HTTP/1.1 connection, under axum; the HTTP source's client; `lotse ctl recording create`'s GET of the recording's body; the dev viewer's GET of a live output's bytes, a test crate never linked into the binary
+hyper-util = ["lotse-api", "lotse-http", "lotse", "lotse-testing"]
 http-auth = ["lotse-http"] # the HTTP source's Basic and Digest answers (retina uses it on its own for RTSP)
 postcard = ["lotse-ipc"]
 landlock = ["lotse-sandbox"]

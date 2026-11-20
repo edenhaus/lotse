@@ -139,6 +139,7 @@ fn allocation(data: &[u8]) {
         AllocationConfig::default(),
         [0; 32],
         now,
+        0,
     );
     let lease = machine
         .add_session(&credentials)

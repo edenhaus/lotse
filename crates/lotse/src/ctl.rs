@@ -56,7 +56,7 @@ pub(crate) struct CtlArgs {
 /// The commands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum CtlCommand {
-    /// Version, build, schemes, outputs, codecs, limits and sandbox.
+    /// Version, build, protocols, outputs, codecs, limits and sandbox.
     Info,
     /// Process and stream counters.
     Metrics,
@@ -102,14 +102,15 @@ pub(crate) enum StreamCommand {
     Put {
         /// The stream.
         stream_id: String,
-        /// A source URL; repeat for several sources. The command line is
-        /// visible to every user of the host (`ps`, `/proc/<pid>/cmdline`)
-        /// and stays in the shell history: give a URL with credentials
-        /// through `--url-file` instead.
+        /// A source URL, whose scheme names its protocol (`rtsp`,
+        /// `rtsps`, `http`, `https`); repeat for several sources. The
+        /// command line is visible to every user of the host (`ps`,
+        /// `/proc/<pid>/cmdline`) and stays in the shell history: give a
+        /// URL with credentials through `--url-file` instead.
         #[arg(
             long = "url",
             value_name = "URL",
-            required_unless_present = "url_file",
+            required_unless_present_any = ["url_file", "protocol"],
             conflicts_with = "url_file"
         )]
         urls: Vec<String>,
@@ -118,7 +119,12 @@ pub(crate) enum StreamCommand {
         /// command line.
         #[arg(long, value_name = "PATH|-")]
         url_file: Option<PathBuf>,
-        /// Per-scheme options as a JSON object, applied to every source.
+        /// The protocol of a source without a URL (`webrtc`), instead of
+        /// `--url` or `--url-file`.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["urls", "url_file"])]
+        protocol: Option<String>,
+        /// The protocol's fields as a JSON object (`{"transport": "udp"}`,
+        /// `{"tls": {"pin": "…"}}`), merged into every source.
         #[arg(long, value_name = "JSON")]
         options: Option<String>,
         /// Keep the stream connected without viewers.
@@ -181,8 +187,19 @@ pub(crate) enum RecordingCommand {
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClientsCommand {
     /// Every client certificate pin the TLS listener lets in, fixed by the
-    /// configuration or enrolled by pairing.
+    /// configuration or enrolled by pairing or `add`, with its role.
     List,
+    /// Enroll a client certificate's pin with a role, for a client that
+    /// cannot pair: `metrics` may only read `GET /v0/metrics` (a Prometheus
+    /// scraper), `control` may do everything. Succeeds when the pin is
+    /// already enrolled with that role.
+    Add {
+        /// The client certificate's SHA-256, 64 hex digits, optionally with
+        /// a colon between each pair, in any case.
+        pin: String,
+        /// `control` or `metrics`.
+        role: String,
+    },
     /// Remove an enrolled client and close its connections; succeeds when
     /// it is not enrolled.
     Remove {
@@ -286,6 +303,9 @@ fn command_of(command: &CtlCommand, stdin: impl Read) -> anyhow::Result<Value> {
         CtlCommand::Schema => json!({ "type": "schema" }),
         CtlCommand::Clients { command } => match command {
             ClientsCommand::List => json!({ "type": "clients/list" }),
+            ClientsCommand::Add { pin, role } => {
+                json!({ "type": "clients/add", "pin": pin, "role": role })
+            }
             ClientsCommand::Remove { pin } => json!({ "type": "clients/remove", "pin": pin }),
         },
         CtlCommand::Stream { command } => match command {
@@ -300,6 +320,7 @@ fn command_of(command: &CtlCommand, stdin: impl Read) -> anyhow::Result<Value> {
                 stream_id,
                 urls,
                 url_file,
+                protocol,
                 options,
                 preload,
                 audio,
@@ -316,10 +337,7 @@ fn command_of(command: &CtlCommand, stdin: impl Read) -> anyhow::Result<Value> {
                     }
                     None => Map::new(),
                 };
-                let sources: Vec<Value> = urls
-                    .iter()
-                    .map(|url| json!({ "url": url, "options": options }))
-                    .collect();
+                let sources = sources(protocol.as_deref(), &urls, &options)?;
                 let mut put = json!({ "type": "stream/put", "stream_id": stream_id,
                                       "sources": sources, "preload": preload, "audio": audio });
                 if let (Some(ms), Some(object)) = (prerecord, put.as_object_mut()) {
@@ -332,6 +350,41 @@ fn command_of(command: &CtlCommand, stdin: impl Read) -> anyhow::Result<Value> {
         CtlCommand::Recording { .. } => anyhow::bail!("recording create is streamed, not called"),
         CtlCommand::Raw { .. } => anyhow::bail!("raw is sent as written"),
     })
+}
+
+/// The sources of `stream put`: the one `--protocol` names, or one per
+/// URL, named by its scheme (lowercase, RFC 3986 §3.1), which is its
+/// protocol; each with the fields of `--options`. An error never repeats
+/// a URL, which may hold credentials.
+fn sources(
+    protocol: Option<&str>,
+    urls: &[String],
+    options: &Map<String, Value>,
+) -> anyhow::Result<Vec<Value>> {
+    anyhow::ensure!(
+        !options.contains_key("protocol") && !options.contains_key("url"),
+        "--options holds the protocol's fields; name the protocol with --protocol or by the --url's scheme"
+    );
+    let source = |protocol: &str, url: Option<&str>| {
+        let mut source = options.clone();
+        source.insert("protocol".to_owned(), json!(protocol));
+        if let Some(url) = url {
+            source.insert("url".to_owned(), json!(url));
+        }
+        Value::Object(source)
+    };
+    match protocol {
+        Some(protocol) => Ok(vec![source(protocol, None)]),
+        None => urls
+            .iter()
+            .map(|url| {
+                let (scheme, _) = url.split_once("://").context(
+                    "a source URL has no scheme (`rtsp://…`); name a source without a URL with --protocol",
+                )?;
+                Ok(source(&scheme.to_ascii_lowercase(), Some(url)))
+            })
+            .collect(),
+    }
 }
 
 /// The source URLs of `stream put`: the `--url`s, or the lines of
@@ -926,6 +979,17 @@ mod tests {
             .unwrap(),
             json!({ "type": "clients/remove", "pin": "ab" })
         );
+        assert_eq!(
+            command_of(
+                &clients(ClientsCommand::Add {
+                    pin: "ab".into(),
+                    role: "metrics".into()
+                }),
+                b"".as_slice()
+            )
+            .unwrap(),
+            json!({ "type": "clients/add", "pin": "ab", "role": "metrics" })
+        );
         let stream = |command| CtlCommand::Stream { command };
         assert_eq!(
             command_of(&stream(StreamCommand::List), b"".as_slice()).unwrap(),
@@ -954,28 +1018,33 @@ mod tests {
         let put = |options: Option<&str>, audio: &str| {
             stream(StreamCommand::Put {
                 stream_id: "front".into(),
-                urls: vec!["rtsp://cam/a".into(), "rtsp://cam/b".into()],
+                urls: vec!["rtsp://cam/a".into(), "RTSPS://cam/b".into()],
                 url_file: None,
+                protocol: None,
                 options: options.map(str::to_owned),
                 preload: true,
                 audio: audio.into(),
                 prerecord: None,
             })
         };
+        // RFC 3986 §3.1: each URL's scheme, lowercase, names its protocol;
+        // the options are merged into every source.
         assert_eq!(
-            command_of(&put(Some(r#"{"transport":"tcp"}"#), "off"), b"".as_slice()).unwrap(),
+            command_of(&put(Some(r#"{"timeout_ms":5000}"#), "off"), b"".as_slice()).unwrap(),
             json!({ "type": "stream/put", "stream_id": "front", "preload": true, "audio": "off",
-                    "sources": [ { "url": "rtsp://cam/a", "options": { "transport": "tcp" } },
-                                 { "url": "rtsp://cam/b", "options": { "transport": "tcp" } } ] })
+                    "sources": [ { "protocol": "rtsp", "url": "rtsp://cam/a", "timeout_ms": 5000 },
+                                 { "protocol": "rtsps", "url": "RTSPS://cam/b", "timeout_ms": 5000 } ] })
         );
         assert_eq!(
-            command_of(&put(None, "auto"), b"".as_slice()).unwrap()["sources"][0]["options"],
-            json!({})
+            command_of(&put(None, "auto"), b"".as_slice()).unwrap()["sources"][0],
+            json!({ "protocol": "rtsp", "url": "rtsp://cam/a" })
         );
         let err = command_of(&put(None, "loud"), b"".as_slice()).unwrap_err();
         assert!(err.to_string().contains("--audio"), "{err}");
-        let err = command_of(&put(Some("[]"), "auto"), b"".as_slice()).unwrap_err();
-        assert!(err.to_string().contains("--options"), "{err}");
+        for options in ["[]", r#"{"url":"rtsp://x/"}"#, r#"{"protocol":"http"}"#] {
+            let err = command_of(&put(Some(options), "auto"), b"".as_slice()).unwrap_err();
+            assert!(err.to_string().contains("--options"), "{options}: {err}");
+        }
         assert!(
             command_of(
                 &stream(StreamCommand::Subscribe {
@@ -990,12 +1059,49 @@ mod tests {
     }
 
     #[test]
+    fn stream_put_names_a_source_without_a_url_by_its_protocol() {
+        let stream = |command| CtlCommand::Stream { command };
+        // A source without a URL is named by its protocol.
+        let signaled = stream(StreamCommand::Put {
+            stream_id: "door".into(),
+            urls: Vec::new(),
+            url_file: None,
+            protocol: Some("webrtc".into()),
+            options: Some(r#"{"data_channel":"dataSendChannel"}"#.into()),
+            preload: false,
+            audio: "auto".into(),
+            prerecord: None,
+        });
+        assert_eq!(
+            command_of(&signaled, b"".as_slice()).unwrap()["sources"],
+            json!([{ "protocol": "webrtc", "data_channel": "dataSendChannel" }])
+        );
+        // A URL without a scheme names no protocol, and is not repeated.
+        let schemeless = stream(StreamCommand::Put {
+            stream_id: "front".into(),
+            urls: vec!["user:secret@cam/a".into()],
+            url_file: None,
+            protocol: None,
+            options: None,
+            preload: false,
+            audio: "auto".into(),
+            prerecord: None,
+        });
+        let err = command_of(&schemeless, b"".as_slice()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "a source URL has no scheme (`rtsp://…`); name a source without a URL with --protocol"
+        );
+    }
+
+    #[test]
     fn stream_put_reads_its_urls_from_a_file_or_stdin_off_the_command_line() {
         let put = |url_file: &str| CtlCommand::Stream {
             command: StreamCommand::Put {
                 stream_id: "front".into(),
                 urls: Vec::new(),
                 url_file: Some(PathBuf::from(url_file)),
+                protocol: None,
                 options: None,
                 preload: false,
                 audio: "auto".into(),
@@ -1315,6 +1421,26 @@ mod tests {
         );
     }
 
+    /// Only the result of the command's own id ends `raw`: a stale result of
+    /// another id, and an event under the command's id, are printed and
+    /// read past. Both would end it in success, so only the failed result
+    /// of its own id gives the failure asserted.
+    #[tokio::test]
+    async fn raw_ends_only_at_the_result_of_its_own_id() {
+        let script = vec![
+            Step::Read,
+            text(&json!({ "type": "result", "id": 99, "success": true, "result": {} })),
+            text(&json!({ "type": "event", "id": 1, "event": {} })),
+            text(&json!({ "type": "result", "id": 1, "success": false, "error": {} })),
+        ];
+        let (code, _read) = against("raw-own-id", true, script, async |socket| {
+            let mut client = Client::connect(socket).await.unwrap();
+            client.raw(json!({ "type": "info" }), true).await.unwrap()
+        })
+        .await;
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
     #[tokio::test]
     async fn raw_fails_when_the_connection_closes_before_the_result() {
         let script = vec![Step::Read, Step::Send(Message::Close(None))];
@@ -1387,6 +1513,20 @@ mod tests {
         assert_eq!(code.unwrap(), ExitCode::SUCCESS);
     }
 
+    /// Another subscription's event does not count toward the limit: the
+    /// client reads on, here into a frame that is not JSON.
+    #[tokio::test]
+    async fn subscribe_counts_only_its_own_events() {
+        let ok = json!({ "type": "result", "id": 1, "success": true, "result": {} });
+        let then = vec![
+            text(&json!({ "type": "event", "id": 1, "event": { "n": 1 } })),
+            text(&json!({ "type": "event", "id": 2, "event": { "n": 0 } })),
+            Step::Send(Message::Text("not json".into())),
+        ];
+        let (code, _command) = subscribe("sub-own", None, Some(2), ok, then).await;
+        assert!(code.is_err(), "read past the other subscription's event");
+    }
+
     #[tokio::test]
     async fn subscribe_reports_a_failed_result_and_fails_without_one() {
         let failed = json!({ "type": "result", "id": 1, "success": false, "error": {} });
@@ -1452,6 +1592,7 @@ mod tests {
                 stream_id: "front".into(),
                 urls: vec!["rtsp://cam/a".into()],
                 url_file: None,
+                protocol: None,
                 options: None,
                 preload: true,
                 audio: "auto".into(),
@@ -1961,6 +2102,20 @@ mod tests {
             "the result and closed: {printed}"
         );
         assert_eq!(read.len(), 2, "recording/create and GET: {read:?}");
+    }
+
+    /// `write` hands every queued line to stdout and flushes it, and fails
+    /// with stdout: a write that returned at once would leave the line
+    /// queued.
+    #[tokio::test]
+    async fn printer_write_hands_the_queued_lines_to_stdout_and_flushes() {
+        let (stdout, taken) = quiet_stdout();
+        let mut printer = Printer::new(Box::pin(stdout));
+        printer.push(&json!({ "a": 1 }), true);
+        let err = bounded(printer.write()).await.unwrap_err();
+        assert_eq!(err.to_string(), "writing stdout");
+        assert_eq!(&*taken.lock().unwrap(), b"{\"a\":1}\n");
+        assert!(printer.queued.is_empty());
     }
 
     /// `finish` has nothing to wait for without a queued line.

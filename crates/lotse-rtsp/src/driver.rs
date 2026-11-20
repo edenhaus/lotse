@@ -1201,7 +1201,7 @@ mod tests {
         let camera = async {
             clock.advance(Duration::from_secs(31));
             let keepalive = cam.request().await;
-            assert!(!keepalive.is_empty());
+            assert_ne!(keepalive, "");
             clock.advance(Duration::from_secs(31));
         };
         let (item, ()) = tokio::join!(driver.next_item(), camera);

@@ -11,11 +11,15 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# An exemption that matches no dependency fails the check, so it is deleted with the update that
+# makes it unnecessary and cannot hide the advisory if the vulnerable version comes back.
+unused-ignored-advisory = "deny"
 ignore = [
-  # crypto-bigint 0.5.5, through elliptic-curve 0.13 (p256, p384, ecdsa) under dimpl, str0m's DTLS:
-  # the fix is 0.7.6 only, and no dimpl release (0.8.0 included, 2026-10-24) leaves p256 0.13.
-  # Delete this entry with the dimpl update that does.
-  { id = "RUSTSEC-2026-0387", reason = "no fixed crypto-bigint 0.5; dimpl, str0m's DTLS, stays on elliptic-curve 0.13" },
+  # chrono is unmaintained (no fix to wait for), not vulnerable. It comes in only through
+  # m3u8-rs 6.0.1, the newest release, which needs it to parse the dates of EXT-X-PROGRAM-DATE-TIME
+  # and EXT-X-DATERANGE (RFC 3339): lotse-http reads neither, and the parsing runs in the
+  # sandboxed worker. Remove with the m3u8-rs release or the own playlist parser that drops it.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; only via m3u8-rs's date parsing, unused by lotse" },
 ]
 
 [licenses]
@@ -34,12 +38,10 @@ allow = [
   "CDLA-Permissive-2.0", # webpki-roots data
 ]
 exceptions = [
-  # libFuzzer's own license (LLVM's before Apache-2.0 WITH LLVM-exception); only the fuzz workspace
-  # (fuzz/Cargo.lock) links it, never a release build, so cargo-about never meets it.
+  # libFuzzer's own license (LLVM's before Apache-2.0 WITH LLVM-exception); only the fuzz targets
+  # (lotse-fuzz) link it, never a release build, so cargo-about never meets it.
   { crate = "libfuzzer-sys", allow = ["NCSA"] },
 ]
-# One policy for two workspaces (the root and fuzz/): each run meets only its own exceptions.
-unused-license-exception = "allow"
 
 [licenses.private]
 ignore = true # our own publish = false crates

@@ -25,11 +25,13 @@
 
 mod derived;
 mod ice_tcp;
+mod live;
 mod params;
 mod recording;
 pub mod relay;
 mod sendmsg;
 mod sessions;
+mod signaling;
 mod talkback;
 #[cfg(test)]
 mod test_logs;
@@ -37,8 +39,8 @@ mod test_logs;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use lotse_codec::transcode::recording::ToOpus;
 use lotse_core::backoff::{BackoffPosition, ReconnectBackoff};
@@ -49,15 +51,18 @@ use lotse_core::runner::{
     ConnectGate, ProbeAsk, ProbeGate, RunnerConfig, RunnerEvent, SourceRunner,
 };
 use lotse_core::session::SessionLimits;
-use lotse_core::source::{BackchannelSlot, BackchannelTasks, ResolvedPeer, TrackSet};
+use lotse_core::signaling::SignalingOpener;
+use lotse_core::source::{
+    BackchannelSlot, BackchannelTasks, ResolvedPeer, Source, SourceConfigError, TrackSet,
+};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackId, TrackLimits};
 use lotse_ipc::{
-    Channel, Decoded, IpcError, PrerecordStats, RecordingReport, RecordingSpec, Sender,
-    SessionEvent, SessionSpec, SourceSpec, SourceState, ToSupervisor, ToWorker, TrackInfo,
-    TrackStats, WorkerStats,
+    Channel, Decoded, IpcError, LiveReport, LiveSpec, PrerecordStats, RecordingReport,
+    RecordingSpec, Sender, SessionEvent, SessionSpec, SignalCommand, SignalReport, SourceSpec,
+    SourceState, SourceTarget, ToSupervisor, ToWorker, TrackInfo, TrackStats, WorkerStats,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -65,12 +70,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::derived::DerivedTracks;
+pub use crate::live::{DEFAULT_LIVE_START_TIMEOUT, DEFAULT_MAX_LIVE_PER_STREAM, LiveSettings};
+use crate::live::{LiveEnd, LiveStart, Lives};
 pub use crate::recording::{
     DEFAULT_MAX_RECORDING, DEFAULT_MAX_RECORDINGS, DEFAULT_RECORDING_START_TIMEOUT,
     RecordingSettings,
 };
 use crate::recording::{EndReason, RecordingStart, Recordings};
 use crate::sessions::{ConnectionMedia, SessionManager};
+use crate::signaling::WorkerSignaling;
 use crate::talkback::{Arbiter, TalkerChanged, TalkerFeed};
 
 /// How often the worker pushes its counters.
@@ -97,6 +105,8 @@ pub struct Settings {
     pub shared_udp_fd: Option<RawFd>,
     /// The event recordings' limits (`limits.recording_*`, `limits.max_recordings`).
     pub recording: RecordingSettings,
+    /// The live outputs' limits (`limits.live_*`).
+    pub live: LiveSettings,
 }
 
 /// Why the worker stopped serving.
@@ -124,7 +134,7 @@ pub enum Error {
     /// validates specs before spawning, so this is a bug on its side.
     #[error("source rejected ({code}): {message}")]
     SourceRejected {
-        /// The API code (`scheme_unsupported`, `invalid_request`).
+        /// The API code (`protocol_unsupported`, `invalid_request`).
         code: &'static str,
         /// What was wrong.
         message: String,
@@ -138,6 +148,12 @@ pub enum Error {
     /// The source did not stop within the shutdown deadline.
     #[error("the source did not stop within {0} ms")]
     ShutdownTimeout(u64),
+    /// A signal report's send to the supervisor, held up by its full
+    /// socket, was cut short at the shutdown deadline: part of a frame may
+    /// be written, so the channel takes nothing more and the worker exits
+    /// without its final flush.
+    #[error("a signal report's send was cut short at the shutdown deadline")]
+    SignalSendCut,
 }
 
 /// Builds the runtime, opens the channel on stdin and serves until the
@@ -257,7 +273,9 @@ pub async fn serve(
     let (standby_tx, standby_rx) = mpsc::channel::<RunnerEvent>(64);
     let (session_tx, mut session_rx) = mpsc::channel::<(String, SessionEvent)>(256);
     let (recording_tx, recording_rx) = mpsc::channel::<(String, RecordingReport)>(64);
+    let (live_tx, live_rx) = mpsc::channel::<(String, LiveReport)>(64);
     let (probes, mut probe_asks) = ProbeGate::closed();
+    let (signaling, signal_rx) = WorkerSignaling::new();
     let mut serving = Serving {
         tx,
         registries,
@@ -272,11 +290,17 @@ pub async fn serve(
         standby: None,
         sessions: None,
         lost_hand_offs: Throttle::default(),
+        full_recordings: Throttle::default(),
         probes,
         backchannels: BackchannelTasks::default(),
         recordings: Recordings::new(recording_tx),
         recording_rx,
+        lives: Lives::new(live_tx),
+        live_rx,
+        full_lives: Throttle::default(),
         prerecord: None,
+        signaling,
+        signal_rx,
     };
     let fds: Vec<BorrowedFd<'_>> = memory.iter().map(AsFd::as_fd).collect();
     serving
@@ -310,9 +334,13 @@ pub async fn serve(
             Some((session_id, event)) = session_rx.recv() => {
                 serving.tx.send_msg(&ToSupervisor::Session { session_id, event }, &[]).await?;
             }
-            // `serving` holds the recordings' sender, so the reports never end.
-            Some((recording_id, event)) = serving.recording_rx.recv() => {
-                serving.on_recording_report(recording_id, event).await?;
+            // `serving` holds the outputs' senders, so the reports never end.
+            Some(report) = output_report(&mut serving.recording_rx, &mut serving.live_rx) => {
+                serving.on_output_report(report).await?;
+            }
+            // `serving` holds the signaling's sender, so the reports never end.
+            Some(report) = serving.signal_rx.recv() => {
+                serving.tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
             }
             // `serving` holds the gate's sender, so the asks never end.
             Some(ask) = probe_asks.recv() => {
@@ -324,6 +352,27 @@ pub async fn serve(
                 serving.push_stats().await?;
             }
         }
+    }
+}
+
+/// A report of one of the worker's outputs, by its id.
+enum OutputReport {
+    /// An event recording's.
+    Recording(String, RecordingReport),
+    /// A live output's.
+    Live(String, LiveReport),
+}
+
+/// The next report of the recordings or the live outputs, whichever comes
+/// first; `None` once a channel ended, which none does while the worker
+/// holds their senders.
+async fn output_report(
+    recordings: &mut mpsc::Receiver<(String, RecordingReport)>,
+    lives: &mut mpsc::Receiver<(String, LiveReport)>,
+) -> Option<OutputReport> {
+    tokio::select! {
+        report = recordings.recv() => report.map(|(id, event)| OutputReport::Recording(id, event)),
+        report = lives.recv() => report.map(|(id, event)| OutputReport::Live(id, event)),
     }
 }
 
@@ -357,6 +406,10 @@ struct Serving<'a> {
     /// The log line for hand-offs whose connection the kernel discarded,
     /// rate-limited: a flood of them must not flood the log.
     lost_hand_offs: Throttle,
+    /// The log line of a recording refused at `max_recordings`, which the
+    /// client can ask for again and again: the first, then a summary per
+    /// [`SUMMARY_INTERVAL`](lotse_core::throttle::SUMMARY_INTERVAL).
+    full_recordings: Throttle,
     /// Where the sources' probes of the device's backchannel wait for
     /// the supervisor's connect permits: one gate for the worker, shared
     /// by the running source and the standby.
@@ -369,9 +422,22 @@ struct Serving<'a> {
     recordings: Recordings,
     /// Their reports.
     recording_rx: mpsc::Receiver<(String, RecordingReport)>,
+    /// The running live outputs.
+    lives: Lives,
+    /// Their reports.
+    live_rx: mpsc::Receiver<(String, LiveReport)>,
+    /// The log line of a live output refused at its limit, which a client
+    /// can ask for again and again, rate-limited as `full_recordings`.
+    full_lives: Throttle,
     /// The connection's pre-record window, set on its native tracks; `None`
     /// keeps no ring.
     prerecord: Option<Duration>,
+    /// The signaling of the worker's signaled sources: one opener for the
+    /// running source and the standby, and the dispatcher of the
+    /// supervisor's answers.
+    signaling: Arc<WorkerSignaling>,
+    /// What the signaled sources send the supervisor.
+    signal_rx: mpsc::Receiver<SignalReport>,
 }
 
 /// The message that passes a probe's `ask` on to the supervisor.
@@ -406,6 +472,14 @@ impl Serving<'_> {
                 )
                 .await?;
         }
+        while let Ok((live_id, event)) = self.live_rx.try_recv() {
+            self.tx
+                .send_msg(&ToSupervisor::Live { live_id, event }, &[])
+                .await?;
+        }
+        while let Ok(report) = self.signal_rx.try_recv() {
+            self.tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
+        }
         while let Ok(event) = self.runner_rx.try_recv() {
             report(&mut self.tx, event, None).await?;
         }
@@ -433,6 +507,9 @@ impl Serving<'_> {
                 }
                 ToWorker::StartRecording(spec) => {
                     tracing::warn!(recording.id = %spec.recording_id, "recording arrived without its pipe: no free descriptor");
+                }
+                ToWorker::StartLive(spec) => {
+                    tracing::warn!(live.id = %spec.live_id, "live output arrived without its pipe: no free descriptor");
                 }
                 _ => return Err(IpcError::FdsTruncated.into()),
             }
@@ -488,8 +565,8 @@ impl Serving<'_> {
                     manager.candidate(&session_id, candidate);
                 }
             }
-            ToWorker::Renegotiate { session_id, sdp } => {
-                self.on_renegotiate(session_id, sdp).await?;
+            ToWorker::Reoffer { session_id, sdp } => {
+                self.on_reoffer(session_id, sdp).await?;
             }
             ToWorker::RelayCandidate {
                 session_id,
@@ -535,6 +612,10 @@ impl Serving<'_> {
             ToWorker::Prerecord { ms } => self.on_prerecord(ms),
             ToWorker::StartRecording(spec) => self.on_start_recording(spec, fds).await?,
             ToWorker::StopRecording { recording_id } => self.on_stop_recording(&recording_id),
+            ToWorker::StartLive(spec) => self.on_start_live(spec, fds).await?,
+            ToWorker::FetchLive { live_id } => self.on_fetch_live(&live_id),
+            ToWorker::StopLive { live_id } => self.on_stop_live(&live_id),
+            ToWorker::Signal(command) => self.on_signal(command).await?,
             ToWorker::Shutdown { deadline_ms } => {
                 return self.on_shutdown(deadline_ms).await.map(Some);
             }
@@ -581,6 +662,7 @@ impl Serving<'_> {
             self.settings,
             &self.probes,
             &self.backchannels,
+            &self.signaling,
             self.runner_tx.clone(),
         )?);
         self.prerecord = prerecord_window(spec.prerecord_ms);
@@ -628,10 +710,7 @@ impl Serving<'_> {
             (None, _, _) => ("internal_error", "this worker runs no recordings"),
             (_, None, _) => ("internal_error", "the recording came without its pipe"),
             (_, _, None) => ("source_not_live", "the worker runs no source"),
-            _ if self.recordings.len() >= self.settings.recording.max_recordings => (
-                "internal_error",
-                "the worker runs as many recordings as it may",
-            ),
+            _ if self.recordings.len() >= self.settings.recording.max_recordings => RECORDINGS_FULL,
             (Some(factory), Some(fd), Some(running)) => {
                 match tokio::net::unix::pipe::Sender::from_owned_fd(fd) {
                     Ok(pipe) => {
@@ -653,7 +732,14 @@ impl Serving<'_> {
                 }
             }
         };
-        refuse_recording(&mut self.tx, spec.recording_id, refusal).await
+        // Only the limit is the client's to repeat; the other refusals are
+        // the worker's setup or the supervisor's bug.
+        let logged = if refusal == RECORDINGS_FULL {
+            self.full_recordings.hit(self.clock.now())
+        } else {
+            Some(1)
+        };
+        refuse_recording(&mut self.tx, spec.recording_id, refusal, logged).await
     }
 
     /// `StopRecording`: ends `recording_id` cleanly; one this worker does not run is
@@ -662,6 +748,99 @@ impl Serving<'_> {
         if !self.recordings.stop(recording_id, EndReason::Stopped) {
             tracing::debug!(recording.id = %recording_id, "stop for a recording this worker does not run; ignored");
         }
+    }
+
+    /// `StartLive`: runs `spec`'s live output into the pipe that came with
+    /// it, or refuses it, closing that pipe, which ends its body for its
+    /// reader: without a container, a pipe, a source, or room. A second
+    /// output under a running one's id is the supervisor's bug: its pipe is
+    /// closed and nothing reported, as for a recording.
+    async fn on_start_live(&mut self, spec: LiveSpec, fds: Vec<OwnedFd>) -> Result<(), Error> {
+        if self.lives.runs(&spec.live_id) {
+            tracing::warn!(live.id = %spec.live_id, "live id already runs; the second start is dropped");
+            return Ok(());
+        }
+        let refusal = match (&self.registries.live, fds.into_iter().next(), &self.running) {
+            (None, _, _) => ("internal_error", "this worker runs no live outputs"),
+            (_, None, _) => ("internal_error", "the live output came without its pipe"),
+            (_, _, None) => ("source_not_live", "the worker runs no source"),
+            _ if self.lives.len() >= self.settings.live.max_outputs => LIVES_FULL,
+            (Some(factory), Some(fd), Some(running)) => {
+                match tokio::net::unix::pipe::Sender::from_owned_fd(fd) {
+                    Ok(pipe) => {
+                        self.lives.start(LiveStart {
+                            spec,
+                            pipe,
+                            tracks: Arc::clone(running.tracks.tracks()),
+                            factory: Arc::clone(factory),
+                            settings: self.settings.live,
+                            clock: Arc::clone(&self.clock),
+                        });
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "live descriptor is no pipe");
+                        ("internal_error", "the live output's descriptor is no pipe")
+                    }
+                }
+            }
+        };
+        let logged = if refusal == LIVES_FULL {
+            self.full_lives.hit(self.clock.now())
+        } else {
+            Some(1)
+        };
+        if let Some(refused) = logged {
+            let (reason, why) = refusal;
+            tracing::warn!(live.id = %spec.live_id, reason, why, refused, "live output refused");
+        }
+        let closed = ToSupervisor::Live {
+            live_id: spec.live_id,
+            event: LiveReport::Closed {
+                reason: refusal.0.to_owned(),
+                bytes: 0,
+                dropped_frames: 0,
+                drops: 0,
+            },
+        };
+        self.tx.send_msg(&closed, &[]).await?;
+        Ok(())
+    }
+
+    /// `FetchLive`: a reader took `live_id`'s body; one this worker does
+    /// not run is ignored.
+    fn on_fetch_live(&self, live_id: &str) {
+        if !self.lives.fetch(live_id) {
+            tracing::debug!(live.id = %live_id, "fetch for a live output this worker does not run; ignored");
+        }
+    }
+
+    /// `StopLive`: ends `live_id`; one this worker does not run is ignored.
+    fn on_stop_live(&self, live_id: &str) {
+        if !self.lives.stop(live_id, LiveEnd::Stopped) {
+            tracing::debug!(live.id = %live_id, "stop for a live output this worker does not run; ignored");
+        }
+    }
+
+    /// An output's report, passed on.
+    async fn on_output_report(&mut self, report: OutputReport) -> Result<(), Error> {
+        match report {
+            OutputReport::Recording(recording_id, event) => {
+                self.on_recording_report(recording_id, event).await
+            }
+            OutputReport::Live(live_id, event) => self.on_live_report(live_id, event).await,
+        }
+    }
+
+    /// A live output's report, passed on; after its `Closed` it is over.
+    async fn on_live_report(&mut self, live_id: String, event: LiveReport) -> Result<(), Error> {
+        if matches!(event, LiveReport::Closed { .. }) {
+            self.lives.ended(&live_id);
+        }
+        self.tx
+            .send_msg(&ToSupervisor::Live { live_id, event }, &[])
+            .await?;
+        Ok(())
     }
 
     /// A recording's report, passed on; after its `Closed` the recording is over.
@@ -685,6 +864,16 @@ impl Serving<'_> {
         Ok(())
     }
 
+    /// `Signal`: the supervisor's answer to a signaled source's open, or
+    /// what the client relays on its channel; a channel the worker cannot
+    /// take is closed at once.
+    async fn on_signal(&mut self, command: SignalCommand) -> Result<(), Error> {
+        if let Some(report) = self.signaling.command(command) {
+            self.tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
+        }
+        Ok(())
+    }
+
     /// `SwitchConnectGranted`: the standby may connect now.
     fn on_switch_connect_granted(&self) {
         if let Some(standby) = &self.standby {
@@ -703,7 +892,7 @@ impl Serving<'_> {
         }
     }
 
-    /// `Renegotiate`: a re-offer for a session, which its session answers.
+    /// `Reoffer`: a re-offer for a session, which its session answers.
     /// One without a manager, for no session or for one whose queue is
     /// full is refused here, straight to the supervisor, never through
     /// the session events this loop alone drains, so a full queue of them
@@ -711,13 +900,13 @@ impl Serving<'_> {
     /// answer that cannot come. The refusal may overtake that session's
     /// queued events, which is harmless: the supervisor has one re-offer
     /// out per session, and this refusal is its only answer.
-    async fn on_renegotiate(&mut self, session_id: String, sdp: String) -> Result<(), Error> {
+    async fn on_reoffer(&mut self, session_id: String, sdp: String) -> Result<(), Error> {
         let message = match &self.sessions {
-            Some(manager) if manager.renegotiate(&session_id, sdp) => return Ok(()),
+            Some(manager) if manager.reoffer(&session_id, sdp) => return Ok(()),
             Some(_) => "the session is gone or busy",
             None => "the worker holds no sockets",
         };
-        refuse_renegotiation(&mut self.tx, session_id, message).await
+        refuse_reoffer(&mut self.tx, session_id, message).await
     }
 
     /// `Shutdown`: ends the recordings, closes every session, stops the standby
@@ -728,7 +917,14 @@ impl Serving<'_> {
     async fn on_shutdown(&mut self, deadline_ms: u32) -> Result<ExitReason, Error> {
         let sessions = self.sessions.as_mut().map_or(0, SessionManager::len);
         let recordings = self.recordings.len();
-        tracing::info!(deadline_ms, sessions, recordings, "shutdown requested");
+        let lives = self.lives.len();
+        tracing::info!(
+            deadline_ms,
+            sessions,
+            recordings,
+            lives,
+            "shutdown requested"
+        );
         let budget = Duration::from_millis(u64::from(deadline_ms));
         let now = self.clock.now();
         let deadline = now.checked_add(budget).unwrap_or(now);
@@ -737,10 +933,14 @@ impl Serving<'_> {
             clock,
             recordings,
             recording_rx,
+            lives,
+            live_rx,
             sessions,
             standby,
             running,
             backchannels,
+            signaling,
+            signal_rx,
             ..
         } = self;
         // Each recording writes its last fragment, and its report waits for the
@@ -748,18 +948,28 @@ impl Serving<'_> {
         // their channel would be aborted at the deadline, its `Closed`
         // lost.
         let ending = async {
-            let ending = recordings.shutdown(clock, deadline);
+            let ending = async {
+                tokio::join!(
+                    recordings.shutdown(clock, deadline),
+                    lives.shutdown(clock, deadline)
+                );
+            };
             tokio::pin!(ending);
             loop {
                 tokio::select! {
                     biased;
-                    () = &mut ending => return Ok::<(), Error>(()),
+                    () = &mut ending => break,
                     // `self` holds the recordings' sender, so the reports never end.
                     Some((recording_id, event)) = recording_rx.recv() => {
                         tx.send_msg(&ToSupervisor::Recording { recording_id, event }, &[]).await?;
                     }
+                    // `self` holds the live outputs' sender, so the reports never end.
+                    Some((live_id, event)) = live_rx.recv() => {
+                        tx.send_msg(&ToSupervisor::Live { live_id, event }, &[]).await?;
+                    }
                 }
             }
+            Ok::<(), Error>(())
         };
         let teardown = async {
             if let Some(mut manager) = sessions.take() {
@@ -775,6 +985,9 @@ impl Serving<'_> {
         let (ended, torn_down) = tokio::join!(ending, teardown);
         ended?;
         torn_down?;
+        // The sources stopped, so their signaling channels are closed: each
+        // relay queues its close, which goes out ahead of the exit.
+        close_signaling(signaling, signal_rx, tx, clock, deadline).await?;
         Ok(ExitReason::Shutdown)
     }
 
@@ -783,6 +996,7 @@ impl Serving<'_> {
     async fn on_supervisor_gone(&mut self) -> Result<ExitReason, Error> {
         tracing::warn!("supervisor closed the control channel; stopping");
         self.recordings.abort_all();
+        self.lives.abort_all();
         self.sessions.take();
         stop_standby(self.standby.take(), &self.clock).await;
         stop_source(self.running.take(), &self.clock, Duration::from_secs(1)).await?;
@@ -812,6 +1026,7 @@ impl Serving<'_> {
             self.settings,
             &self.probes,
             &self.backchannels,
+            &self.signaling,
             self.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -1090,14 +1305,31 @@ fn set_prerecord(tracks: &DerivedTracks, window: Option<Duration>) {
     }
 }
 
+/// The refusal of a live output past `limits.max_live_per_stream`: its
+/// reason and why.
+const LIVES_FULL: (&str, &str) = (
+    "internal_error",
+    "the worker runs as many live outputs as it may",
+);
+
+/// The refusal of a recording past `max_recordings`: its reason and why.
+const RECORDINGS_FULL: (&str, &str) = (
+    "internal_error",
+    "the worker runs as many recordings as it may",
+);
+
 /// Refuses the recording `recording_id` with `(reason, why)`: its `Closed` at once,
-/// nothing written; its pipe, if one came, is closed already.
+/// nothing written; its pipe, if one came, is closed already. `logged` is
+/// the count of refusals its log line covers, `None` when no line is due.
 async fn refuse_recording(
     tx: &mut Sender,
     recording_id: String,
     (reason, why): (&str, &str),
+    logged: Option<u64>,
 ) -> Result<(), Error> {
-    tracing::warn!(recording.id = %recording_id, reason, why, "recording refused");
+    if let Some(refused) = logged {
+        tracing::warn!(recording.id = %recording_id, reason, why, refused, "recording refused");
+    }
     let closed = ToSupervisor::Recording {
         recording_id,
         event: RecordingReport::Closed {
@@ -1113,16 +1345,12 @@ async fn refuse_recording(
 
 /// Refuses a re-offer for `session_id` that no session takes, saying why
 /// in `message`.
-async fn refuse_renegotiation(
-    tx: &mut Sender,
-    session_id: String,
-    message: &str,
-) -> Result<(), Error> {
+async fn refuse_reoffer(tx: &mut Sender, session_id: String, message: &str) -> Result<(), Error> {
     tracing::debug!(session = %session_id, message, "re-offer refused by the worker");
     tx.send_msg(
         &ToSupervisor::Session {
             session_id,
-            event: SessionEvent::RenegotiateRefused {
+            event: SessionEvent::ReofferRefused {
                 code: "internal_error".to_owned(),
                 message: message.to_owned(),
             },
@@ -1135,7 +1363,8 @@ async fn refuse_renegotiation(
 
 /// Validates `spec` against the registry and starts its runner on a new
 /// track set, its probes waiting at `probes`, its backchannel sessions'
-/// tasks tracked in `backchannels`.
+/// tasks tracked in `backchannels`, a signaled source's channels opened
+/// through `signaling`.
 #[expect(
     clippy::too_many_arguments,
     reason = "wires the source into the worker's shared parts, as start_runner does"
@@ -1147,6 +1376,7 @@ fn start_source(
     settings: &Settings,
     probes: &ProbeGate,
     backchannels: &BackchannelTasks,
+    signaling: &Arc<WorkerSignaling>,
     events: mpsc::Sender<RunnerEvent>,
 ) -> Result<Running, Error> {
     let native = TrackSet::new(settings.limits, clock.now());
@@ -1157,6 +1387,7 @@ fn start_source(
         settings,
         probes,
         backchannels,
+        signaling,
         events,
         Arc::clone(&native),
         "source",
@@ -1189,10 +1420,81 @@ fn start_source(
     })
 }
 
+/// A source a spec names, built by its factory, and how the worker wires
+/// it.
+#[derive(Debug)]
+struct Built {
+    /// The source.
+    source: Box<dyn Source>,
+    /// Its protocol can carry audio back (`SourceCapabilities::backchannel`).
+    backchannel: bool,
+    /// The client relays its signaling: it gets the signaling opener.
+    signaled: bool,
+    /// What names it in the log: the redacted URL, or the protocol.
+    shown: String,
+}
+
+/// Builds the source `spec` names with the registry's factory for it: a
+/// URL's scheme's, which is its protocol, or a signaled source's
+/// protocol's. The supervisor checked the spec before it sent it, so a
+/// refusal is a bug on its side.
+fn build_source(spec: &SourceSpec, registries: &Registries) -> Result<Built, Error> {
+    let options: serde_json::Value =
+        serde_json::from_str(&spec.options).map_err(|err| Error::SourceRejected {
+            code: "invalid_request",
+            message: format!("options are not JSON: {err}"),
+        })?;
+    match &spec.target {
+        SourceTarget::Url(raw) => {
+            let url = SourceUrl::parse(raw).map_err(|err| Error::SourceRejected {
+                code: "invalid_request",
+                message: err.to_string(),
+            })?;
+            let Some(factory) = registries.sources.get(url.scheme()) else {
+                return Err(Error::SourceRejected {
+                    code: "protocol_unsupported",
+                    message: format!("protocol {:?} is not compiled in", url.scheme()),
+                });
+            };
+            Ok(Built {
+                source: factory
+                    .validate(&url, &options)
+                    .map_err(|err| invalid(&err))?,
+                backchannel: factory.capabilities().backchannel,
+                signaled: false,
+                shown: url.to_string(),
+            })
+        }
+        SourceTarget::Signaled(protocol) => {
+            let Some(factory) = registries.sources.signaled(protocol) else {
+                return Err(Error::SourceRejected {
+                    code: "protocol_unsupported",
+                    message: format!("signaled protocol {protocol:?} is not compiled in"),
+                });
+            };
+            Ok(Built {
+                source: factory.validate(&options).map_err(|err| invalid(&err))?,
+                backchannel: false,
+                signaled: true,
+                shown: protocol.clone(),
+            })
+        }
+    }
+}
+
+/// A factory's refusal of a spec's source, as the worker reports it.
+fn invalid(err: &SourceConfigError) -> Error {
+    Error::SourceRejected {
+        code: "invalid_request",
+        message: err.to_string(),
+    }
+}
+
 /// Validates `spec` against the registry and starts its runner on
 /// `native`, reporting to `events`, its probes waiting at `probes`, its
-/// backchannel sessions' tasks tracked in `backchannels`; `role` names it
-/// in the log.
+/// backchannel sessions' tasks tracked in `backchannels`, its signaling
+/// channels opened through `signaling` when its protocol's signaling is
+/// the client's to relay; `role` names it in the log.
 #[expect(
     clippy::too_many_arguments,
     reason = "wires one runner into the worker's shared parts; called from two places"
@@ -1204,46 +1506,36 @@ fn start_runner(
     settings: &Settings,
     probes: &ProbeGate,
     backchannels: &BackchannelTasks,
+    signaling: &Arc<WorkerSignaling>,
     events: mpsc::Sender<RunnerEvent>,
     native: Arc<TrackSet>,
     role: &'static str,
 ) -> Result<Runner, Error> {
-    let url = SourceUrl::parse(&spec.url).map_err(|err| Error::SourceRejected {
-        code: "invalid_request",
-        message: err.to_string(),
-    })?;
-    let factory = registries
-        .sources
-        .get(url.scheme())
-        .ok_or_else(|| Error::SourceRejected {
-            code: "scheme_unsupported",
-            message: format!("scheme {:?} is not compiled in", url.scheme()),
-        })?;
-    let options: serde_json::Value =
-        serde_json::from_str(&spec.options).map_err(|err| Error::SourceRejected {
-            code: "invalid_request",
-            message: format!("options are not JSON: {err}"),
-        })?;
-    let source = factory
-        .validate(&url, &options)
-        .map_err(|err| Error::SourceRejected {
-            code: "invalid_request",
-            message: err.to_string(),
-        })?;
+    let Built {
+        source,
+        backchannel,
+        signaled,
+        shown,
+    } = build_source(spec, registries)?;
     // Two-way audio stays off for a protocol that cannot carry audio
     // back, whatever its source puts in the slot.
-    let backchannel = factory
-        .capabilities()
-        .backchannel
-        .then(|| BackchannelSlot::gated(probes.clone()).tracked(backchannels.clone()));
+    let backchannel =
+        backchannel.then(|| BackchannelSlot::gated(probes.clone()).tracked(backchannels.clone()));
     let capable = backchannel.is_some();
+    // Only a signaled source gets the opener: no other opens a channel to
+    // the control-API client.
+    let signaled = signaled.then(|| {
+        let opener: Arc<dyn SignalingOpener> = Arc::<WorkerSignaling>::clone(signaling);
+        opener
+    });
     tracing::info!(
         connection = %spec.connection_id,
-        url = %url,
+        source = %shown,
         peer = %spec.peer_host,
         addrs = ?spec.peer_addrs,
         role,
         backchannel = capable,
+        signaled = signaled.is_some(),
         backoff_attempts = spec.backoff.attempts,
         immediate_used = spec.backoff.immediate_used,
         "running source"
@@ -1261,6 +1553,7 @@ fn start_runner(
         native,
         Arc::clone(&mapper),
         backchannel.clone().unwrap_or_default(),
+        signaled,
         Arc::clone(clock),
         settings.runner,
         ReconnectBackoff::resumed(
@@ -1375,6 +1668,62 @@ async fn close_backchannels(tasks: &BackchannelTasks, clock: &Arc<dyn Clock>) {
             grace_ms = BACKCHANNEL_CLOSE_GRACE.as_millis(),
             "backchannel sessions still closing after the grace; the worker exits without them"
         ),
+    }
+}
+
+/// Waits, until `deadline` on `clock`, for the relays of the signaling
+/// channels to end, each having queued its channel's close, and sends the
+/// reports of `signal_rx` to the supervisor on `tx` meanwhile, so no relay
+/// waits for room; the last ones go out with the worker's final flush. A
+/// send the supervisor's full socket holds up is cut short at the
+/// deadline too, and is [`Error::SignalSendCut`]: it may have written
+/// part of a frame, so nothing, the final flush included, may follow it
+/// on `tx`.
+async fn close_signaling(
+    signaling: &WorkerSignaling,
+    signal_rx: &mut mpsc::Receiver<SignalReport>,
+    tx: &mut Sender,
+    clock: &Arc<dyn Clock>,
+    deadline: Instant,
+) -> Result<(), Error> {
+    let open = signaling.relays();
+    // Set while a send is under way, so the deadline knows it cut one.
+    let sending = AtomicBool::new(false);
+    let relay = async {
+        let ended = signaling.relays_ended();
+        tokio::pin!(ended);
+        loop {
+            tokio::select! {
+                biased;
+                // The signaling holds the reports' sender, so they never end.
+                Some(report) = signal_rx.recv() => {
+                    sending.store(true, Ordering::Relaxed);
+                    tx.send_msg(&ToSupervisor::Signal(report), &[]).await?;
+                    sending.store(false, Ordering::Relaxed);
+                }
+                () = &mut ended => {
+                    tracing::debug!(open, "signaling relays ended");
+                    return Ok::<(), Error>(());
+                }
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        relayed = relay => relayed,
+        () = clock.sleep(deadline.saturating_duration_since(clock.now())) => {
+            tracing::warn!(
+                left = signaling.relays(),
+                "signaling relays still closing at the deadline; the worker exits without their closes"
+            );
+            if sending.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    "a signal report's send to the supervisor's full socket was cut short; the worker exits without its final flush"
+                );
+                return Err(Error::SignalSendCut);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1557,8 +1906,8 @@ mod tests {
     };
     use lotse_core::task::BoxFuture;
     use lotse_core::test_util::{
-        BackchannelCapture, ECHO_ANSWER, EchoSessionFactory, FakeOutputFactory,
-        FakeRecordingMuxerFactory, FakeSourceFactory,
+        BackchannelCapture, ECHO_ANSWER, EchoSessionFactory, FakeLiveMuxerFactory,
+        FakeOutputFactory, FakeRecordingMuxerFactory, FakeSignaledSourceFactory, FakeSourceFactory,
     };
     use lotse_ipc::Receiver;
     use tokio::sync::Notify;
@@ -1576,6 +1925,7 @@ mod tests {
             max_sessions: 256,
             shared_udp_fd: None,
             recording: RecordingSettings::default(),
+            live: LiveSettings::default(),
         }
     }
 
@@ -1620,7 +1970,7 @@ mod tests {
     fn spec(url: &str, options: &str) -> SourceSpec {
         SourceSpec {
             connection_id: "c1".into(),
-            url: url.into(),
+            target: SourceTarget::Url(url.into()),
             options: options.into(),
             peer_host: "cam".into(),
             peer_addrs: vec![],
@@ -2423,7 +2773,7 @@ mod tests {
         let samples = |packets: Vec<lotse_core::media::MediaPacket>| -> Vec<u8> {
             packets.iter().map(|packet| packet.payload[0]).collect()
         };
-        let renegotiate = |session: &str, sdp: &str| ToWorker::Renegotiate {
+        let reoffer = |session: &str, sdp: &str| ToWorker::Reoffer {
             session_id: session.into(),
             sdp: sdp.into(),
         };
@@ -2462,15 +2812,13 @@ mod tests {
         .await
         .unwrap();
         seen.extend(messages_until(&mut h, |seen| closed(seen, "a")).await);
-        h.tx.send_msg(&renegotiate("b", "v=0 talk"), &[])
-            .await
-            .unwrap();
+        h.tx.send_msg(&reoffer("b", "v=0 talk"), &[]).await.unwrap();
         let answered = |seen: &[ToSupervisor]| {
             session_events(seen).any(|(session, event)| {
                 session == "b"
                     && *event
-                        == SessionEvent::Renegotiated {
-                            sdp: "v=0 echo renegotiated backchannel=pcmu".into(),
+                        == SessionEvent::ReofferAnswered {
+                            sdp: "v=0 echo reoffer answer backchannel=pcmu".into(),
                             talkback: Some("pcmu".into()),
                         }
             })
@@ -2515,9 +2863,7 @@ mod tests {
             })
         };
         seen.extend(messages_until(&mut h, dropped).await);
-        h.tx.send_msg(&renegotiate("b", "v=0 talk"), &[])
-            .await
-            .unwrap();
+        h.tx.send_msg(&reoffer("b", "v=0 talk"), &[]).await.unwrap();
         let claimed_again = |seen: &[ToSupervisor]| {
             seen.iter().any(|message| {
                 matches!(message, ToSupervisor::Talker(change) if change.reason == "claimed")
@@ -2532,14 +2878,14 @@ mod tests {
         );
         // A re-offer that drops talk-back lets go; one the engine refuses
         // is refused; one for no session is refused too.
-        h.tx.send_msg(&renegotiate("b", "v=0"), &[]).await.unwrap();
+        h.tx.send_msg(&reoffer("b", "v=0"), &[]).await.unwrap();
         // Answered without talk-back, b stays in the stats with all it
         // counted: `session/get`'s counters never go back.
         let let_go = |seen: &[ToSupervisor]| {
             seen.iter().any(|message| {
-                matches!(message, ToSupervisor::Talker(change) if change.reason == "renegotiated")
+                matches!(message, ToSupervisor::Talker(change) if change.reason == "reoffered")
             }) && session_events(seen).any(|(session, event)| {
-                session == "b" && matches!(event, SessionEvent::Renegotiated { talkback: None, .. })
+                session == "b" && matches!(event, SessionEvent::ReofferAnswered { talkback: None, .. })
             })
         };
         seen.extend(messages_until(&mut h, let_go).await);
@@ -2561,20 +2907,18 @@ mod tests {
             )]
         );
         seen.extend(pushed);
-        h.tx.send_msg(&renegotiate("b", "refuse"), &[])
-            .await
-            .unwrap();
-        h.tx.send_msg(&renegotiate("zz", "v=0"), &[]).await.unwrap();
+        h.tx.send_msg(&reoffer("b", "refuse"), &[]).await.unwrap();
+        h.tx.send_msg(&reoffer("zz", "v=0"), &[]).await.unwrap();
         let refused = |seen: &[ToSupervisor]| {
             session_events(seen)
-                .filter(|(_, event)| matches!(event, SessionEvent::RenegotiateRefused { .. }))
+                .filter(|(_, event)| matches!(event, SessionEvent::ReofferRefused { .. }))
                 .count()
                 == 2
         };
         seen.extend(messages_until(&mut h, refused).await);
         let mut refusals: Vec<(&str, &str, &str)> = session_events(&seen)
             .filter_map(|(session, event)| match event {
-                SessionEvent::RenegotiateRefused { code, message } => {
+                SessionEvent::ReofferRefused { code, message } => {
                     Some((session, code.as_str(), message.as_str()))
                 }
                 _ => None,
@@ -2625,7 +2969,7 @@ mod tests {
                 ("b", "claimed"),
                 ("b", "released"),
                 ("b", "claimed"),
-                ("b", "renegotiated"),
+                ("b", "reoffered"),
             ]
         );
     }
@@ -2636,7 +2980,7 @@ mod tests {
         let mut h = start_with_settings(echo_registries(), quiet_settings());
         h.next().await;
         h.tx.send_msg(
-            &ToWorker::Renegotiate {
+            &ToWorker::Reoffer {
                 session_id: "s".into(),
                 sdp: "v=0".into(),
             },
@@ -2644,13 +2988,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let refused = session_event_where(&mut h, |e| {
-            matches!(e, SessionEvent::RenegotiateRefused { .. })
-        })
-        .await;
+        let refused =
+            session_event_where(&mut h, |e| matches!(e, SessionEvent::ReofferRefused { .. })).await;
         assert_eq!(
             refused,
-            SessionEvent::RenegotiateRefused {
+            SessionEvent::ReofferRefused {
                 code: "internal_error".into(),
                 message: "the worker holds no sockets".into(),
             }
@@ -2690,7 +3032,7 @@ mod tests {
         )
         .unwrap();
         serving.sessions = Some(manager);
-        within(serving.on_renegotiate("ghost".into(), "v=0".into()))
+        within(serving.on_reoffer("ghost".into(), "v=0".into()))
             .await
             .unwrap();
         let (message, _) = within(rx.recv_msg::<ToSupervisor>())
@@ -2701,12 +3043,373 @@ mod tests {
             message,
             ToSupervisor::Session {
                 session_id: "ghost".into(),
-                event: SessionEvent::RenegotiateRefused {
+                event: SessionEvent::ReofferRefused {
                     code: "internal_error".into(),
                     message: "the session is gone or busy".into(),
                 },
             }
         );
+    }
+
+    /// The signaled fake source, as the WebRTC camera source's protocol.
+    fn signaled_registries() -> Arc<Registries> {
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register_signaled(Arc::new(FakeSignaledSourceFactory::new("webrtc")))
+            .unwrap();
+        Arc::new(registries)
+    }
+
+    /// The spec of a signaled source of `protocol`: no address.
+    fn signaled_spec(protocol: &str, options: &str) -> SourceSpec {
+        SourceSpec {
+            target: SourceTarget::Signaled(protocol.into()),
+            peer_host: String::new(),
+            ..spec("unused://", options)
+        }
+    }
+
+    /// The worker's next signal report, the other messages skipped.
+    async fn next_signal(h: &mut Harness) -> SignalReport {
+        let_assert!(
+            ToSupervisor::Signal(report) =
+                next_where(h, &|message| matches!(message, ToSupervisor::Signal(_))).await
+        );
+        report
+    }
+
+    async fn signal_command(h: &mut Harness, command: SignalCommand) {
+        h.tx.send_msg(&ToWorker::Signal(command), &[])
+            .await
+            .unwrap();
+    }
+
+    /// A signaled source opens a channel per attempt through the
+    /// supervisor: its offer and candidates go out as reports, the
+    /// client's answer comes in and it goes live; the client gone ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rfc8829_5_a_signaled_source_s_offer_and_answer_go_through_the_supervisor() {
+        let mut h = start_with_settings(signaled_registries(), quiet_settings());
+        h.next().await;
+        h.tx.send_msg(&ToWorker::RunSource(signaled_spec("webrtc", "{}")), &[])
+            .await
+            .unwrap();
+        let_assert!(SignalReport::Open { request } = next_signal(&mut h).await);
+        signal_command(
+            &mut h,
+            SignalCommand::Opened {
+                request,
+                signal_id: "sig-1".into(),
+                local_addrs: vec!["192.0.2.7".parse().unwrap()],
+            },
+        )
+        .await;
+        let candidate = |candidate: &str| SignalReport::Candidate {
+            signal_id: "sig-1".into(),
+            candidate: candidate.into(),
+            mid: Some("0".into()),
+            mline_index: Some(0),
+        };
+        assert_eq!(
+            [
+                next_signal(&mut h).await,
+                next_signal(&mut h).await,
+                next_signal(&mut h).await,
+            ],
+            [
+                SignalReport::Offer {
+                    signal_id: "sig-1".into(),
+                    sdp: lotse_core::test_util::FAKE_SIGNALED_OFFER.into(),
+                },
+                candidate("candidate:1 1 udp 2130706431 192.0.2.7 9 typ host"),
+                candidate(""),
+            ]
+        );
+        signal_command(
+            &mut h,
+            SignalCommand::Answer {
+                signal_id: "sig-1".into(),
+                sdp: "v=0 answer".into(),
+            },
+        )
+        .await;
+        next_where(&mut h, &|message| {
+            *message == ToSupervisor::SourceState(SourceState::Live)
+        })
+        .await;
+
+        signal_command(
+            &mut h,
+            SignalCommand::Gone {
+                signal_id: "sig-1".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            next_signal(&mut h).await,
+            SignalReport::Closed {
+                signal_id: "sig-1".into(),
+                code: "signaling_lost".into(),
+                message: "the signaling client is gone".into(),
+            }
+        );
+        // The reconnect's attempt opens again.
+        let_assert!(SignalReport::Open { request: again } = next_signal(&mut h).await);
+        assert_eq!(again, request + 1);
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
+    /// A signaled source whose open the supervisor refuses backs off
+    /// unreachable; a channel no attempt asked for is closed at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_signaled_source_whose_open_is_refused_backs_off_unreachable() {
+        let mut h = start_with_settings(signaled_registries(), quiet_settings());
+        h.next().await;
+        signal_command(
+            &mut h,
+            SignalCommand::Opened {
+                request: 99,
+                signal_id: "stale".into(),
+                local_addrs: vec![],
+            },
+        )
+        .await;
+        assert_eq!(
+            next_signal(&mut h).await,
+            SignalReport::Closed {
+                signal_id: "stale".into(),
+                code: "source_stopped".into(),
+                message: "the attempt that asked for the channel is over".into(),
+            }
+        );
+        h.tx.send_msg(&ToWorker::RunSource(signaled_spec("webrtc", "{}")), &[])
+            .await
+            .unwrap();
+        let_assert!(SignalReport::Open { request: again } = next_signal(&mut h).await);
+        signal_command(
+            &mut h,
+            SignalCommand::Refused {
+                request: again,
+                code: "no_signaling_client".into(),
+                message: "no client relays this stream's signaling".into(),
+            },
+        )
+        .await;
+        // One line, so the line is covered whichever message comes first.
+        let backoff = next_where(&mut h, &|m| {
+            matches!(m, ToSupervisor::SourceState(SourceState::Backoff { .. }))
+        })
+        .await;
+        let_assert!(
+            ToSupervisor::SourceState(SourceState::Backoff { code, message, .. }) = backoff
+        );
+        assert_eq!(code, "source_unreachable");
+        assert!(message.contains("no_signaling_client"), "{message}");
+
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(h.worker.await.unwrap().unwrap(), ExitReason::Shutdown);
+    }
+
+    /// The signal reports still queued when the worker is done go out
+    /// with its last messages.
+    #[tokio::test]
+    async fn the_last_signal_reports_go_out_before_the_worker_exits() {
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let (signaling, signal_rx) = WorkerSignaling::new();
+        serving.signaling = signaling;
+        serving.signal_rx = signal_rx;
+        let opening = spawn_named("test.open", serving.signaling.open());
+        while serving.signal_rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let mut session_rx = mpsc::channel(1).1;
+        serving
+            .flush(ExitReason::Shutdown, &mut session_rx)
+            .await
+            .unwrap();
+        drop(serving);
+        assert_eq!(
+            within(rx.recv_msg::<ToSupervisor>())
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            ToSupervisor::Signal(SignalReport::Open { request: 1 })
+        );
+        opening.abort();
+    }
+
+    /// Opens the channel `signal_id` through `signaling`, reading the open
+    /// from `signal_rx`.
+    async fn opened_channel(
+        signaling: &WorkerSignaling,
+        signal_rx: &mut mpsc::Receiver<SignalReport>,
+        signal_id: &str,
+    ) -> lotse_core::signaling::SignalingChannel {
+        let opening = spawn_named("test.open", signaling.open());
+        let_assert!(Some(SignalReport::Open { request }) = within(signal_rx.recv()).await);
+        let opened = SignalCommand::Opened {
+            request,
+            signal_id: signal_id.into(),
+            local_addrs: vec![],
+        };
+        assert_eq!(signaling.command(opened), None);
+        opening.await.unwrap().unwrap()
+    }
+
+    /// The shutdown waits for the signaling relays, so the close each
+    /// queues once its source let go of the channel goes out before the
+    /// worker exits.
+    #[tokio::test]
+    async fn the_shutdown_waits_for_the_signaling_relays_to_queue_their_closes() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let (signaling, mut signal_rx) = WorkerSignaling::new();
+        let mut channels = Vec::new();
+        for signal_id in ["sig-1", "sig-2"] {
+            channels.push(opened_channel(&signaling, &mut signal_rx, signal_id).await);
+        }
+        serving.signaling = signaling;
+        serving.signal_rx = signal_rx;
+        // The sources let go of their channels a while later, as stopping
+        // ones do.
+        let _sources = spawn_named("test.sources", async move {
+            for channel in channels {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                drop(channel);
+            }
+        });
+        assert_eq!(
+            serving.on_shutdown(1_000).await.unwrap(),
+            ExitReason::Shutdown
+        );
+        drop(serving);
+        for signal_id in ["sig-1", "sig-2"] {
+            assert_eq!(
+                within(rx.recv_msg::<ToSupervisor>())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                ToSupervisor::Signal(SignalReport::Closed {
+                    signal_id: signal_id.into(),
+                    code: "source_stopped".into(),
+                    message: "the source stopped".into(),
+                })
+            );
+        }
+        assert_eq!(
+            logs.lines(Level::DEBUG, "signaling relays ended")[0].fields,
+            " open=2"
+        );
+    }
+
+    /// A report the supervisor does not read holds the shutdown up only
+    /// until its deadline: the send to a full socket is cut short, and as
+    /// it may have written part of a frame, the shutdown ends in
+    /// `SignalSendCut` instead of the final flush, which would write after
+    /// it and wait on the same full socket with no deadline.
+    #[tokio::test]
+    async fn a_signal_report_a_full_socket_holds_up_is_cut_short_at_the_deadline() {
+        let (logs, _guard) = Logs::capture();
+        let settings = settings();
+        let (mut serving, unread_socket) = serving(&settings);
+        let fake = Arc::new(FakeClock::default());
+        serving.clock = fake.clone();
+        let (signaling, mut signal_rx) = WorkerSignaling::new();
+        let channel = opened_channel(&signaling, &mut signal_rx, "sig-1").await;
+        // More offers than the socket's buffer holds, which no one reads.
+        let (reports, unread) = mpsc::channel(64);
+        for _ in 0..64 {
+            reports
+                .try_send(SignalReport::Offer {
+                    signal_id: "sig-1".into(),
+                    sdp: "v".repeat(lotse_ipc::MAX_SIGNAL_OFFER_BYTES),
+                })
+                .unwrap();
+        }
+        serving.signaling = signaling;
+        serving.signal_rx = unread;
+        let done = AtomicBool::new(false);
+        let shutdown = async {
+            let ended = serving.on_shutdown(1_000).await;
+            done.store(true, Ordering::Relaxed);
+            ended
+        };
+        let deadline = async {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!done.load(Ordering::Relaxed), "the send waits for room");
+            fake.advance(Duration::from_secs(1));
+        };
+        let (ended, ()) = within(async { tokio::join!(shutdown, deadline) }).await;
+        let left = serving.signal_rx.len();
+        assert!(matches!(ended, Err(Error::SignalSendCut)), "{ended:?}");
+        assert!(left > 0, "it stopped sending: {left} left");
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "signaling relays still closing at the deadline; the worker exits without their closes"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "a signal report's send to the supervisor's full socket was cut short; the worker exits without its final flush"
+            )
+            .len(),
+            1
+        );
+        drop((channel, unread_socket, reports));
+    }
+
+    /// A relay whose channel is still open at the shutdown's deadline is
+    /// left with a warning: the shutdown goes on.
+    #[tokio::test]
+    async fn a_signaling_relay_still_open_at_the_deadline_is_left_with_a_warning() {
+        let (logs, _guard) = Logs::capture();
+        let fake = Arc::new(FakeClock::default());
+        let clock: Arc<dyn Clock> = fake.clone();
+        let (signaling, mut signal_rx) = WorkerSignaling::new();
+        let channel = opened_channel(&signaling, &mut signal_rx, "sig-1").await;
+        let (ours, theirs) = Channel::pair().unwrap();
+        let (mut tx, _) = Channel::from_fd(theirs).unwrap().split();
+        let deadline = fake.now() + Duration::from_secs(1);
+        let closing = spawn_named("test.close", async move {
+            close_signaling(&signaling, &mut signal_rx, &mut tx, &clock, deadline)
+                .await
+                .unwrap();
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        fake.advance(Duration::from_millis(999));
+        tokio::task::yield_now().await;
+        assert!(!closing.is_finished(), "waits until the deadline");
+        fake.advance(Duration::from_millis(1));
+        within(closing).await.unwrap();
+        assert_eq!(
+            logs.lines(
+                Level::WARN,
+                "signaling relays still closing at the deadline; the worker exits without their closes"
+            )[0]
+            .fields,
+            " left=1"
+        );
+        drop((channel, ours));
     }
 
     /// A release on a connection whose protocol has no backchannel does
@@ -3441,7 +4144,7 @@ mod tests {
         fn open_session(
             &self,
             request: lotse_core::session::SessionRequest,
-            now: std::time::Instant,
+            now: Instant,
         ) -> Result<
             (Box<dyn lotse_core::session::SessionEngine>, String),
             lotse_core::session::SessionOpenError,
@@ -3611,17 +4314,13 @@ mod tests {
                     &mut frame,
                 );
                 datagrams.send(&frame).unwrap();
-                let (echoed, _, mark) = within(async {
-                    loop {
-                        browser.readable().await.unwrap();
-                        if let Ok(received) = browser.try_io(tokio::io::Interest::READABLE, || {
-                            Ok(lotse_testing::dscp::recv_marked(&browser)?)
-                        }) {
-                            break received;
-                        }
-                    }
-                })
-                .await;
+                // `async_io` waits out a spurious readiness itself.
+                let (echoed, _, mark) =
+                    within(browser.async_io(tokio::io::Interest::READABLE, || {
+                        Ok(lotse_testing::dscp::recv_marked(&browser)?)
+                    }))
+                    .await
+                    .unwrap();
                 assert_eq!((&echoed[..], mark), (payload, Some(dscp)));
             }
         }
@@ -4567,9 +5266,65 @@ mod tests {
 
     #[tokio::test]
     async fn bad_specs_and_a_second_source_are_errors() {
+        for (spec, code, message) in [
+            (
+                spec("not a url", "null"),
+                "invalid_request",
+                "url does not parse",
+            ),
+            (
+                spec("rtsp://cam/", "null"),
+                "protocol_unsupported",
+                "protocol \"rtsp\" is not compiled in",
+            ),
+            (
+                spec("fake://cam/", "{not json"),
+                "invalid_request",
+                "options are not JSON",
+            ),
+            (
+                spec("fake://cam/", "{\"transport\":\"udp\"}"),
+                "invalid_request",
+                "fake source takes no options",
+            ),
+            (
+                signaled_spec("webrtc", "null"),
+                "protocol_unsupported",
+                "signaled protocol \"webrtc\" is not compiled in",
+            ),
+            (
+                signaled_spec("fake-signaled", "{\"audio\":true}"),
+                "invalid_request",
+                "fake signaled source takes no options",
+            ),
+            (
+                signaled_spec("fake-signaled", "{not json"),
+                "invalid_request",
+                "options are not JSON",
+            ),
+        ] {
+            let mut registries = Registries::default();
+            registries
+                .sources
+                .register(Arc::new(FakeSourceFactory::new(&["fake"])))
+                .unwrap();
+            registries
+                .sources
+                .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
+                .unwrap();
+            let shown = format!("{:?}", spec.target);
+            let_assert!(
+                Err(Error::SourceRejected {
+                    code: got,
+                    message: text
+                }) = build_source(&spec, &registries)
+            );
+            assert_eq!(got, code, "{shown}");
+            assert!(text.contains(message), "{shown}: {text}");
+        }
         for (url, options, code) in [
             ("not a url", "null", "invalid_request"),
-            ("rtsp://cam/", "null", "scheme_unsupported"),
+            ("rtsp://cam/", "null", "protocol_unsupported"),
             ("fake://cam/", "{not json", "invalid_request"),
             ("fake://cam/", "{\"transport\":\"udp\"}", "invalid_request"),
         ] {
@@ -4605,7 +5360,7 @@ mod tests {
             .unwrap();
         let err = within(h.worker).await.unwrap().unwrap_err();
         let_assert!(Error::SourceRejected { code: got, .. } = err);
-        assert_eq!(got, "scheme_unsupported");
+        assert_eq!(got, "protocol_unsupported");
     }
 
     /// The worker process: the control channel on stdin, a runtime of its
@@ -4662,11 +5417,17 @@ mod tests {
             standby: None,
             sessions: None,
             lost_hand_offs: Throttle::default(),
+            full_recordings: Throttle::default(),
             probes: ProbeGate::default(),
             backchannels: BackchannelTasks::default(),
             recordings: Recordings::new(mpsc::channel(1).0),
             recording_rx: mpsc::channel(1).1,
+            lives: Lives::new(mpsc::channel(1).0),
+            live_rx: mpsc::channel(1).1,
+            full_lives: Throttle::default(),
             prerecord: None,
+            signaling: WorkerSignaling::new().0,
+            signal_rx: mpsc::channel(1).1,
         };
         (serving, ours.split().1)
     }
@@ -4751,6 +5512,7 @@ mod tests {
             &settings,
             &serving.probes,
             &serving.backchannels,
+            &serving.signaling,
             serving.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -4826,7 +5588,7 @@ mod tests {
         fn describe(&self) -> SourceDescriptor {
             SourceDescriptor {
                 protocol: "stubborn",
-                url: self.url.clone(),
+                url: Some(self.url.clone()),
                 options: serde_json::Value::Null,
             }
         }
@@ -4864,7 +5626,7 @@ mod tests {
     }
 
     impl SourceFactory for Stubborn {
-        fn schemes(&self) -> &'static [&'static str] {
+        fn protocols(&self) -> &'static [&'static str] {
             &["stubborn"]
         }
 
@@ -4996,7 +5758,7 @@ mod tests {
             let (logs, _guard) = Logs::capture();
             let settings = settings();
             let (mut serving, _rx) = serving(&settings);
-            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let closed = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&closed);
             let close = CancellationToken::new();
             let _session = serving
@@ -5079,6 +5841,7 @@ mod tests {
             &settings,
             &ProbeGate::default(),
             &tasks,
+            &WorkerSignaling::new().0,
             mpsc::channel(1).0,
             TrackSet::new(TrackLimits::default(), clock.now()),
             "source",
@@ -5098,11 +5861,11 @@ mod tests {
     fn errors_display_and_seeds_differ_by_time() {
         assert_eq!(
             Error::SourceRejected {
-                code: "scheme_unsupported",
+                code: "protocol_unsupported",
                 message: "x".into()
             }
             .to_string(),
-            "source rejected (scheme_unsupported): x"
+            "source rejected (protocol_unsupported): x"
         );
         assert_eq!(
             Error::ShutdownTimeout(5).to_string(),
@@ -5112,6 +5875,23 @@ mod tests {
         let a = jitter_seed(&clock);
         clock.advance(Duration::from_millis(1));
         assert_ne!(a, jitter_seed(&clock));
+        // The wall clock's nanoseconds mixed with the pid, every bit of both:
+        // on a clock whose low 32 bits are all ones, the pid's bits flip them.
+        let wall_nanos = || {
+            clock
+                .wall_now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        };
+        let low = u64::try_from(wall_nanos() % (1 << 32)).unwrap();
+        clock.advance(Duration::from_nanos(u64::from(u32::MAX) - low));
+        let nanos = wall_nanos();
+        assert_eq!(nanos % (1 << 32), u128::from(u32::MAX));
+        assert_eq!(
+            jitter_seed(&clock),
+            u64::try_from(nanos).unwrap() ^ u64::from(std::process::id())
+        );
         assert_eq!(STATS_INTERVAL, Duration::from_secs(1));
     }
 
@@ -5177,7 +5957,7 @@ mod tests {
             "nothing for the window or the stop"
         );
         assert_eq!(h.next().await, refused("k2"));
-        assert!(drained(reader).is_empty());
+        assert_eq!(drained(reader), b"");
         let windows = logs.lines(Level::DEBUG, "pre-record window received");
         assert!(windows[0].fields.contains("window_ms=30000"), "{windows:?}");
         assert_eq!(
@@ -5224,7 +6004,7 @@ mod tests {
         rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).unwrap();
         drop(writer);
         assert_eq!(answer, refused("k1"));
-        assert!(drained(reader).is_empty());
+        assert_eq!(drained(reader), b"");
         assert_eq!(
             logs.count(
                 Level::WARN,
@@ -5360,7 +6140,9 @@ mod tests {
     /// pipe and one past `max_recordings`, each with its pipe closed; a second
     /// start under a running recording's id is dropped with its pipe and no
     /// report, which would be the running recording's. The running recording
-    /// reports through the worker and ends `stopped` on `StopRecording`.
+    /// reports through the worker and ends `stopped` on `StopRecording`. The
+    /// client can ask past the limit again and again: that refusal is logged
+    /// as the first, then one summary per interval with the count.
     #[tokio::test]
     async fn recordings_are_refused_without_a_source_a_pipe_or_room_and_a_running_one_reports() {
         let (logs, _guard) = Logs::capture();
@@ -5380,7 +6162,7 @@ mod tests {
             } = h.next().await
         );
         assert_eq!(reason, "source_not_live");
-        assert!(recording_bytes(reader).await.is_empty());
+        assert_eq!(recording_bytes(reader).await, b"");
         h.tx.send_msg(
             &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 100}"#)),
             &[],
@@ -5405,6 +6187,7 @@ mod tests {
                 audio: None,
             })
         );
+        refuse_k6_and_k7(&mut h, &logs).await;
         h.tx.send_msg(
             &ToWorker::StopRecording {
                 recording_id: "k4".into(),
@@ -5452,6 +6235,41 @@ mod tests {
         );
     }
 
+    /// Starts recordings `k6`, then `k7` a summary interval later, past
+    /// `max_recordings` beside a running `k4`: both are refused, and the
+    /// limit's warning, first logged for `k5`, comes once more for `k7`,
+    /// with the count.
+    async fn refuse_k6_and_k7(h: &mut Harness, logs: &Logs) {
+        // Past the limit again, within the interval of k5's line and after it.
+        for (recording_id, wait) in [
+            ("k6", Duration::ZERO),
+            ("k7", lotse_core::throttle::SUMMARY_INTERVAL),
+        ] {
+            h.clock.advance(wait);
+            let (refused_reader, writer) = recording_pipe();
+            h.tx.send_msg(&start_recording(recording_id), &[writer.as_fd()])
+                .await
+                .unwrap();
+            drop(writer);
+            messages_until(h, |seen| seen.contains(&refused(recording_id))).await;
+            assert_eq!(recording_bytes(refused_reader).await, b"");
+        }
+        let full: Vec<String> = logs
+            .lines(Level::WARN, "recording refused")
+            .into_iter()
+            .map(|line| line.fields)
+            .filter(|fields| fields.contains("as many recordings"))
+            .collect();
+        let why = r#"reason="internal_error" why="the worker runs as many recordings as it may""#;
+        assert_eq!(
+            full,
+            [
+                format!(" recording.id=k5 {why} refused=1"),
+                format!(" recording.id=k7 {why} refused=2"),
+            ]
+        );
+    }
+
     /// Starts recording `k4`, a second `k4` that is dropped and `k5`, which
     /// `max_recordings` 1 refuses, both with their pipes closed; `k4`'s
     /// reader's end and what the worker sent until it started.
@@ -5479,8 +6297,8 @@ mod tests {
         })
         .await;
         assert!(seen.contains(&refused("k5")), "{seen:?}");
-        assert!(recording_bytes(second).await.is_empty());
-        assert!(recording_bytes(fifth).await.is_empty());
+        assert_eq!(recording_bytes(second).await, b"");
+        assert_eq!(recording_bytes(fifth).await, b"");
         (reader, seen)
     }
 
@@ -5660,6 +6478,7 @@ mod tests {
             &settings,
             &serving.probes,
             &serving.backchannels,
+            &serving.signaling,
             serving.standby_tx.clone(),
             Arc::clone(&staging),
             "standby",
@@ -5805,7 +6624,7 @@ mod tests {
             ),
             0
         );
-        assert!(recording_bytes(reader).await.is_empty());
+        assert_eq!(recording_bytes(reader).await, b"");
     }
 
     /// A recording whose reader stalls ends by the shutdown's deadline, aborted
@@ -5884,5 +6703,432 @@ mod tests {
         );
         assert_eq!(aborted.len(), 1);
         assert!(aborted[0].fields.contains("grace_ms=500"), "{aborted:?}");
+    }
+
+    fn start_live(live_id: &str) -> ToWorker {
+        ToWorker::StartLive(LiveSpec {
+            live_id: live_id.into(),
+            audio: true,
+            buffer_bytes: 1 << 20,
+            framed: false,
+        })
+    }
+
+    fn live_refused(live_id: &str, reason: &str) -> ToSupervisor {
+        ToSupervisor::Live {
+            live_id: live_id.into(),
+            event: LiveReport::Closed {
+                reason: reason.into(),
+                bytes: 0,
+                dropped_frames: 0,
+                drops: 0,
+            },
+        }
+    }
+
+    /// `live_id`'s report among `seen` that `want` picks.
+    fn live_report<'a>(
+        seen: &'a [ToSupervisor],
+        live_id: &str,
+        want: fn(&LiveReport) -> bool,
+    ) -> Option<&'a LiveReport> {
+        seen.iter().find_map(|message| match message {
+            ToSupervisor::Live { live_id: id, event } if id == live_id && want(event) => {
+                Some(event)
+            }
+            _ => None,
+        })
+    }
+
+    fn live_started(report: &LiveReport) -> bool {
+        matches!(report, LiveReport::Started { .. })
+    }
+
+    fn live_closed(report: &LiveReport) -> bool {
+        matches!(report, LiveReport::Closed { .. })
+    }
+
+    /// The fake source, the fake output and the fake live container.
+    fn live_registries() -> Arc<Registries> {
+        let mut registries = Registries::default();
+        registries
+            .sources
+            .register(Arc::new(FakeSourceFactory::new(&["fake"])))
+            .unwrap();
+        registries
+            .outputs
+            .register(Arc::new(FakeOutputFactory("webrtc")))
+            .unwrap();
+        registries.live = Some(Arc::new(FakeLiveMuxerFactory::default()));
+        Arc::new(registries)
+    }
+
+    /// A worker that runs no live outputs refuses every `StartLive` at once
+    /// with `internal_error` and closes the pipe that came with it, and one
+    /// without a pipe too; a fetch or a stop for an output it does not run
+    /// sends nothing back, and it keeps serving.
+    #[tokio::test]
+    async fn a_live_output_is_refused_with_its_pipe_closed_and_a_fetch_or_a_stop_is_ignored() {
+        let (logs, _guard) = Logs::capture();
+        let mut h = start();
+        h.next().await;
+        for message in [
+            ToWorker::FetchLive {
+                live_id: "l0".into(),
+            },
+            ToWorker::StopLive {
+                live_id: "l0".into(),
+            },
+        ] {
+            h.tx.send_msg(&message, &[]).await.unwrap();
+        }
+        let (reader, writer) = io::pipe().unwrap();
+        let writer = OwnedFd::from(writer);
+        h.tx.send_msg(&start_live("l1"), &[writer.as_fd()])
+            .await
+            .unwrap();
+        drop(writer);
+        h.tx.send_msg(&start_live("l2"), &[]).await.unwrap();
+        assert_eq!(h.next().await, live_refused("l1", "internal_error"));
+        assert_eq!(h.next().await, live_refused("l2", "internal_error"));
+        assert_eq!(drained(reader), b"");
+        for line in [
+            "fetch for a live output this worker does not run; ignored",
+            "stop for a live output this worker does not run; ignored",
+        ] {
+            assert_eq!(logs.count(Level::DEBUG, line), 1, "{line}");
+        }
+        let refusals = logs.lines(Level::WARN, "live output refused");
+        assert_eq!(refusals.len(), 2, "{refusals:?}");
+        assert!(
+            refusals.iter().all(|line| line
+                .fields
+                .contains("why=\"this worker runs no live outputs\"")),
+            "{refusals:?}"
+        );
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+
+    /// WRK-20 for a live output: its pipe arrives while the worker's
+    /// descriptor table is full. That costs the one output, refused as one
+    /// without a pipe, never the worker.
+    #[tokio::test]
+    async fn a_live_output_whose_pipe_found_no_free_descriptor_is_refused_and_the_worker_lives() {
+        let (logs, _guard) = Logs::capture();
+        let mut h = start();
+        h.next().await;
+        let (reader, writer) = io::pipe().unwrap();
+        let writer = OwnedFd::from(writer);
+        let limit = starve_descriptors();
+        h.tx.send_msg(&start_live("l1"), &[writer.as_fd()])
+            .await
+            .unwrap();
+        let answer = h.next().await;
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).unwrap();
+        drop(writer);
+        assert_eq!(answer, live_refused("l1", "internal_error"));
+        assert_eq!(drained(reader), b"");
+        assert_eq!(
+            logs.count(
+                Level::WARN,
+                "live output arrived without its pipe: no free descriptor"
+            ),
+            1
+        );
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+    }
+
+    /// Starts live outputs `l4`, a second `l4` that is dropped, `l5` and
+    /// `l6`, which a limit of one refuses, each with its pipe closed but
+    /// `l4`'s; `l4`'s reader's end once it started.
+    async fn start_l4_beside_l5_and_l6(h: &mut Harness) -> tokio::net::unix::pipe::Receiver {
+        let mut readers = Vec::new();
+        for live_id in ["l4", "l4", "l5", "l6"] {
+            let (reader, writer) = recording_pipe();
+            h.tx.send_msg(&start_live(live_id), &[writer.as_fd()])
+                .await
+                .unwrap();
+            drop(writer);
+            readers.push(reader);
+        }
+        let seen = messages_until(h, |seen| {
+            live_report(seen, "l4", live_started).is_some()
+                && live_report(seen, "l6", live_closed).is_some()
+        })
+        .await;
+        assert_eq!(
+            live_report(&seen, "l4", live_started),
+            Some(&LiveReport::Started {
+                mime: "video/fake; codecs=\"h264\"".into(),
+                video: "h264".into(),
+                audio: None,
+            })
+        );
+        assert!(
+            seen.contains(&live_refused("l5", "internal_error")),
+            "{seen:?}"
+        );
+        let l4 = readers.remove(0);
+        for refused_reader in readers {
+            assert_eq!(recording_bytes(refused_reader).await, b"");
+        }
+        l4
+    }
+
+    /// Each refusal of `live_outputs_are_refused_…` was logged, the limit's
+    /// once within its interval, and the second start under a running id.
+    fn assert_live_refusals(logs: &Logs) {
+        let whys: Vec<String> = logs
+            .lines(Level::WARN, "live output refused")
+            .into_iter()
+            .map(|line| line.fields)
+            .collect();
+        for why in [
+            "the worker runs no source",
+            "the live output came without its pipe",
+            "the live output's descriptor is no pipe",
+            "the worker runs as many live outputs as it may",
+        ] {
+            assert!(
+                whys.iter().any(|fields| fields.contains(why)),
+                "{why}: {whys:?}"
+            );
+        }
+        assert_eq!(
+            whys.iter()
+                .filter(|fields| fields.contains("as many live"))
+                .count(),
+            1,
+            "l6's refusal falls in l5's interval: {whys:?}"
+        );
+        assert_eq!(
+            logs.count(
+                Level::WARN,
+                "live id already runs; the second start is dropped"
+            ),
+            1
+        );
+    }
+
+    /// A worker with a live container refuses an output before any source
+    /// (`source_not_live`), one without a pipe, one whose descriptor is no
+    /// pipe and one past its limit, each with its pipe closed; a second
+    /// start under a running output's id is dropped with its pipe and no
+    /// report. The running output reports `Started` through the worker,
+    /// takes its fetch, ends `stopped` on `StopLive`, and is gone from the
+    /// worker after: a stop for it is ignored. The limit's refusal is logged
+    /// rate-limited.
+    #[tokio::test]
+    async fn live_outputs_are_refused_without_a_source_a_pipe_or_room_and_a_running_one_reports() {
+        let (logs, _guard) = Logs::capture();
+        let mut settings = quiet_settings();
+        settings.live.max_outputs = 1;
+        let mut h = start_with_settings(live_registries(), settings);
+        h.next().await;
+        let (reader, writer) = recording_pipe();
+        h.tx.send_msg(&start_live("l1"), &[writer.as_fd()])
+            .await
+            .unwrap();
+        drop(writer);
+        assert_eq!(h.next().await, live_refused("l1", "source_not_live"));
+        assert_eq!(recording_bytes(reader).await, b"");
+        h.tx.send_msg(
+            &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 100}"#)),
+            &[],
+        )
+        .await
+        .unwrap();
+        until_live(&mut h).await;
+        h.tx.send_msg(&start_live("l2"), &[]).await.unwrap();
+        assert_eq!(h.next().await, live_refused("l2", "internal_error"));
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        h.tx.send_msg(&start_live("l3"), &[socket.as_fd()])
+            .await
+            .unwrap();
+        assert_eq!(h.next().await, live_refused("l3", "internal_error"));
+        let l4 = start_l4_beside_l5_and_l6(&mut h).await;
+        h.tx.send_msg(
+            &ToWorker::FetchLive {
+                live_id: "l4".into(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        h.tx.send_msg(
+            &ToWorker::StopLive {
+                live_id: "l4".into(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        let seen = messages_until(&mut h, |seen| {
+            live_report(seen, "l4", live_closed).is_some()
+        })
+        .await;
+        let_assert!(
+            Some(LiveReport::Closed { reason, .. }) = live_report(&seen, "l4", live_closed)
+        );
+        assert_eq!(reason, "stopped");
+        let bytes = recording_bytes(l4).await;
+        assert!(bytes.starts_with(b"init video=h264\n"), "{bytes:?}");
+        assert_live_refusals(&logs);
+        h.tx.send_msg(
+            &ToWorker::StopLive {
+                live_id: "l4".into(),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+            .await
+            .unwrap();
+        let stopped = ToSupervisor::SourceState(SourceState::Stopped);
+        messages_until(&mut h, |seen| seen.contains(&stopped)).await;
+        assert_eq!(
+            ended(h.worker).await.unwrap().unwrap(),
+            ExitReason::Shutdown
+        );
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "stop for a live output this worker does not run; ignored"
+            ),
+            1
+        );
+    }
+
+    /// The daemon's shutdown ends a running live output `shutting_down`,
+    /// its `Closed` passed on before the worker ends; the supervisor gone
+    /// aborts one, its pipe closed.
+    #[tokio::test]
+    async fn a_shutdown_ends_the_live_outputs_and_the_supervisor_gone_aborts_them() {
+        for supervisor_gone in [false, true] {
+            let mut h = start_with_settings(live_registries(), quiet_settings());
+            h.next().await;
+            h.tx.send_msg(
+                &ToWorker::RunSource(spec("fake://cam/", r#"{"keyframes_every_ms": 100}"#)),
+                &[],
+            )
+            .await
+            .unwrap();
+            until_live(&mut h).await;
+            let (reader, writer) = recording_pipe();
+            h.tx.send_msg(&start_live("l1"), &[writer.as_fd()])
+                .await
+                .unwrap();
+            drop(writer);
+            messages_until(&mut h, |seen| {
+                live_report(seen, "l1", live_started).is_some()
+            })
+            .await;
+            if supervisor_gone {
+                drop(h.tx);
+                drop(h.rx);
+                assert_eq!(
+                    ended(h.worker).await.unwrap().unwrap(),
+                    ExitReason::SupervisorGone
+                );
+            } else {
+                h.tx.send_msg(&ToWorker::Shutdown { deadline_ms: 2_000 }, &[])
+                    .await
+                    .unwrap();
+                let seen = messages_until(&mut h, |seen| {
+                    live_report(seen, "l1", live_closed).is_some()
+                })
+                .await;
+                let_assert!(
+                    Some(LiveReport::Closed { reason, .. }) = live_report(&seen, "l1", live_closed)
+                );
+                assert_eq!(reason, "shutting_down");
+                assert_eq!(
+                    ended(h.worker).await.unwrap().unwrap(),
+                    ExitReason::Shutdown
+                );
+            }
+            let bytes = recording_bytes(reader).await;
+            assert!(
+                bytes.starts_with(b"init video=h264\n"),
+                "{supervisor_gone} {bytes:?}"
+            );
+        }
+    }
+
+    /// The shutdown passes the live outputs' reports on while it waits for
+    /// them, as the recordings': a full report channel never holds a
+    /// `Closed` back until the grace runs out.
+    #[tokio::test]
+    async fn a_shutdown_passes_the_live_reports_on_while_it_waits_for_them() {
+        let settings = settings();
+        let (mut serving, mut rx) = serving(&settings);
+        let clock = Arc::new(FakeClock::default());
+        serving.clock = clock.clone();
+        let (live_tx, live_rx) = mpsc::channel(1);
+        let queued = LiveReport::Warning {
+            code: "audio_omitted".into(),
+            message: "queued before the shutdown".into(),
+        };
+        live_tx.try_send(("l0".into(), queued.clone())).unwrap();
+        serving.lives = Lives::new(live_tx);
+        serving.live_rx = live_rx;
+        let (_reader, writer) = recording_pipe();
+        serving.lives.start(LiveStart {
+            spec: LiveSpec {
+                live_id: "l1".into(),
+                audio: false,
+                buffer_bytes: 1 << 20,
+                framed: false,
+            },
+            pipe: tokio::net::unix::pipe::Sender::from_owned_fd(writer).unwrap(),
+            // Never ready: the output waits for its tracks.
+            tracks: TrackSet::new(TrackLimits::default(), clock.now()),
+            factory: Arc::new(FakeLiveMuxerFactory::default()),
+            settings: LiveSettings::default(),
+            clock: clock.clone(),
+        });
+        let exit = serving.on_shutdown(1_000).await;
+        assert_eq!(exit.unwrap(), ExitReason::Shutdown);
+        let mut session_rx = mpsc::channel(1).1;
+        serving
+            .flush(ExitReason::Shutdown, &mut session_rx)
+            .await
+            .unwrap();
+        drop(serving);
+        let mut seen = Vec::new();
+        while let Some((message, _)) = within(rx.recv_msg::<ToSupervisor>()).await.unwrap() {
+            seen.push(message);
+        }
+        assert_eq!(
+            seen,
+            [
+                ToSupervisor::Live {
+                    live_id: "l0".into(),
+                    event: queued,
+                },
+                ToSupervisor::Live {
+                    live_id: "l1".into(),
+                    event: LiveReport::Closed {
+                        reason: "shutting_down".into(),
+                        bytes: 0,
+                        dropped_frames: 0,
+                        drops: 0,
+                    },
+                },
+            ]
+        );
     }
 }

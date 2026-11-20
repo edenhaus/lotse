@@ -1388,7 +1388,7 @@ mod tests {
         let mut rig = Rig::pcmu(FrameSize::new(480).unwrap());
         let input = codes(3);
         let mut out = rig.feed(&input, 160, &[1], ms(60)).await;
-        assert!(out.is_empty());
+        assert_eq!(out, []);
         for k in 0..3_u64 {
             rig.publish(100_000 + 160 * k as i64, &input[0]);
             out.extend(rig.run_to(ms(80 + 20 * k)).await);

@@ -6,7 +6,7 @@
 # changing a tool, run `mise lock` and commit both files; Renovate does the same for its updates.
 
 # The release that wrote mise.lock (lockfile revision 2) and that CI pins (jdx/mise-action `version`).
-min_version = "2026.9.15"
+min_version = "2026.11.0"
 
 [settings]
 # Rust comes from rust-toolchain.toml, so the version is pinned in one place.
@@ -16,26 +16,32 @@ idiomatic_version_file_enable_tools = ["rust"]
 cargo.binstall = false
 
 [tools]
-prek = "0.5.4"
+prek = "0.5.10"
 cargo-deny = "0.20.2"
 shellcheck = "0.11.0" # actionlint checks workflow scripts with it when it is on PATH, as on the CI runners
-zizmor = "1.30.1" # the workflows' security audit: the prek hook offline, CI's Zizmor job online (one pin for both)
-"github:nextest-rs/nextest" = { version = "0.9.146", version_prefix = "cargo-nextest-" }
-"github:rust-cross/cargo-zigbuild" = "0.23.4"
-zig = "0.15.2" # C compiler and linker for every musl build, tests included (see .cargo/config.toml)
-cmake = "4.4.3" # builds the bundled libopus (`opusic-sys`, behind the `opus` crate) on every host
+zizmor = "1.32.0" # the workflows' security audit: the prek hook offline, CI's Zizmor job online (one pin for both)
+grype = "0.121.3" # the release image's vulnerability scan (scripts/scan-image.sh: CI's Rootless Podman job, release.yml)
+"github:nextest-rs/nextest" = { version = "0.9.151", version_prefix = "cargo-nextest-" }
+"github:rust-cross/cargo-zigbuild" = "0.24.1"
+"github:rust-secure-code/cargo-auditable" = "0.7.7" # the release binary's dependency list, embedded for scanners and `cargo audit bin`
+zig = "0.17.1" # C compiler and linker for every musl build, tests included (see .cargo/config.toml)
+cmake = "4.5.0" # builds the bundled libopus (`opusic-sys`, behind the `opus` crate) on every host
 "github:taiki-e/cargo-llvm-cov" = "0.9.1" # line coverage gate
 "cargo:cargo-mutants" = "27.1.0" # mutation testing gate (no aarch64-darwin release asset, so built from source)
-"github:taiki-e/cargo-hack" = "0.6.45" # checks every feature combination builds
-"github:boshen/cargo-shear" = "1.14.0" # fails on unused dependencies
-"github:EmbarkStudios/cargo-about" = "0.9.2" # THIRD_PARTY_LICENSES.md of a release (`mise run licenses`)
-"github:CycloneDX/cyclonedx-rust-cargo" = { version = "0.5.9", version_prefix = "cargo-cyclonedx-" } # the CycloneDX SBOM of a release (`mise run sbom`)
-uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks (tests/browser/uv.lock)
+"github:taiki-e/cargo-hack" = "0.6.46" # checks every feature combination builds
+"github:boshen/cargo-shear" = "v1.14.1" # fails on unused dependencies
+"github:EmbarkStudios/cargo-about" = "0.9.3" # THIRD_PARTY_LICENSES.md of a release (`mise run licenses`)
+"github:CycloneDX/cyclonedx-rust-cargo" = { version = "0.5.10", version_prefix = "cargo-cyclonedx-" } # the CycloneDX SBOM of a release (`mise run sbom`)
+uv = "0.13.8" # the browser test's Python, Selenium and pytest, and its checks (tests/browser/uv.lock)
 
 # The camera of the browser and interop tests: ffmpeg encodes and publishes, MediaMTX serves RTSP
 # and HLS; ffmpeg alone serves raw MPEG-TS over HTTP.
 # Third-party tools on purpose, so the stream is not our own reading of the specs.
-"github:bluenviron/mediamtx" = "1.21.1"
+"github:bluenviron/mediamtx" = "1.21.3"
+# The scraper of the metrics test (`mise run interop`, the ignored `prometheus_` test): a real
+# Prometheus scraping the daemon over mutual TLS, so the exposition and Go's TLS path (the server
+# certificate's DNS name, `server_name`, the client certificate) are a third party's reading.
+"github:prometheus/prometheus" = "3.16.0"
 # FFmpeg 9.0.2, static GPL builds (libx264, libopus; the native aac and pcm_mulaw encoders). Linux:
 # BtbN/FFmpeg-Builds, the build ffmpeg.org links, a month-end autobuild (kept for years, the daily
 # ones only for weeks) from the release/9.0 branch. macOS arm64 (the Safari browser test): Martin
@@ -45,7 +51,7 @@ uv = "0.12.23" # the browser test's Python, Selenium and pytest, and its checks 
 # go2rtc, the server the browser test is compared with (`mise run compare`, report only): the
 # release its common deployment pins, observed 2026-10-07. Its release binaries are UPX-packed;
 # they run as they are.
-"github:AlexxIT/go2rtc" = { version = "1.9.14", bin = "go2rtc", os = ["linux"], platforms = { linux-x64 = { asset_pattern = "go2rtc_linux_amd64", checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6" }, linux-arm64 = { asset_pattern = "go2rtc_linux_arm64", checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50" } } }
+"github:AlexxIT/go2rtc" = { version = "v1.9.15", bin = "go2rtc", os = ["linux"], platforms = { linux-x64 = { asset_pattern = "go2rtc_linux_amd64", checksum = "sha256:32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6" }, linux-arm64 = { asset_pattern = "go2rtc_linux_arm64", checksum = "sha256:359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50" } } }
 
 # Git hooks are installed on every `mise install`, so nobody has to remember.
 [hooks]
@@ -79,11 +85,8 @@ dir = "tests/browser"
 run = "uv run --locked pytest -q"
 
 [tasks.audit]
-description = "Advisories (RustSec database) for the root and the fuzz workspace; needs the network"
-run = [
-  "cargo deny --all-features check advisories",
-  "cargo deny --manifest-path fuzz/Cargo.toml --all-features check advisories",
-]
+description = "Advisories (RustSec database) for the workspace, the fuzz targets included; needs the network"
+run = "cargo deny --all-features check advisories"
 
 [tasks.coverage]
 description = "Line-coverage gate as CI's Tests jobs run it: the instrumented musl tests built (coverage-archive), then run and gated (coverage-musl); Linux only"
@@ -161,8 +164,8 @@ description = "The TURN client against a real coturn in Docker (UDP and TCP, lon
 run = "scripts/turn-e2e.sh"
 
 [tasks.interop]
-description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (the ignored `mediamtx_iso14496_12_recording_` tests); and ffprobe reading the recording muxer's fixtures (the ignored `ffprobe_` tests)"
-run = "scripts/nextest.sh -E 'binary_id(lotse::interop) | binary_id(lotse-mux::fixtures)' --run-ignored only --no-tests=fail mediamtx_ ffmpeg_ ffprobe_"
+description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (the ignored `mediamtx_iso14496_12_recording_` tests); an LL-HLS session read by ffmpeg as plain HLS, H.264 with AAC and with Opus, and decoded by ffprobe (the ignored `mediamtx_hls_ll_` tests); and ffprobe reading the recording muxer's fixtures (the ignored `ffprobe_` tests); and a real Prometheus scraping `GET /v0/metrics` over mutual TLS with an openssl-made P-256 client certificate, in OpenMetrics and in the Prometheus text format, a certificate never enrolled refused (the ignored `prometheus_` test)"
+run = "scripts/nextest.sh -E 'binary_id(lotse::interop) | binary_id(lotse::metrics) | binary_id(lotse-mux::fixtures)' --run-ignored only --no-tests=fail mediamtx_ ffmpeg_ ffprobe_ prometheus_"
 
 [tasks.load]
 description = "The load generator: N fake cameras x M headless viewers against a release daemon; report in target/load-report.json"
@@ -182,11 +185,11 @@ arg "[cycle]" help="one cycle of viewers and a camera hang-up; over a minute, af
 run = 'scripts/load.sh --cameras 4 --viewers 2 --duration "$usage_duration" --cycle "$usage_cycle" --drop --sample 10s --report target/soak-report.json'
 
 [tasks.browser]
-description = "The browser test: Selenium has Chrome, Firefox or Safari play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash); report and logs in target/browser-<engine>/<case>/"
+description = "The browser test: Selenium has Chrome, Firefox or Safari play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash; live fMP4 through MSE beside WebRTC with AAC, PCMU and Opus, and LL-HLS through hls.js with AAC and Opus, their latency reported); report and logs in target/browser-<engine>/<case>/"
 usage = '''
 arg "[engine]" help="chrome, firefox or safari" default="chrome"
 arg "[play]" help="how long each window plays (20s); a case with a disruption plays one before it and one after" default="20s"
-arg "[case]" help="join, aac, pli, reconnect, crash or all" default="all"
+arg "[case]" help="join, aac, pli, reconnect, crash, mse, mse-pcmu, mse-opus, llhls, llhls-opus or all" default="all"
 '''
 run = 'scripts/browser.sh "$usage_engine" "$usage_play" --case "$usage_case"'
 
@@ -206,12 +209,14 @@ arg "<target>" help="a target under fuzz/fuzz_targets"
 arg "[secs]" help="seconds to run" default="60"
 '''
 # The nightly is pinned by date, the same one as CI's Fuzz build (Renovate bumps both). cargo-fuzz
-# has no `--locked`: the fetch fails on a stale fuzz/Cargo.lock, and the build then resolves
+# has no `--locked`: the fetch fails on a stale Cargo.lock, and the build then resolves
 # nothing new. scripts/fuzz.sh holds libFuzzer's time and memory limits, for CI too.
-env = { NIGHTLY = "nightly-2026-10-01" }
+# The release profile without the daemon's fat LTO, single codegen unit and stripped symbols, as
+# CI's Fuzz build sets it: a faster build, and the sanitizer's stack traces keep their names.
+env = { NIGHTLY = "nightly-2026-11-13", CARGO_PROFILE_RELEASE_LTO = "false", CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16", CARGO_PROFILE_RELEASE_STRIP = "none" }
 run = [
   'rustup toolchain install "$NIGHTLY" --profile minimal',
-  'cargo "+$NIGHTLY" fetch --manifest-path fuzz/Cargo.toml --locked',
+  'cargo "+$NIGHTLY" fetch --locked',
   'scripts/fuzz.sh "$usage_target" "$usage_secs"',
 ]
 
@@ -222,16 +227,14 @@ run = """
 sed -i.bak -E '/^\\[workspace\\.package\\]/,/^\\[/ s/^version = ".*"/version = "'"$usage_version"'"/' Cargo.toml
 rm Cargo.toml.bak
 cargo update --workspace
-# The fuzz workspace's lockfile records the library crates' version too; cargo updates only that.
-cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
 """
 
 [tasks.release-build]
-description = "Static musl binary (Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"
+description = "Static musl binary with its dependency list embedded (cargo auditable; Linux only; CI builds each arch on its own runner); zig links (.cargo/config.toml)"
 usage = 'arg "[arch]" help="x86_64 or aarch64" default="x86_64"'
 run = """
 [ "$(uname -s)" = Linux ] || { echo "release-build runs on Linux; CI builds both arches (build.yml)" >&2; exit 1; }
-cargo build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl
+cargo auditable build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl
 """
 
 # The release steps that need no tag, so a release can be checked and reproduced off CI;
@@ -251,10 +254,33 @@ cargo about generate --locked --fail --config .cargo/about.toml --manifest-path 
   --output-file target/dist/THIRD_PARTY_LICENSES.md .cargo/about.hbs
 """
 
+# Reproducible, as release.yml builds it: every timestamp is the commit's, so the same binary gives
+# the same image. Podman from 5.1 clamps the layers' timestamps to --source-date-epoch; before, its
+# --timestamp sets them all. Docker: BuildKit's rewrite-timestamp, and no provenance attestation,
+# which records the build's own time.
 [tasks.image]
-description = "The release image of the host's arch (Dockerfile), into the local Docker as lotse:dev (Linux only, as release-build)"
+description = "The release image of the host's arch (Dockerfile), reproducibly, into the local Podman, or Docker without it, as lotse:dev (Linux only, as release-build)"
 run = """
 mise run release-build "$(uname -m)"
 install -D target/$(uname -m)-unknown-linux-musl/release/lotse target/image/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/lotse
-docker build --tag lotse:dev .
+epoch="$(git log -1 --format=%ct)"
+if ! command -v podman >/dev/null; then
+  SOURCE_DATE_EPOCH="$epoch" docker buildx build --file Dockerfile --provenance=false --sbom=false \
+    --output type=docker,name=lotse:dev,rewrite-timestamp=true .
+elif podman build --help | grep -q -- --rewrite-timestamp; then
+  podman build --file Dockerfile --source-date-epoch "$epoch" --rewrite-timestamp --tag lotse:dev .
+else
+  podman build --file Dockerfile --timestamp "$epoch" --tag lotse:dev .
+fi
+"""
+
+[tasks.rootless-podman]
+description = "The release image under rootless Podman, read-only and without capabilities, started as its user and as root (scripts/rootless-podman.sh, as CI's Rootless Podman job); Linux only, as an unprivileged user, after release-build"
+usage = '''
+arg "[binary]" help="The static release binary" default=""
+arg "[arch]" help="x86_64 or aarch64, the host's by default" default=""
+'''
+run = """
+arch="${usage_arch:-$(uname -m)}"
+scripts/rootless-podman.sh "${usage_binary:-target/$arch-unknown-linux-musl/release/lotse}" "$arch"
 """

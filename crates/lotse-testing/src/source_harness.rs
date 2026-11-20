@@ -58,6 +58,7 @@ impl Harness {
             clock: clock_input,
             time: clock,
             backchannel: backchannel.clone(),
+            signaling: None,
             cancel: cancel.clone(),
         };
         let run = spawn_named("harness.source", source.run(ctx));

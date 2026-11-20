@@ -418,14 +418,14 @@ mod tests {
     use lotse_testing::{CameraConfig, FakeCamera};
 
     use super::*;
-    use crate::options::RtspOptions;
+    use crate::options::{RtspOptions, defaults};
 
     fn camera_at(cam: &FakeCamera) -> Camera {
         Camera {
             url: SourceUrl::parse(&cam.url()).unwrap(),
             options: RtspOptions {
                 backchannel: true,
-                ..RtspOptions::default()
+                ..defaults()
             },
             tls: None,
             addr: cam.addr(),
@@ -437,7 +437,7 @@ mod tests {
     fn a_session_the_camera_closed_without_an_error_says_so() {
         let camera = Camera {
             url: SourceUrl::parse("rtsp://127.0.0.1:1/stream").unwrap(),
-            options: RtspOptions::default(),
+            options: defaults(),
             tls: None,
             addr: "127.0.0.1:1".parse().unwrap(),
             time: Arc::new(SystemClock),

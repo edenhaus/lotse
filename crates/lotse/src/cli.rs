@@ -5,12 +5,13 @@
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use lotse_core::fingerprint::Fingerprint;
 use lotse_sandbox::Mode;
+use lotse_supervisor::AdvertisedAddress;
 
 use crate::config::{LogFormat, TcpListen};
 use crate::ctl::{CtlArgs, PairArgs};
@@ -39,7 +40,8 @@ pub(crate) enum Command {
     /// Talk to a running daemon over its control socket; prints JSON.
     Ctl(CtlArgs),
     /// Print the pin of the control TLS listener's certificate, the SHA-256
-    /// clients check, from the data directory.
+    /// clients check, from the data directory; or the certificate itself, or
+    /// replace it with one that names the DNS name `lotse`.
     Identity(IdentityArgs),
     /// Print a one-time code that pairs a client with the control TLS
     /// listener, asking the daemon over its control socket.
@@ -52,6 +54,24 @@ pub(crate) struct IdentityArgs {
     /// The daemon's data directory, as `serve` has it.
     #[arg(long, env = "LOTSE_DATA_DIR", value_name = "PATH")]
     pub(crate) data_dir: PathBuf,
+
+    /// The uid `serve` drops to, as it has it: run as root, this reads a
+    /// data directory that belongs to that uid, as a start as root does.
+    #[arg(long, env = "LOTSE_USER", value_name = "UID")]
+    pub(crate) user: Option<u32>,
+
+    /// Print the certificate as PEM instead of its pin, never the key: what
+    /// a client that verifies the daemon by name (Prometheus) trusts as its
+    /// CA file, with `lotse` as the server name.
+    #[arg(long, conflicts_with = "reissue")]
+    pub(crate) certificate: bool,
+
+    /// Replace the certificate with one from the same key that names the
+    /// DNS name `lotse`, as an identity made by an older daemon does not,
+    /// and print its pin. The pin changes: every client must pair again,
+    /// and the daemon serves the new certificate once restarted.
+    #[arg(long)]
+    pub(crate) reissue: bool,
 }
 
 /// `lotse worker`: the flags the supervisor passes. No environment, no
@@ -66,8 +86,9 @@ pub(crate) struct WorkerArgs {
     #[arg(long, value_name = "LEVEL", default_value = "info")]
     pub(crate) log_level: String,
 
-    /// Process isolation, as for `serve`.
-    #[arg(long, value_name = "on|require|off", default_value = "on")]
+    /// Process isolation, as for `serve`, whose effective mode the
+    /// supervisor always passes; the default is `serve`'s too.
+    #[arg(long, value_name = "on|require|off", default_value = "require")]
     pub(crate) sandbox: Mode,
 
     /// Tokio threads.
@@ -110,6 +131,16 @@ pub(crate) struct WorkerArgs {
     /// The most recordings at once: the daemon's `limits.max_recordings`.
     #[arg(long, value_name = "N", default_value_t = lotse_worker::DEFAULT_MAX_RECORDINGS)]
     pub(crate) max_recordings: usize,
+
+    /// How long a live output waits for the stream's video and, once
+    /// fetched, its first keyframe: the daemon's `limits.live_start_timeout_ms`.
+    #[arg(long, value_name = "MS", default_value_t = 10_000)]
+    pub(crate) live_start_timeout_ms: u64,
+
+    /// The most live outputs at once: the daemon's
+    /// `limits.max_live_per_stream`, a worker running one stream's connection.
+    #[arg(long, value_name = "N", default_value_t = lotse_worker::DEFAULT_MAX_LIVE_PER_STREAM)]
+    pub(crate) max_live: usize,
 }
 
 /// `lotse serve`. Every flag has a `LOTSE_*` variable; both override the
@@ -121,7 +152,8 @@ pub(crate) struct ServeArgs {
     pub(crate) config: Option<PathBuf>,
 
     /// Path of the control socket. Its directory must exist, be 0700 and be
-    /// owned by the uid the daemon starts as.
+    /// owned by the uid the daemon starts as (or, started as root, by
+    /// `--user`).
     #[arg(long, env = "LOTSE_SOCKET", value_name = "PATH")]
     pub(crate) socket: Option<PathBuf>,
 
@@ -156,15 +188,29 @@ pub(crate) struct ServeArgs {
     )]
     pub(crate) control_clients: Option<Vec<Fingerprint>>,
 
+    /// The client certificates allowed on the control TLS listener to read
+    /// `GET /v0/metrics` and nothing else (a Prometheus scraper), by their
+    /// SHA-256 as `--control-clients` takes them, comma-separated. A pin in
+    /// both lists stops the start.
+    #[arg(
+        long,
+        env = "LOTSE_METRICS_CLIENTS",
+        value_name = "PIN,...",
+        value_delimiter = ','
+    )]
+    pub(crate) metrics_clients: Option<Vec<Fingerprint>>,
+
     /// Where the daemon keeps what outlives a restart: the control TLS
     /// listener's key and certificate. Must exist, belong to the starting uid
-    /// and give the group and others no access (mode 0700 or stricter).
+    /// (or, started as root, to `--user`) and give the group and others no
+    /// access (mode 0700 or stricter).
     #[arg(long, env = "LOTSE_DATA_DIR", value_name = "PATH")]
     pub(crate) data_dir: Option<PathBuf>,
 
-    /// Process isolation: `on` (best effort, reported), `require` (refuse to
-    /// start without every layer) or `off` (debugging only: no Landlock or
-    /// seccomp; the privilege drop still happens).
+    /// Process isolation: `require`, the default (refuse to start without
+    /// every layer: seccomp, Landlock's filesystem and TCP rules), `on`
+    /// (best effort: what the kernel lacks is reported) or `off` (debugging
+    /// only: no Landlock or seccomp; the privilege drop still happens).
     #[arg(long, env = "LOTSE_SANDBOX", value_name = "on|require|off")]
     pub(crate) sandbox: Option<Mode>,
 
@@ -175,6 +221,20 @@ pub(crate) struct ServeArgs {
     /// The ICE-TCP listener, or `off`.
     #[arg(long, env = "LOTSE_WEBRTC_TCP_LISTEN", value_name = "ADDR|off")]
     pub(crate) webrtc_tcp_listen: Option<TcpListen>,
+
+    /// Addresses a NAT in front of the daemon forwards to the WebRTC UDP
+    /// socket and the ICE-TCP listener (a container bridge network's
+    /// published ports), comma-separated, at most eight: browsers are told
+    /// these instead of the daemon's own addresses. `IP` takes each
+    /// listener's port, `IP:PORT` (`[IPv6]:PORT`) that port for both; no
+    /// hostnames. None by default.
+    #[arg(
+        long,
+        env = "LOTSE_WEBRTC_ADVERTISE",
+        value_name = "IP[:PORT],...",
+        value_delimiter = ','
+    )]
+    pub(crate) webrtc_advertise: Option<Vec<AdvertisedAddress>>,
 
     /// Control connections at once.
     #[arg(long, env = "LOTSE_MAX_CONNECTIONS", value_name = "N")]
@@ -237,6 +297,74 @@ pub(crate) struct ServeArgs {
     /// Recordings at once on one stream.
     #[arg(long, env = "LOTSE_MAX_RECORDINGS_PER_STREAM", value_name = "N")]
     pub(crate) max_recordings_per_stream: Option<u32>,
+
+    /// What one live output holds that its reader has not taken, in bytes;
+    /// beyond it the output drops to the next keyframe.
+    #[arg(long, env = "LOTSE_LIVE_BUFFER_BYTES", value_name = "BYTES")]
+    pub(crate) live_buffer_bytes: Option<u32>,
+
+    /// How long a live output's body waits for its `GET`; then the output ends.
+    #[arg(long, env = "LOTSE_LIVE_FETCH_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) live_fetch_timeout_ms: Option<u64>,
+
+    /// How long a live output waits for the stream's video and, once
+    /// fetched, its first keyframe; and `live/create` for its init segment.
+    #[arg(long, env = "LOTSE_LIVE_START_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) live_start_timeout_ms: Option<u64>,
+
+    /// Live outputs at once, over every stream.
+    #[arg(long, env = "LOTSE_MAX_LIVE", value_name = "N")]
+    pub(crate) max_live: Option<u32>,
+
+    /// Live outputs at once on one stream.
+    #[arg(long, env = "LOTSE_MAX_LIVE_PER_STREAM", value_name = "N")]
+    pub(crate) max_live_per_stream: Option<u32>,
+
+    /// LL-HLS outputs (windows) at once, over every stream.
+    #[arg(long, env = "LOTSE_MAX_HLS_OUTPUTS", value_name = "N")]
+    pub(crate) max_hls_outputs: Option<u32>,
+
+    /// LL-HLS sessions at once, over every stream.
+    #[arg(long, env = "LOTSE_MAX_HLS_SESSIONS", value_name = "N")]
+    pub(crate) max_hls_sessions: Option<u32>,
+
+    /// LL-HLS sessions at once on one stream.
+    #[arg(long, env = "LOTSE_MAX_HLS_SESSIONS_PER_STREAM", value_name = "N")]
+    pub(crate) max_hls_sessions_per_stream: Option<u32>,
+
+    /// The media one LL-HLS window holds, in bytes; at least 1.
+    #[arg(long, env = "LOTSE_HLS_WINDOW_BYTES", value_name = "BYTES")]
+    pub(crate) hls_window_bytes: Option<NonZeroU32>,
+
+    /// The LL-HLS part target until a window measures its Part Target
+    /// Duration; at least 1.
+    #[arg(long, env = "LOTSE_HLS_PART_TARGET_MS", value_name = "MS")]
+    pub(crate) hls_part_target_ms: Option<NonZeroU64>,
+
+    /// After how long the next keyframe starts an LL-HLS segment.
+    #[arg(long, env = "LOTSE_HLS_SEGMENT_TARGET_MS", value_name = "MS")]
+    pub(crate) hls_segment_target_ms: Option<u64>,
+
+    /// How long an LL-HLS session lives without a request; at least 1.
+    #[arg(long, env = "LOTSE_HLS_IDLE_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) hls_idle_timeout_ms: Option<NonZeroU64>,
+
+    /// LL-HLS requests of one session blocked at once.
+    #[arg(long, env = "LOTSE_MAX_HLS_BLOCKED_PER_SESSION", value_name = "N")]
+    pub(crate) max_hls_blocked_per_session: Option<u32>,
+
+    /// LL-HLS requests blocked at once, over every session.
+    #[arg(long, env = "LOTSE_MAX_HLS_BLOCKED", value_name = "N")]
+    pub(crate) max_hls_blocked: Option<u32>,
+
+    /// LL-HLS requests of one session in flight at once, until their
+    /// response's connection ends.
+    #[arg(long, env = "LOTSE_MAX_HLS_REQUESTS_PER_SESSION", value_name = "N")]
+    pub(crate) max_hls_requests_per_session: Option<u32>,
+
+    /// LL-HLS requests in flight at once, over every session.
+    #[arg(long, env = "LOTSE_MAX_HLS_REQUESTS", value_name = "N")]
+    pub(crate) max_hls_requests: Option<u32>,
 
     /// Source connection attempts at once, across every camera; at least 1.
     #[arg(long, env = "LOTSE_CONNECT_CONCURRENCY", value_name = "N")]
@@ -341,8 +469,8 @@ mod tests {
         );
         assert_eq!(args.connect_ports, [554, 80]);
         let bare: WorkerArgs = args_of(&["lotse", "worker"], "worker");
-        assert!(bare.connect_ports.is_empty());
-        assert_eq!(bare.sandbox, Mode::On);
+        assert_eq!(bare.connect_ports, Vec::<u16>::new());
+        assert_eq!(bare.sandbox, Mode::Require);
         assert_eq!(bare.max_sessions, 256);
         // A worker started by hand holds the daemon's default recording limits.
         assert_eq!(
@@ -417,6 +545,32 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_started_by_hand_holds_the_daemon_s_default_live_limits() {
+        let bare: WorkerArgs = args_of(&["lotse", "worker"], "worker");
+        assert_eq!(
+            (
+                Duration::from_millis(bare.live_start_timeout_ms),
+                bare.max_live
+            ),
+            (
+                lotse_worker::DEFAULT_LIVE_START_TIMEOUT,
+                lotse_worker::DEFAULT_MAX_LIVE_PER_STREAM
+            )
+        );
+        assert_eq!(
+            (
+                lotse_supervisor::LiveLimits::DEFAULT.start_timeout,
+                usize::try_from(lotse_supervisor::LiveLimits::DEFAULT.max_live_per_stream).unwrap()
+            ),
+            (
+                lotse_worker::DEFAULT_LIVE_START_TIMEOUT,
+                lotse_worker::DEFAULT_MAX_LIVE_PER_STREAM
+            ),
+            "the supervisor's are the worker's"
+        );
+    }
+
+    #[test]
     fn ctl_parses_its_commands() {
         use crate::ctl::{CtlCommand, StreamCommand};
         let args: CtlArgs = args_of(
@@ -449,6 +603,7 @@ mod tests {
                         stream_id,
                         urls,
                         url_file: None,
+                        protocol: None,
                         options,
                         preload: true,
                         audio,
@@ -489,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn ctl_stream_put_takes_its_urls_from_url_or_url_file_never_both() {
+    fn ctl_stream_put_takes_its_urls_from_url_or_url_file_or_a_protocol_never_two() {
         use crate::ctl::{CtlCommand, StreamCommand};
         let put = |args: &[&str]| {
             let base = ["lotse", "ctl", "--socket", "/s", "stream", "put", "front"];
@@ -523,6 +678,39 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         let err = put(&["--url", "fake://cam/", "--url-file", "-"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        // A source without a URL is named by its protocol, never beside one.
+        let args: CtlArgs = args_of(
+            &[
+                "lotse",
+                "ctl",
+                "--socket",
+                "/s",
+                "stream",
+                "put",
+                "door",
+                "--protocol",
+                "webrtc",
+            ],
+            "ctl",
+        );
+        assert!(
+            matches!(
+                &args.command,
+                CtlCommand::Stream {
+                    command: StreamCommand::Put { urls, url_file: None, protocol: Some(protocol), .. },
+                } if urls.is_empty() && protocol == "webrtc"
+            ),
+            "{:?}",
+            args.command
+        );
+        for other in [["--url", "fake://cam/"], ["--url-file", "-"]] {
+            let err = put(&["--protocol", "webrtc", other[0], other[1]]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{other:?}"
+            );
+        }
     }
 
     #[test]
@@ -633,6 +821,13 @@ mod tests {
         let err =
             Cli::try_parse_from(["lotse", "serve", "--connect-concurrency", "0"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        // An advertised address is an IP: no hostname, no wildcard, no
+        // port 0, each entry of the list checked.
+        for bad in ["cam.example", "203.0.113.7,0.0.0.0", "203.0.113.7:0"] {
+            let err =
+                Cli::try_parse_from(["lotse", "serve", "--webrtc-advertise", bad]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+        }
         let err = Cli::try_parse_from(["lotse"]).unwrap_err();
         assert_eq!(
             err.kind(),

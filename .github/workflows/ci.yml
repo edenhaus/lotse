@@ -9,7 +9,7 @@ name: CI
 #
 # Build once: the Build job compiles the tests of the static musl target once per arch and
 # archives them (cargo nextest archive); Interop, TURN and Sandbox isolation run that archive and
-# compile nothing. Coverage build does the same with coverage instrumentation, for the Tests jobs,
+# compile nothing, and Rootless Podman builds the release image from Release build's binary. Coverage build does the same with coverage instrumentation, for the Tests jobs,
 # which check the coverage gate on each arch and upload the report to Codecov. Fuzz build compiles
 # the fuzz targets once for the Fuzz jobs, which run them up to 4 at a time. The other compiling
 # jobs build what only they need (clippy's check build, the release profile) and each keeps its
@@ -99,7 +99,7 @@ jobs:
             if git diff --quiet "$base" HEAD -- "$@"; then echo false; else echo true; fi
           }
           {
-            echo "deps=$(changed Cargo.lock fuzz/Cargo.lock .cargo/deny.toml)"
+            echo "deps=$(changed Cargo.lock .cargo/deny.toml)"
             echo "schema=$(changed crates/lotse-api-types/schema/api.json)"
             # What a fuzz target can be built from, and what scripts/fuzz-select.sh runs them all
             # for.
@@ -116,17 +116,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           # What the hooks run; cmake builds libopus for clippy and rustdoc.
           install_args: rust cmake prek cargo-deny github:taiki-e/cargo-hack github:boshen/cargo-shear uv shellcheck zizmor
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: check
-          workspaces: |
-            . -> target
-            fuzz -> fuzz/target
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/uv
@@ -162,16 +159,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           # zig through cargo-zigbuild compiles and links musl, cmake builds libopus.
           install_args: rust zig cmake github:rust-cross/cargo-zigbuild github:nextest-rs/nextest
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: musl-tests-${{ matrix.arch }}
       - run: mise run test-archive
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tests-${{ matrix.arch }}
           path: target/nextest-archive.tar.zst
@@ -202,16 +199,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust zig cmake github:rust-cross/cargo-zigbuild github:nextest-rs/nextest github:taiki-e/cargo-llvm-cov
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: musl-coverage-${{ matrix.arch }}
           workspaces: ". -> target/cov/target" # mise.toml `coverage-archive`
       - run: mise run coverage-archive
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-tests-${{ matrix.arch }}
           path: target/cov/nextest-archive.tar.zst
@@ -244,12 +241,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           # rust: cargo and llvm-tools, which cargo-llvm-cov runs the archive and reports with.
           install_args: rust github:nextest-rs/nextest github:taiki-e/cargo-llvm-cov
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage-tests-${{ matrix.arch }}
           path: target/cov
@@ -264,10 +261,11 @@ jobs:
           fail_ci_if_error: true # a report Codecov never got would leave its gate unchecked
 
   # The daemon against a third-party RTSP server (MediaMTX) fed by ffmpeg, over TCP and UDP, video
-  # only and with AAC, PCMU and Opus; and ffprobe reading the recording muxer's fixtures. Both tools are
-  # pinned in mise.toml; both arches, so both ffmpeg pins are exercised.
+  # only and with AAC, PCMU and Opus; ffprobe reading the recording muxer's fixtures; and a real
+  # Prometheus scraping the metrics over mutual TLS with the runner's openssl. The tools are pinned in
+  # mise.toml; both arches, so both ffmpeg pins are exercised.
   interop:
-    name: Interop with MediaMTX and ffmpeg (${{ matrix.arch }})
+    name: Interop with MediaMTX, ffmpeg and Prometheus (${{ matrix.arch }})
     needs: build
     strategy:
       fail-fast: false
@@ -284,11 +282,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
-          install_args: github:nextest-rs/nextest github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+          version: 2026.11.8
+          install_args: github:nextest-rs/nextest github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds github:prometheus/prometheus
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tests-${{ matrix.arch }}
       - run: mise run interop
@@ -305,11 +303,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: github:nextest-rs/nextest
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tests-x86_64
       - run: mise run turn-e2e
@@ -326,7 +324,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tests-x86_64
       - name: Take the binary from the archive
@@ -355,6 +353,53 @@ jobs:
             --volume "$PWD/scripts/sandbox-isolation.sh:/check.sh:ro" \
             lotse-sandbox-check /bin/sh /check.sh
 
+  # The release image under rootless Podman, as the runner's unprivileged user and as README.md's
+  # "Running in a container" runs it (scripts/rootless-podman.sh): read-only, without capabilities,
+  # no_new_privs, the ports published and the sandbox required; started as the image's user, then
+  # as root with CAP_SETUID and CAP_SETGID alone, then as root on the directories of the image's
+  # user. `podman build` takes the Release build job's x86_64 binary, so the job compiles nothing
+  # and takes about a minute: every push and PR runs it, since a change to the Dockerfile, the
+  # owner checks or the sandbox can break the image as no other job would notice. Then Grype scans
+  # the same image (scripts/scan-image.sh), reading the crates from the binary's cargo-auditable
+  # list, and fails on a HIGH or CRITICAL vulnerability with a fix; on main its findings go to code
+  # scanning, as Zizmor's do. Grype, not Trivy: Trivy's release credentials and GitHub Actions were
+  # compromised in March 2026 (CVE-2026-33634, a malicious v0.69.4 and rewritten action tags).
+  rootless-podman:
+    name: Rootless Podman
+    needs: release-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # uploading the scan's findings to code scanning, on main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lotse-x86_64
+          path: artifacts
+      # The runner's own Podman, and the subordinate ids its rootless user namespace maps 65532 from.
+      - name: Podman and the runner's subordinate ids
+        run: |
+          podman version
+          grep "^$(id -un):" /etc/subuid /etc/subgid
+      - name: Run the image rootless
+        run: scripts/rootless-podman.sh artifacts/lotse x86_64
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.11.8
+          install_args: grype
+      - name: Scan the image
+        run: |
+          podman save --format oci-archive --output "$RUNNER_TEMP/lotse.tar" localhost/lotse:rootless-check
+          scripts/scan-image.sh "oci-archive:$RUNNER_TEMP/lotse.tar" "" grype.sarif
+      - if: ${{ !cancelled() && github.event_name == 'push' && hashFiles('grype.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: grype.sarif
+          category: grype
+
   # How many Mutants jobs the PR needs, from its changed lines' mutants (scripts/mutants-shards.sh):
   # up to 10 a job, at most 8 jobs, none when it has no mutants. Listing them builds nothing.
   mutants-plan:
@@ -371,9 +416,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0 # `--in-diff` needs the merge base
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust cargo:cargo-mutants
       - id: plan
         run: scripts/mutants-shards.sh "origin/$BASE_REF" >>"$GITHUB_OUTPUT"
@@ -393,11 +438,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust cmake github:nextest-rs/nextest
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: mutants
       - run: mise run mutants-cache
@@ -429,11 +474,11 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0 # `--in-diff` needs the merge base
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust cmake github:nextest-rs/nextest cargo:cargo-mutants
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: mutants
           save-if: false # the Mutants cache job's, from main
@@ -455,9 +500,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust cargo:cargo-mutants
       - id: plan
         run: scripts/mutants-shards.sh --all 300 40 >>"$GITHUB_OUTPUT"
@@ -484,11 +529,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust cmake github:nextest-rs/nextest cargo:cargo-mutants
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: mutants
           save-if: false # the Mutants cache job's, from main
@@ -506,8 +551,14 @@ jobs:
       groups: ${{ steps.select.outputs.groups }}
       corpus: ${{ steps.corpus.outputs.sha }}
     env:
-      NIGHTLY: nightly-2026-10-01 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
-      BIN_DIR: fuzz/target/x86_64-unknown-linux-gnu/release
+      NIGHTLY: nightly-2026-11-13 # pinned by date, the same as `mise run fuzz` (Renovate bumps both)
+      BIN_DIR: target/x86_64-unknown-linux-gnu/release
+      # cargo-fuzz builds the release profile; the daemon's (fat LTO, one codegen unit, symbols
+      # stripped) would slow the build down and take the names out of the sanitizer's stack traces.
+      # The same as `mise run fuzz` (mise.toml).
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_STRIP: none
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -515,15 +566,14 @@ jobs:
           fetch-depth: 0 # the base to compare with
       - name: Nightly toolchain (the one nightly use)
         run: rustup toolchain install "$NIGHTLY" --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: fuzz-build
-          workspaces: fuzz -> target # relative to the workspace: fuzz/target
           cache-bin: true # cargo-fuzz
       - run: cargo "+$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
-      # cargo-fuzz has no `--locked`: this fails on a stale fuzz/Cargo.lock, and the build below
-      # then resolves nothing new.
-      - run: cargo "+$NIGHTLY" fetch --manifest-path fuzz/Cargo.toml --locked
+      # cargo-fuzz has no `--locked`: this fails on a stale Cargo.lock, and the build below then
+      # resolves nothing new.
+      - run: cargo "+$NIGHTLY" fetch --locked
       - run: cargo "+$NIGHTLY" fuzz build
       # The selected targets in groups of up to 4, one Fuzz job each (scripts/fuzz-parallel.sh).
       - name: Select the targets
@@ -550,7 +600,7 @@ jobs:
           # shellcheck disable=SC2046 # one argument per target
           tar --zstd -cf fuzz-targets.tar.zst -C "$BIN_DIR" $(cat selected)
       - if: steps.select.outputs.groups != '[]'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-targets
           path: fuzz-targets.tar.zst
@@ -590,7 +640,7 @@ jobs:
           ref: ${{ needs.fuzz-build.outputs.corpus }}
           path: fuzz/corpus
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: fuzz-targets
       - name: Unpack the group's targets
@@ -608,7 +658,7 @@ jobs:
           # shellcheck disable=SC2086 # one argument per target
           scripts/fuzz-parallel.sh "$SECS" $GROUP
       - if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-findings-${{ strategy.job-index }}
           path: |
@@ -628,7 +678,7 @@ jobs:
             cp -R "fuzz/corpus/$target" fuzz-corpus/
           done
       - if: ${{ !cancelled() && steps.fuzz.outcome != 'skipped' && github.ref == 'refs/heads/main' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-corpus-${{ strategy.job-index }}
           path: fuzz-corpus/
@@ -658,7 +708,7 @@ jobs:
       group: fuzz-corpus
       cancel-in-progress: false
     steps:
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: app
         with:
           client-id: ${{ vars.LOTSE_BOT_CLIENT_ID }}
@@ -673,7 +723,7 @@ jobs:
           path: corpus
           token: ${{ steps.app.outputs.token }}
           persist-credentials: true
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: fuzz-corpus-*
           merge-multiple: true
@@ -738,11 +788,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}
           config-file: ./.github/codeql/codeql-config.yml # test code kept out of the results
-      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: /language:${{ matrix.language }}
 
@@ -754,7 +804,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: moderate
 
@@ -769,9 +819,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust cargo-deny # cargo-deny reads `cargo metadata`
       - run: mise run audit
 
@@ -791,21 +841,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: zizmor
       - name: Audit the workflows
         env:
           GH_TOKEN: ${{ github.token }} # the online audits read the actions' repositories
         run: zizmor --persona=pedantic --strict-collection --no-exit-codes --no-progress --format=sarif . > zizmor.sarif
-      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: zizmor.sarif
           category: zizmor
 
   # The browser test (scripts/browser.sh): one pytest test in tests/browser/, run once per browser
-  # and case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash), has
+  # and case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash; live
+  # fMP4 through the browser's MSE beside WebRTC with AAC, PCMU and Opus; LL-HLS through hls.js,
+  # pinned and loaded from jsDelivr with its Subresource Integrity hash, with AAC and Opus), has
   # Selenium drive a real browser that plays the synthetic camera (ffmpeg publishing to MediaMTX,
   # both pinned in mise.toml) through a release daemon and the dev viewer, and checks what it
   # showed, played and reported in getStats(). Chrome and Firefox on the x86-64 Linux runner,
@@ -844,13 +896,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: ${{ matrix.tools }}
       # One cache for the browser test, the comparison, load and soak on Linux: the same release
       # builds of the daemon and the examples.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: nightly-${{ runner.os }}
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -864,7 +916,7 @@ jobs:
         env:
           ENGINE: ${{ matrix.engine }}
           LOTSE_BROWSER_ARGS: ${{ matrix.browser_args }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: browser-${{ matrix.engine }}
@@ -888,12 +940,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           # The browser job's Linux tools, and go2rtc.
           install_args: rust zig cmake github:rust-cross/cargo-zigbuild github:bluenviron/mediamtx github:BtbN/FFmpeg-Builds uv github:AlexxIT/go2rtc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: nightly-${{ runner.os }}
           save-if: false # the browser job saves it
@@ -906,7 +958,7 @@ jobs:
           # As in the browser job: Ubuntu 24.04's AppArmor keeps Chrome's sandbox from its user
           # namespaces.
           LOTSE_BROWSER_ARGS: --no-sandbox
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: compare-chrome
@@ -925,16 +977,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust zig cmake github:rust-cross/cargo-zigbuild
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: nightly-${{ runner.os }}
           save-if: false # the browser job saves it
       - run: mise run load 4 4 2m
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: load-report
@@ -952,16 +1004,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust zig cmake github:rust-cross/cargo-zigbuild
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: nightly-${{ runner.os }}
           save-if: false # the browser job saves it
       - run: mise run soak "$DURATION"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: soak-report
@@ -999,7 +1051,7 @@ jobs:
       cancel-in-progress: true
     steps:
       # GITHUB_TOKEN reaches only this repository.
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: app
         with:
           client-id: ${{ vars.LOTSE_BOT_CLIENT_ID }}
@@ -1034,6 +1086,7 @@ jobs:
       - interop
       - turn
       - sandbox
+      - rootless-podman
       - mutants-plan
       - mutants-cache
       - mutants

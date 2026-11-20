@@ -8,7 +8,7 @@
 pub mod allocation;
 pub mod credential;
 pub mod demux;
-mod hosts;
+pub(crate) mod hosts;
 pub mod stun;
 pub mod stun_client;
 pub mod tcp;

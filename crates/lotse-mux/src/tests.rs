@@ -26,17 +26,17 @@ use crate::fragment::{Sample, duration_of, ticks};
 use crate::init::{NON_SYNC_SAMPLE, SYNC_SAMPLE};
 
 /// One H.264 frame at 25 fps in 90 kHz ticks.
-const FRAME: i64 = 3600;
+pub(crate) const FRAME: i64 = 3600;
 
-fn base() -> Instant {
+pub(crate) fn base() -> Instant {
     FakeClock::from_system().now()
 }
 
-fn ms(base: Instant, at: u64) -> Instant {
+pub(crate) fn ms(base: Instant, at: u64) -> Instant {
     base + Duration::from_millis(at)
 }
 
-fn frame(
+pub(crate) fn frame(
     wallclock: Instant,
     ts: i64,
     keyframe: bool,
@@ -54,7 +54,7 @@ fn frame(
     })
 }
 
-fn annex_b(units: &[&[u8]]) -> Bytes {
+pub(crate) fn annex_b(units: &[&[u8]]) -> Bytes {
     let mut out = Vec::new();
     for unit in units {
         out.extend([0, 0, 0, 1]);
@@ -64,7 +64,7 @@ fn annex_b(units: &[&[u8]]) -> Bytes {
 }
 
 /// An H.264 access unit: the sets before a keyframe, then a slice.
-fn h264_au(keyframe: bool, n: u8) -> Bytes {
+pub(crate) fn h264_au(keyframe: bool, n: u8) -> Bytes {
     let slice = [if keyframe { 0x65 } else { 0x41 }, 0x88, n, n ^ 0x5a];
     if keyframe {
         annex_b(&[
@@ -78,7 +78,7 @@ fn h264_au(keyframe: bool, n: u8) -> Bytes {
 }
 
 /// An H.265 access unit: the sets before a keyframe, then a slice.
-fn h265_au(keyframe: bool, n: u8) -> Bytes {
+pub(crate) fn h265_au(keyframe: bool, n: u8) -> Bytes {
     let unit_type = if keyframe { 19 } else { 1 };
     let slice = [unit_type << 1, 0x01, 0xaf, n];
     if keyframe {
@@ -95,7 +95,7 @@ fn h265_au(keyframe: bool, n: u8) -> Bytes {
 
 /// The sample an access unit becomes: each NAL unit behind its 4-byte
 /// length.
-fn length_prefixed(au: &[u8]) -> Vec<u8> {
+pub(crate) fn length_prefixed(au: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     for unit in annex_b_units(au) {
         out.extend(u32::try_from(unit.len()).unwrap().to_be_bytes());
@@ -104,7 +104,7 @@ fn length_prefixed(au: &[u8]) -> Vec<u8> {
     out
 }
 
-fn h264_codec(sps: Vec<u8>) -> Codec {
+pub(crate) fn h264_codec(sps: Vec<u8>) -> Codec {
     Codec::H264 {
         profile_level_id: None,
         sps: Some(Bytes::from(sps)),
@@ -112,14 +112,14 @@ fn h264_codec(sps: Vec<u8>) -> Codec {
     }
 }
 
-fn h264_track() -> RecordingTrack {
+pub(crate) fn h264_track() -> RecordingTrack {
     RecordingTrack {
         codec: h264_codec(h264::test_data::sps(320, 240)),
         clock_rate: 90_000,
     }
 }
 
-fn h265_codec(sps: Vec<u8>) -> Codec {
+pub(crate) fn h265_codec(sps: Vec<u8>) -> Codec {
     Codec::H265 {
         vps: Some(Bytes::from(h265::test_data::vps())),
         sps: Some(Bytes::from(sps)),
@@ -127,7 +127,7 @@ fn h265_codec(sps: Vec<u8>) -> Codec {
     }
 }
 
-fn h265_track() -> RecordingTrack {
+pub(crate) fn h265_track() -> RecordingTrack {
     RecordingTrack {
         codec: h265_codec(h265::test_data::sps(640, 480)),
         clock_rate: 90_000,
@@ -142,14 +142,14 @@ fn aac_codec(sample_rate: u32) -> Codec {
     }
 }
 
-fn aac_track() -> RecordingTrack {
+pub(crate) fn aac_track() -> RecordingTrack {
     RecordingTrack {
         codec: aac_codec(16_000),
         clock_rate: 16_000,
     }
 }
 
-fn opus_track(channels: u8) -> RecordingTrack {
+pub(crate) fn opus_track(channels: u8) -> RecordingTrack {
     RecordingTrack {
         codec: Codec::Opus { channels },
         clock_rate: 48_000,
@@ -158,7 +158,7 @@ fn opus_track(channels: u8) -> RecordingTrack {
 
 /// An Opus packet of one 20 ms CELT frame (RFC 6716 §3.1: config 31,
 /// code 0).
-fn opus_packet(n: u8) -> Bytes {
+pub(crate) fn opus_packet(n: u8) -> Bytes {
     Bytes::from(vec![0xf8, n, 0xfe])
 }
 
@@ -203,14 +203,14 @@ fn run(
 }
 
 /// The file read back with mp4-atom: every box, in order.
-struct File {
-    ftyp: Ftyp,
-    moov: Moov,
+pub(crate) struct File {
+    pub(crate) ftyp: Ftyp,
+    pub(crate) moov: Moov,
     /// Each fragment and where its `moof` starts.
-    fragments: Vec<(Moof, usize)>,
+    pub(crate) fragments: Vec<(Moof, usize)>,
 }
 
-fn read(file: &[u8]) -> File {
+pub(crate) fn read(file: &[u8]) -> File {
     let mut rest = file;
     let (mut ftyp, mut moov, mut fragments) = (None, None, Vec::new());
     let mut mdats = 0;
@@ -234,16 +234,16 @@ fn read(file: &[u8]) -> File {
 
 /// One sample read back.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Read {
-    fragment: usize,
-    dts: u64,
-    duration: u32,
-    flags: Option<u32>,
-    cts: i32,
-    bytes: Vec<u8>,
+pub(crate) struct Read {
+    pub(crate) fragment: usize,
+    pub(crate) dts: u64,
+    pub(crate) duration: u32,
+    pub(crate) flags: Option<u32>,
+    pub(crate) cts: i32,
+    pub(crate) bytes: Vec<u8>,
 }
 
-fn samples(file: &[u8], track_id: u32) -> Vec<Read> {
+pub(crate) fn samples(file: &[u8], track_id: u32) -> Vec<Read> {
     let parsed = read(file);
     let mut out = Vec::new();
     for (index, (moof, start)) in parsed.fragments.iter().enumerate() {
@@ -258,7 +258,7 @@ fn samples(file: &[u8], track_id: u32) -> Vec<Read> {
             assert_eq!(traf.trun.len(), 1);
             let trun = &traf.trun[0];
             let mut at = start + usize::try_from(trun.data_offset.unwrap()).unwrap();
-            for entry in &trun.entries {
+            for entry in &trun.samples {
                 let size = usize::try_from(entry.size.unwrap()).unwrap();
                 let duration = entry.duration.unwrap();
                 out.push(Read {
@@ -266,7 +266,7 @@ fn samples(file: &[u8], track_id: u32) -> Vec<Read> {
                     dts,
                     duration,
                     flags: entry.flags,
-                    cts: entry.cts.unwrap_or(0),
+                    cts: i32::try_from(entry.cts.unwrap_or(0)).unwrap(),
                     bytes: file[at..at + size].to_vec(),
                 });
                 at += size;
@@ -374,11 +374,11 @@ fn iso14496_15_5_3_2_video_samples_are_slices_of_the_frame_never_copies() {
     let au = h264_au(true, 7);
     let mut muxer = Muxer::new(&policy(1000));
     muxer.start(&h264_track(), None).unwrap();
-    assert!(
+    assert_eq!(
         muxer
             .push(Kind::Video, frame(base, 0, true, 0, au.clone()))
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        Vec::<Bytes>::new()
     );
     let out = muxer.finish().unwrap();
     // The moof and mdat header, then length and unit for each of the three units.
@@ -600,8 +600,12 @@ fn iso14496_12_8_4_each_track_has_its_media_header_handler_and_empty_sample_tabl
         assert_eq!(stbl.stsd.codecs.len(), 1);
         assert!(stbl.stts.entries.is_empty() && stbl.stsc.entries.is_empty());
         assert_eq!(stbl.stco.as_ref().unwrap().entries, Vec::<u32>::new());
-        assert_eq!(trak.mdia.minf.dinf.dref.urls.len(), 1);
-        assert_eq!(trak.mdia.minf.dinf.dref.urls[0].location, "");
+        let entries = &trak.mdia.minf.dinf.dref.entries;
+        assert_eq!(entries.len(), 1);
+        let mp4_atom::DrefEntry::Url(url) = &entries[0] else {
+            panic!("a url entry: {entries:?}");
+        };
+        assert_eq!(url.location, "");
     }
 }
 
@@ -681,7 +685,7 @@ fn iso14496_15_5_3_3_1_avcc_carries_the_sets_profile_level_and_the_high_profiles
         (ext.chroma_format, ext.bit_depth_luma, ext.bit_depth_chroma),
         (2, 10, 10)
     );
-    assert!(ext.sequence_parameter_sets_ext.is_empty());
+    assert_eq!(ext.sequence_parameter_sets_ext, Vec::<Vec<u8>>::new());
     assert_eq!((avc1.visual.width, avc1.visual.height), (640, 480));
 }
 
@@ -811,7 +815,12 @@ fn h265_parameter_sets_other_than_the_entry_s_stay_in_band_with_every_later_samp
 /// An H.265 SPS up to its bit depths (ITU-T H.265 §7.3.2.2.1), 640 ×
 /// 480 4:2:0, in `profile_space`, the High tier when `high_tier`, of
 /// the bit depths minus 8 given.
-fn h265_sps(profile_space: u32, high_tier: bool, luma_minus8: u32, chroma_minus8: u32) -> Vec<u8> {
+pub(crate) fn h265_sps(
+    profile_space: u32,
+    high_tier: bool,
+    luma_minus8: u32,
+    chroma_minus8: u32,
+) -> Vec<u8> {
     let mut b = h264::test_data::Bits::default();
     b.bits(0, 4).bits(0, 3).bit(true); // vps id, one sub-layer, nesting
     b.bits(profile_space, 2).bit(high_tier).bits(2, 5); // Main 10
@@ -2100,7 +2109,7 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
         file.extend_from_slice(&piece);
     }
     for (kind, frame) in reordered_gop(base, 0, 0, 0) {
-        assert!(reordered.push(kind, frame).unwrap().is_empty());
+        assert_eq!(reordered.push(kind, frame).unwrap(), Vec::<Bytes>::new());
     }
     assert_eq!(
         reordered.media_end(),
@@ -2108,7 +2117,10 @@ fn iso14496_12_8_8_8_the_media_end_counts_the_video_s_last_sample_until_its_end_
         "P6's end"
     );
     let audio = frame(ms(base, 300), 0, true, 0, opus_packet(0));
-    assert!(reordered.push(Kind::Audio, audio).unwrap().is_empty());
+    assert_eq!(
+        reordered.push(Kind::Audio, audio).unwrap(),
+        Vec::<Bytes>::new()
+    );
     assert_eq!(
         reordered.media_end(),
         Duration::from_millis(320),

@@ -21,6 +21,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::clients::ClientsError;
 use crate::identity::IdentityError;
+use crate::owners::Owners;
 
 /// Who an authenticated peer is, as its listener learned it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,8 +91,8 @@ pub enum BindError {
         path: String,
         /// Its owner.
         owner: u32,
-        /// The uid the daemon started as.
-        expected: u32,
+        /// The uids that may own it.
+        expected: Owners,
     },
     /// The socket could not be bound.
     #[error("binding {path}: {source}")]
@@ -160,9 +161,14 @@ where
 /// Binds the Unix socket after checking its directory, with umask 0177 so
 /// it is 0600 from the moment it exists. A stale socket file from an
 /// earlier run is removed first.
+///
+/// The directory must be mode 0700 and belong to one of `owners`: the uid
+/// the daemon started as, or, started as root, the uid it drops to
+/// ([`Owners`] says why that widens nothing). Nobody else can then reach
+/// the socket's path, replace the socket or put one in its place.
 pub(crate) fn bind_unix(
     path: &Path,
-    owner_uid: u32,
+    owners: Owners,
 ) -> Result<std::os::unix::net::UnixListener, BindError> {
     let text = path.display().to_string();
     if text.starts_with('\0') || text.starts_with('@') {
@@ -187,11 +193,11 @@ pub(crate) fn bind_unix(
             mode,
         });
     }
-    if meta.uid() != owner_uid {
+    if !owners.accepts(meta.uid()) {
         return Err(BindError::Owner {
             path: parent_text,
             owner: meta.uid(),
-            expected: owner_uid,
+            expected: owners,
         });
     }
     if let Ok(existing) = std::fs::symlink_metadata(path)
@@ -297,12 +303,12 @@ mod tests {
         let dir = private_dir("bind", 0o700);
         let path = dir.join("lotse.sock");
         let uid = rustix::process::getuid().as_raw();
-        let listener = bind_unix(&path, uid).unwrap();
+        let listener = bind_unix(&path, Owners::only(uid)).unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.mode() & 0o777, 0o600, "umask 0177 at bind");
         drop(listener);
         // A stale socket file is replaced on the next bind.
-        assert!(bind_unix(&path, uid).is_ok());
+        assert!(bind_unix(&path, Owners::only(uid)).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -314,7 +320,7 @@ mod tests {
         let path = dir.join("lotse.sock");
         let uid = rustix::process::getuid().as_raw();
         let mut listener = CheckedUnix::new(
-            bind_unix(&path, uid).unwrap(),
+            bind_unix(&path, Owners::only(uid)).unwrap(),
             [uid.wrapping_add(1), uid.wrapping_add(2)],
             Arc::new(FakeClock::default()),
         )
@@ -347,7 +353,7 @@ mod tests {
         let path = dir.join("lotse.sock");
         let uid = rustix::process::getuid().as_raw();
         let mut listener = CheckedUnix::new(
-            bind_unix(&path, uid).unwrap(),
+            bind_unix(&path, Owners::only(uid)).unwrap(),
             [uid.wrapping_add(1), uid],
             Arc::new(FakeClock::default()),
         )
@@ -446,7 +452,7 @@ mod tests {
         let uid = rustix::process::getuid().as_raw();
         let clock = Arc::new(FakeClock::default());
         let mut listener = CheckedUnix::new(
-            bind_unix(&path, uid).unwrap(),
+            bind_unix(&path, Owners::only(uid)).unwrap(),
             [uid, uid],
             Arc::<FakeClock>::clone(&clock),
         )
@@ -509,36 +515,74 @@ mod tests {
     }
 
     #[test]
+    fn the_directory_may_belong_to_the_uid_a_root_start_drops_to() {
+        let uid = rustix::process::getuid().as_raw();
+        let dir = private_dir("drop-owner", 0o700);
+        let path = dir.join("lotse.sock");
+        let root = Owners {
+            starting: 0,
+            drop_to: uid,
+        };
+        drop(bind_unix(&path, root).unwrap());
+        // Any other start drops to nobody, so its drop target owns nothing.
+        let other = Owners {
+            starting: uid.wrapping_add(1),
+            drop_to: uid,
+        };
+        let err = bind_unix(&path, other).unwrap_err();
+        assert!(
+            matches!(err, BindError::Owner { owner, expected, .. } if owner == uid && expected == other),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn refuses_the_wrong_directory_or_namespace() {
         let uid = rustix::process::getuid().as_raw();
         assert!(matches!(
-            bind_unix(Path::new("@lotse"), uid).unwrap_err(),
+            bind_unix(Path::new("@lotse"), Owners::only(uid)).unwrap_err(),
             BindError::AbstractNamespace
         ));
         assert!(matches!(
-            bind_unix(Path::new("lotse.sock"), uid).unwrap_err(),
+            bind_unix(Path::new("lotse.sock"), Owners::only(uid)).unwrap_err(),
             BindError::NoParent(_)
         ));
         assert!(matches!(
-            bind_unix(Path::new("/nonexistent-lotse/lotse.sock"), uid).unwrap_err(),
+            bind_unix(
+                Path::new("/nonexistent-lotse/lotse.sock"),
+                Owners::only(uid)
+            )
+            .unwrap_err(),
             BindError::Directory { .. }
         ));
         let open = private_dir("open", 0o755);
-        let err = bind_unix(&open.join("lotse.sock"), uid).unwrap_err();
+        let err = bind_unix(&open.join("lotse.sock"), Owners::only(uid)).unwrap_err();
         assert!(matches!(err, BindError::Mode { mode: 0o755, .. }), "{err}");
         assert!(err.to_string().contains("0755"));
         let private = private_dir("owner", 0o700);
-        let err = bind_unix(&private.join("lotse.sock"), uid.wrapping_add(1)).unwrap_err();
+        let err = bind_unix(
+            &private.join("lotse.sock"),
+            Owners::only(uid.wrapping_add(1)),
+        )
+        .unwrap_err();
         assert!(matches!(err, BindError::Owner { .. }), "{err}");
+        assert!(
+            err.to_string().ends_with(&format!(
+                "is owned by uid {uid}, not {}",
+                uid.wrapping_add(1)
+            )),
+            "{err}"
+        );
         let file = private.join("file");
         std::fs::write(&file, b"").unwrap();
         assert!(matches!(
-            bind_unix(&file.join("lotse.sock"), uid).unwrap_err(),
+            bind_unix(&file.join("lotse.sock"), Owners::only(uid)).unwrap_err(),
             BindError::NotADirectory(_)
         ));
         // A file in the socket's place is not a stale socket: it stays,
         // and the bind fails.
-        let err = bind_unix(&file, uid).unwrap_err();
+        let err = bind_unix(&file, Owners::only(uid)).unwrap_err();
         assert!(matches!(err, BindError::Bind { .. }), "{err}");
         assert!(file.is_file());
         std::fs::remove_dir_all(&open).unwrap();

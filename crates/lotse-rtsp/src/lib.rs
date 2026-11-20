@@ -2,7 +2,9 @@
 //! (M4).
 //!
 //! First implementation of the source contract; runs in a worker. Depends on
-//! `lotse-core`, `lotse-codec` and `lotse-tls` only, never on another source.
+//! `lotse-core`, `lotse-codec`, `lotse-tls` and `lotse-api-types` (the
+//! `rtsp` and `rtsps` sources' fields, declared there once) only, never on
+//! another source.
 //! The binary registers its factory behind the `source-rtsp` feature.
 //!
 //! Standards: RFC 2326 (RTSP 1.0), RFC 3550 (RTP/RTCP), RFC 6184, RFC 7798,
@@ -22,5 +24,7 @@ pub mod retina_log;
 mod source;
 mod udp;
 
-pub use factory::{BACKCHANNEL, DEFAULT_PORT, DEFAULT_TLS_PORT, PROTOCOL, RtspFactory};
+pub use factory::{
+    BACKCHANNEL, DEFAULT_PORT, DEFAULT_TLS_PORT, PROTOCOL, RtspFactory, TLS_PROTOCOL,
+};
 pub use source::RtspSource;

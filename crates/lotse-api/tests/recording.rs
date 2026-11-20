@@ -21,7 +21,7 @@ use futures_util::StreamExt as _;
 use lotse_api::test_util::{FakeRecordingWriter, FakeRecordings};
 use lotse_api::{
     BODY_STALL_TIMEOUT, CLOSE_TIMEOUT, Config, ConnectionId, Handler, MAX_PENDING_UPGRADES,
-    Outcome, RecordingBody, RecordingBodyError, ServeError, Server, UPGRADE_TIMEOUT,
+    Outcome, Owners, RecordingBody, RecordingBodyError, ServeError, Server, UPGRADE_TIMEOUT,
 };
 use lotse_api_types::command::Command;
 use lotse_api_types::frame::{Hello, HelloTag};
@@ -99,7 +99,7 @@ fn start(name: &str) -> Running {
     };
     let server = Server::bind(Config {
         socket: socket.clone(),
-        owner_uid: uid,
+        owners: Owners::only(uid),
         allow_uid: uid,
         max_connections: 8,
         max_subscriptions: 8,

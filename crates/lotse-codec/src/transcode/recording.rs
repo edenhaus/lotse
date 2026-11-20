@@ -722,12 +722,7 @@ mod tests {
             let rate = codec.sample_rate().unwrap();
             let expected = (rate / CHUNKS_PER_SECOND) as usize;
             let mut chain = ToOpus::failing(&codec).unwrap();
-            assert!(
-                chain
-                    .push(&frame(TS0, 0, t0, Vec::new()))
-                    .unwrap()
-                    .is_empty()
-            );
+            assert_eq!(chain.push(&frame(TS0, 0, t0, Vec::new())).unwrap(), []);
             for frame in frames(&codec, &onset(rate, 0, 40), t0) {
                 assert_eq!(
                     chain.push(&frame),

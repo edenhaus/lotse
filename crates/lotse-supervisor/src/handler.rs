@@ -12,6 +12,10 @@
 //! `recording/create`, the read end waits here for `GET /v0/recording/{recording_id}`
 //! ([`Handler::recording_body`]). A recording ends with its control connection, as
 //! its events have nowhere else to go ([`crate::recording`]).
+//!
+//! A signaled source's signaling goes to the `signaling/subscribe`
+//! subscription for its stream, and the client's answer, candidates and
+//! errors back to its worker ([`crate::signaling`]).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -19,35 +23,46 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lotse_api::{ConnectionId, Event, Handler, Outcome, RecordingBody, RecordingBodyError};
+use lotse_api::{
+    ConnectionId, Event, Handler, HlsAnswer, HlsRequest, LiveBody, LiveBodyError, Outcome,
+    RecordingBody, RecordingBodyError,
+};
 use lotse_api_types::API_VERSION;
 use lotse_api_types::command::{
-    Command, RecordingCreate, StreamPut, WebrtcCandidate, WebrtcOffer, WebrtcRenegotiate,
+    Command, HlsCreate, LiveCreate, RecordingCreate, StreamPut, WebrtcCandidate, WebrtcOffer,
+    WebrtcReoffer,
 };
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Hello, HelloTag};
+use lotse_api_types::hls::{HlsCloseReason, HlsCreateResult};
 use lotse_api_types::info::{
     BuildInfo, Codecs, DemuxMetrics, InfoResult, Limits, Metrics, ProcessMetrics, SandboxInfo,
     SupervisorMetrics,
 };
+use lotse_api_types::live::{LiveCloseReason, LiveCreateResult, live_path};
 use lotse_api_types::recording::{RecordingCloseReason, RecordingCreateResult, recording_path};
-use lotse_api_types::session::{CloseCode, SessionEvent, SessionList, WebrtcRenegotiateResult};
+use lotse_api_types::session::{CloseCode, SessionEvent, SessionList, WebrtcReofferResult};
+use lotse_api_types::source::SourceSpec;
 use lotse_api_types::stream::{AudioMode, BackchannelReleaseResult, StreamList, StreamPutResult};
 use lotse_core::clock::Clock;
 use lotse_core::codec::{CodecFamily, Kind};
 use lotse_core::connection::{ConnectionConfig, ConnectionError, ConnectionState};
-use lotse_core::id::{RecordingId, StreamId};
+use lotse_core::id::{HlsId, LiveId, RecordingId, StreamId};
 use lotse_core::registry::Registries;
+use lotse_core::source::SourceConfigError;
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
-use lotse_ipc::{RecordingSpec, SessionSpec};
+use lotse_ipc::{LiveSpec, RecordingSpec, SessionSpec};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 
 use crate::connect::ConnectPermits;
 use crate::driver::{COMMAND_QUEUE, Demand, Driver, DriverCommand, DriverSpec};
-use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnServer};
+use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnEntry};
+use crate::hls::Hls;
+use crate::host_cache::{HostCache, HostScan, HostSnapshot};
+use crate::live::{LIVE_QUEUE, LiveEntry, LiveLimits, LiveOwner};
 use crate::memory::{Memory, MemoryProbe};
 use crate::net::demux::{DemuxStats, Registrations};
 use crate::net::stun_client::StunClient;
@@ -56,13 +71,14 @@ use crate::recording::{
     RECORDING_QUEUE, RecordingEntry, RecordingLimits, RecordingOwner, RecordingTimer,
 };
 use crate::registry::{
-    CloseBy, ConnectionEntry, ConnectionKey, ConnectionSnapshot, Shared, State, StreamEntry,
-    StreamSource, Talker,
+    CloseBy, ConnectionEntry, ConnectionKey, ConnectionSnapshot, Shared, SourceTarget, State,
+    StreamEntry, StreamSource, Talker,
 };
 use crate::session::{
     MAX_EARLY_CANDIDATES, MAX_REMOTE_CANDIDATES, SESSION_QUEUE, SessionEntry, api_event,
     ice_credentials, ulid,
 };
+use crate::signaling::Owner;
 use crate::worker::{WorkerConfig, WorkerManager};
 use crate::{Settings, millis};
 
@@ -72,6 +88,21 @@ const WEBRTC: &str = "webrtc";
 /// The output kind of event recordings, announced when the build has a recording
 /// container (`Registries::recording`).
 const RECORDING: &str = "recording";
+
+/// The output kind of live fMP4 over HTTP, announced when the build has a
+/// live container (`Registries::live`).
+const LIVE: &str = "live";
+
+/// The output kind of LL-HLS, announced when the build has a live container
+/// and LL-HLS (`Limits::hls`).
+const HLS: &str = "hls";
+
+/// How much longer than `limits.live_start_timeout_ms` `live/create` waits
+/// for the worker's init segment: the worker's own timeout ends the output
+/// first and says why; this only bounds a start that never reached a worker
+/// (its host lookup keeps failing, a backoff holds the worker back).
+/// `hls/create` waits as long for its output's.
+pub(crate) const LIVE_CREATE_SLACK: Duration = Duration::from_secs(2);
 
 /// What `hello` and `info` always announce beyond the outputs.
 const FEATURES: [&str; 1] = ["session_adopt"];
@@ -96,9 +127,9 @@ const AUDIO_CODECS: [CodecFamily; 5] = [
 /// Extra time the shutdown waits for drivers past the workers' budget.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
-/// How long `webrtc/renegotiate` waits for the worker's answer: a worker
+/// How long `webrtc/reoffer` waits for the worker's answer: a worker
 /// answers a re-offer in milliseconds, so this only bounds a stuck one.
-const RENEGOTIATE_TIMEOUT: Duration = Duration::from_secs(10);
+const REOFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What `hello` and `info` say about this build and process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,11 +164,14 @@ pub struct Environment {
 pub struct FrontDoor {
     /// The demux's sessions, which the drivers register with.
     pub registrations: Arc<Registrations>,
-    /// The host candidates' addresses.
+    /// The host candidates' addresses, as found when the socket was bound.
     pub hosts: Vec<SocketAddr>,
     /// The passive ICE-TCP host candidates' addresses: the host addresses
     /// at the listener's port; empty with the listener off.
     pub tcp_hosts: Vec<SocketAddr>,
+    /// How an offer reads both again ([`HostScan`]); `None`
+    /// keeps them as given.
+    pub scan: Option<HostScan>,
     /// The STUN client of server-reflexive gathering, on the shared socket.
     pub stun: Option<Arc<StunClient>>,
     /// The TURN client of relay gathering, on the shared socket.
@@ -148,24 +182,37 @@ pub struct FrontDoor {
 
 /// A source of `stream/put` after validation.
 struct ValidatedSource {
-    /// The parsed URL.
-    url: SourceUrl,
-    /// The URL as given, credentials included, for the worker.
-    raw: String,
-    /// The options as given.
+    /// The parsed URL, or the signaled source's protocol and stream.
+    target: SourceTarget,
+    /// The URL as given, credentials included, or the protocol, for the
+    /// worker.
+    raw: lotse_ipc::SourceTarget,
+    /// The protocol's fields but the URL, defaults filled in, for the
+    /// factory in the worker.
     options: serde_json::Map<String, serde_json::Value>,
-    /// What the connection is keyed by: the URL, credentials included, and
-    /// the source's normalized connection options.
+    /// What the connection is keyed by: the target, credentials included,
+    /// and the source's normalized connection options.
     key: ConnectionKey,
     /// The options as the source reports them, secrets redacted.
     described: serde_json::Value,
-    /// The protocol name.
-    protocol: &'static str,
-    /// The scheme's default port.
+    /// The source as `stream/get` reports it: as put, the URL redacted.
+    reported: SourceSpec,
+    /// The protocol's default port.
     default_port: Option<u16>,
     /// The source asks for the camera's backchannel
     /// ([`Source::wants_backchannel`](lotse_core::source::Source::wants_backchannel)).
     backchannel: bool,
+}
+
+impl ValidatedSource {
+    /// The port the source's worker may connect to, from the URL or the
+    /// protocol's default; none for a signaled source, which connects to
+    /// what the client's signaling names.
+    fn port(&self) -> Option<u16> {
+        self.target
+            .url()
+            .and_then(|url| url.port().or(self.default_port))
+    }
 }
 
 /// The supervisor: the registry and the API handler over it.
@@ -178,7 +225,7 @@ pub struct Supervisor {
     /// The build and sandbox.
     identity: Identity,
     /// The registry and what the drivers need.
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     /// When the supervisor started, for `metrics/get`.
     started: Instant,
     /// Its own `smaps_rollup`; `None` without `/proc`.
@@ -191,21 +238,32 @@ impl Supervisor {
     /// A supervisor with no streams.
     pub fn new(settings: Settings, environment: Environment, clock: Arc<dyn Clock>) -> Self {
         let started = clock.now();
-        let (registrations, hosts, tcp_hosts, stun, turn, demux) = environment.front_door.map_or(
-            (None, Vec::new(), Vec::new(), None, None, None),
-            |door| {
-                (
-                    Some(door.registrations),
-                    door.hosts,
-                    door.tcp_hosts,
-                    door.stun,
-                    door.turn,
-                    door.demux,
-                )
-            },
-        );
+        let (registrations, hosts, tcp_hosts, scan, stun, turn, demux) =
+            environment.front_door.map_or(
+                (None, Vec::new(), Vec::new(), None, None, None, None),
+                |door| {
+                    (
+                        Some(door.registrations),
+                        door.hosts,
+                        door.tcp_hosts,
+                        door.scan,
+                        door.stun,
+                        door.turn,
+                        door.demux,
+                    )
+                },
+            );
+        let hosts = Arc::new(HostCache::new(
+            HostSnapshot::new(hosts, tcp_hosts, &settings.advertise),
+            scan,
+            &settings.advertise,
+            &clock,
+        ));
         let mut state = State::default();
         state.registrations = registrations;
+        state.signaling.clock = Arc::clone(&clock);
+        // A signaled source gathers on the hosts sessions answer with.
+        state.signaling.hosts = Arc::clone(&hosts);
         // Without a recording output the workers refuse every recording: no window
         // and no recording is accepted, which `info` reports.
         state.recording_limits = if environment.registries.recording.is_some() {
@@ -213,15 +271,27 @@ impl Supervisor {
         } else {
             RecordingLimits::NONE
         };
+        // Likewise without a live container: no live output is accepted.
+        state.live_limits = if environment.registries.live.is_some() {
+            settings.limits.live
+        } else {
+            LiveLimits::NONE
+        };
+        // LL-HLS windows are filled from live outputs: none without them.
+        state.hls = Hls::new(
+            settings
+                .limits
+                .hls
+                .filter(|_| environment.registries.live.is_some()),
+        );
         let shared = Arc::new(Shared {
-            clock,
-            manager: WorkerManager::new(environment.worker, environment.udp)
+            manager: WorkerManager::new(environment.worker, environment.udp, Arc::clone(&clock))
                 .with_turn(turn.clone()),
+            clock,
             tracker: TaskTracker::new(),
             shutdown_budget: settings.shutdown_budget,
             connects: ConnectPermits::new(settings.connect_concurrency),
             hosts,
-            tcp_hosts,
             stun,
             turn,
             state: Mutex::new(state),
@@ -237,10 +307,14 @@ impl Supervisor {
         }
     }
 
-    /// Closes every session and ends every recording with `shutting_down`; the
-    /// first step of the shutdown, before the control connections say
-    /// goodbye. A recording's worker writes its last fragment while it stops,
-    /// but its report is not waited for, so the body is cut.
+    /// Closes every session and ends every recording and live output with
+    /// `shutting_down`, an LL-HLS output and its sessions among the live
+    /// outputs, and ends the signaling (each offered signal closes
+    /// `source_stopped`, each signaling subscription ends); the first step
+    /// of the shutdown, before the control connections say goodbye. A
+    /// recording's worker writes its last fragment while it stops, but its
+    /// report is not waited for, so the body is cut; a live output's
+    /// `closed` goes out at once, its counters zero, for the same reason.
     pub fn close_sessions(&self) {
         let mut state = self.shared.lock();
         state.close_sessions_where(
@@ -250,6 +324,8 @@ impl Supervisor {
             CloseBy::Supervisor,
         );
         state.end_recordings_where(|_| true, RecordingCloseReason::ShuttingDown);
+        state.close_lives_now(LiveCloseReason::ShuttingDown);
+        state.signaling_shutdown();
     }
 
     /// Closes the sessions, stops every connection's worker within the
@@ -278,10 +354,10 @@ impl Supervisor {
         InfoResult {
             version: self.identity.version.clone(),
             build: self.identity.build.clone(),
-            schemes: self
+            protocols: self
                 .registries
                 .sources
-                .schemes()
+                .protocols()
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
@@ -316,9 +392,9 @@ impl Supervisor {
     /// talk-back behind).
     fn features(&self) -> Vec<String> {
         let sources = &self.registries.sources;
-        let backchannel = sources.schemes().into_iter().any(|scheme| {
+        let backchannel = sources.protocols().into_iter().any(|protocol| {
             sources
-                .get(scheme)
+                .get(protocol)
                 .is_some_and(|factory| factory.capabilities().backchannel)
         });
         let two_way_audio = backchannel
@@ -333,13 +409,17 @@ impl Supervisor {
     }
 
     /// The output kinds compiled in: the session outputs, then `recording` with
-    /// a recording container.
+    /// a recording container, `live` with a live one, and `hls` with LL-HLS
+    /// besides.
     fn outputs(&self) -> Vec<String> {
+        let hls = self.registries.live.is_some() && self.settings.limits.hls.is_some();
         self.registries
             .outputs
             .kinds()
             .into_iter()
             .chain(self.registries.recording.is_some().then_some(RECORDING))
+            .chain(self.registries.live.is_some().then_some(LIVE))
+            .chain(hls.then_some(HLS))
             .map(str::to_owned)
             .collect()
     }
@@ -392,40 +472,73 @@ impl Supervisor {
         }
     }
 
-    /// Checks a source's URL, scheme and options with the scheme's factory.
+    /// Checks a source of `stream_id` with its protocol's factory: a
+    /// protocol this build registered, a URL of the protocol's scheme for
+    /// a source lotse connects to, and the protocol's fields. A signaled
+    /// source's stream is its identity.
     fn validate_source(
         &self,
-        source: &lotse_api_types::stream::SourceSpec,
+        stream_id: &StreamId,
+        source: &SourceSpec,
     ) -> Result<ValidatedSource, ApiError> {
-        let url = SourceUrl::parse(&source.url).map_err(|err| {
-            ApiError::new(ErrorCode::InvalidRequest, format!("source url: {err}"))
-        })?;
-        let factory = self.registries.sources.get(url.scheme()).ok_or_else(|| {
+        let protocol = source.protocol();
+        let options = source.options();
+        let given = serde_json::Value::Object(options.clone());
+        let sources = &self.registries.sources;
+        let unsupported = || {
             ApiError::new(
-                ErrorCode::SchemeUnsupported,
-                format!("no source handles {:?} urls", url.scheme()),
+                ErrorCode::ProtocolUnsupported,
+                format!("this build has no {protocol} source"),
             )
-            .with_detail("scheme", url.scheme())
-        })?;
-        let options = serde_json::Value::Object(source.options.clone());
-        let built = factory
-            .validate(&url, &options)
-            .map_err(|err| ApiError::new(ErrorCode::InvalidRequest, err.to_string()))?;
-        let described = built.describe();
-        let backchannel = built.wants_backchannel();
-        let default_port = factory.default_port(url.scheme());
+            .with_detail("protocol", protocol)
+        };
+        let refused =
+            |err: SourceConfigError| ApiError::new(ErrorCode::InvalidRequest, err.to_string());
+        let (built, target, raw, default_port) = if let Some(raw) = source.url() {
+            let url = SourceUrl::parse(raw).map_err(|err| {
+                ApiError::new(ErrorCode::InvalidRequest, format!("source url: {err}"))
+            })?;
+            if url.scheme() != protocol {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "protocol {protocol} takes {protocol}:// urls, not {}://",
+                        url.scheme()
+                    ),
+                )
+                .with_detail("protocol", protocol));
+            }
+            let factory = sources.get(protocol).ok_or_else(unsupported)?;
+            let built = factory.validate(&url, &given).map_err(refused)?;
+            let default_port = factory.default_port(protocol);
+            let raw = lotse_ipc::SourceTarget::Url(raw.to_owned());
+            (built, SourceTarget::Url(url), raw, default_port)
+        } else {
+            let factory = sources.signaled(protocol).ok_or_else(unsupported)?;
+            let built = factory.validate(&given).map_err(refused)?;
+            let target = SourceTarget::Signaled {
+                protocol: factory.protocol(),
+                stream: stream_id.as_str().to_owned(),
+            };
+            let raw = lotse_ipc::SourceTarget::Signaled(protocol.to_owned());
+            (built, target, raw, None)
+        };
+        let reported = target.url().map_or_else(
+            || source.clone(),
+            |url| source.clone().with_url(url.to_string()),
+        );
         Ok(ValidatedSource {
             key: ConnectionKey {
-                url: url.clone(),
+                target: target.clone(),
                 options: built.connection_options(),
             },
-            url,
-            raw: source.url.clone(),
-            options: source.options.clone(),
-            described: described.options,
-            protocol: described.protocol,
+            target,
+            raw,
+            options,
+            described: built.describe().options,
+            reported,
             default_port,
-            backchannel,
+            backchannel: built.wants_backchannel(),
         })
     }
 
@@ -514,10 +627,12 @@ impl Supervisor {
                 recordings,
             },
         );
+        let now = (self.shared.clock.now(), self.shared.clock.wall_now());
         for connection in connections {
             state.refresh_connection(&connection);
             state.follow_backchannel(&connection, stream_id.as_str());
             state.follow_prerecord(&connection, stream_id.as_str());
+            state.route_waiting_opens(&connection, now);
         }
         close_moved_sessions(&mut state, stream_id.as_str());
         if reoriented {
@@ -561,12 +676,13 @@ impl Supervisor {
                     put.prerecord_ms
                 ),
             )
-            .with_detail("field", "prerecord_ms"));
+            .with_detail("field", "prerecord_ms")
+            .with_detail("limit", "max_prerecord_ms"));
         }
         let validated = put
             .sources
             .iter()
-            .map(|source| self.validate_source(source))
+            .map(|source| self.validate_source(&stream_id, source))
             .collect::<Result<Vec<_>, _>>()?;
         Ok((stream_id, validated))
     }
@@ -595,7 +711,7 @@ impl Supervisor {
                         tracing::info!(
                             stream.id = %stream_id,
                             connection.id = %id,
-                            url = %source.url,
+                            source = %source.target,
                             "stream/put: the connection switches to the new source in place"
                         );
                         state.switch_connection(id, source.key.clone(), driver_spec(id, &source));
@@ -609,9 +725,9 @@ impl Supervisor {
             }
             sources.push(StreamSource {
                 spec: driver_spec(&connection, &source),
-                url: source.url,
+                target: source.target,
                 options: source.options,
-                protocol: source.protocol,
+                reported: source.reported,
                 connection,
             });
         }
@@ -629,21 +745,26 @@ impl Supervisor {
         state.next_connection = state.next_connection.saturating_add(1);
         let id = format!("c{}", state.next_connection);
         let (demand, demand_rx) = watch::channel(Demand::default());
-        // Room besides the rest for the close each session reserves and
-        // the stop each recording does.
+        // Room besides the rest for the close each session reserves, the
+        // stop each recording does, and the fetch and stop each live output
+        // does.
         let sessions = usize::try_from(self.settings.limits.max_sessions).unwrap_or(usize::MAX);
         let recordings =
             usize::try_from(state.recording_limits.max_recordings).unwrap_or(usize::MAX);
+        let lives = usize::try_from(state.live_limits.max_live)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2);
         let (commands, commands_rx) = mpsc::channel(
             COMMAND_QUEUE
                 .saturating_add(sessions)
-                .saturating_add(recordings),
+                .saturating_add(recordings)
+                .saturating_add(lives),
         );
         state.connections.insert(
             id.clone(),
             ConnectionEntry {
                 key: source.key.clone(),
-                port: source.url.port().or(source.default_port),
+                port: source.port(),
                 backchannel: source.backchannel,
                 prerecord_ms,
                 demand,
@@ -659,7 +780,7 @@ impl Supervisor {
             linger: self.settings.linger,
             ..ConnectionConfig::default()
         };
-        let span = tracing::info_span!("connection", connection.id = %id, url = %source.url);
+        let span = tracing::info_span!("connection", connection.id = %id, source = %source.target);
         let run = Driver::new(
             (spec, prerecord_ms),
             Arc::clone(&self.shared),
@@ -670,7 +791,7 @@ impl Supervisor {
         .run()
         .instrument(span);
         let _handle = spawn_named("connection.driver", self.shared.tracker.track_future(run));
-        tracing::info!(connection.id = %id, url = %source.url, options = %source.described, "connection created");
+        tracing::info!(connection.id = %id, source = %source.target, options = %source.described, "connection created");
         id
     }
 
@@ -715,6 +836,10 @@ impl Supervisor {
                 |recording| recording.stream_id == stream_id,
                 RecordingCloseReason::StreamDeleted,
             );
+            state.end_lives_where(
+                |live| live.stream_id == stream_id,
+                LiveCloseReason::StreamDeleted,
+            );
             state.streams.remove(stream_id).map(|entry| {
                 for source in entry.sources {
                     state.refresh_connection(&source.connection);
@@ -745,6 +870,34 @@ impl Supervisor {
             );
         }
         Outcome::Subscribed(self.shared.lock().subscribe(connection, stream_id))
+    }
+
+    /// `signaling/subscribe`: takes the signals of one stream's signaled
+    /// sources, or of every stream's ([`crate::signaling`]).
+    fn signaling_subscribe(
+        &self,
+        connection: ConnectionId,
+        id: u64,
+        stream_id: Option<String>,
+    ) -> Outcome {
+        if let Some(id) = &stream_id
+            && let Err(err) = StreamId::new(id)
+        {
+            return Outcome::Error(
+                ApiError::new(ErrorCode::InvalidStreamId, err.to_string())
+                    .with_detail("stream_id", id.as_str()),
+            );
+        }
+        let owner = Owner {
+            connection,
+            subscription: id,
+        };
+        let now = (self.shared.clock.now(), self.shared.clock.wall_now());
+        Outcome::Subscribed(
+            self.shared
+                .lock()
+                .signaling_subscribe(owner, stream_id, now),
+        )
     }
 
     /// `webrtc/offer`: validates, registers the session on the stream's
@@ -782,6 +935,9 @@ impl Supervisor {
         let mut ice = crate::gather::plan(offer.ice_servers.as_deref().unwrap_or_default())?;
         let (stun_servers, turn_servers) = self.gatherable(&mut ice);
         let (ice_ufrag, ice_pass) = ice_credentials().map_err(internal)?;
+        // The session answers with the host addresses of now, and keeps
+        // them for its life.
+        let hosts = self.shared.hosts.current();
 
         let mut state = self.shared.lock();
         let stream = state.streams.get(stream_id.as_str()).ok_or_else(|| {
@@ -808,8 +964,8 @@ impl Supervisor {
             offer: offer.sdp,
             ice_ufrag: ice_ufrag.clone(),
             ice_pass,
-            candidates: self.shared.hosts.clone(),
-            tcp_candidates: self.shared.tcp_hosts.clone(),
+            candidates: hosts.hosts.clone(),
+            tcp_candidates: hosts.tcp_hosts.clone(),
             audio,
             orientation: orientation.code(),
         };
@@ -828,6 +984,7 @@ impl Supervisor {
             Arc::clone(&self.shared.clock),
         );
         entry.close_slot = close_slot;
+        entry.advertise(Arc::clone(&hosts.advertisement));
         entry.deliver(
             &session_id,
             api_event(&SessionEvent::Session {
@@ -841,11 +998,15 @@ impl Supervisor {
             state.close_offer(&session_id, entry, &error, connection_state);
             return Ok(rx);
         }
-        entry.gathering(stun_servers.len().saturating_add(turn_servers.len()));
+        // Each STUN server is a gather, and the TURN queue one more.
+        entry.gathering(
+            stun_servers
+                .len()
+                .saturating_add(usize::from(!turn_servers.is_empty())),
+        );
         state.sessions.insert(session_id.clone(), entry);
         state.refresh_connection(&connection_id);
         drop(state);
-        let hosts = self.shared.hosts.len();
         tracing::info!(
             event = "session_opened",
             session.id = %session_id,
@@ -854,16 +1015,16 @@ impl Supervisor {
             control.connection = connection.0,
             audio,
             orientation = ?orientation,
-            hosts,
+            hosts = hosts.hosts.len(),
             "session opened; offer handed to the connection"
         );
-        self.start_gathering(&session_id, serial, stun_servers, turn_servers);
+        self.start_gathering(&session_id, serial, stun_servers, turn_servers, &hosts);
         Ok(rx)
     }
 
     /// The STUN and TURN servers of `ice` this front door has a client
     /// for.
-    fn gatherable(&self, ice: &mut IcePlan) -> (Vec<StunServer>, Vec<TurnServer>) {
+    fn gatherable(&self, ice: &mut IcePlan) -> (Vec<StunServer>, Vec<TurnEntry>) {
         let stun = std::mem::take(&mut ice.stun);
         let turn = std::mem::take(&mut ice.turn);
         (
@@ -880,16 +1041,20 @@ impl Supervisor {
         )
     }
 
-    /// Gathers a server-reflexive candidate from each of `stun` and a
-    /// relay candidate from each of `turn` for session `serial`, and
-    /// releases end-of-candidates after [`GATHER_DEADLINE`] whatever they
-    /// did; a lease that comes later than that is released.
+    /// Gathers a server-reflexive candidate from each of `stun`, all at
+    /// once, and relay candidates from `turn` in their queue's order
+    /// ([`crate::gather::relay_all`]) for session `serial`, on a base
+    /// among the session's `hosts`, and releases end-of-candidates after
+    /// [`GATHER_DEADLINE`] whatever they did; the TURN attempts still
+    /// running then are dropped, and a lease that comes later than that,
+    /// or is ready just as it passes, is released.
     fn start_gathering(
         &self,
         session_id: &str,
         serial: u64,
         stun: Vec<StunServer>,
-        turn: Vec<TurnServer>,
+        turn: Vec<TurnEntry>,
+        hosts: &Arc<HostSnapshot>,
     ) {
         if self.shared.stun.is_none() && self.shared.turn.is_none() {
             return;
@@ -899,28 +1064,45 @@ impl Supervisor {
             for (index, server) in stun.into_iter().enumerate() {
                 let client = Arc::clone(client);
                 let shared = Arc::clone(&self.shared);
+                let hosts = Arc::clone(hosts);
                 let id = session_id.to_owned();
                 let _handle = spawn_named("session.gather", async move {
-                    let candidate = crate::gather::gather(&client, &server, &shared.hosts)
-                        .await
-                        .map(|(mapped, base)| crate::gather::srflx_candidate(index, mapped, base));
+                    let candidate =
+                        crate::gather::gather(&client, &server, &hosts.hosts, hosts.generation)
+                            .await
+                            .map(|(mapped, base)| {
+                                let related = hosts.advertisement.related(mapped, base);
+                                crate::gather::srflx_candidate(index, mapped, related)
+                            });
                     shared.lock().session_gathered(&id, serial, candidate);
                 });
             }
         }
-        if let Some(client) = &self.shared.turn {
-            for server in turn {
-                let client = Arc::clone(client);
-                let shared = Arc::clone(&self.shared);
-                let id = session_id.to_owned();
-                let _handle = spawn_named("session.relay", async move {
-                    let relayed = tokio::select! {
-                        relayed = crate::gather::relay(&client, &server, &shared.hosts) => relayed,
-                        () = shared.clock.sleep(GATHER_DEADLINE) => None,
-                    };
-                    shared.lock().session_relayed(&id, serial, relayed);
-                });
-            }
+        if let Some(client) = &self.shared.turn
+            && !turn.is_empty()
+        {
+            let client = Arc::clone(client);
+            let shared = Arc::clone(&self.shared);
+            let hosts = Arc::clone(hosts);
+            let id = session_id.to_owned();
+            // The deadline counts from now, not from the task's first poll.
+            let deadline = shared.clock.sleep(GATHER_DEADLINE);
+            let _handle = spawn_named("session.relay", async move {
+                let mut leased = |relayed| shared.lock().session_relayed(&id, serial, relayed);
+                let cut = crate::gather::relay_all(
+                    &client,
+                    shared.clock.as_ref(),
+                    turn,
+                    &hosts,
+                    deadline,
+                    &mut leased,
+                )
+                .await;
+                // Cut short: the attempts still running at the deadline
+                // were dropped, and a lease ready just then released.
+                tracing::debug!(session.id = id, cut_by_deadline = cut, "turn attempts over");
+                shared.lock().session_relays_done(&id, serial);
+            });
         }
         let id = session_id.to_owned();
         self.shared
@@ -997,18 +1179,14 @@ impl Supervisor {
         Outcome::Result(serde_json::Value::Object(serde_json::Map::new()))
     }
 
-    /// `webrtc/renegotiate`: passed on to the session's worker, whose
+    /// `webrtc/reoffer`: passed on to the session's worker, whose
     /// answer or refusal is the result; waited for up to
-    /// [`RENEGOTIATE_TIMEOUT`] on the daemon's clock. Like
+    /// [`REOFFER_TIMEOUT`] on the daemon's clock. Like
     /// `webrtc/candidate`, only the connection that owns the session may
     /// send one, and only once the session is answered; a session has one
     /// re-offer out at a time, until the worker answers it, even when its
-    /// command gave up ([`SessionEntry::renegotiate`]).
-    async fn webrtc_renegotiate(
-        &self,
-        connection: ConnectionId,
-        command: WebrtcRenegotiate,
-    ) -> Outcome {
+    /// command gave up ([`SessionEntry::reoffer`]).
+    async fn webrtc_reoffer(&self, connection: ConnectionId, command: WebrtcReoffer) -> Outcome {
         let session_id = command.session_id;
         let (reply, waiting) = oneshot::channel();
         {
@@ -1031,14 +1209,14 @@ impl Supervisor {
                     .with_detail("session_id", session_id.as_str()),
                 );
             }
-            if let Err(error) = session.renegotiate(reply) {
+            if let Err(error) = session.reoffer(reply) {
                 return Outcome::Error(error.with_detail("session_id", session_id.as_str()));
             }
             let connection = session.connection.clone();
             let queued = state.connections.get(&connection).is_some_and(|entry| {
                 entry
                     .commands
-                    .try_send(DriverCommand::Renegotiate {
+                    .try_send(DriverCommand::Reoffer {
                         session_id: session_id.clone(),
                         sdp: command.sdp,
                     })
@@ -1046,7 +1224,7 @@ impl Supervisor {
             });
             if !queued {
                 if let Some(session) = state.sessions.get_mut(&session_id) {
-                    session.renegotiation_unsent();
+                    session.reoffer_unsent();
                 }
                 return Outcome::Error(
                     ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
@@ -1056,7 +1234,7 @@ impl Supervisor {
             drop(state);
         }
         tracing::info!(
-            event = "session_renegotiate",
+            event = "session_reoffered",
             session.id = %session_id,
             "re-offer handed to the worker"
         );
@@ -1065,7 +1243,7 @@ impl Supervisor {
             // The re-offer stays out until the worker's report, which
             // then goes nowhere: the next re-offer is refused till then,
             // so a late report never answers it.
-            () = self.shared.clock.sleep(RENEGOTIATE_TIMEOUT) => {
+            () = self.shared.clock.sleep(REOFFER_TIMEOUT) => {
                 tracing::warn!(session.id = %session_id, "re-offer not answered by the worker in time");
                 return Outcome::Error(
                     ApiError::new(ErrorCode::InternalError, "the worker did not answer the re-offer")
@@ -1076,12 +1254,12 @@ impl Supervisor {
         match answer {
             Ok(Ok(sdp)) => {
                 tracing::info!(
-                    event = "session_renegotiated",
+                    event = "session_reoffer_answered",
                     session.id = %session_id,
                     "re-offer answered"
                 );
                 Outcome::Result(
-                    serde_json::to_value(WebrtcRenegotiateResult { sdp }).unwrap_or_default(),
+                    serde_json::to_value(WebrtcReofferResult { sdp }).unwrap_or_default(),
                 )
             }
             Ok(Err(error)) => {
@@ -1172,9 +1350,10 @@ impl Supervisor {
             .sources
             .iter()
             .filter(|source| {
-                self.registries
-                    .sources
-                    .get(source.url.scheme())
+                source
+                    .target
+                    .url()
+                    .and_then(|url| self.registries.sources.get(url.scheme()))
                     .is_some_and(|factory| factory.capabilities().backchannel)
             })
             .filter_map(|source| state.connections.get(&source.connection))
@@ -1326,6 +1505,178 @@ impl Supervisor {
         Ok((result, rx))
     }
 
+    /// `live/create`: validates against the limits, creates the output's
+    /// pipe, hands its start with the write end to the stream's
+    /// connection's driver (which raises its demand: a live output is a
+    /// viewer), and waits for the worker's init segment, whose MIME type the
+    /// result carries, for at most `limits.live_start_timeout_ms` and
+    /// [`LIVE_CREATE_SLACK`]: the one command that waits on the camera,
+    /// bounded, as `webrtc/reoffer` waits on a worker. The control
+    /// connection reads and answers its further commands meanwhile, so an
+    /// on-demand signaled source this output starts can be answered on the
+    /// same connection (its `signaling/answer`) and send the init segment.
+    /// Then the fetch deadline runs until the body is taken. The command's
+    /// future may be dropped at its wait (the client removed, shutdown, the
+    /// connection closed): the output stays registered with its owner,
+    /// whose connection's close ends it.
+    async fn live_create(
+        &self,
+        connection: ConnectionId,
+        create: &LiveCreate,
+    ) -> Result<(LiveCreateResult, mpsc::Receiver<Event>), ApiError> {
+        let stream_id = StreamId::new(&create.stream_id).map_err(|err| {
+            ApiError::new(ErrorCode::InvalidStreamId, err.to_string())
+                .with_detail("stream_id", create.stream_id.as_str())
+        })?;
+        let live_id = LiveId::new(&ulid(self.shared.clock.wall_now()).map_err(internal)?)
+            .map_err(internal)?;
+        let (reader, writer) = std::io::pipe().map_err(internal)?;
+        let reader =
+            tokio::net::unix::pipe::Receiver::from_owned_fd(reader.into()).map_err(internal)?;
+        let (events, rx) = mpsc::channel(LIVE_QUEUE);
+        let (waiting, started) = oneshot::channel();
+        let limits = {
+            let mut state = self.shared.lock();
+            let limits = state.live_limits;
+            check_live_limits(&mut state, stream_id.as_str(), limits, "live/create")?;
+            let stream = state.streams.get(stream_id.as_str()).ok_or_else(|| {
+                ApiError::new(ErrorCode::StreamNotFound, "no such stream")
+                    .with_detail("stream_id", stream_id.as_str())
+            })?;
+            let SessionConnection {
+                id: connection_id,
+                commands,
+                ..
+            } = session_connection(&state, stream)?;
+            let spec = LiveSpec {
+                live_id: live_id.as_str().to_owned(),
+                audio: create.audio,
+                buffer_bytes: limits.buffer_bytes,
+                framed: false,
+            };
+            let (fetch_slot, stop_slot) = hand_over_live(&commands, spec, writer.into())?;
+            let serial = state.last_live.saturating_add(1);
+            state.last_live = serial;
+            state.lives.insert(
+                live_id.as_str().to_owned(),
+                LiveEntry {
+                    serial,
+                    stream_id: stream_id.as_str().to_owned(),
+                    connection: connection_id.clone(),
+                    owner: Some(LiveOwner {
+                        connection,
+                        subscription: create.id,
+                        events,
+                    }),
+                    waiting: Some(waiting),
+                    mime: None,
+                    body: Some(reader),
+                    fetch_slot: Some(fetch_slot),
+                    stop_slot: Some(stop_slot),
+                    ending: None,
+                    warned: false,
+                    timer: None,
+                },
+            );
+            state.refresh_connection(&connection_id);
+            drop(state);
+            tracing::info!(
+                event = "live_opened",
+                live.id = %live_id,
+                stream.id = %stream_id,
+                connection.id = %connection_id,
+                control.connection = connection.0,
+                audio = create.audio,
+                "live output opened; waiting for its init segment"
+            );
+            limits
+        };
+        let wait = limits.start_timeout.saturating_add(LIVE_CREATE_SLACK);
+        let outcome = tokio::select! {
+            outcome = started => outcome.unwrap_or(Err(LiveCloseReason::InternalError)),
+            () = self.shared.clock.sleep(wait) => Err(LiveCloseReason::SourceNotLive),
+        };
+        let mime = match outcome {
+            Ok(mime) => mime,
+            Err(reason) => {
+                self.shared.lock().end_live(live_id.as_str(), reason);
+                tracing::info!(live.id = %live_id, reason = reason.as_str(), "live output ended before its init segment");
+                return Err(live_start_error(reason).with_detail("live_id", live_id.as_str()));
+            }
+        };
+        let timer = self.live_fetch_deadline(live_id.as_str(), limits.fetch_timeout);
+        if let Some(entry) = self.shared.lock().lives.get_mut(live_id.as_str()) {
+            entry.timer = Some(timer);
+        }
+        let result = LiveCreateResult {
+            url: live_path(live_id.as_str()),
+            live_id: live_id.as_str().to_owned(),
+            mime,
+        };
+        Ok((result, rx))
+    }
+
+    /// The fetch deadline of live output `live_id`, `timeout` from now on the
+    /// injected clock ([`State::live_fetch_deadline`]).
+    fn live_fetch_deadline(&self, live_id: &str, timeout: Duration) -> RecordingTimer {
+        let sleep = self.shared.clock.sleep(timeout);
+        let serial = self
+            .shared
+            .lock()
+            .lives
+            .get(live_id)
+            .map_or(0, |entry| entry.serial);
+        let shared = Arc::clone(&self.shared);
+        let id = live_id.to_owned();
+        let timer = spawn_named("live.fetch", async move {
+            sleep.await;
+            shared.lock().live_fetch_deadline(&id, serial);
+        });
+        RecordingTimer(timer.abort_handle())
+    }
+
+    /// `live/close`: ends a live output `closed`; one not open is
+    /// `live_not_found`.
+    fn live_close(&self, live_id: &str) -> Result<(), ApiError> {
+        let open = self.shared.lock().lives.contains_key(live_id);
+        if !open {
+            return Err(
+                ApiError::new(ErrorCode::LiveNotFound, "no open live output has this id")
+                    .with_detail("live_id", live_id),
+            );
+        }
+        self.shared
+            .lock()
+            .end_live(live_id, LiveCloseReason::Closed);
+        Ok(())
+    }
+
+    /// `hls/close`: ends an LL-HLS session `closed`; one not open is
+    /// `hls_not_found`.
+    fn hls_close(&self, hls_id: &str) -> Result<(), ApiError> {
+        if self
+            .shared
+            .lock()
+            .close_hls_session(hls_id, HlsCloseReason::Closed, true)
+        {
+            Ok(())
+        } else {
+            Err(
+                ApiError::new(ErrorCode::HlsNotFound, "no open LL-HLS session has this id")
+                    .with_detail("hls_id", hls_id),
+            )
+        }
+    }
+
+    /// `hls/create` ([`crate::hls::create`]).
+    async fn hls_create(
+        &self,
+        connection: ConnectionId,
+        create: &HlsCreate,
+    ) -> Result<(HlsCreateResult, mpsc::Receiver<Event>), ApiError> {
+        crate::hls::create(&self.shared, connection, create).await
+    }
+
     /// The fetch deadline of recording `serial`, `recording_id`, `timeout` from now on
     /// the injected clock ([`State::recording_fetch_deadline`]).
     fn fetch_deadline(&self, recording_id: &str, serial: u64, timeout: Duration) -> RecordingTimer {
@@ -1361,9 +1712,7 @@ impl Supervisor {
                 Err(error) => Outcome::Error(error),
             },
             Command::WebrtcCandidate(candidate) => self.webrtc_candidate(connection, &candidate),
-            Command::WebrtcRenegotiate(renegotiate) => {
-                self.webrtc_renegotiate(connection, renegotiate).await
-            }
+            Command::WebrtcReoffer(reoffer) => self.webrtc_reoffer(connection, reoffer).await,
             Command::SessionGet(get) => self.session_get(&get.session_id),
             Command::SessionList(_) => self.session_list(),
             Command::SessionClose(close) => self.session_close(&close.session_id),
@@ -1383,12 +1732,47 @@ impl Supervisor {
                     Outcome::Error(error)
                 }
             },
+            Command::LiveCreate(create) => match self.live_create(connection, &create).await {
+                Ok((result, events)) => Outcome::SubscribedWith {
+                    result: serde_json::to_value(result).unwrap_or_default(),
+                    events,
+                },
+                Err(error) => {
+                    tracing::debug!(code = error.code.as_str(), detail = %error.message, "live/create refused");
+                    Outcome::Error(error)
+                }
+            },
+            Command::LiveClose(close) => empty(self.live_close(&close.live_id)),
+            Command::HlsCreate(create) => match self.hls_create(connection, &create).await {
+                Ok((result, events)) => Outcome::SubscribedWith {
+                    result: serde_json::to_value(result).unwrap_or_default(),
+                    events,
+                },
+                Err(error) => {
+                    tracing::debug!(code = error.code.as_str(), detail = %error.message, "hls/create refused");
+                    Outcome::Error(error)
+                }
+            },
+            Command::HlsClose(close) => empty(self.hls_close(&close.hls_id)),
+            Command::SignalingSubscribe(subscribe) => {
+                self.signaling_subscribe(connection, subscribe.id, subscribe.stream_id)
+            }
+            Command::SignalingAnswer(answer) => {
+                empty(self.shared.lock().signal_answer(connection, &answer))
+            }
+            Command::SignalingCandidate(candidate) => {
+                empty(self.shared.lock().signal_candidate(connection, &candidate))
+            }
+            Command::SignalingError(error) => {
+                empty(self.shared.lock().signal_error(connection, &error))
+            }
             Command::Ping(_)
             | Command::Schema(_)
             | Command::Unsubscribe(_)
             | Command::PairingCreate(_)
             | Command::ClientsList(_)
-            | Command::ClientsRemove(_) => {
+            | Command::ClientsRemove(_)
+            | Command::ClientsAdd(_) => {
                 tracing::error!(
                     command = command.name(),
                     "the server answers this command itself"
@@ -1422,10 +1806,15 @@ impl Handler for Supervisor {
     }
 
     /// A session's ends with its `closed`; a recording's is stopped, and its
-    /// `closed` goes nowhere, the client having asked for no more events.
+    /// `closed` goes nowhere, the client having asked for no more events;
+    /// a signaling one ends its signals, whose sources connect again.
     fn unsubscribed(&self, connection: ConnectionId, subscription: u64) -> Option<Event> {
         let mut state = self.shared.lock();
-        if state.unsubscribe_recording(connection, subscription) {
+        if state.unsubscribe_recording(connection, subscription)
+            || state.unsubscribe_live(connection, subscription)
+            || state.unsubscribe_hls(connection, subscription)
+            || state.signaling_unsubscribed(connection, subscription)
+        {
             return None;
         }
         let session_id = state
@@ -1441,11 +1830,14 @@ impl Handler for Supervisor {
         )
     }
 
-    /// Its sessions are orphaned for the grace, its recordings end at once.
+    /// Its sessions are orphaned for the grace, its recordings and its
+    /// signaling subscriptions end at once.
     fn connection_closed(&self, connection: ConnectionId) {
         let orphans = {
             let mut state = self.shared.lock();
             state.recordings_connection_closed(connection);
+            state.lives_connection_closed(connection);
+            state.hls_connection_closed(connection);
             state.connection_closed(connection)
         };
         for (id, serial, epoch) in orphans {
@@ -1472,6 +1864,30 @@ impl Handler for Supervisor {
         }
     }
 
+    /// Hands out the read end of a live output's pipe once, with its MIME
+    /// type; the worker is told a reader took it.
+    fn live_body(&self, live_id: &LiveId) -> Result<LiveBody, LiveBodyError> {
+        let body = self.shared.lock().take_live_body(live_id.as_str());
+        if let Err(error) = &body {
+            tracing::debug!(live.id = %live_id, %error, "live body refused");
+        }
+        body
+    }
+
+    /// Answers an LL-HLS request from its session's window, waiting,
+    /// bounded, for what it does not hold yet (`crate::hls::serve`).
+    fn hls(&self, hls_id: &HlsId, request: HlsRequest) -> impl Future<Output = HlsAnswer> + Send {
+        let shared = Arc::clone(&self.shared);
+        let hls_id = hls_id.clone();
+        async move { crate::hls::serve(&shared, &hls_id, request).await }
+    }
+
+    /// The snapshot `metrics/get` answers with, for `GET /v0/metrics`: the
+    /// one collection of the numbers.
+    async fn metrics_snapshot(&self) -> Option<Metrics> {
+        Some(self.metrics().await)
+    }
+
     /// Hands out the read end of the recording's pipe once, with the way its
     /// worker's `bytes` reach the body.
     fn recording_body(
@@ -1491,6 +1907,15 @@ impl Handler for Supervisor {
             }
         }
         body
+    }
+}
+
+/// The empty result of a command that changed what `result` says, or its
+/// refusal.
+fn empty(result: Result<(), ApiError>) -> Outcome {
+    match result {
+        Ok(()) => Outcome::Result(serde_json::Value::Object(serde_json::Map::new())),
+        Err(error) => Outcome::Error(error),
     }
 }
 
@@ -1514,7 +1939,7 @@ fn unchanged(entry: &StreamEntry, put: &StreamPut, validated: &[ValidatedSource]
             .sources
             .iter()
             .zip(validated)
-            .all(|(a, b)| a.url == b.url && a.options == b.options)
+            .all(|(a, b)| a.target == b.target && a.options == b.options)
 }
 
 /// `source_in_use` when a source of `stream_id`'s put is another stream's
@@ -1526,19 +1951,19 @@ fn source_in_use(
     validated: &[ValidatedSource],
 ) -> Option<ApiError> {
     validated.iter().find_map(|source| {
-        let other = state.stream_with_source(stream_id, &source.url)?;
+        let url = source.target.url()?;
+        let other = state.stream_with_source(stream_id, url)?;
         tracing::info!(
             stream.id = %stream_id,
             other.id = %other,
-            url = %source.url,
+            url = %url,
             "stream/put refused: the source is another stream's"
         );
         Some(
             ApiError::new(
                 ErrorCode::SourceInUse,
                 format!(
-                    "{} is already the source of stream {other}; use that stream id, or put {other} with the new source",
-                    source.url
+                    "{url} is already the source of stream {other}; use that stream id, or put {other} with the new source"
                 ),
             )
             .with_detail("stream_id", other),
@@ -1550,22 +1975,28 @@ fn source_in_use(
 fn driver_spec(id: &str, source: &ValidatedSource) -> DriverSpec {
     DriverSpec {
         connection_id: id.to_owned(),
-        url: source.raw.clone(),
+        target: source.raw.clone(),
         options: serde_json::Value::Object(source.options.clone()).to_string(),
-        host: source.url.host().to_owned(),
-        port: source.url.port().or(source.default_port),
+        host: source
+            .target
+            .url()
+            .map(|url| url.host().to_owned())
+            .unwrap_or_default(),
+        port: source.port(),
         backchannel: source.backchannel,
     }
 }
 
 /// Whether connection `id` can switch to `source` in place, keeping its
 /// worker and so its sessions: the worker's sandbox is pinned to the port
-/// it may connect to, so a source on another port needs a new worker.
+/// it may connect to, so a source on another port needs a new worker. A
+/// signaled source never switches in place, to or from: its standby would
+/// be a second signal of one camera, offered while the first still
+/// streams.
 fn switchable(state: &State, id: &str, source: &ValidatedSource) -> bool {
-    state
-        .connections
-        .get(id)
-        .is_some_and(|entry| entry.port == source.url.port().or(source.default_port))
+    state.connections.get(id).is_some_and(|entry| {
+        !entry.key.target.signaled() && !source.target.signaled() && entry.port == source.port()
+    })
 }
 
 /// Closes the sessions and ends the recordings of `stream_id` that are not on
@@ -1588,6 +2019,10 @@ fn close_moved_sessions(state: &mut State, stream_id: &str) {
             recording.stream_id == stream_id && current.as_ref() != Some(&recording.connection)
         },
         RecordingCloseReason::StreamChanged,
+    );
+    state.end_lives_where(
+        |live| live.stream_id == stream_id && current.as_ref() != Some(&live.connection),
+        LiveCloseReason::StreamChanged,
     );
 }
 
@@ -1637,7 +2072,8 @@ fn check_recording_request(
                 start.prerecord_ms, limits.max_prerecord_ms
             ),
         )
-        .with_detail("field", "prerecord_ms"));
+        .with_detail("field", "prerecord_ms")
+        .with_detail("limit", "max_prerecord_ms"));
     }
     if start.duration_ms > limits.max_recording_ms {
         return Err(ApiError::new(
@@ -1647,7 +2083,8 @@ fn check_recording_request(
                 start.duration_ms, limits.max_recording_ms
             ),
         )
-        .with_detail("field", "duration_ms"));
+        .with_detail("field", "duration_ms")
+        .with_detail("limit", "max_recording_ms"));
     }
     if state.recordings_held() >= usize::try_from(limits.max_recordings).unwrap_or(usize::MAX) {
         return Err(
@@ -1720,19 +2157,110 @@ fn hand_over_recording(
     Ok(stop)
 }
 
+/// `limit_reached` when another live output would exceed `limits.max_live`
+/// or, on `stream_id`, `limits.max_live_per_stream`; the refusal of
+/// `command` (`live/create`, or `hls/create` starting an output) is logged
+/// at warn, rate-limited, since a client can ask again and again.
+pub(crate) fn check_live_limits(
+    state: &mut State,
+    stream_id: &str,
+    limits: LiveLimits,
+    command: &'static str,
+) -> Result<(), ApiError> {
+    let (on_stream, total) = state.lives_open(stream_id);
+    let (limit, refused) = if total >= usize::try_from(limits.max_live).unwrap_or(usize::MAX) {
+        ("max_live", "too many live outputs")
+    } else if on_stream >= usize::try_from(limits.max_live_per_stream).unwrap_or(usize::MAX) {
+        ("max_live_per_stream", "too many live outputs of the stream")
+    } else {
+        return Ok(());
+    };
+    if let Some(count) = state.full_lives.hit(state.signaling.clock.now()) {
+        tracing::warn!(
+            stream.id = stream_id,
+            limit,
+            on_stream,
+            total,
+            count,
+            command,
+            "live output refused at its limit"
+        );
+    }
+    Err(ApiError::new(ErrorCode::LimitReached, refused).with_detail("limit", limit))
+}
+
+/// The error `live/create` answers with when its output ended for `reason`
+/// before its init segment.
+fn live_start_error(reason: LiveCloseReason) -> ApiError {
+    match reason {
+        LiveCloseReason::NoVideoTrack => {
+            ApiError::new(ErrorCode::NoVideoTrack, "the stream has no video track")
+        }
+        LiveCloseReason::SourceNotLive => ApiError::new(
+            ErrorCode::SourceNotLive,
+            "the stream showed no video the live container carries in time",
+        ),
+        LiveCloseReason::WorkerCrashed => ApiError::new(
+            ErrorCode::WorkerCrashed,
+            "the camera's worker process exited",
+        ),
+        LiveCloseReason::ShuttingDown => ApiError::new(ErrorCode::ShuttingDown, "shutting down"),
+        LiveCloseReason::StreamDeleted => {
+            ApiError::new(ErrorCode::StreamNotFound, "the stream was deleted")
+        }
+        LiveCloseReason::SessionClosed => ApiError::new(
+            ErrorCode::LiveNotFound,
+            "the live output was closed before it started: its subscription was unsubscribed",
+        ),
+        other => ApiError::new(
+            ErrorCode::InternalError,
+            "the live output ended before it started",
+        )
+        .with_detail("reason", other.as_str()),
+    }
+}
+
+/// Hands the start of live output `spec`, with `pipe`, to its connection's
+/// driver, and returns the slots reserved behind it for its fetch and its
+/// stop; a queue without room for all three is `limit_reached`.
+pub(crate) fn hand_over_live(
+    commands: &mpsc::Sender<DriverCommand>,
+    spec: LiveSpec,
+    pipe: std::os::fd::OwnedFd,
+) -> Result<
+    (
+        mpsc::OwnedPermit<DriverCommand>,
+        mpsc::OwnedPermit<DriverCommand>,
+    ),
+    ApiError,
+> {
+    let busy = |_| {
+        ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
+            .with_detail("limit", "connection_queue")
+    };
+    let start = commands.clone().try_reserve_owned().map_err(busy)?;
+    let fetch = commands.clone().try_reserve_owned().map_err(busy)?;
+    let stop = commands.clone().try_reserve_owned().map_err(busy)?;
+    drop(start.send(DriverCommand::StartLive { spec, pipe }));
+    Ok((fetch, stop))
+}
+
 /// The connection a session opens on, as [`session_connection`] finds it.
-struct SessionConnection {
+pub(crate) struct SessionConnection {
     /// The connection's id.
-    id: String,
+    pub(crate) id: String,
     /// The connection's command queue.
-    commands: mpsc::Sender<DriverCommand>,
+    pub(crate) commands: mpsc::Sender<DriverCommand>,
     /// The failure a session waiting for its answer closes with, and the
     /// connection's state with it; none while the connection can answer.
     failure: Option<(ConnectionError, ConnectionState)>,
 }
 
 /// The connection a session of `stream` opens on: its first source's.
-fn session_connection(state: &State, stream: &StreamEntry) -> Result<SessionConnection, ApiError> {
+pub(crate) fn session_connection(
+    state: &State,
+    stream: &StreamEntry,
+) -> Result<SessionConnection, ApiError> {
     stream
         .sources
         .first()
@@ -1786,7 +2314,7 @@ fn invalid_session_id(session_id: &str) -> ApiError {
 }
 
 /// `internal_error` for a failure that is a bug or a broken host.
-fn internal(error: impl std::fmt::Display) -> ApiError {
+pub(crate) fn internal(error: impl std::fmt::Display) -> ApiError {
     tracing::error!(error = %error, "internal error");
     ApiError::new(ErrorCode::InternalError, error.to_string())
 }
@@ -1809,7 +2337,7 @@ fn demux_metrics(stats: &DemuxStats) -> DemuxMetrics {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::arithmetic_side_effects,
         clippy::missing_docs_in_private_items,
@@ -1827,12 +2355,13 @@ mod tests {
     use lotse_core::connection::{ConnectionError, ConnectionState};
     use lotse_core::let_assert;
     use lotse_core::source::SourceError;
-    use lotse_core::test_util::{FakeOutputFactory, FakeSourceFactory};
+    use lotse_core::test_util::{FakeOutputFactory, FakeSignaledSourceFactory, FakeSourceFactory};
     use lotse_ipc::SessionEvent as Report;
     use serde_json::{Value, json};
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::host_cache::test_support::Interfaces;
     use crate::test_support::{Captured, environment, private_dir, settings};
 
     #[test]
@@ -1851,17 +2380,17 @@ mod tests {
         Supervisor::new(settings, environment(binary), clock)
     }
 
-    async fn call(supervisor: &Supervisor, command: &str) -> Outcome {
+    pub(crate) async fn call(supervisor: &Supervisor, command: &str) -> Outcome {
         let command = parse_command(command).expect(command);
         supervisor.handle(ConnectionId(1), command).await
     }
 
-    fn result(outcome: Outcome) -> Value {
+    pub(crate) fn result(outcome: Outcome) -> Value {
         let_assert!(Outcome::Result(value) = outcome);
         value
     }
 
-    fn error(outcome: Outcome) -> ApiError {
+    pub(crate) fn error(outcome: Outcome) -> ApiError {
         let_assert!(Outcome::Error(err) = outcome);
         err
     }
@@ -1873,7 +2402,7 @@ mod tests {
 
     /// The next event, failing the test after 10 s instead of hanging it
     /// (a lost event is a failure, not a timeout of the mutation run).
-    async fn next(rx: &mut mpsc::Receiver<Event>) -> Value {
+    pub(crate) async fn next(rx: &mut mpsc::Receiver<Event>) -> Value {
         tokio::select! {
             event = rx.recv() => event.expect("an event").payload,
             () = SystemClock.sleep(Duration::from_secs(10)) => panic!("no event in 10 s"),
@@ -1881,22 +2410,24 @@ mod tests {
     }
     /// `future`'s output, or a failed test after five seconds of real
     /// time: a command whose answer never comes fails instead of hanging.
-    async fn within<T>(future: impl Future<Output = T>) -> T {
+    pub(crate) async fn within<T>(future: impl Future<Output = T>) -> T {
         tokio::select! {
             output = future => output,
             () = SystemClock.sleep(Duration::from_secs(5)) => panic!("nothing within 5 s"),
         }
     }
 
-    fn put(stream_id: &str, url: &str, preload: bool) -> String {
+    /// A `stream/put` of one source at `url`, named by its scheme.
+    pub(crate) fn put(stream_id: &str, url: &str, preload: bool) -> String {
+        let protocol = url.split_once("://").map_or(url, |(scheme, _)| scheme);
         json!({ "id": 1, "type": "stream/put", "stream_id": stream_id,
-                "sources": [{ "url": url }], "preload": preload })
+                "sources": [{ "protocol": protocol, "url": url }], "preload": preload })
         .to_string()
     }
 
     /// A worker that ignores its arguments and blocks, standing in for a
     /// worker that never reports.
-    fn blocking_worker(dir: &std::path::Path) -> String {
+    pub(crate) fn blocking_worker(dir: &std::path::Path) -> String {
         let path = dir.join("worker.sh");
         std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1904,7 +2435,7 @@ mod tests {
     }
 
     /// Settings with at most two sessions per stream and three in all.
-    fn session_settings() -> Settings {
+    pub(crate) fn session_settings() -> Settings {
         let mut settings = settings(PathBuf::from("/nonexistent/lotse.sock"));
         settings.shutdown_budget = Duration::from_millis(200);
         settings.limits.max_sessions = 3;
@@ -1931,6 +2462,7 @@ mod tests {
             registrations: Arc::new(Registrations::default()),
             hosts: vec!["192.0.2.1:18556".parse().unwrap()],
             tcp_hosts: vec!["192.0.2.1:18557".parse().unwrap()],
+            scan: None,
             stun: None,
             turn: None,
             demux: None,
@@ -1938,7 +2470,11 @@ mod tests {
         Supervisor::new(session_settings(), webrtc_environment(binary, door), clock)
     }
 
-    async fn call_on(supervisor: &Supervisor, connection: u64, command: &Value) -> Outcome {
+    pub(crate) async fn call_on(
+        supervisor: &Supervisor,
+        connection: u64,
+        command: &Value,
+    ) -> Outcome {
         let command = parse_command(&command.to_string()).unwrap();
         supervisor.handle(ConnectionId(connection), command).await
     }
@@ -1966,10 +2502,10 @@ mod tests {
             (hello.api.as_str(), hello.version.as_str()),
             (API_VERSION, "0.0.0-test")
         );
-        assert!(hello.outputs.is_empty());
+        assert_eq!(hello.outputs, Vec::<String>::new());
         assert_eq!(hello.features, ["session_adopt"]);
         let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
-        assert_eq!(info["schemes"], json!(["fake"]));
+        assert_eq!(info["protocols"], json!(["fake", "fake-signaled"]));
         assert_eq!(info["build"]["target"], "test");
         // Only what an output can play: MJPEG is ingested and reported per
         // track, but no output negotiates it.
@@ -2021,7 +2557,7 @@ mod tests {
         let _logs = captured.install();
         // A window asked for is refused, not ignored.
         let windowed = json!({ "id": 2, "type": "stream/put", "stream_id": "front",
-                               "sources": [{ "url": "fake://127.0.0.1/" }], "prerecord_ms": 1 });
+                               "sources": [{ "protocol": "fake", "url": "fake://127.0.0.1/" }], "prerecord_ms": 1 });
         let err = error(call(&s, &windowed.to_string()).await);
         assert_eq!(err.code, ErrorCode::InvalidRequest);
         assert_eq!(
@@ -2029,6 +2565,7 @@ mod tests {
             "`prerecord_ms` is 1, the maximum is 0 (`limits.max_prerecord_ms`)"
         );
         assert_eq!(err.details["field"], "prerecord_ms");
+        assert_eq!(err.details["limit"], "max_prerecord_ms");
         assert!(s.shared.lock().streams.is_empty());
         let err = error(
             call(
@@ -2174,16 +2711,22 @@ mod tests {
             registrations: Arc::new(Registrations::default()),
             hosts: vec!["192.0.2.1:18556".parse().unwrap()],
             tcp_hosts: Vec::new(),
+            scan: None,
             stun: None,
             turn: None,
             demux: None,
         };
         let mut environment = webrtc_environment(&blocking_worker(&dir), door);
-        environment
-            .registries
-            .sources
-            .register(Arc::new(FakeSourceFactory::with_backchannel(&["talk"])))
+        // The fake protocol carries audio back here; the signaled one,
+        // which has no URL, does not.
+        let mut sources = lotse_core::registry::SourceRegistry::default();
+        sources
+            .register(Arc::new(FakeSourceFactory::with_backchannel(&["fake"])))
             .unwrap();
+        sources
+            .register_signaled(Arc::new(FakeSignaledSourceFactory::new("fake-signaled")))
+            .unwrap();
+        environment.registries.sources = sources;
         let s = Supervisor::new(session_settings(), environment, Arc::new(SystemClock));
         let release = |id: u64, stream_id: &str| json!({ "id": id, "type": "backchannel/release", "stream_id": stream_id });
         let err = error(call_on(&s, 1, &release(1, "ghost")).await);
@@ -2191,14 +2734,14 @@ mod tests {
             (err.code, &err.details["stream_id"]),
             (ErrorCode::StreamNotFound, &json!("ghost"))
         );
-        result(call(&s, &put("plain", "fake://127.0.0.1:1/", false)).await);
+        result(call(&s, &put_signaled("plain", "fake-signaled", &json!({}))).await);
         let err = error(call_on(&s, 1, &release(2, "plain")).await);
         assert_eq!(
             (err.code, &err.details["stream_id"]),
             (ErrorCode::BackchannelUnsupported, &json!("plain"))
         );
 
-        result(call(&s, &put("front", "talk://127.0.0.1:1/", false)).await);
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let connection = s.shared.lock().streams["front"].sources[0]
             .connection
             .clone();
@@ -2275,17 +2818,51 @@ mod tests {
             .await,
         );
         assert_eq!(err.code, ErrorCode::InvalidRequest);
-        let err = error(call(&s, &put("a", "rtsp://cam/", false)).await);
-        assert_eq!(err.code, ErrorCode::SchemeUnsupported);
-        assert_eq!(err.details["scheme"], "rtsp");
-        let err = error(call(&s, &put("a", "not a url", false)).await);
+        // A protocol the API defines but this build did not register,
+        // either kind.
+        for source in [
+            json!({ "protocol": "rtsp", "url": "rtsp://cam/" }),
+            json!({ "protocol": "webrtc" }),
+        ] {
+            let put =
+                json!({ "id": 1, "type": "stream/put", "stream_id": "a", "sources": [source] });
+            let err = error(call(&s, &put.to_string()).await);
+            assert_eq!(err.code, ErrorCode::ProtocolUnsupported, "{source}");
+            assert_eq!(err.details["protocol"], source["protocol"]);
+            assert_eq!(
+                err.message,
+                format!(
+                    "this build has no {} source",
+                    source["protocol"].as_str().unwrap()
+                )
+            );
+        }
+        // One the API does not define is no request.
+        let err = parse_command(&put("a", "rtmp://cam/", false)).unwrap_err();
+        assert_eq!(err.error.code, ErrorCode::InvalidRequest);
+        assert!(
+            err.error.message.contains("unknown variant"),
+            "{}",
+            err.error
+        );
+        let source = |url: &str| {
+            json!({ "id": 1, "type": "stream/put", "stream_id": "a",
+                    "sources": [{ "protocol": "fake", "url": url }] })
+            .to_string()
+        };
+        let err = error(call(&s, &source("not a url")).await);
         assert_eq!(err.code, ErrorCode::InvalidRequest);
         assert!(err.message.contains("source url"), "{err}");
+        // A URL protocol's name is its URL's scheme.
+        let err = error(call(&s, &source("rtsp://cam/")).await);
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert_eq!(err.message, "protocol fake takes fake:// urls, not rtsp://");
+        assert_eq!(err.details["protocol"], "fake");
         let err = error(
             call(
                 &s,
                 &json!({ "id": 1, "type": "stream/put", "stream_id": "a",
-                         "sources": [{ "url": "fake://cam/", "options": { "x": 1 } }] })
+                         "sources": [{ "protocol": "fake", "url": "fake://cam/", "x": 1 }] })
                 .to_string(),
             )
             .await,
@@ -2324,7 +2901,11 @@ mod tests {
         let url = "fake://admin:pw5b1c@cam:8/camkey7f3a/live?token=tok9d2e";
         result(call(&s, &put("front", url, false)).await);
         let front = result(call(&s, r#"{"id":1,"type":"stream/get","stream_id":"front"}"#).await);
-        assert_eq!(front["sources"][0]["url"], "fake://****@cam:8/****?****");
+        // In the shape `stream/put` took it, the URL redacted.
+        assert_eq!(
+            front["sources"][0]["source"],
+            json!({ "protocol": "fake", "url": "fake://****@cam:8/****?****" })
+        );
         let list = result(call(&s, r#"{"id":1,"type":"stream/list"}"#).await);
         let listed = list.to_string();
         for secret in ["pw5b1c", "camkey7f3a", "tok9d2e"] {
@@ -2347,8 +2928,8 @@ mod tests {
         assert_eq!(front["state"], "idle");
         assert_eq!(front["preload"], false);
         assert_eq!(front["last_error"], Value::Null);
-        assert_eq!(front["sources"][0]["url"], "fake://cam/");
-        assert_eq!(front["sources"][0]["protocol"], "fake");
+        assert_eq!(front["sources"][0]["source"]["url"], "fake://cam/");
+        assert_eq!(front["sources"][0]["source"]["protocol"], "fake");
         assert_eq!(front["sources"][0]["connection"]["id"], "c1");
         assert_eq!(front["sources"][0]["connection"]["worker"], Value::Null);
         assert!(front["since"].as_str().unwrap().ends_with('Z'));
@@ -2377,7 +2958,7 @@ mod tests {
         result(call(&s, &put("front", "fake://other/", false)).await);
         let front = result(call(&s, r#"{"id":1,"type":"stream/get","stream_id":"front"}"#).await);
         assert_eq!(front["sources"][0]["connection"]["id"], "c1");
-        assert_eq!(front["sources"][0]["url"], "fake://other/");
+        assert_eq!(front["sources"][0]["source"]["url"], "fake://other/");
         assert_eq!(s.shared.lock().connections.len(), 2);
         // On another port it needs a new worker: a new connection, and
         // the one it left is released.
@@ -2475,6 +3056,11 @@ mod tests {
             cfg!(target_os = "linux")
         );
         assert_eq!(metrics["sessions"], 0);
+        // `GET /v0/metrics` reads the same snapshot.
+        let snapshot = Handler::metrics_snapshot(&s).await.unwrap();
+        let snapshot = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(snapshot["workers"], metrics["workers"]);
+        assert_eq!(snapshot["supervisor"]["uptime_ms"], 1500);
         let front = result(call(&s, r#"{"id":3,"type":"stream/get","stream_id":"front"}"#).await);
         assert_eq!(
             front["sources"][0]["connection"]["worker"]["pss_bytes"],
@@ -2649,9 +3235,9 @@ mod tests {
     /// `stream/put` of `front` on one fake source with `options`, which
     /// `null` leaves out, preloaded.
     fn put_options(options: &Value) -> String {
-        let mut source = json!({ "url": "fake://127.0.0.1:1/" });
-        if !options.is_null() {
-            source["options"] = options.clone();
+        let mut source = json!({ "protocol": "fake", "url": "fake://127.0.0.1:1/" });
+        if let (Some(source), Some(options)) = (source.as_object_mut(), options.as_object()) {
+            source.extend(options.clone());
         }
         json!({ "id": 1, "type": "stream/put", "stream_id": "front",
                 "sources": [source], "preload": true })
@@ -2835,7 +3421,7 @@ mod tests {
         assert_eq!(next(&mut s1).await["type"], "session");
         let pid = worker_pid(&s).await;
         let turn = json!({ "id": 3, "type": "stream/put", "stream_id": "front",
-            "sources": [{ "url": "fake://127.0.0.1:1/" }], "orientation": "rotate_right" });
+            "sources": [{ "protocol": "fake", "url": "fake://127.0.0.1:1/" }], "orientation": "rotate_right" });
         result(call(&s, &turn.to_string()).await);
         let message = lotse_ipc::ToWorker::SessionOrientation {
             session_id: "s1".into(),
@@ -2864,6 +3450,69 @@ mod tests {
         assert!(s1.try_recv().is_err(), "the session stays: {s1:?}");
         assert_eq!(s.shared.lock().connections.len(), 1);
         s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A worker that reports its source connecting and then live, as
+    /// frames on its control channel (its standard input), then blocks
+    /// until it is killed.
+    fn live_worker(dir: &std::path::Path) -> String {
+        let mut frames = Vec::new();
+        for message in [
+            lotse_ipc::ToSupervisor::SourceState(lotse_ipc::SourceState::Connecting { attempt: 1 }),
+            lotse_ipc::ToSupervisor::SourceState(lotse_ipc::SourceState::Live),
+        ] {
+            let payload = lotse_ipc::encode(&message).unwrap();
+            frames.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+            frames.extend_from_slice(&payload);
+        }
+        let reports = dir.join("reports");
+        std::fs::write(&reports, frames).unwrap();
+        let path = dir.join("worker.sh");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ncat {} >&0\nexec sleep 30\n", reports.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_configured_linger_holds_a_live_worker_after_its_demand_goes() {
+        let dir = private_dir("linger");
+        let clock = Arc::new(FakeClock::from_system());
+        let mut settings = settings(PathBuf::from("/nonexistent/lotse.sock"));
+        settings.shutdown_budget = Duration::from_millis(200);
+        // Not the default of 5 s, and short of the worker's silence limit.
+        settings.linger = Duration::from_secs(8);
+        let s = Supervisor::new(settings, environment(&live_worker(&dir)), clock.clone());
+        let mut events = subscription(call(&s, r#"{"id":1,"type":"stream/subscribe"}"#).await);
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", true)).await);
+        for expected in ["idle", "connecting", "live"] {
+            assert_eq!(next(&mut events).await["state"], expected);
+        }
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        assert_eq!(next(&mut events).await["state"], "draining");
+        clock.advance(Duration::from_secs(5));
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(events.try_recv().is_err(), "still lingering after 5 s");
+        clock.advance(Duration::from_secs(3));
+        assert_eq!(next(&mut events).await["state"], "idle");
+        // The worker ignores its stop: the budget runs out on the fake
+        // clock, and it is killed.
+        let shutdown = s.shutdown();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                () = SystemClock.sleep(Duration::from_millis(5)) => {
+                    clock.advance(Duration::from_millis(200));
+                }
+            }
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2924,9 +3573,11 @@ mod tests {
             "nothing opened on an error"
         );
 
-        // RFC 7065 turns: is not supported yet: a warning after `session`.
+        // RFC 7065 turns: over UDP (DTLS, RFC 7350) is not supported: a
+        // warning after `session`; over TCP it is TLS, which is.
         let mut with_ice = offer(2, "front", Some("s1"));
-        with_ice["ice_servers"] = json!([{ "urls": ["stun:stun.example:3478", "TURN:t", "turns:t:5349"],
+        with_ice["ice_servers"] = json!([{ "urls": ["stun:stun.example:3478", "TURN:t", "turns:t:5349",
+                                                    "turns:t:5349?transport=udp"],
                                             "username": "u", "credential": "c" }]);
         let mut s1 = subscription(call_on(&s, 1, &with_ice).await);
         assert_eq!(
@@ -2942,7 +3593,7 @@ mod tests {
             warning["message"]
                 .as_str()
                 .unwrap()
-                .contains("turns:t:5349")
+                .contains("turns:t:5349?transport=udp")
         );
         let err = error(call_on(&s, 1, &offer(3, "front", Some("s1"))).await);
         assert_eq!(err.code, ErrorCode::SessionIdInUse);
@@ -3133,37 +3784,37 @@ mod tests {
         s.shutdown().await;
     }
 
-    fn renegotiate(id: u64, session_id: &str) -> Value {
-        json!({ "id": id, "type": "webrtc/renegotiate", "session_id": session_id, "sdp": "v=0\r\n" })
+    fn reoffer(id: u64, session_id: &str) -> Value {
+        json!({ "id": id, "type": "webrtc/reoffer", "session_id": session_id, "sdp": "v=0\r\n" })
     }
 
     /// Yields until the session `session_id` of `s` has a re-offer
     /// waiting for its worker, which the worker then answers.
     async fn until_waiting(s: &Supervisor, session_id: &str) {
         let mut yields = 0;
-        while !s.shared.lock().sessions[session_id].renegotiating() {
+        while !s.shared.lock().sessions[session_id].reoffer_pending() {
             assert!(yields < 10_000, "no re-offer waiting");
             yields += 1;
             tokio::task::yield_now().await;
         }
     }
 
-    /// `webrtc/renegotiate` is for the session's owner, after the answer:
+    /// `webrtc/reoffer` is for the session's owner, after the answer:
     /// the worker's answer is its result, a refusal its error, and a
     /// session that closes meanwhile, or a worker that never answers, end
     /// the wait too.
     #[tokio::test]
     #[expect(clippy::too_many_lines, reason = "every end of a re-offer")]
     async fn a_re_offer_is_answered_by_the_worker_or_refused() {
-        let dir = private_dir("renegotiate");
+        let dir = private_dir("reoffer");
         let clock = Arc::new(FakeClock::default());
         let s = Arc::new(with_webrtc(&blocking_worker(&dir), clock.clone()));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
         next(&mut events).await;
-        let err = error(call_on(&s, 1, &renegotiate(3, "ghost")).await);
+        let err = error(call_on(&s, 1, &reoffer(3, "ghost")).await);
         assert_eq!(err.code, ErrorCode::SessionNotFound);
-        let err = error(call_on(&s, 2, &renegotiate(3, "s1")).await);
+        let err = error(call_on(&s, 2, &reoffer(3, "s1")).await);
         assert_eq!(
             (err.code, err.message.as_str()),
             (
@@ -3171,7 +3822,7 @@ mod tests {
                 "the session is not this connection's"
             )
         );
-        let err = error(within(call_on(&s, 1, &renegotiate(4, "s1"))).await);
+        let err = error(within(call_on(&s, 1, &reoffer(4, "s1"))).await);
         assert_eq!(
             (err.code, err.message.as_str()),
             (ErrorCode::InvalidRequest, "the session has no answer yet")
@@ -3190,17 +3841,17 @@ mod tests {
         // reports the talk-back it negotiated.
         let waiting = {
             let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(5, "s1")).await
+            spawn_named("test.reoffer", async move {
+                call_on(&s, 1, &reoffer(5, "s1")).await
             })
         };
         until_waiting(&s, "s1").await;
-        let err = error(within(call_on(&s, 1, &renegotiate(6, "s1"))).await);
+        let err = error(within(call_on(&s, 1, &reoffer(6, "s1"))).await);
         assert_eq!(err.code, ErrorCode::InvalidRequest, "one at a time");
         report(
             &s,
             "s1",
-            Report::Renegotiated {
+            Report::ReofferAnswered {
                 sdp: "v=0\r\na=mid:0\r\n".into(),
                 talkback: Some("pcmu".into()),
             },
@@ -3230,15 +3881,15 @@ mod tests {
         // The worker refuses: the error is the result.
         let waiting = {
             let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(8, "s1")).await
+            spawn_named("test.reoffer", async move {
+                call_on(&s, 1, &reoffer(8, "s1")).await
             })
         };
         until_waiting(&s, "s1").await;
         report(
             &s,
             "s1",
-            Report::RenegotiateRefused {
+            Report::ReofferRefused {
                 code: "no_video_track".into(),
                 message: "no video".into(),
             },
@@ -3252,12 +3903,12 @@ mod tests {
         // A re-offer (A) loses its client: it is still out, so the retry
         // (B) is refused until the worker answers A, and A's late answer
         // goes nowhere; B gets its own.
-        let a = renegotiate(14, "s1");
+        let a = reoffer(14, "s1");
         tokio::select! {
             outcome = call_on(&s, 1, &a) => panic!("answered: {outcome:?}"),
             () = until_waiting(&s, "s1") => {}
         }
-        let err = error(within(call_on(&s, 1, &renegotiate(15, "s1"))).await);
+        let err = error(within(call_on(&s, 1, &reoffer(15, "s1"))).await);
         assert_eq!(
             (err.code, err.message.as_str()),
             (
@@ -3268,22 +3919,22 @@ mod tests {
         report(
             &s,
             "s1",
-            Report::RenegotiateRefused {
+            Report::ReofferRefused {
                 code: "invalid_sdp".into(),
                 message: "A".into(),
             },
         );
         let b = {
             let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(16, "s1")).await
+            spawn_named("test.reoffer", async move {
+                call_on(&s, 1, &reoffer(16, "s1")).await
             })
         };
         until_waiting(&s, "s1").await;
         report(
             &s,
             "s1",
-            Report::Renegotiated {
+            Report::ReofferAnswered {
                 sdp: "v=0\r\na=mid:B\r\n".into(),
                 talkback: None,
             },
@@ -3311,8 +3962,8 @@ mod tests {
         // The session closes while the re-offer waits.
         let waiting = {
             let s = Arc::clone(&s);
-            spawn_named("test.renegotiate", async move {
-                call_on(&s, 1, &renegotiate(10, "s1")).await
+            spawn_named("test.reoffer", async move {
+                call_on(&s, 1, &reoffer(10, "s1")).await
             })
         };
         until_waiting(&s, "s1").await;
@@ -3338,12 +3989,12 @@ mod tests {
             &mut s.shared.lock().connections.get_mut("c1").unwrap().commands,
             full,
         );
-        let err = error(within(call_on(&s, 1, &renegotiate(13, "s2"))).await);
+        let err = error(within(call_on(&s, 1, &reoffer(13, "s2"))).await);
         assert_eq!(
             (err.code, &err.details["limit"]),
             (ErrorCode::LimitReached, &json!("connection_queue"))
         );
-        assert!(!s.shared.lock().sessions["s2"].renegotiating());
+        assert!(!s.shared.lock().sessions["s2"].reoffer_pending());
         s.shared.lock().connections.get_mut("c1").unwrap().commands = commands;
 
         // The worker never answers: the daemon's clock bounds the wait.
@@ -3359,11 +4010,11 @@ mod tests {
         // close is the last thing the test waits for.
         worker_pid(&s).await;
         {
-            let a = renegotiate(9, "s2");
+            let a = reoffer(9, "s2");
             let mut waiting = std::pin::pin!(call_on(&s, 1, &a));
             assert!(poll_alone(waiting.as_mut()).is_pending());
-            assert!(s.shared.lock().sessions["s2"].renegotiating());
-            clock.advance(RENEGOTIATE_TIMEOUT);
+            assert!(s.shared.lock().sessions["s2"].reoffer_pending());
+            clock.advance(REOFFER_TIMEOUT);
             let_assert!(Poll::Ready(outcome) = poll_alone(waiting));
             let err = error(outcome);
             assert_eq!(
@@ -3374,8 +4025,8 @@ mod tests {
                 )
             );
         }
-        assert!(s.shared.lock().sessions["s2"].renegotiating());
-        let retry = renegotiate(17, "s2");
+        assert!(s.shared.lock().sessions["s2"].reoffer_pending());
+        let retry = reoffer(17, "s2");
         let_assert!(Poll::Ready(outcome) = poll_alone(std::pin::pin!(call_on(&s, 1, &retry))));
         let err = error(outcome);
         assert_eq!(
@@ -3385,12 +4036,12 @@ mod tests {
         report(
             &s,
             "s2",
-            Report::Renegotiated {
+            Report::ReofferAnswered {
                 sdp: "v=0\r\na=mid:A\r\n".into(),
                 talkback: None,
             },
         );
-        assert!(!s.shared.lock().sessions["s2"].renegotiating());
+        assert!(!s.shared.lock().sessions["s2"].reoffer_pending());
         assert_eq!(
             next(&mut s2).await,
             json!({ "type": "closed", "code": "worker_crashed",
@@ -3486,6 +4137,242 @@ mod tests {
             .await,
         );
         s.shutdown().await;
+    }
+
+    /// `stream/put` with a signaled source: `{"protocol": ...}` and its
+    /// `fields`.
+    fn put_signaled(stream_id: &str, protocol: &str, fields: &Value) -> String {
+        let mut source = json!({ "protocol": protocol });
+        if let (Some(source), Some(fields)) = (source.as_object_mut(), fields.as_object()) {
+            source.extend(fields.clone());
+        }
+        json!({ "id": 1, "type": "stream/put", "stream_id": stream_id, "sources": [source] })
+            .to_string()
+    }
+
+    /// A signaled source is named by its protocol alone, which the
+    /// supervisor hands its factory with its fields; each stream has its
+    /// own.
+    #[tokio::test]
+    async fn a_signaled_source_is_named_by_protocol_alone() {
+        let s = supervisor("/bin/sh", Arc::new(SystemClock));
+        let err = error(
+            call(
+                &s,
+                &put_signaled("a", "fake-signaled", &json!({ "audio": true })),
+            )
+            .await,
+        );
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert!(
+            err.message
+                .contains("fake signaled source takes no options"),
+            "{err}"
+        );
+        // Two streams each have their own: no source is another's.
+        for stream in ["a", "b"] {
+            let put = put_signaled(stream, "fake-signaled", &json!({}));
+            assert_eq!(result(call(&s, &put).await)["created"], true);
+            assert_eq!(result(call(&s, &put).await)["created"], false, "unchanged");
+        }
+        let a = result(call(&s, r#"{"id":1,"type":"stream/get","stream_id":"a"}"#).await);
+        let reported = &a["sources"][0]["source"];
+        assert_eq!(reported, &json!({ "protocol": "fake-signaled" }));
+        let (a, b, key) = {
+            let state = s.shared.lock();
+            let a = state.streams["a"].sources[0].clone();
+            let key = format!("{:?}", state.connections[&a.connection].key);
+            (a, state.streams["b"].sources[0].clone(), key)
+        };
+        assert_ne!(a.connection, b.connection);
+        assert_eq!(
+            key,
+            r#"ConnectionKey { target: fake-signaled of stream a, options: ["signaled"] }"#
+        );
+        assert_eq!(
+            a.spec.target,
+            lotse_ipc::SourceTarget::Signaled("fake-signaled".into())
+        );
+        assert_eq!((a.spec.host.as_str(), a.spec.port), ("", None));
+        s.shutdown().await;
+    }
+
+    /// A signaled source has no port to pin its worker to, and a
+    /// connection never switches to or from one in place: each is a new
+    /// connection.
+    #[tokio::test]
+    async fn a_signaled_source_has_no_port_and_never_switches_in_place() {
+        let dir = private_dir("signaled-switch");
+        let s = Supervisor::new(
+            settings(PathBuf::from("/nonexistent/lotse.sock")),
+            environment(&blocking_worker(&dir)),
+            Arc::new(SystemClock),
+        );
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let source = |s: &Supervisor| {
+            let state = s.shared.lock();
+            let source = state.streams["front"].sources[0].clone();
+            let port = state.connections[&source.connection].port;
+            drop(state);
+            (source.connection, source.spec, port)
+        };
+        let mut connections = Vec::new();
+        for url in [
+            "fake://127.0.0.1/",
+            "fake-signaled",
+            "fake://127.0.0.1/other",
+            "fake://127.0.0.1/again",
+        ] {
+            let signaled = !url.contains("://");
+            let put = if signaled {
+                put_signaled("front", url, &json!({}))
+            } else {
+                put("front", url, false)
+            };
+            result(call(&s, &put).await);
+            let (connection, spec, port) = source(&s);
+            assert_eq!(spec.signaled(), signaled, "{url}");
+            assert_eq!((spec.port, port), (None, None), "{url}");
+            connections.push(connection);
+        }
+        // To the signaled source, away from it: new connections each; then
+        // between two portless fakes, in place.
+        assert_eq!(connections[1..], ["c2", "c3", "c3"], "{connections:?}");
+        assert_eq!(
+            captured
+                .lines("the connection switches to the new source in place")
+                .len(),
+            1
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A signal of the signaled source of `door`, its worker's offer
+    /// handed to the registry.
+    fn offered_signal(s: &Supervisor, request: u64) -> String {
+        let mut state = s.shared.lock();
+        let connection = state.streams["door"].sources[0].connection.clone();
+        let from = crate::signaling::SignalFrom {
+            connection: &connection,
+            worker: 1,
+        };
+        let now = SystemClock.now();
+        state.signal_report(
+            &from,
+            lotse_ipc::SignalReport::Open { request },
+            now,
+            std::time::UNIX_EPOCH,
+        );
+        let signal_id = state
+            .signal_ids_for_tests()
+            .into_iter()
+            .last()
+            .expect("a signal");
+        state.signal_report(
+            &from,
+            lotse_ipc::SignalReport::Offer {
+                signal_id: signal_id.clone(),
+                sdp: lotse_core::test_util::FAKE_SIGNALED_OFFER.into(),
+            },
+            now,
+            std::time::UNIX_EPOCH,
+        );
+        signal_id
+    }
+
+    #[tokio::test]
+    async fn signaling_commands_reach_the_owner_s_signals_and_end_with_its_subscription() {
+        let dir = private_dir("signaling-commands");
+        let mut environment = environment(&blocking_worker(&dir));
+        environment.front_door = Some(FrontDoor {
+            registrations: Arc::new(Registrations::default()),
+            // Two ports of one address: a source gathers on each address
+            // once.
+            hosts: vec![
+                "192.0.2.1:18556".parse().unwrap(),
+                "192.0.2.1:18557".parse().unwrap(),
+                "[2001:db8::1]:18556".parse().unwrap(),
+            ],
+            tcp_hosts: vec![],
+            scan: None,
+            stun: None,
+            turn: None,
+            demux: None,
+        });
+        let s = Supervisor::new(
+            settings(PathBuf::from("/nonexistent/lotse.sock")),
+            environment,
+            Arc::new(SystemClock),
+        );
+        assert_eq!(
+            s.shared.lock().signaling.hosts.latest().local_addrs,
+            [
+                "192.0.2.1".parse::<std::net::IpAddr>().unwrap(),
+                "2001:db8::1".parse().unwrap()
+            ]
+        );
+        result(call(&s, &put_signaled("door", "fake-signaled", &json!({}))).await);
+        let refused = error(
+            call_on(
+                &s,
+                1,
+                &json!({ "id": 1, "type": "signaling/subscribe", "stream_id": "a b" }),
+            )
+            .await,
+        );
+        assert_eq!(refused.code, ErrorCode::InvalidStreamId);
+        assert_eq!(refused.details["stream_id"], "a b");
+        let mut door = subscription(
+            call_on(
+                &s,
+                1,
+                &json!({ "id": 2, "type": "signaling/subscribe", "stream_id": "door" }),
+            )
+            .await,
+        );
+        let signal_id = offered_signal(&s, 1);
+        let offer = next(&mut door).await;
+        assert_eq!(offer["type"], "offer");
+        assert_eq!(offer["signal_id"], signal_id.as_str());
+        assert_eq!(offer["protocol"], "fake-signaled");
+        assert_eq!(offer["sdp"], lotse_core::test_util::FAKE_SIGNALED_OFFER);
+        let commands = |id: u64, signal_id: &str| {
+            [
+                json!({ "id": id, "type": "signaling/answer", "signal_id": signal_id, "sdp": "v=0\r\n" }),
+                json!({ "id": id + 1, "type": "signaling/candidate", "signal_id": signal_id, "candidate": "" }),
+                json!({ "id": id + 2, "type": "signaling/error", "signal_id": signal_id, "code": "offline", "message": "m" }),
+            ]
+        };
+        // Another control connection's are refused; the owner's taken.
+        for command in commands(3, &signal_id) {
+            let refused = error(call_on(&s, 2, &command).await);
+            assert_eq!(refused.code, ErrorCode::SignalNotFound, "{command}");
+        }
+        for command in commands(6, &signal_id) {
+            assert_eq!(
+                result(call_on(&s, 1, &command).await),
+                json!({}),
+                "{command}"
+            );
+        }
+        // Its unsubscribe ends its signals; another subscription's is no
+        // signaling one.
+        assert!(s.unsubscribed(ConnectionId(1), 99).is_none());
+        assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+        let refused = error(call_on(&s, 1, &commands(9, &signal_id)[0]).await);
+        assert_eq!(refused.code, ErrorCode::SignalNotFound);
+        assert!(door.recv().await.is_none(), "the subscription ended");
+        // So does its control connection's close.
+        let _all =
+            subscription(call_on(&s, 3, &json!({ "id": 1, "type": "signaling/subscribe" })).await);
+        let signal_id = offered_signal(&s, 2);
+        s.connection_closed(ConnectionId(3));
+        let refused = error(call_on(&s, 3, &commands(2, &signal_id)[1]).await);
+        assert_eq!(refused.code, ErrorCode::SignalNotFound);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Shuts down while moving a fake clock, so the worker stop budget
@@ -3862,7 +4749,7 @@ mod tests {
 
     /// Lets the connection's driver run up to its first wait, so its first
     /// snapshot is in before the test publishes its own.
-    async fn settle() {
+    pub(crate) async fn settle() {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
@@ -4141,11 +5028,12 @@ mod tests {
             ),
             true,
         );
-        // As many turns: URLs as an offer may carry, each worth a warning.
+        // As many turns: URLs over DTLS as an offer may carry, each worth a
+        // warning.
         let servers: Vec<Value> = (0..lotse_api_types::limits::MAX_ICE_SERVERS)
             .map(|server| {
                 let urls: Vec<String> = (0..lotse_api_types::limits::MAX_ICE_URLS)
-                    .map(|url| format!("turns:t{server}-{url}.example"))
+                    .map(|url| format!("turns:t{server}-{url}.example?transport=udp"))
                     .collect();
                 json!({ "urls": urls })
             })
@@ -4235,7 +5123,7 @@ mod tests {
         let dir = private_dir("unchanged");
         let s = with_webrtc(&blocking_worker(&dir), Arc::new(SystemClock));
         let base = json!({ "id": 1, "type": "stream/put", "stream_id": "front",
-            "sources": [{ "url": "fake://127.0.0.1:1/", "options": { "ready_after_ms": 1 } }],
+            "sources": [{ "protocol": "fake", "url": "fake://127.0.0.1:1/", "ready_after_ms": 1 }],
             "preload": false, "audio": "auto", "orientation": "rotate_left" });
         result(call(&s, &base.to_string()).await);
         let parse = |value: &Value| {
@@ -4245,7 +5133,10 @@ mod tests {
             let validated: Vec<ValidatedSource> = put
                 .sources
                 .iter()
-                .map(|source| s.validate_source(source).unwrap())
+                .map(|source| {
+                    s.validate_source(&StreamId::new(&put.stream_id).unwrap(), source)
+                        .unwrap()
+                })
                 .collect();
             (put, validated)
         };
@@ -4255,19 +5146,19 @@ mod tests {
         };
         assert!(check(&base));
         let mut two = base.clone();
-        two["sources"] = json!([{ "url": "fake://127.0.0.1:1/", "options": { "ready_after_ms": 1 } },
-                                { "url": "fake://127.0.0.1:2/" }]);
+        two["sources"] = json!([{ "protocol": "fake", "url": "fake://127.0.0.1:1/", "ready_after_ms": 1 },
+                                { "protocol": "fake", "url": "fake://127.0.0.1:2/" }]);
         for (field, value) in [
             ("preload", json!(true)),
             ("audio", json!("off")),
             ("orientation", json!("rotate_right")),
             (
                 "sources",
-                json!([{ "url": "fake://127.0.0.1:2/", "options": { "ready_after_ms": 1 } }]),
+                json!([{ "protocol": "fake", "url": "fake://127.0.0.1:2/", "ready_after_ms": 1 }]),
             ),
             (
                 "sources",
-                json!([{ "url": "fake://127.0.0.1:1/", "options": { "ready_after_ms": 2 } }]),
+                json!([{ "protocol": "fake", "url": "fake://127.0.0.1:1/", "ready_after_ms": 2 }]),
             ),
             ("sources", two["sources"].clone()),
         ] {
@@ -4474,13 +5365,119 @@ mod tests {
         s.shutdown().await;
     }
 
+    /// A supervisor like [`with_webrtc`]'s whose host addresses `scan`
+    /// reads again, at first `192.0.2.1`, on `clock`; its connection `c1`
+    /// of stream `front` sends its driver commands to the receiver.
+    async fn with_rescan(
+        binary: &str,
+        scan: HostScan,
+        clock: &Arc<FakeClock>,
+    ) -> (Supervisor, mpsc::Receiver<DriverCommand>) {
+        let door = FrontDoor {
+            registrations: Arc::new(Registrations::default()),
+            hosts: vec!["192.0.2.1:18556".parse().unwrap()],
+            tcp_hosts: vec!["192.0.2.1:18557".parse().unwrap()],
+            scan: Some(scan),
+            stun: None,
+            turn: None,
+            demux: None,
+        };
+        let mut settings = session_settings();
+        settings.limits.max_sessions_per_stream = 8;
+        settings.limits.max_sessions = 8;
+        let s = Supervisor::new(
+            settings,
+            webrtc_environment(binary, door),
+            Arc::<FakeClock>::clone(clock),
+        );
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let (tx, rx) = mpsc::channel(8);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        (s, rx)
+    }
+
+    /// The host addresses of the session `rx`'s next offer answers with.
+    async fn offered_hosts(
+        rx: &mut mpsc::Receiver<DriverCommand>,
+    ) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+        let_assert!(
+            Some(DriverCommand::OpenSession(spec)) = rx.recv().await,
+            "an offer"
+        );
+        (spec.candidates, spec.tcp_candidates)
+    }
+
+    #[tokio::test]
+    async fn rfc8445_5_1_1_1_each_offer_answers_with_the_host_addresses_of_now() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let dir = private_dir("rescan");
+        let clock = Arc::new(FakeClock::default());
+        let interfaces = Interfaces::with(&["192.0.2.1"]);
+        let (s, mut rx) = with_rescan(
+            &blocking_worker(&dir),
+            interfaces.scan("[::]:18556", Some("[::]:18557")),
+            &clock,
+        )
+        .await;
+        let addrs = |list: &[&str]| -> Vec<SocketAddr> {
+            list.iter().map(|a| a.parse().unwrap()).collect()
+        };
+        let before = (addrs(&["192.0.2.1:18556"]), addrs(&["192.0.2.1:18557"]));
+        // An interface comes up; within the max age two offers read nothing
+        // and answer with the addresses found at the start.
+        interfaces.set(&["192.0.2.1", "2001:db8:1::2"]);
+        let _s1 = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        let _s2 = subscription(call_on(&s, 1, &offer(3, "front", Some("s2"))).await);
+        assert_eq!(offered_hosts(&mut rx).await, before);
+        assert_eq!(offered_hosts(&mut rx).await, before);
+        assert_eq!(interfaces.reads(), 0);
+        // Past it the next offer reads them once, and gets the new one.
+        clock.advance(crate::host_cache::MAX_AGE);
+        let _s3 = subscription(call_on(&s, 1, &offer(4, "front", Some("s3"))).await);
+        let _s4 = subscription(call_on(&s, 1, &offer(5, "front", Some("s4"))).await);
+        let after = (
+            addrs(&["192.0.2.1:18556", "[2001:db8:1::2]:18556"]),
+            addrs(&["192.0.2.1:18557", "[2001:db8:1::2]:18557"]),
+        );
+        assert_eq!(offered_hosts(&mut rx).await, after);
+        assert_eq!(offered_hosts(&mut rx).await, after);
+        assert_eq!(interfaces.reads(), 1, "a burst reads once");
+        // A signaled source opened from now on gathers on them too.
+        assert_eq!(
+            s.shared.lock().signaling.hosts.latest().local_addrs,
+            [
+                "192.0.2.1".parse::<std::net::IpAddr>().unwrap(),
+                "2001:db8:1::2".parse().unwrap()
+            ]
+        );
+        let changed = captured.lines("host addresses changed");
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert!(changed[0].contains("INFO"), "{changed:?}");
+        s.shutdown().await;
+
+        // An explicitly bound address is never re-read.
+        let interfaces = Interfaces::with(&["192.0.2.1", "192.0.2.2"]);
+        let (s, mut rx) = with_rescan(
+            &blocking_worker(&dir),
+            interfaces.scan("192.0.2.1:18556", Some("192.0.2.1:18557")),
+            &clock,
+        )
+        .await;
+        clock.advance(crate::host_cache::MAX_AGE);
+        let _e1 = subscription(call_on(&s, 1, &offer(2, "front", Some("e1"))).await);
+        assert_eq!(offered_hosts(&mut rx).await, before);
+        assert_eq!(interfaces.reads(), 0);
+        s.shutdown().await;
+    }
+
     #[tokio::test]
     async fn the_driver_gets_the_offer_with_credentials_hosts_and_audio_and_the_closes() {
         let dir = private_dir("to-driver");
         let s = with_webrtc(&blocking_worker(&dir), Arc::new(SystemClock));
         let put = |stream: &str, audio: &str, orientation: &str| {
             json!({ "id": 1, "type": "stream/put", "stream_id": stream,
-                "sources": [{ "url": format!("fake://127.0.0.1:{}/", stream.len()) }],
+                "sources": [{ "protocol": "fake", "url": format!("fake://127.0.0.1:{}/", stream.len()) }],
                 "audio": audio, "orientation": orientation })
             .to_string()
         };
@@ -4574,7 +5571,7 @@ mod tests {
         let s = with_webrtc(&blocking_worker(&dir), Arc::new(SystemClock));
         let put = |stream: &str, audio: &str, orientation: &str| {
             json!({ "id": 1, "type": "stream/put", "stream_id": stream,
-                "sources": [{ "url": format!("fake://127.0.0.1:{}/", stream.len()) }],
+                "sources": [{ "protocol": "fake", "url": format!("fake://127.0.0.1:{}/", stream.len()) }],
                 "audio": audio, "orientation": orientation })
             .to_string()
         };
@@ -4632,8 +5629,18 @@ mod tests {
     }
 
     /// [`with_webrtc`] with a STUN client on a loopback socket and its
-    /// demux; the host address is the socket's.
+    /// demux; the host address is the socket's. It has a TURN client too,
+    /// which an offer without `turn:` servers leaves idle.
     fn with_stun(binary: &str, clock: Arc<dyn Clock>) -> (Supervisor, crate::net::demux::Demux) {
+        with_stun_advertising(binary, clock, Vec::new())
+    }
+
+    /// [`with_stun`] with `advertise` as `webrtc.advertise`.
+    fn with_stun_advertising(
+        binary: &str,
+        clock: Arc<dyn Clock>,
+        advertise: Vec<crate::AdvertisedAddress>,
+    ) -> (Supervisor, crate::net::demux::Demux) {
         let bound = crate::net::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
         let demux = crate::net::demux::Demux::start(
             Arc::clone(&bound.socket),
@@ -4646,16 +5653,24 @@ mod tests {
             registrations: demux.registrations(),
             hosts: bound.hosts,
             tcp_hosts: vec![],
+            scan: None,
             stun: Some(Arc::new(StunClient::new(
-                bound.socket,
+                Arc::clone(&bound.socket),
                 demux.responses(),
                 Arc::clone(&clock),
                 crate::net::stun_client::StunClientConfig::default(),
             ))),
-            turn: None,
+            turn: Some(Arc::new(TurnClient::new(
+                bound.socket,
+                &demux,
+                Arc::clone(&clock),
+                crate::net::allocation::AllocationConfig::default(),
+            ))),
             demux: Some(demux.stats()),
         };
-        let s = Supervisor::new(session_settings(), webrtc_environment(binary, door), clock);
+        let mut settings = session_settings();
+        settings.advertise = advertise;
+        let s = Supervisor::new(settings, webrtc_environment(binary, door), clock);
         (s, demux)
     }
 
@@ -4682,6 +5697,123 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A STUN server answering every Binding with `mapped`, and how many
+    /// it answered.
+    fn counting_stun_server(
+        mapped: SocketAddr,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&answered);
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 1500];
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                let request = crate::net::stun::parse(&buf[..n]).unwrap();
+                let reply = crate::net::stun::Builder::new(
+                    crate::net::stun::Class::Success,
+                    crate::net::stun::METHOD_BINDING,
+                    request.transaction_id,
+                )
+                .xor_mapped_address(mapped)
+                .build();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _sent = socket.send_to(&reply, from);
+            }
+        });
+        (addr, answered)
+    }
+
+    #[tokio::test]
+    async fn rfc8445_5_1_1_2_the_first_offer_after_a_host_address_change_asks_stun_again() {
+        let dir = private_dir("srflx-rescan");
+        let clock = Arc::new(FakeClock::default());
+        let bound = crate::net::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let demux = crate::net::demux::Demux::start(
+            Arc::clone(&bound.socket),
+            bound.local,
+            bound.hosts.clone(),
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        let interfaces = Interfaces::with(&["192.0.2.1"]);
+        let door = FrontDoor {
+            registrations: demux.registrations(),
+            hosts: vec!["192.0.2.1:18556".parse().unwrap()],
+            tcp_hosts: vec![],
+            scan: Some(interfaces.scan("0.0.0.0:18556", None)),
+            stun: Some(Arc::new(StunClient::new(
+                bound.socket,
+                demux.responses(),
+                Arc::<FakeClock>::clone(&clock),
+                crate::net::stun_client::StunClientConfig::default(),
+            ))),
+            turn: None,
+            demux: Some(demux.stats()),
+        };
+        let mut settings = session_settings();
+        settings.limits.max_sessions_per_stream = 8;
+        settings.limits.max_sessions = 8;
+        let s = Supervisor::new(
+            settings,
+            webrtc_environment(&blocking_worker(&dir), door),
+            Arc::<FakeClock>::clone(&clock),
+        );
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        // The offers' commands stop here; the worker's reports are made up.
+        let (tx, _offers) = mpsc::channel(8);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        let (server, asked) = counting_stun_server("203.0.113.7:40000".parse().unwrap());
+        // The srflx candidate of session `id`, once its gathering is done.
+        let srflx = async |id: u64, session: &str| -> String {
+            let mut events = subscription(call_on(&s, 1, &stun_offer(id, session, server)).await);
+            next(&mut events).await;
+            report(
+                &s,
+                session,
+                Report::Answer {
+                    sdp: "v=0\r\na=mid:0\r\n".into(),
+                    talkback: None,
+                },
+            );
+            assert_eq!(next(&mut events).await["type"], "answer");
+            report(&s, session, end_of_candidates());
+            let candidate = next(&mut events).await["candidate"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                next(&mut events).await,
+                json!({ "type": "candidate", "candidate": "" })
+            );
+            candidate
+        };
+        let ordinal = std::sync::atomic::Ordering::SeqCst;
+        assert!(srflx(2, "s1").await.contains("typ srflx raddr 192.0.2.1"));
+        assert_eq!(asked.load(ordinal), 1);
+        // Read again, unchanged: the mapping is the cached one.
+        clock.advance(crate::host_cache::MAX_AGE);
+        assert!(srflx(3, "s2").await.contains("typ srflx raddr 192.0.2.1"));
+        assert_eq!(asked.load(ordinal), 1, "served from the cache");
+        assert_eq!(interfaces.reads(), 1);
+        // Changed: the server is asked again on the new base.
+        interfaces.set(&["192.0.2.2"]);
+        clock.advance(crate::host_cache::MAX_AGE);
+        assert!(srflx(4, "s3").await.contains("typ srflx raddr 192.0.2.2"));
+        assert_eq!(asked.load(ordinal), 2, "asked again after the change");
+        // The worker is stopped within the budget, on the fake clock.
+        let mut shutdown = std::pin::pin!(s.shutdown());
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                () = SystemClock.sleep(Duration::from_millis(5)) => {
+                    clock.advance(Duration::from_millis(100));
+                }
+            }
+        }
+        demux.stop();
     }
 
     fn stun_offer(id: u64, session_id: &str, server: SocketAddr) -> Value {
@@ -4747,6 +5879,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advertised_candidates_follow_the_answer_in_place_of_the_host_ones() {
+        let dir = private_dir("advertise");
+        let mut settings = session_settings();
+        settings.advertise = vec!["203.0.113.7".parse().unwrap()];
+        let door = FrontDoor {
+            registrations: Arc::new(Registrations::default()),
+            hosts: vec!["192.0.2.1:18556".parse().unwrap()],
+            tcp_hosts: vec!["192.0.2.1:18557".parse().unwrap()],
+            scan: None,
+            stun: None,
+            turn: None,
+            demux: None,
+        };
+        let s = Supervisor::new(
+            settings,
+            webrtc_environment(&blocking_worker(&dir), door),
+            Arc::new(SystemClock),
+        );
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut events = subscription(call_on(&s, 1, &offer(2, "front", Some("s1"))).await);
+        assert_eq!(next(&mut events).await["type"], "session");
+        let host = "candidate:1 1 udp 2130706431 192.0.2.1 18556 typ host";
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: format!("v=0\r\na=mid:0\r\na={host}\r\n"),
+                talkback: None,
+            },
+        );
+        let answer = next(&mut events).await;
+        assert_eq!(answer["sdp"], "v=0\r\na=mid:0\r\n", "{answer}");
+        let udp = next(&mut events).await;
+        assert_eq!(udp["sdp_mid"], "0");
+        assert_eq!(
+            udp["candidate"],
+            "candidate:au0 1 udp 1694498559 203.0.113.7 18556 typ srflx raddr 0.0.0.0 rport 9"
+        );
+        let tcp = next(&mut events).await;
+        assert_eq!(
+            tcp["candidate"],
+            "candidate:at0 1 tcp 1684013055 203.0.113.7 18557 typ srflx raddr 0.0.0.0 rport 9 tcptype passive"
+        );
+        // The worker's host candidate is not told; its end-of-candidates
+        // ends the browser's.
+        report(
+            &s,
+            "s1",
+            Report::Candidate {
+                candidate: host.into(),
+                mid: Some("0".into()),
+            },
+        );
+        report(&s, "s1", end_of_candidates());
+        assert_eq!(
+            next(&mut events).await,
+            json!({ "type": "candidate", "candidate": "" })
+        );
+        s.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn with_an_address_advertised_stun_candidates_withhold_their_base_and_repeat_none() {
+        let dir = private_dir("srflx-advertised");
+        let (s, demux) = with_stun_advertising(
+            &blocking_worker(&dir),
+            Arc::new(SystemClock),
+            vec!["203.0.113.7:40000".parse().unwrap()],
+        );
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let same = stun_server(Some("203.0.113.7:40000".parse().unwrap()));
+        let other = stun_server(Some("203.0.113.8:40000".parse().unwrap()));
+        let mut offer = offer(2, "front", Some("s1"));
+        offer["ice_servers"] =
+            json!([{ "urls": [format!("stun:{same}"), format!("stun:{other}")] }]);
+        let mut events = subscription(call_on(&s, 1, &offer).await);
+        next(&mut events).await;
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0\r\na=mid:0\r\n".into(),
+                talkback: None,
+            },
+        );
+        assert_eq!(next(&mut events).await["type"], "answer");
+        report(&s, "s1", end_of_candidates());
+        let mut told = Vec::new();
+        loop {
+            let event = next(&mut events).await;
+            let line = event["candidate"].as_str().unwrap().to_owned();
+            if line.is_empty() {
+                break;
+            }
+            told.push(line);
+        }
+        // The advertised candidate first, the STUN server's mapping of it
+        // not again, the other mapping with its base withheld.
+        assert_eq!(
+            told,
+            [
+                "candidate:au0 1 udp 1694498559 203.0.113.7 40000 typ srflx raddr 0.0.0.0 rport 9",
+                "candidate:s1 1 udp 1694498815 203.0.113.8 40000 typ srflx raddr 0.0.0.0 rport 9",
+            ]
+        );
+        s.shutdown().await;
+        demux.stop();
+    }
+
+    #[tokio::test]
     async fn a_silent_stun_server_holds_end_of_candidates_for_the_deadline_only() {
         let dir = private_dir("srflx-deadline");
         let clock = Arc::new(FakeClock::from_system());
@@ -4766,6 +6008,7 @@ mod tests {
         assert_eq!(next(&mut events).await["type"], "answer");
         report(&s, "s1", end_of_candidates());
         tokio::task::yield_now().await;
+        // Not released by the TURN client either, which has no server.
         assert!(events.try_recv().is_err(), "held while the gather runs");
         clock.advance(GATHER_DEADLINE);
         assert_eq!(
@@ -4779,7 +6022,14 @@ mod tests {
     /// [`with_webrtc`] with a TURN client on a loopback socket and its
     /// demux, and that socket's host address.
     fn with_turn(binary: &str) -> (Supervisor, crate::net::demux::Demux, SocketAddr) {
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        with_turn_on(binary, Arc::new(SystemClock))
+    }
+
+    /// [`with_turn`] on `clock`.
+    fn with_turn_on(
+        binary: &str,
+        clock: Arc<dyn Clock>,
+    ) -> (Supervisor, crate::net::demux::Demux, SocketAddr) {
         let bound = crate::net::udp::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
         let demux = crate::net::demux::Demux::start(
             Arc::clone(&bound.socket),
@@ -4792,6 +6042,7 @@ mod tests {
             registrations: demux.registrations(),
             hosts: bound.hosts,
             tcp_hosts: vec![],
+            scan: None,
             stun: None,
             turn: Some(Arc::new(TurnClient::new(
                 bound.socket,
@@ -4995,7 +6246,10 @@ mod tests {
     async fn a_refused_turn_credential_ends_the_relay_gather_without_a_candidate() {
         let dir = private_dir("relay-refused");
         let (turn, server) = turn_server().await;
-        let (s, demux, _host) = with_turn(&blocking_worker(&dir));
+        // The clock stands still: end-of-candidates comes as the queue ends,
+        // not at the deadline.
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, _host) = with_turn_on(&blocking_worker(&dir), clock.clone());
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut events =
             subscription(call_on(&s, 1, &turn_offer(2, server.udp_addr(), "wrong")).await);
@@ -5014,8 +6268,151 @@ mod tests {
             next(&mut events).await,
             json!({ "type": "candidate", "candidate": "" })
         );
-        assert!(turn.allocations().is_empty());
-        s.shutdown().await;
+        assert_eq!(turn.allocations(), []);
+        shutdown_on(&s, &clock).await;
+        demux.stop();
+    }
+
+    /// A TURN server over TCP on a loopback port nobody listens on: its
+    /// connection is refused at once.
+    fn refused_turn_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = listener.local_addr().unwrap();
+        drop(listener);
+        format!("turn:{closed}?transport=tcp")
+    }
+
+    #[tokio::test]
+    async fn four_failed_turn_servers_make_room_for_a_fifth_before_the_deadline() {
+        let dir = private_dir("relay-queue");
+        let (turn, server) = turn_server().await;
+        // The clock stands still: the deadline never passes.
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, _host) = with_turn_on(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let (tx, mut rx) = mpsc::channel(16);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        let mut urls: Vec<String> = (0..crate::gather::TURN_IN_FLIGHT)
+            .map(|_| refused_turn_url())
+            .collect();
+        urls.push(format!("turn:{}", server.udp_addr()));
+        let mut offer = offer(2, "front", Some("s1"));
+        offer["ice_servers"] = json!([{ "urls": urls, "username": "ha", "credential": "pw" }]);
+        let mut events = subscription(call_on(&s, 1, &offer).await);
+        next(&mut events).await;
+        let_assert!(
+            DriverCommand::RelayCandidate {
+                relayed,
+                server: via,
+                tcp: false,
+                ..
+            } = next_command(&mut rx).await,
+            "the fifth server's relay candidate"
+        );
+        assert_eq!(via, server.udp_addr());
+        assert_eq!(turn.allocations().len(), 1);
+        // Nothing left in flight or queued: end-of-candidates follows the
+        // relay's line at once (RFC 8838 §13).
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
+        );
+        assert_eq!(next(&mut events).await["type"], "answer");
+        report(&s, "s1", end_of_candidates());
+        report(
+            &s,
+            "s1",
+            Report::Relayed {
+                relayed,
+                candidate: None,
+            },
+        );
+        assert_eq!(
+            next(&mut events).await,
+            json!({ "type": "candidate", "candidate": "" })
+        );
+        shutdown_on(&s, &clock).await;
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_silent_turn_server_holds_end_of_candidates_for_the_deadline_only() {
+        let dir = private_dir("relay-deadline");
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, _host) = with_turn_on(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut events =
+            subscription(call_on(&s, 1, &turn_offer(2, silent.local_addr().unwrap(), "pw")).await);
+        next(&mut events).await;
+        report(
+            &s,
+            "s1",
+            Report::Answer {
+                sdp: "v=0".into(),
+                talkback: None,
+            },
+        );
+        assert_eq!(next(&mut events).await["type"], "answer");
+        report(&s, "s1", end_of_candidates());
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err(), "held while the attempt runs");
+        clock.advance(GATHER_DEADLINE);
+        assert_eq!(
+            next(&mut events).await,
+            json!({ "type": "candidate", "candidate": "" })
+        );
+        shutdown_on(&s, &clock).await;
+        demux.stop();
+    }
+
+    #[tokio::test]
+    async fn a_silent_udp_turn_server_s_tcp_twin_relays_before_the_deadline_rfc_7065_3_1() {
+        let dir = private_dir("relay-twin");
+        let (turn, server) = turn_server().await;
+        let clock = Arc::new(FakeClock::from_system());
+        let (s, demux, host) = with_turn_on(&blocking_worker(&dir), clock.clone());
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let (tx, mut rx) = mpsc::channel(16);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        // A network that drops UDP to the server: its host and port over
+        // UDP never answer, over TCP they are the fake server's.
+        let address = server.tcp_addr();
+        let silent = tokio::net::UdpSocket::bind(address).await.unwrap();
+        let mut offer = offer(2, "front", Some("s1"));
+        offer["ice_servers"] = json!([{
+            "urls": [format!("turn:{address}"), format!("turn:{address}?transport=tcp")],
+            "username": "ha", "credential": "pw"
+        }]);
+        let mut events = subscription(call_on(&s, 1, &offer).await);
+        next(&mut events).await;
+        // The UDP attempt runs; its twin waits.
+        let mut buf = [0_u8; 1500];
+        let (_, from) = silent.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from, host);
+        assert_eq!(server.tcp_clients(), []);
+        // No answer over UDP within the delay: the twin starts alongside,
+        // long before the gather deadline.
+        clock.advance(crate::gather::TWIN_DELAY);
+        let_assert!(
+            DriverCommand::RelayCandidate {
+                relayed,
+                server: via,
+                tcp: true,
+                ..
+            } = next_command(&mut rx).await,
+            "the tcp twin's relay candidate"
+        );
+        assert_eq!(via, address);
+        let allocations = turn.allocations();
+        assert_eq!(allocations.len(), 1);
+        assert!(allocations[0].tcp);
+        assert_eq!(allocations[0].relayed, relayed);
+        shutdown_on(&s, &clock).await;
         demux.stop();
     }
 
@@ -5039,7 +6436,7 @@ mod tests {
     }
 
     /// A subscription's result and events.
-    fn started(outcome: Outcome) -> (Value, mpsc::Receiver<Event>) {
+    pub(crate) fn started(outcome: Outcome) -> (Value, mpsc::Receiver<Event>) {
         let_assert!(Outcome::SubscribedWith { result, events } = outcome);
         (result, events)
     }
@@ -5063,7 +6460,7 @@ mod tests {
 
     /// The commands `c1`'s driver would get from now on, on a queue of
     /// `capacity`.
-    fn intercept(s: &Supervisor, capacity: usize) -> mpsc::Receiver<DriverCommand> {
+    pub(crate) fn intercept(s: &Supervisor, capacity: usize) -> mpsc::Receiver<DriverCommand> {
         let (tx, rx) = mpsc::channel(capacity);
         s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
         rx
@@ -5082,7 +6479,7 @@ mod tests {
         )
     }
 
-    fn demand(s: &Supervisor) -> Demand {
+    pub(crate) fn demand(s: &Supervisor) -> Demand {
         *s.shared.lock().connections["c1"].demand.borrow()
     }
 
@@ -5122,7 +6519,7 @@ mod tests {
             )
         );
         let windowed = json!({ "id": 2, "type": "stream/put", "stream_id": "front",
-                               "sources": [{ "url": "fake://127.0.0.1/" }], "prerecord_ms": 30_001 });
+                               "sources": [{ "protocol": "fake", "url": "fake://127.0.0.1/" }], "prerecord_ms": 30_001 });
         let err = error(call(&s, &windowed.to_string()).await);
         assert_eq!(
             err.message,
@@ -5177,7 +6574,7 @@ mod tests {
         let mut body = s.recording_body(&RecordingId::new("k1").unwrap()).unwrap();
         let mut bytes = Vec::new();
         within(body.reader.read_to_end(&mut bytes)).await.unwrap();
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, b"");
         recording_report(
             &s,
             "k1",
@@ -5263,6 +6660,7 @@ mod tests {
         far["prerecord_ms"] = json!(300_001);
         let err = refused(call(&s, &far.to_string()).await);
         assert_eq!(err.details["field"], "prerecord_ms");
+        assert_eq!(err.details["limit"], "max_prerecord_ms");
         assert_eq!(
             err.message,
             "`prerecord_ms` is 300001, the maximum is 300000 (`limits.max_prerecord_ms`)"
@@ -5271,6 +6669,7 @@ mod tests {
         long["duration_ms"] = json!(3_600_001);
         let err = refused(call(&s, &long.to_string()).await);
         assert_eq!(err.details["field"], "duration_ms");
+        assert_eq!(err.details["limit"], "max_recording_ms");
         // The longest window and the longest recording are allowed, 5 minutes
         // before and an hour after, the most a client's record call asks:
         // what refuses this one is the stream.
@@ -5720,7 +7119,7 @@ mod tests {
         let s = with_recordings(&recording_worker(&dir), Arc::new(SystemClock));
         let windowed = |prerecord_ms: u32, preload: bool| {
             json!({ "id": 1, "type": "stream/put", "stream_id": "front",
-                    "sources": [{ "url": "fake://127.0.0.1:1/" }],
+                    "sources": [{ "protocol": "fake", "url": "fake://127.0.0.1:1/" }],
                     "preload": preload, "prerecord_ms": prerecord_ms })
             .to_string()
         };
@@ -5966,5 +7365,477 @@ mod tests {
         assert!(!s.shared.lock().recording_id_in_use("k1"));
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A supervisor with the fake live container, whose workers run `binary`.
+    pub(crate) fn with_live(binary: &str, clock: Arc<dyn Clock>) -> Supervisor {
+        let mut environment = environment(binary);
+        environment.registries.live = Some(Arc::new(
+            lotse_core::test_util::FakeLiveMuxerFactory::default(),
+        ));
+        Supervisor::new(session_settings(), environment, clock)
+    }
+
+    fn live_create(id: u64, stream_id: &str) -> String {
+        json!({ "id": id, "type": "live/create", "stream_id": stream_id }).to_string()
+    }
+
+    pub(crate) const LIVE_MIME: &str = "video/mp4; codecs=\"avc1.42c028\"";
+
+    /// Waits for the start the driver's queue `commands` gets; its live id.
+    async fn live_start(commands: &mut mpsc::Receiver<DriverCommand>) -> String {
+        let_assert!(Some(DriverCommand::StartLive { spec, .. }) = within(commands.recv()).await);
+        spec.live_id
+    }
+
+    pub(crate) fn live_report(s: &Supervisor, live_id: &str, report: lotse_ipc::LiveReport) {
+        s.shared.lock().live_report("c1", live_id, report);
+    }
+
+    pub(crate) fn live_started() -> lotse_ipc::LiveReport {
+        lotse_ipc::LiveReport::Started {
+            mime: LIVE_MIME.into(),
+            video: "h264".into(),
+            audio: None,
+        }
+    }
+
+    pub(crate) fn live_closed(reason: &str) -> lotse_ipc::LiveReport {
+        lotse_ipc::LiveReport::Closed {
+            reason: reason.into(),
+            bytes: 10,
+            dropped_frames: 0,
+            drops: 0,
+        }
+    }
+
+    /// `live/create` hands the start to the stream's connection, which it
+    /// raises demand on, and answers once the worker's init segment is in,
+    /// with the MIME type; the body is taken once, the worker told; and
+    /// `live/close` ends it `closed`, the worker's `Closed` its last event.
+    #[tokio::test]
+    async fn a_live_output_is_answered_with_its_mime_type_once_its_worker_started_it() {
+        let dir = private_dir("live-start");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
+        assert_eq!(info["outputs"], json!(["live", "hls"]));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        assert_eq!(demand(&s).viewers, 1, "a live output is a viewer");
+        assert!(!create.is_finished(), "it waits for the init segment");
+        live_report(&s, &live_id, live_started());
+        let (answer, mut events) = started(within(create).await.unwrap());
+        assert_eq!(
+            answer,
+            json!({ "live_id": live_id, "mime": LIVE_MIME, "url": format!("/v0/live/{live_id}") })
+        );
+        let id = LiveId::new(&live_id).unwrap();
+        let body = s.live_body(&id).unwrap();
+        assert_eq!(body.mime, LIVE_MIME);
+        let_assert!(Some(DriverCommand::FetchLive { live_id: fetched }) = commands.recv().await);
+        assert_eq!(fetched, live_id);
+        assert_eq!(s.live_body(&id).unwrap_err(), LiveBodyError::AlreadyFetched);
+        let close = json!({ "id": 3, "type": "live/close", "live_id": live_id });
+        assert_eq!(result(call(&s, &close.to_string()).await), json!({}));
+        let_assert!(Some(DriverCommand::StopLive { live_id: stopped }) = commands.recv().await);
+        assert_eq!(stopped, live_id);
+        live_report(&s, &live_id, live_closed(lotse_ipc::STOPPED_AS_ASKED));
+        let closed = next(&mut events).await;
+        assert_eq!(
+            (&closed["type"], &closed["reason"]),
+            (&json!("closed"), &json!("closed"))
+        );
+        assert!(events.recv().await.is_none(), "closed is the last event");
+        assert_eq!(demand(&s).viewers, 0);
+        let err = error(call(&s, &close.to_string()).await);
+        assert_eq!(err.code, ErrorCode::LiveNotFound);
+        assert_eq!(
+            s.live_body(&LiveId::new("gone").unwrap()).unwrap_err(),
+            LiveBodyError::NotFound
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A shutdown closes a started live output `shutting_down` at once: its
+    /// owner gets `closed`, its last event, without the worker's report,
+    /// and the worker is asked to stop it.
+    #[tokio::test]
+    async fn a_shutdown_closes_a_live_output_shutting_down_without_its_worker_s_report() {
+        let dir = private_dir("live-shutdown");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        live_report(&s, &live_id, live_started());
+        let (_answer, mut events) = started(within(create).await.unwrap());
+        s.close_sessions();
+        let closed = next(&mut events).await;
+        assert_eq!(
+            (&closed["type"], &closed["reason"], &closed["bytes"]),
+            (&json!("closed"), &json!("shutting_down"), &json!(0))
+        );
+        assert!(events.recv().await.is_none(), "closed is the last event");
+        assert!(s.shared.lock().lives.is_empty());
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        // The worker's late report finds the output gone.
+        live_report(&s, &live_id, live_closed(lotse_ipc::STOPPED_AS_ASKED));
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `unsubscribe` of a live output's subscription ends it
+    /// `session_closed`, asked of its worker; nothing answers but the
+    /// unsubscribe itself.
+    #[tokio::test]
+    async fn unsubscribing_a_live_output_ends_it_session_closed() {
+        let dir = private_dir("live-unsubscribe");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        live_report(&s, &live_id, live_started());
+        let (_answer, _events) = started(within(create).await.unwrap());
+        assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        assert_eq!(
+            s.shared.lock().lives[&live_id].ending,
+            Some(LiveCloseReason::SessionClosed)
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `unsubscribe` of a `live/create` still waiting for its init segment
+    /// ends the output `session_closed`, asked of its worker, and refuses
+    /// the create `live_not_found`.
+    #[tokio::test]
+    async fn unsubscribing_a_waiting_live_create_ends_it_and_refuses_the_create() {
+        let dir = private_dir("live-unsubscribe-waiting");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+        let err = error(within(create).await.unwrap());
+        assert_eq!(err.code, ErrorCode::LiveNotFound);
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `live/create` holds the request to its stream, a container to write
+    /// with, the limits (refused at either, logged rate-limited) and room in
+    /// the connection's queue for its start, fetch and stop.
+    #[tokio::test]
+    async fn live_create_holds_the_request_to_the_stream_the_limits_and_the_queue() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let dir = private_dir("live-limits");
+        let none = Supervisor::new(
+            session_settings(),
+            environment(&blocking_worker(&dir)),
+            Arc::new(SystemClock),
+        );
+        result(call(&none, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let err = error(call(&none, &live_create(2, "front")).await);
+        assert_eq!(
+            (err.code, &err.details["limit"]),
+            (ErrorCode::LimitReached, &json!("max_live")),
+            "no live container: no live output"
+        );
+        none.shutdown().await;
+        let mut settings = session_settings();
+        settings.limits.live = LiveLimits {
+            max_live: 2,
+            max_live_per_stream: 1,
+            ..LiveLimits::DEFAULT
+        };
+        let mut environment = environment(&blocking_worker(&dir));
+        environment.registries.live = Some(Arc::new(
+            lotse_core::test_util::FakeLiveMuxerFactory::default(),
+        ));
+        let s = Arc::new(Supervisor::new(
+            settings,
+            environment,
+            Arc::new(SystemClock),
+        ));
+        let err = error(call(&s, &live_create(1, "bad id")).await);
+        assert_eq!(err.code, ErrorCode::InvalidStreamId);
+        let err = error(call(&s, &live_create(2, "front")).await);
+        assert_eq!(err.code, ErrorCode::StreamNotFound);
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
+        // A busy connection takes no start: one free slot is not three.
+        let (tx, _full) = mpsc::channel(2);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        let err = error(call(&s, &live_create(3, "front")).await);
+        assert_eq!(err.details["limit"], "connection_queue");
+        assert!(s.shared.lock().lives.is_empty());
+        let mut commands = intercept(&s, 16);
+        let front = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(4, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        let err = error(call(&s, &live_create(5, "front")).await);
+        assert_eq!(err.details["limit"], "max_live_per_stream");
+        // A second stream's output fills `max_live`.
+        let back_connection = s.shared.lock().streams["back"].sources[0]
+            .connection
+            .clone();
+        let (tx, mut back_commands) = mpsc::channel(16);
+        s.shared
+            .lock()
+            .connections
+            .get_mut(&back_connection)
+            .unwrap()
+            .commands = tx;
+        let back = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(6, "back")).await }
+        });
+        let back_id = live_start(&mut back_commands).await;
+        let err = error(call(&s, &live_create(7, "back")).await);
+        assert_eq!(err.details["limit"], "max_live");
+        assert_eq!(
+            captured.lines("live output refused at its limit").len(),
+            2,
+            "the first and none more within the interval"
+        );
+        live_report(&s, &live_id, live_closed("source_not_live"));
+        let err = error(within(front).await.unwrap());
+        assert_eq!(err.code, ErrorCode::SourceNotLive);
+        s.shared
+            .lock()
+            .live_report(&back_connection, &back_id, live_closed("no_video_track"));
+        let err = error(within(back).await.unwrap());
+        assert_eq!(err.code, ErrorCode::NoVideoTrack);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The queue of a connection holds the fetch and the stop every live
+    /// output the daemon allows reserves besides its own room: outputs up
+    /// to `max_live` never leave a create without room in an idle queue.
+    #[tokio::test]
+    async fn a_connection_s_queue_holds_the_slots_every_allowed_live_output_reserves() {
+        let dir = private_dir("live-room");
+        let mut settings = session_settings();
+        settings.limits.live = LiveLimits {
+            max_live: 3,
+            ..LiveLimits::DEFAULT
+        };
+        let mut environment = environment(&blocking_worker(&dir));
+        environment.registries.live = Some(Arc::new(
+            lotse_core::test_util::FakeLiveMuxerFactory::default(),
+        ));
+        let s = Supervisor::new(settings, environment, Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let sessions = usize::try_from(s.settings.limits.max_sessions).unwrap();
+        let recordings = usize::try_from(s.shared.lock().recording_limits.max_recordings).unwrap();
+        assert_eq!(
+            s.shared.lock().connections["c1"].commands.max_capacity(),
+            COMMAND_QUEUE + sessions + recordings + 3 * 2
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A start no worker answers within the start timeout and its slack ends
+    /// the output `source_not_live`, its stop handed to the driver; an
+    /// answered one not fetched within the fetch timeout ends `not_fetched`.
+    #[tokio::test]
+    async fn a_live_output_not_started_or_not_fetched_in_time_ends() {
+        let dir = private_dir("live-deadlines");
+        let clock = Arc::new(FakeClock::from_system());
+        let s = Arc::new(with_live(&blocking_worker(&dir), clock.clone()));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(1, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        clock.advance(LiveLimits::DEFAULT.start_timeout + LIVE_CREATE_SLACK);
+        let err = error(within(create).await.unwrap());
+        assert_eq!(err.code, ErrorCode::SourceNotLive);
+        assert_eq!(err.details["live_id"], json!(live_id));
+        let_assert!(Some(DriverCommand::StopLive { .. }) = commands.recv().await);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let second = live_start(&mut commands).await;
+        live_report(&s, &second, live_started());
+        let (_answer, mut events) = started(within(create).await.unwrap());
+        clock.advance(LiveLimits::DEFAULT.fetch_timeout);
+        settle().await;
+        let_assert!(Some(DriverCommand::StopLive { live_id: stopped }) = commands.recv().await);
+        assert_eq!(stopped, second);
+        live_report(&s, &second, live_closed(lotse_ipc::STOPPED_AS_ASKED));
+        assert_eq!(next(&mut events).await["reason"], "not_fetched");
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A live output of a stream moved to another source ends
+    /// `stream_changed` as its old connection goes, one of a deleted stream
+    /// `stream_deleted`, asked of its worker first.
+    #[tokio::test]
+    async fn a_moved_or_deleted_stream_ends_its_live_outputs() {
+        let dir = private_dir("live-moved");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        let delete = json!({ "id": 1, "type": "stream/delete", "stream_id": "front" }).to_string();
+        for (id, change, reason) in [
+            (
+                1,
+                put("front", "fake://127.0.0.1:9/", false),
+                "stream_changed",
+            ),
+            (2, delete, "stream_deleted"),
+        ] {
+            result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+            let connection = s.shared.lock().streams["front"].sources[0]
+                .connection
+                .clone();
+            let (tx, mut commands) = mpsc::channel(16);
+            s.shared
+                .lock()
+                .connections
+                .get_mut(&connection)
+                .unwrap()
+                .commands = tx;
+            let create = spawn_named("test.live_create", {
+                let s = Arc::clone(&s);
+                async move { call(&s, &live_create(id, "front")).await }
+            });
+            let live_id = live_start(&mut commands).await;
+            s.shared
+                .lock()
+                .live_report(&connection, &live_id, live_started());
+            let (_answer, mut events) = started(within(create).await.unwrap());
+            result(call(&s, &change).await);
+            assert_eq!(next(&mut events).await["reason"], reason);
+            assert!(!s.shared.lock().lives.contains_key(&live_id));
+        }
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A live output of a stream whose first source moves to another
+    /// connection, the old one kept as a later source, is asked to stop at
+    /// once and ends `stream_changed` with its worker's `Closed`.
+    #[tokio::test]
+    async fn a_live_output_of_a_stream_whose_first_source_moved_ends_stream_changed() {
+        let dir = private_dir("live-moved-first");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let connection = s.shared.lock().streams["front"].sources[0]
+            .connection
+            .clone();
+        let (tx, mut commands) = mpsc::channel(16);
+        s.shared
+            .lock()
+            .connections
+            .get_mut(&connection)
+            .unwrap()
+            .commands = tx;
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        s.shared
+            .lock()
+            .live_report(&connection, &live_id, live_started());
+        let (_answer, mut events) = started(within(create).await.unwrap());
+        // Another stream's output, on a connection of its own, stays.
+        result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
+        let back = s.shared.lock().streams["back"].sources[0]
+            .connection
+            .clone();
+        let (tx, mut back_commands) = mpsc::channel(16);
+        s.shared.lock().connections.get_mut(&back).unwrap().commands = tx;
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(4, "back")).await }
+        });
+        let back_live = live_start(&mut back_commands).await;
+        s.shared
+            .lock()
+            .live_report(&back, &back_live, live_started());
+        let (_answer, _back_events) = started(within(create).await.unwrap());
+        let failover = json!({ "id": 3, "type": "stream/put", "stream_id": "front",
+                               "sources": [{ "protocol": "fake", "url": "fake://127.0.0.1:9/" },
+                                           { "protocol": "fake", "url": "fake://127.0.0.1:1/" }] });
+        result(call(&s, &failover.to_string()).await);
+        assert_eq!(
+            s.shared.lock().streams["front"].sources[1].connection,
+            connection,
+            "the old connection stays, as the second source's"
+        );
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        s.shared.lock().live_report(
+            &connection,
+            &live_id,
+            live_closed(lotse_ipc::STOPPED_AS_ASKED),
+        );
+        assert_eq!(next(&mut events).await["reason"], "stream_changed");
+        assert!(!s.shared.lock().lives.contains_key(&live_id));
+        assert!(s.shared.lock().lives.contains_key(&back_live));
+        assert!(back_commands.try_recv().is_err(), "nothing asked of it");
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Why an output that ended before its init segment refuses its
+    /// `live/create`.
+    #[test]
+    fn a_live_output_ended_before_its_start_refuses_its_create_with_why() {
+        for (reason, code) in [
+            (LiveCloseReason::NoVideoTrack, ErrorCode::NoVideoTrack),
+            (LiveCloseReason::SourceNotLive, ErrorCode::SourceNotLive),
+            (LiveCloseReason::WorkerCrashed, ErrorCode::WorkerCrashed),
+            (LiveCloseReason::ShuttingDown, ErrorCode::ShuttingDown),
+            (LiveCloseReason::StreamDeleted, ErrorCode::StreamNotFound),
+            (LiveCloseReason::SessionClosed, ErrorCode::LiveNotFound),
+            (LiveCloseReason::CodecChanged, ErrorCode::InternalError),
+        ] {
+            assert_eq!(live_start_error(reason).code, code, "{reason}");
+        }
+        assert_eq!(
+            live_start_error(LiveCloseReason::ClientGone).details["reason"],
+            "client_gone"
+        );
     }
 }

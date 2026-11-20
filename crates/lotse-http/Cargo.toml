@@ -17,9 +17,10 @@ http-auth = { workspace = true } # Basic and Digest answers to a server's challe
 http-body-util = { workspace = true } # the empty GET body, frame-by-frame body reads and the `Limited` cap of a whole body
 hyper = { workspace = true, features = ["client"] } # the HTTP/1.1 connections to the source (`client::conn::http1`)
 hyper-util = { workspace = true } # `TokioIo` between the connection's tokio stream and hyper
+lotse-api-types = { workspace = true } # the `http` and `https` sources' fields (`HttpOptions`, `HttpsOptions`), declared with the API's `stream/put` variants
 lotse-codec = { workspace = true } # ADTS splitting of AAC from MPEG-TS
 lotse-core = { workspace = true } # the codecs and kinds of a demultiplexed program's tracks, and the tracks it is published on
-lotse-tls = { workspace = true } # `https`: the certificate check and the TLS stream to the server; the `tls_fingerprint` option
+lotse-tls = { workspace = true } # `https`: the certificate check and the TLS stream to the server; the `tls` field parsed to a trust
 m3u8-rs = { workspace = true }
 mp4-atom = { workspace = true }
 mpeg2ts-reader = { workspace = true }

@@ -116,7 +116,7 @@ async fn the_dev_viewer_page_plays_a_camera_through_a_running_daemon() {
     lotse_webrtc::install_crypto_provider();
     let mut viewer = Viewer::new(viewer_addr, clock().now()).expect("a viewer");
     let put = json!({ "id": 1, "type": "stream/put", "stream_id": "cam",
-                      "sources": [{ "url": cam.url() }], "orientation": "rotate_left" });
+                      "sources": [lotse_testing::source(&cam.url(), json!({}))], "orientation": "rotate_left" });
     page.send(Message::text(put.to_string())).await.unwrap();
     let put = next_frame(&mut page).await;
     assert_eq!(

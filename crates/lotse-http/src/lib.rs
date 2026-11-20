@@ -5,11 +5,12 @@
 //! and publishing of their units on the tracks, the HTTP/1.1 client
 //! that fetches playlists and segments, and the source that runs them
 //! for one connection attempt ([`source::HttpSource`]) with its options,
-//! and the factory of the `http` and `https` schemes ([`HttpFactory`]).
+//! and the factory of the `http` and `https` protocols ([`HttpFactory`]).
 //!
 //! Runs in a worker, on bytes from the network: every parser here is fuzzed.
-//! May depend on `lotse-core`, `lotse-codec` and `lotse-tls` only, never on
-//! another source crate. The binary registers its factory behind the
+//! May depend on `lotse-core`, `lotse-codec`, `lotse-tls` and
+//! `lotse-api-types` (the `http` and `https` sources' fields, declared there
+//! once) only, never on another source crate. The binary registers its factory behind the
 //! `source-http` feature.
 //!
 //! Standards: RFC 8216 (HTTP Live Streaming), RFC 6381 §3 (the codec names
@@ -34,3 +35,4 @@ pub mod source;
 pub mod ts;
 
 pub use factory::{DEFAULT_PORT, DEFAULT_TLS_PORT, HttpFactory};
+pub use source::{PROTOCOL, TLS_PROTOCOL};

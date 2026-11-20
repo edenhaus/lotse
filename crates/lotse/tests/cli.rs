@@ -217,6 +217,55 @@ fn sandbox_require_refuses_to_start_off_linux() {
     assert!(stderr.contains("require"), "{stderr}");
 }
 
+/// `require` is the default: started with no sandbox setting, the daemon
+/// either enforces every layer or refuses to start, naming the layer it
+/// lacks and how to choose `on`. Which one depends on the host's kernel
+/// (and outside Linux it always refuses), so the test takes the branch the
+/// daemon took and checks it.
+#[test]
+fn sandbox_defaults_to_require_every_layer_or_no_start() {
+    let dir = socket_dir("default-sandbox");
+    let socket = dir.join("lotse.sock");
+    let mut daemon = Daemon::start(
+        &[
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "127.0.0.1:0",
+            "--socket",
+            socket.to_str().expect("utf-8"),
+            "--log-format",
+            "json",
+        ],
+        &[],
+    );
+    let setting = json(&daemon.wait_for("\"setting\":\"sandbox\""));
+    assert_eq!(setting["value"], "require");
+    assert_eq!(setting["source"], "default");
+    let outcome = json(&daemon.wait_for_any(&["sandbox applied", "lotse failed"]));
+    if outcome["message"] == "sandbox applied" {
+        for layer in ["seccomp", "landlock_fs", "landlock_net"] {
+            assert_eq!(outcome[layer], "enforced", "{layer}: {outcome}");
+        }
+        daemon.wait_for("\"event\":\"ready\"");
+        let (code, _) = daemon.terminate();
+        assert_eq!(code, Some(0));
+    } else {
+        let error = outcome["error"].as_str().unwrap_or_default();
+        assert!(error.starts_with("sandbox: sandbox layer "), "{outcome}");
+        assert!(
+            error.contains("is unavailable and the sandbox mode is `require`, the default"),
+            "{outcome}"
+        );
+        assert!(
+            error.contains("`--sandbox on`, `LOTSE_SANDBOX=on`"),
+            "{outcome}"
+        );
+        let (code, _) = daemon.exit();
+        assert_eq!(code, Some(1));
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn sandbox_on_lets_the_supervisor_run_under_its_profile() {
@@ -289,15 +338,99 @@ fn the_control_tls_listener_starts_with_its_identity_and_identity_prints_its_pin
     let (code, rest) = daemon.terminate();
     assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
 
-    let output = lotse()
-        .arg("identity")
-        .env("LOTSE_DATA_DIR", data)
-        .output()
-        .expect("runs");
-    assert!(output.status.success());
+    // The drop target, as `serve` takes it, changes nothing for a start
+    // that is not root.
+    for user in [None, Some("4242")] {
+        let mut identity = lotse();
+        identity.arg("identity").env("LOTSE_DATA_DIR", data);
+        if let Some(user) = user {
+            identity.env("LOTSE_USER", user);
+        }
+        let output = identity.output().expect("runs");
+        assert!(output.status.success(), "{user:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            bound["server_pin"].as_str().unwrap()
+        );
+    }
+}
+
+/// An identity an older daemon made, without the DNS name: `--certificate`
+/// prints it and says what to do, `--reissue` replaces the certificate
+/// from the same key, and the pin changes.
+#[test]
+fn identity_prints_the_certificate_rfc7468_5_and_reissues_it_naming_lotse_rfc5280_4_2_1_6() {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    let dir = socket_dir("identity-reissue");
+    let data = dir.join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let identity = |args: &[&str]| {
+        lotse()
+            .arg("identity")
+            .args(args)
+            .env("LOTSE_DATA_DIR", &data)
+            .output()
+            .expect("runs")
+    };
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    let missing = identity(&["--reissue"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(text(&missing.stderr).contains("reissuing the control identity"));
+
+    let legacy = lotse_testing::control_tls::legacy_server_identity_pem().unwrap();
+    let file = data.join("control-identity.pem");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&file)
+        .unwrap()
+        .write_all(legacy.as_bytes())
+        .unwrap();
+    let old_pin = text(&identity(&[]).stdout).trim().to_owned();
+    let old = identity(&["--certificate"]);
+    assert!(old.status.success());
+    let old_pem = text(&old.stdout);
+    assert!(
+        old_pem.starts_with("-----BEGIN CERTIFICATE-----\n"),
+        "{old_pem}"
+    );
+    assert!(
+        old_pem.ends_with("-----END CERTIFICATE-----\n"),
+        "{old_pem}"
+    );
+    assert!(!old_pem.contains("PRIVATE"), "never the key");
+    assert!(legacy.ends_with(&old_pem), "the certificate as it is");
+    assert!(text(&old.stderr).contains("lotse identity --reissue"));
+
+    let both = identity(&["--certificate", "--reissue"]);
+    assert_eq!(both.status.code(), Some(2), "the flags exclude each other");
+    assert_eq!(text(&identity(&[]).stdout).trim(), old_pin, "untouched");
+
+    let reissued = identity(&["--reissue"]);
+    assert!(reissued.status.success(), "{reissued:?}");
+    let new_pin = text(&reissued.stdout).trim().to_owned();
+    assert_ne!(new_pin, old_pin);
+    assert!(text(&reissued.stderr).contains("every client must pair again"));
+    assert_eq!(text(&identity(&[]).stdout).trim(), new_pin);
+    let new = identity(&["--certificate"]);
+    assert!(new.status.success());
+    assert_ne!(text(&new.stdout), old_pem);
+    assert!(
+        new.stderr.is_empty(),
+        "it names lotse: {}",
+        text(&new.stderr)
+    );
+    let key = |pem: &str| pem[..pem.find("-----BEGIN CERTIFICATE").unwrap()].to_owned();
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        bound["server_pin"].as_str().unwrap()
+        key(&std::fs::read_to_string(&file).unwrap()),
+        key(&legacy),
+        "the same key"
     );
 }
 
@@ -385,7 +518,7 @@ fn pair_without_a_control_tls_listener_fails() {
 }
 
 #[test]
-fn ctl_clients_lists_the_pins_and_removes_an_enrolled_one_for_good() {
+fn ctl_clients_lists_the_pins_adds_a_metrics_pin_and_removes_an_enrolled_one_for_good() {
     use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 
@@ -452,8 +585,8 @@ fn ctl_clients_lists_the_pins_and_removes_an_enrolled_one_for_good() {
     assert_eq!(
         printed(&output),
         serde_json::json!({ "clients": [
-            { "pin": enrolled, "fixed": false, "connected": false },
-            { "pin": fixed, "fixed": true, "connected": false },
+            { "pin": enrolled, "fixed": false, "role": "control", "connected": false },
+            { "pin": fixed, "fixed": true, "role": "control", "connected": false },
         ] })
     );
     let output = ctl(&["remove", fixed]);
@@ -466,9 +599,69 @@ fn ctl_clients_lists_the_pins_and_removes_an_enrolled_one_for_good() {
     let output = ctl(&["list"]);
     assert_eq!(
         printed(&output)["clients"],
-        serde_json::json!([{ "pin": fixed, "fixed": true, "connected": false }])
+        serde_json::json!([{ "pin": fixed, "fixed": true, "role": "control", "connected": false }])
+    );
+    // A scraper's pin, as `openssl x509 -fingerprint -sha256` prints it:
+    // enrolled as `metrics` on the socket, no restart.
+    let scraper = ["AB"; 32].join(":");
+    let output = ctl(&["add", &scraper, "metrics"]);
+    assert!(output.status.success(), "{output:?}");
+    daemon.wait_for("control client added");
+    let output = ctl(&["add", fixed, "metrics"]);
+    assert_eq!(printed(&output)["error"]["details"]["role"], "control");
+    let output = ctl(&["add", &scraper, "admin"]);
+    assert_eq!(printed(&output)["error"]["code"], "invalid_request");
+    let output = ctl(&["list"]);
+    assert_eq!(
+        printed(&output)["clients"][0],
+        serde_json::json!({ "pin": scraper.to_lowercase(), "fixed": false, "role": "metrics", "connected": false })
     );
     let (exit, rest) = daemon.terminate();
     assert_eq!(exit, Some(0), "clean exit\n{}", rest.join("\n"));
-    assert_eq!(std::fs::read_to_string(&pins).unwrap(), "");
+    assert_eq!(
+        std::fs::read_to_string(&pins).unwrap(),
+        format!("{} metrics\n", scraper.to_lowercase())
+    );
+}
+
+#[test]
+fn a_pin_in_both_client_lists_stops_the_start() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let dir = socket_dir("both-roles");
+    let socket = dir.join("lotse.sock");
+    let data = dir.join("data");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&data)
+        .unwrap();
+    let pin = ["ab"; 32].join(":");
+    let output = lotse()
+        .args([
+            "serve",
+            "--webrtc-udp-listen",
+            "127.0.0.1:0",
+            "--webrtc-tcp-listen",
+            "off",
+            "--socket",
+            socket.to_str().expect("utf-8 path"),
+            "--sandbox",
+            "off",
+            "--control-listen",
+            "127.0.0.1:0",
+            "--data-dir",
+            data.to_str().expect("utf-8 path"),
+            "--control-clients",
+            &pin,
+            "--metrics-clients",
+            &pin,
+        ])
+        .output()
+        .expect("runs");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("is configured both as a control and as a metrics client"),
+        "{output:?}"
+    );
 }

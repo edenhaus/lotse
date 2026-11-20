@@ -7,7 +7,7 @@ rule for humans: whoever submits a change can explain every line of it.
 ## What this is
 
 lotse is a media daemon built for Home Assistant: RTSP and HLS/MPEG-TS
-cameras in, WebRTC to browsers and event recordings (fragmented MP4 with a pre-record) out, driven by its
+cameras by URL and WebRTC cameras whose signaling its client relays in, WebRTC to browsers and event recordings (fragmented MP4 with a pre-record) out, driven by its
 client over a Unix-socket control API. It is in the design phase.
 
 ## Commands
@@ -18,7 +18,7 @@ download checked against `mise.lock`) and installs the git hooks. After
 changing `[tools]`, run `mise lock` and commit both files.
 
 Every check is a prek hook in `.pre-commit-config.yaml`: fmt, clippy,
-rustdoc, cargo-hack, cargo-shear, the fuzz crate's `cargo check`, the
+rustdoc, cargo-hack, cargo-shear, the fuzz crate's `cargo check` (clippy skips it), the
 crate-layering, license-list and fuzz-select checks, cargo-deny, codespell, actionlint, zizmor and file hygiene run on `git commit` (only when matching files changed).
 Add new checks there. No test
 is a hook: the tests, the doctests, coverage and mutants are mise tasks
@@ -31,7 +31,9 @@ it may restore a cache), `scorecard.yml`, `pr-title.yml` and
 `cleanup-caches.yml` (a closed PR's caches deleted) stand apart (each
 says why). Its Build job compiles the musl tests once per arch
 into a nextest archive that the Interop, TURN and Sandbox
-isolation jobs run without compiling; its Coverage build job does the same
+isolation jobs run without compiling, and its Rootless Podman job builds
+the release image from the Release build job's binary, runs it rootless
+and scans it with Grype (as `release.yml` scans the pushed image); its Coverage build job does the same
 with coverage instrumentation for the Tests jobs, which gate on 100 % line
 coverage on each arch and upload the report to Codecov, which gates
 each arch at 100 % again on the PR (`.github/codecov.yml`, one flag per
@@ -66,17 +68,18 @@ workflow and job names start with a capital letter.
 | `mise run turn-e2e` | the TURN client against a real coturn in Docker (ignored `coturn_` tests) |
 | `mise run load [cameras] [viewers] [duration]` | the load generator against a release daemon (`target/load-report.json`) |
 | `mise run soak [duration] [cycle]` | the soak: viewer and camera churn, checked for memory, task and descriptor growth (`target/soak-report.json`) |
-| `mise run interop` | the daemon against MediaMTX fed by ffmpeg (pinned in `mise.toml`): RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS; and ffmpeg's raw MPEG-TS over HTTP (ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (ignored `mediamtx_iso14496_12_recording_` tests); and ffprobe reading the recording muxer's fixtures (ignored `ffprobe_` tests) |
-| `mise run browser [chrome\|firefox\|safari] [play] [case]` | the browser test: one pytest test (`tests/browser/`) has Selenium drive a real browser playing ffmpeg's stream from MediaMTX through a release daemon, per case (`join`, `aac`, `pli`, `reconnect`, `crash`, or `all`, the default) (`target/browser-<engine>/<case>/`); needs the browser, Selenium Manager finds or fetches its driver |
+| `mise run interop` | the daemon against MediaMTX fed by ffmpeg (pinned in `mise.toml`): RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS; and ffmpeg's raw MPEG-TS over HTTP (ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (ignored `mediamtx_iso14496_12_recording_` tests); an LL-HLS session read by ffmpeg as plain HLS, H.264 with AAC and with Opus, and decoded by ffprobe (ignored `mediamtx_hls_ll_` tests); and ffprobe reading the recording muxer's fixtures (ignored `ffprobe_` tests); a real Prometheus (pinned in `mise.toml`) scraping `GET /v0/metrics` over mutual TLS with an openssl-made client certificate, in OpenMetrics and in the Prometheus text format (ignored `prometheus_` test) |
+| `mise run browser [chrome\|firefox\|safari] [play] [case]` | the browser test: one pytest test (`tests/browser/`) has Selenium drive a real browser playing ffmpeg's stream from MediaMTX through a release daemon, per case (`join`, `aac`, `pli`, `reconnect`, `crash`; `mse`, `mse-pcmu`, `mse-opus`, live fMP4 through the browser's MSE beside WebRTC; `llhls`, `llhls-opus`, LL-HLS through a pinned hls.js beside WebRTC; their latencies reported; or `all`, the default) (`target/browser-<engine>/<case>/`); needs the browser, Selenium Manager finds or fetches its driver |
 | `mise run compare [engine] [runs] [play]` | the browser test through lotse and through go2rtc, side by side; a report, not a gate (`target/compare-<engine>/compare.json`) |
 | `mise run test-musl` | the tests on the static musl target (Linux only); CI runs them from `coverage-archive`'s archive instead (`coverage-musl`) |
 | `mise run test-archive` | the musl tests built and archived for other machines, then the doctests (CI's Build job) |
-| `mise run audit` | RustSec advisories, the root and the fuzz workspace (network) |
+| `mise run audit` | RustSec advisories of the workspace, the fuzz crate included (network) |
 | `mise run fuzz <target> [secs]` | one `cargo fuzz` target on the date-pinned nightly the task installs, under the contract's time and memory limits (`scripts/fuzz.sh`, as CI; cargo-fuzz installed by hand, the one nightly use) |
 | `mise run set-version <version>` | the workspace version and its lockfile entries; only a release build sets it, from the tag (the repository keeps `0.0.0-dev`) |
-| `mise run release-build [x86_64\|aarch64]` | static musl binary (Linux only); zig links every musl build (`.cargo/config.toml`) |
+| `mise run release-build [x86_64\|aarch64]` | static musl binary, its dependency list embedded by cargo-auditable for scanners (Linux only); zig links every musl build (`.cargo/config.toml`) |
 | `mise run sbom` / `mise run licenses` | a release's CycloneDX SBOMs and `THIRD_PARTY_LICENSES.md`, in `target/dist/` |
-| `mise run image` | `release-build` for the host's arch, then the release image from it (`Dockerfile`, which takes `target/image/<docker arch>/lotse`), into the local Docker as `lotse:dev` (Linux only) |
+| `mise run image` | `release-build` for the host's arch, then the release image from it, reproducibly (`Dockerfile`, which takes `target/image/<docker arch>/lotse`), into the local Podman, or Docker without it, as `lotse:dev` (Linux only) |
+| `mise run rootless-podman [binary] [arch]` | the release image under rootless Podman, read-only and without capabilities, as a start as its user and as root (`scripts/rootless-podman.sh`, CI's Rootless Podman job; Linux only, as an unprivileged user) |
 
 ## Layout
 
@@ -89,6 +92,9 @@ the same PR. `cargo shear` fails on declared
 dependencies nothing uses, so never add a dependency ahead of the code that
 uses it. The binary only parses the CLI and dispatches to
 `lotse-supervisor` or `lotse-worker`; both are libraries with tests.
+The fuzz targets are a member too (`fuzz/`, `lotse-fuzz`, outside
+`default-members`), sharing the one `Cargo.lock`; `cargo fuzz build` builds
+them on the pinned nightly, whose AddressSanitizer is the only reason for it.
 The clients, the Python `lotse-client` among them, live in their own repository,
 [lotse-clients](https://github.com/edenhaus/lotse-clients): their models are generated from a copy of the API's JSON Schema bundle.
 

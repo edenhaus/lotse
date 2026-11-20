@@ -11,7 +11,9 @@
 //! up to `gop_cache_bytes` of payload and `gop_cache_frames` frames, past
 //! which it is cut back to the keyframe; the keyframe itself is bounded
 //! only by `max_frame_bytes`, because a larger frame is dropped before it
-//! reaches the cache (its frame subscribers take the drop as a lag).
+//! reaches the cache (its frame subscribers take the drop as a lag, and the
+//! cache is cut back to its keyframe there, as the frames after the drop
+//! may reference it); a codec family or clock-rate change empties it.
 //! Nothing checks `max_frame_bytes` against `gop_cache_bytes`: the cache holds at most the larger of the two, which
 //! is `gop_cache_bytes` with the defaults (equal, and the only limits a
 //! worker gives its tracks). While a window is set the track also keeps a
@@ -29,6 +31,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::clock_map::ticks_between;
 use crate::codec::{Codec, Kind};
+use crate::keyframe::{KEYFRAME_REQUEST_INTERVAL, KeyframeOutcome, KeyframeRequests};
 use crate::lateness::LatenessMeter;
 use crate::media::{MediaFrame, MediaPacket, MediaTime};
 use crate::prerecord::{Prerecord, PrerecordShared, PrerecordSnapshot, PrerecordStats, Truncation};
@@ -160,9 +163,15 @@ pub struct GopSnapshot {
     frames: usize,
     /// Payload bytes held, keyframe included.
     bytes: usize,
-    /// The GOP outgrew `gop_cache_bytes` or `gop_cache_frames`, so only the
-    /// keyframe is kept until the next keyframe.
+    /// The GOP outgrew `gop_cache_bytes` or `gop_cache_frames`, or lost a
+    /// frame over `max_frame_bytes`, so only the keyframe is kept until the
+    /// next keyframe.
     truncated: bool,
+    /// The track's descriptor when the keyframe was published: the one its
+    /// frames were published under. A change of family or clock rate
+    /// empties the cache, one within the family (another profile) does
+    /// not, so the track's descriptor may have moved on since.
+    codec: Arc<Codec>,
 }
 
 /// One frame after a GOP's keyframe, linked to the frame before it. Every
@@ -215,9 +224,29 @@ impl GopSnapshot {
         self.bytes
     }
 
-    /// Whether the GOP outgrew the cache and only the keyframe is kept.
+    /// Whether the GOP outgrew the cache or lost a frame, and only the
+    /// keyframe is kept: a still, the frames after it not decodable from
+    /// it alone.
     pub const fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// The track's descriptor when the keyframe was published, which a
+    /// joiner whose format was set by a later descriptor compares.
+    pub const fn codec(&self) -> &Arc<Codec> {
+        &self.codec
+    }
+
+    /// This GOP cut back to its keyframe, truncated.
+    fn cut(&self) -> Self {
+        Self {
+            keyframe: Arc::clone(&self.keyframe),
+            newest: None,
+            frames: 1,
+            bytes: self.keyframe.payload.len(),
+            truncated: true,
+            codec: Arc::clone(&self.codec),
+        }
     }
 
     /// How old the keyframe is at `now`, by its capture time, but at
@@ -260,6 +289,17 @@ pub struct TrackStats {
     /// libwebrtc receivers assemble, as the source reported them
     /// ([`Track::count_frame_over_browser_limit`]).
     pub frames_over_browser_limit: u64,
+    /// Keyframe requests the track's viewers made
+    /// ([`Track::request_keyframe`]).
+    pub keyframe_requests: u64,
+    /// Requests handed to the source feeding the track: one per
+    /// [`KEYFRAME_REQUEST_INTERVAL`] at most, those sent at an interval's
+    /// end for the ones folded in included.
+    pub keyframe_requests_forwarded: u64,
+    /// Requests folded into one forwarded within the interval.
+    pub keyframe_requests_coalesced: u64,
+    /// Requests dropped because no source feeding the track takes them.
+    pub keyframe_requests_dropped: u64,
     /// The pre-record ring, while a window is set ([`Track::set_prerecord`]).
     pub prerecord: Option<PrerecordStats>,
 }
@@ -281,6 +321,14 @@ struct Counters {
     frames_dropped_oversize: AtomicU64,
     /// See [`TrackStats::frames_over_browser_limit`].
     frames_over_browser_limit: AtomicU64,
+    /// See [`TrackStats::keyframe_requests`].
+    keyframe_requests: AtomicU64,
+    /// See [`TrackStats::keyframe_requests_forwarded`].
+    keyframe_requests_forwarded: AtomicU64,
+    /// See [`TrackStats::keyframe_requests_coalesced`].
+    keyframe_requests_coalesced: AtomicU64,
+    /// See [`TrackStats::keyframe_requests_dropped`].
+    keyframe_requests_dropped: AtomicU64,
 }
 
 impl Counters {
@@ -299,6 +347,10 @@ impl Counters {
             keyframes: self.keyframes.load(Ordering::Relaxed),
             frames_dropped_oversize: self.frames_dropped_oversize.load(Ordering::Relaxed),
             frames_over_browser_limit: self.frames_over_browser_limit.load(Ordering::Relaxed),
+            keyframe_requests: self.keyframe_requests.load(Ordering::Relaxed),
+            keyframe_requests_forwarded: self.keyframe_requests_forwarded.load(Ordering::Relaxed),
+            keyframe_requests_coalesced: self.keyframe_requests_coalesced.load(Ordering::Relaxed),
+            keyframe_requests_dropped: self.keyframe_requests_dropped.load(Ordering::Relaxed),
             prerecord: None,
         }
     }
@@ -317,9 +369,20 @@ pub enum TrackControlEvent {
         /// The epoch number that media items now carry.
         epoch: u32,
     },
-    /// The codec descriptor changed on a reconnect. A session closes with
-    /// `stream_changed` only if the family changed.
-    TrackChanged(Arc<Codec>),
+    /// The codec descriptor or the RTP clock rate changed, on a reconnect
+    /// or in band. A session closes with `stream_changed` only if the
+    /// family changed: each family it carries has one RTP clock rate
+    /// (G.711 and G.722 8000, RFC 3551 §4.5.14 and §4.5.2; Opus 48 kHz,
+    /// RFC 7587 §4.1; video 90 kHz). A recording, whose sample entry and
+    /// timescale are fixed once it started, ends on either. A clock-rate
+    /// change is followed by a new epoch on the track
+    /// ([`TrackPublisher::declare`](crate::source::TrackPublisher::declare)).
+    TrackChanged {
+        /// The codec descriptor of the items from here on.
+        codec: Arc<Codec>,
+        /// Ticks per second of their timestamps (RFC 3550 §5.1).
+        clock_rate: u32,
+    },
     /// The source connection is gone; the track stays and will resume.
     SourceLost,
     /// The source connection is back.
@@ -364,7 +427,12 @@ pub enum TrackEvent {
         epoch: u32,
     },
     /// See [`TrackControlEvent::TrackChanged`].
-    TrackChanged(Arc<Codec>),
+    TrackChanged {
+        /// The codec descriptor of the items from here on.
+        codec: Arc<Codec>,
+        /// Ticks per second of their timestamps (RFC 3550 §5.1).
+        clock_rate: u32,
+    },
     /// See [`TrackControlEvent::SourceLost`].
     SourceLost,
     /// See [`TrackControlEvent::SourceRestored`].
@@ -392,7 +460,9 @@ impl TrackEvent {
     fn from_control(event: TrackControlEvent) -> Option<Self> {
         match event {
             TrackControlEvent::EpochStart { epoch } => Some(Self::EpochStart { epoch }),
-            TrackControlEvent::TrackChanged(codec) => Some(Self::TrackChanged(codec)),
+            TrackControlEvent::TrackChanged { codec, clock_rate } => {
+                Some(Self::TrackChanged { codec, clock_rate })
+            }
             TrackControlEvent::SourceLost => Some(Self::SourceLost),
             TrackControlEvent::SourceRestored => Some(Self::SourceRestored),
             TrackControlEvent::SourceSwitched => Some(Self::SourceSwitched),
@@ -701,6 +771,14 @@ pub struct Feeds {
     next_tag: AtomicU8,
     /// The armed staging set's tracks, for the switch.
     armed_tracks: Mutex<Vec<Weak<Track>>>,
+    /// The armed staging set, which becomes [`Self::feeding`] at the
+    /// switch.
+    armed_set: Mutex<Weak<crate::source::TrackSet>>,
+    /// The staging set whose source feeds the live tracks since the last
+    /// switch: where a live track's keyframe requests go
+    /// ([`Track::request_keyframe`]). Empty before any switch, when the
+    /// live set's own source feeds them.
+    feeding: Mutex<Weak<crate::source::TrackSet>>,
     /// The live set, for the switch.
     live: Weak<crate::source::TrackSet>,
     /// The tag last switched to, for whoever runs the sources.
@@ -717,6 +795,8 @@ impl Feeds {
             armed_has_video: AtomicBool::new(false),
             next_tag: AtomicU8::new(1),
             armed_tracks: Mutex::new(Vec::new()),
+            armed_set: Mutex::new(Weak::new()),
+            feeding: Mutex::new(Weak::new()),
             live,
             switched,
         }
@@ -738,9 +818,13 @@ impl Feeds {
         self.next_tag.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Arms the staging set with `tag` and `tracks`: it switches at its
-    /// first keyframe. Replaces a standby armed before.
-    pub(crate) fn arm(&self, tag: u8, tracks: &[Arc<Track>]) {
+    /// Arms the staging set `set` with `tag` and `tracks`, its tracks: it
+    /// switches at its first keyframe. Replaces a standby armed before.
+    pub(crate) fn arm(&self, tag: u8, set: Weak<crate::source::TrackSet>, tracks: &[Arc<Track>]) {
+        *self
+            .armed_set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = set;
         *self
             .armed_tracks
             .lock()
@@ -820,7 +904,7 @@ impl Feeds {
         for track in &staging {
             let codec = (*track.codec()).clone();
             match track.forward_to.load_full() {
-                Some(target) => target.set_codec_inner(tag, codec),
+                Some(target) => target.set_format_inner(tag, codec, Some(track.clock_rate())),
                 None => {
                     if let Some(live) = &live {
                         let declared = live.declare(track.id(), codec, track.clock_rate());
@@ -833,6 +917,13 @@ impl Feeds {
         if let Some(live) = &live {
             live.mark_ready(true);
         }
+        let armed_set = std::mem::take(
+            &mut *self
+                .armed_set
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        *self.feeding.lock().unwrap_or_else(PoisonError::into_inner) = armed_set;
         self.armed.store(0, Ordering::Release);
         self.armed_has_video.store(false, Ordering::Release);
         self.active.store(tag, Ordering::Release);
@@ -842,6 +933,21 @@ impl Feeds {
             "source switched: the standby feeds the tracks"
         );
         self.switched.send_replace(tag);
+    }
+}
+
+impl Feeds {
+    /// The track `id` of the staging set that feeds the live tracks since
+    /// the last switch, whose source takes the live track's keyframe
+    /// requests; `None` before any switch, or once that set is gone or
+    /// has no such track.
+    fn feeder(&self, id: TrackId) -> Option<Arc<Track>> {
+        let set = self
+            .feeding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .upgrade()?;
+        set.get(id)
     }
 }
 
@@ -868,8 +974,11 @@ struct Fed {
 pub struct Track {
     /// The track's id within its stream.
     id: TrackId,
-    /// Ticks per second of `MediaTime` and of the RTP timestamps.
-    clock_rate: u32,
+    /// Ticks per second of `MediaTime` and of the RTP timestamps (RFC 3550
+    /// §5.1); changed only by a redeclaration ([`Self::redeclare`]): with
+    /// the codec under the pre-record lock, or, on a staging track that
+    /// forwards into its live counterpart, as its source's own rate alone.
+    clock_rate: AtomicU32,
     /// The codec descriptor; swapped when a reconnect changes it.
     codec: ArcSwap<Codec>,
     /// The live path: every packet, as read.
@@ -942,6 +1051,39 @@ pub struct Track {
     /// The live counterpart a staging track forwards into, once its source
     /// is active; set at the switch for a track the live set lacked.
     forward_to: ArcSwapOption<Self>,
+    /// The keyframe requests this track's own source takes: bumped per
+    /// request forwarded, its receiver held by the source
+    /// ([`Self::keyframe_requests`]) while it can ask.
+    keyframe_tx: watch::Sender<u64>,
+    /// When the last keyframe request was forwarded, where in the
+    /// broadcast the latest one was made, and the throttle of the line of
+    /// a dropped one. Taken by whoever asks (the sessions' tasks) and,
+    /// while a request is wanted, by the source's task at each frame;
+    /// never held across anything else.
+    keyframe_gate: Mutex<KeyframeGate>,
+    /// A request was made that no keyframe broadcast after it answered
+    /// yet: it goes out again once the interval since the last one sent
+    /// ends. Set under `keyframe_gate` before the request reads
+    /// `frame_seq`, and read after a frame's broadcast (both
+    /// sequentially consistent with `frame_seq`), so a keyframe that
+    /// sees it unset was numbered before the request read the sequence
+    /// and cannot answer it; read without the gate on every frame, so a
+    /// track nobody asks costs one load.
+    keyframe_wanted: AtomicBool,
+}
+
+/// A track's keyframe-request spacing ([`Track::request_keyframe`]).
+#[derive(Debug, Default)]
+struct KeyframeGate {
+    /// When the last request was forwarded, on the injected clock.
+    last_forwarded: Option<Instant>,
+    /// `frame_seq` as the latest request read it: only a keyframe
+    /// numbered at or after it, broadcast after the request, answers it.
+    /// One numbered before may be the very keyframe its viewer lost.
+    wanted_from: u64,
+    /// Rate-limits the line of a dropped request, which every viewer of a
+    /// source that cannot ask makes.
+    drops: Throttle,
 }
 
 impl Track {
@@ -990,7 +1132,7 @@ impl Track {
         let (control, _no_receivers_yet) = broadcast::channel(CONTROL_CAPACITY);
         Self {
             id,
-            clock_rate,
+            clock_rate: AtomicU32::new(clock_rate),
             codec: ArcSwap::from_pointee(codec),
             packets,
             frames,
@@ -1017,6 +1159,9 @@ impl Track {
             feeds,
             tag,
             forward_to: ArcSwapOption::new(forward_to),
+            keyframe_tx: watch::channel(0).0,
+            keyframe_gate: Mutex::default(),
+            keyframe_wanted: AtomicBool::new(false),
         }
     }
 
@@ -1063,9 +1208,11 @@ impl Track {
         self.id.kind()
     }
 
-    /// Ticks per second of `MediaTime` and of the RTP timestamps.
-    pub const fn clock_rate(&self) -> u32 {
-        self.clock_rate
+    /// Ticks per second of `MediaTime` and of the RTP timestamps: the rate
+    /// the current connection declared
+    /// ([`TrackPublisher::declare`](crate::source::TrackPublisher::declare)).
+    pub fn clock_rate(&self) -> u32 {
+        self.clock_rate.load(Ordering::Relaxed)
     }
 
     /// The bounds enforced.
@@ -1079,22 +1226,52 @@ impl Track {
     }
 
     /// Replaces the codec descriptor, for a reconnect or a stream that
-    /// changed it, and tells subscribers. A descriptor equal to the current
+    /// changed it, and tells subscribers; the clock rate stays
+    /// (a reconnect's declaration moves both). A descriptor equal to the current
     /// one is a no-op. The line is rate-limited, timed by the track's
     /// activity: a camera can change its parameter sets on every frame.
     pub fn set_codec(&self, codec: Codec) {
+        self.set_format(codec, None);
+    }
+
+    /// Redeclares the track for a new connection of its source: `codec`
+    /// as [`Self::set_codec`] sets it, and `clock_rate`, the RTP clock the
+    /// new connection's timestamps and Sender Reports tick at (RFC 3550
+    /// §5.1), which a codec change can move (AAC at 16 kHz back as PCMU at
+    /// 8000, RFC 3551 §4.5.14; Opus at 48 kHz, RFC 7587 §4.1, back as
+    /// G.711). The track stays the same object under the same id, so its
+    /// sinks keep it; a new rate clears its pre-record, measures lateness
+    /// at the new rate and starts a new epoch on it, after the
+    /// `TrackChanged` that carries the rate: nothing timed at the old rate
+    /// is read at the new one. A staging track forwarding into its live
+    /// counterpart takes the rate too, which its source's Sender Reports
+    /// are mapped at.
+    pub(crate) fn redeclare(&self, codec: Codec, clock_rate: u32) {
+        if self.forwarded().is_some() {
+            self.clock_rate.store(clock_rate, Ordering::Relaxed);
+        }
+        self.set_format(codec, Some(clock_rate));
+    }
+
+    /// Sets the codec and, when `clock_rate` is `Some`, the clock rate, on
+    /// the track the writes of this one's source land on: its live
+    /// counterpart once forwarded, itself while fed, and a standby's own
+    /// track, kept for the switch; nothing on a live track another source
+    /// feeds.
+    fn set_format(&self, codec: Codec, clock_rate: Option<u32>) {
         if self.fed() {
             match self.forwarded() {
-                Some(target) => target.set_codec_inner(self.tag, codec),
-                None => self.set_codec_inner(self.tag, codec),
+                Some(target) => target.set_format_inner(self.tag, codec, clock_rate),
+                None => self.set_format_inner(self.tag, codec, clock_rate),
             }
         } else if self.tag != 0 {
             // A standby's codec, kept for the switch.
-            self.set_codec_inner(self.tag, codec);
+            self.set_format_inner(self.tag, codec, clock_rate);
         }
     }
 
-    /// [`Self::set_codec`] on this track itself, whoever feeds it.
+    /// [`Self::set_format`] on this track itself, whoever feeds it: the
+    /// codec, and the clock rate when `clock_rate` is `Some`.
     /// Another family clears the pre-record: nothing before it can share a
     /// recording with what follows. On audio any change does: an audio frame
     /// carries no decoder configuration (AAC's `AudioSpecificConfig`,
@@ -1102,13 +1279,17 @@ impl Track {
     /// does Opus's channel count), so the frames before it would be read
     /// with the new descriptor. A video keyframe carries its parameter sets
     /// in-band ([`MediaFrame::payload`]), so a video ring keeps its GOPs.
+    /// The GOP cache goes on the same changes, a joiner's start being of
+    /// the new descriptor ([`Self::subscribe_from_gop`]).
     /// The ring's clearing, the new descriptor and the event happen under
     /// the ring's lock, so a recording's subscription, snapshot and descriptor
     /// ([`Self::subscribe_from_prerecord`]) are all on one side of the change.
+    /// So does another clock rate: the ring's timestamps tick at the old
+    /// one (RFC 3550 §5.1); its new epoch starts under that lock too.
     /// Under the same lock, a change `writer` (a source's tag) made is
     /// dropped once the track takes another source: the old source's,
     /// made while a switch ran, would label the standby's frames.
-    fn set_codec_inner(&self, writer: u8, codec: Codec) {
+    fn set_format_inner(&self, writer: u8, codec: Codec, clock_rate: Option<u32>) {
         let mut fed = self.lock_prerecord();
         if fed.source != writer {
             let source = fed.source;
@@ -1116,21 +1297,56 @@ impl Track {
             tracing::debug!(track = %self.id, writer, source, "codec change dropped: the track takes another source");
             return;
         }
-        let family = {
+        let was = self.clock_rate();
+        let rate = clock_rate.unwrap_or(was);
+        let rate_changed = rate != was;
+        let (family, codec_changed) = {
             let current = self.codec.load();
-            if **current == codec {
+            let codec_changed = **current != codec;
+            if !codec_changed && !rate_changed {
                 return;
             }
-            current.family()
+            (current.family(), codec_changed)
         };
         let codec = Arc::new(codec);
-        let clears = family != codec.family() || self.kind() == Kind::Audio;
+        let clears = rate_changed || family != codec.family() || self.kind() == Kind::Audio;
         let prerecord_cleared = clears && fed.ring.clear();
+        // A joiner's GOP is of the descriptor and rate it joins under
+        // ([`Self::subscribe_from_gop`]): one of another family or timed at
+        // another rate goes too, until the next keyframe. Audio has none.
+        let gop_cleared = clears && self.gop.swap(None).is_some();
         self.codec.store(Arc::clone(&codec));
-        self.publish_control(TrackControlEvent::TrackChanged(Arc::clone(&codec)));
+        if rate_changed {
+            self.clock_rate.store(rate, Ordering::Relaxed);
+            *self.lateness.lock().unwrap_or_else(PoisonError::into_inner) =
+                LatenessMeter::new(rate);
+        }
+        self.publish_control(TrackControlEvent::TrackChanged {
+            codec: Arc::clone(&codec),
+            clock_rate: rate,
+        });
+        // The new epoch starts under the same lock as the writer check: once
+        // it is released a switch can hand the track to a standby, whose
+        // feed this writer's epoch would cut.
+        let epoch = rate_changed.then(|| self.start_epoch_inner());
         drop(fed);
         if clears && self.leads_prerecord() {
             self.prerecord_shared.set_floor(None);
+        }
+        if let Some(epoch) = epoch {
+            tracing::info!(
+                track = %self.id,
+                codec = codec.name(),
+                was,
+                now = rate,
+                epoch,
+                prerecord_cleared,
+                gop_cleared,
+                "track clock rate changed; a new epoch at the new rate"
+            );
+        }
+        if !codec_changed {
+            return;
         }
         let due = self
             .codec_changes
@@ -1142,6 +1358,7 @@ impl Track {
                 track = %self.id,
                 codec = codec.name(),
                 prerecord_cleared,
+                gop_cleared,
                 count,
                 "track codec changed"
             );
@@ -1228,9 +1445,10 @@ impl Track {
         let _delivered_to = self.control.send((before, event));
     }
 
-    /// The next side-branch item's sequence number, taken.
+    /// The next side-branch item's sequence number, taken. Sequentially
+    /// consistent, for the keyframe requests (`keyframe_wanted`).
     fn frame_seq(&self) -> u64 {
-        self.frame_seq.fetch_add(1, Ordering::Relaxed)
+        self.frame_seq.fetch_add(1, Ordering::SeqCst)
     }
 
     /// The connection switched to the source tagged `tag`: the track takes
@@ -1318,16 +1536,17 @@ impl Track {
     }
 
     /// A frame subscription, the pre-record ring's snapshot from `target`
-    /// (as [`Self::prerecord_snapshot`] chooses it), the codec descriptor and
-    /// the tag of the source the track takes ([`Feeds`]), taken together
-    /// under the ring's lock: every frame reaches the ring and the
-    /// broadcast under that lock, so the snapshot holds every frame
-    /// published before the subscription, from its start, and the
-    /// subscription yields every frame published after. A codec change and
-    /// a source switch happen under the lock too, so the descriptor is the
-    /// one of the frames the subscription yields up to its first
-    /// `TrackChanged`, and of the snapshot's (which a video change of the
-    /// same family keeps, their parameter sets in band), and the source is
+    /// (as [`Self::prerecord_snapshot`] chooses it), the codec descriptor,
+    /// the clock rate and the tag of the source the track takes
+    /// ([`Feeds`]), taken together under the ring's lock: every frame
+    /// reaches the ring and the broadcast under that lock, so the snapshot
+    /// holds every frame published before the subscription, from its
+    /// start, and the subscription yields every frame published after. A
+    /// codec or clock rate change and a source switch happen under the lock
+    /// too, so the descriptor and the rate are the ones of the frames the
+    /// subscription yields up to its first `TrackChanged`, and of the
+    /// snapshot's (which a video change of the same family keeps, their
+    /// parameter sets in band; a rate change clears it), and the source is
     /// the one of the snapshot's frames and of those up to the first
     /// `SourceSwitched`: two tracks' starts with the same source have no
     /// switch between them. The snapshot is `None` when the ring holds
@@ -1335,14 +1554,46 @@ impl Track {
     pub fn subscribe_from_prerecord(
         self: &Arc<Self>,
         target: Instant,
-    ) -> (TrackSubscription, Option<PrerecordSnapshot>, Arc<Codec>, u8) {
+    ) -> (
+        TrackSubscription,
+        Option<PrerecordSnapshot>,
+        Arc<Codec>,
+        u32,
+        u8,
+    ) {
         let mut fed = self.lock_prerecord();
         let subscription = self.subscribe(Unit::Frames);
         let snapshot = fed.ring.snapshot(target);
         let codec = self.codec();
+        let clock_rate = self.clock_rate();
         let source = fed.source;
         drop(fed);
-        (subscription, snapshot, codec, source)
+        (subscription, snapshot, codec, clock_rate, source)
+    }
+
+    /// A frame subscription, the GOP cache, the codec descriptor and the
+    /// clock rate, taken together under the ring's lock, as
+    /// [`Self::subscribe_from_prerecord`] takes its snapshot: every frame
+    /// reaches the GOP cache and the broadcast under that lock, so the GOP
+    /// holds the frames published before the subscription from its keyframe
+    /// on, the subscription yields every frame published after, and none is
+    /// in both or in neither. A live output's join: the GOP is a decodable
+    /// start, and the descriptor is the one of its frames and of those the
+    /// subscription yields up to its first `TrackChanged`: a change of
+    /// family or clock rate empties the cache under that lock
+    /// ([`Self::set_codec`], [`TrackPublisher::declare`](crate::source::TrackPublisher::declare)). The GOP is `None` before the first
+    /// keyframe and after such a change until the next one. The lock is
+    /// held for the subscribe and the loads only.
+    pub fn subscribe_from_gop(
+        self: &Arc<Self>,
+    ) -> (TrackSubscription, Option<Arc<GopSnapshot>>, Arc<Codec>, u32) {
+        let fed = self.lock_prerecord();
+        let subscription = self.subscribe(Unit::Frames);
+        let gop = self.gop();
+        let codec = self.codec();
+        let clock_rate = self.clock_rate();
+        drop(fed);
+        (subscription, gop, codec, clock_rate)
     }
 
     /// Frees the pre-record ring and its window, for a closed track.
@@ -1375,8 +1626,8 @@ impl Track {
         }
         let anchor_ts = u32::try_from(anchor.ts.ticks().rem_euclid(1_i64 << 32)).ok()?;
         let ticks = ticks_between(anchor_ts, rtp_ts);
-        let span =
-            MediaTime::from_ticks(i64::from(ticks.unsigned_abs())).to_duration(self.clock_rate)?;
+        let span = MediaTime::from_ticks(i64::from(ticks.unsigned_abs()))
+            .to_duration(self.clock_rate())?;
         if ticks.is_negative() {
             anchor.wallclock.checked_sub(span)
         } else {
@@ -1478,8 +1729,8 @@ impl Track {
     /// (and `discontinuity` if it is the epoch's first): updates the GOP
     /// cache (video) and broadcasts it. Returns `false` for a frame larger
     /// than `max_frame_bytes`, which is dropped, counted and reported to the
-    /// frame subscribers as a lag of one, and cuts the pre-record's GOP short
-    /// there (until the next keyframe).
+    /// frame subscribers as a lag of one, and cuts the pre-record's GOP and
+    /// the GOP cache short there (until the next keyframe).
     pub fn publish_frame(&self, frame: MediaFrame) -> bool {
         self.touch(frame.arrival);
         if !self.feeds.admits(self.tag, self.kind(), frame.keyframe) {
@@ -1535,6 +1786,12 @@ impl Track {
             }
             // The pre-record's GOP now misses this frame: it is cut there.
             fed.ring.frame_dropped();
+            // So does the cache's, whose joiners would send the frames
+            // after it without their reference: its keyframe alone is
+            // kept, until the next one, as for a GOP that outgrew it.
+            if let Some(current) = self.gop.load_full() {
+                self.gop.store(Some(Arc::new(current.cut())));
+            }
             // The subscribers miss it too: a lag of one, never a silent
             // hole before the frames that may reference it.
             let _delivered_to = self.frames.send((self.frame_seq(), None));
@@ -1542,6 +1799,7 @@ impl Track {
             return false;
         }
         self.touch(frame.arrival);
+        let (keyframe, arrival) = (frame.keyframe, frame.arrival);
         self.counters.frames.fetch_add(1, Ordering::Relaxed);
         Counters::add_bytes(&self.counters.frame_bytes, bytes);
         if frame.keyframe {
@@ -1554,8 +1812,12 @@ impl Track {
         let truncation = self.update_prerecord(&mut fed, &frame);
         self.last_frame.store(Some(Arc::clone(&frame)));
         // As above: no subscriber is not an error.
-        let _delivered_to = self.frames.send((self.frame_seq(), Some(frame)));
+        let seq = self.frame_seq();
+        let _delivered_to = self.frames.send((seq, Some(frame)));
         drop(fed);
+        if self.keyframe_wanted.load(Ordering::SeqCst) {
+            self.settle_keyframe_request(keyframe, seq, arrival);
+        }
         if let Some(truncation) = truncation {
             tracing::debug!(
                 track = %self.id,
@@ -1567,6 +1829,133 @@ impl Track {
             );
         }
         true
+    }
+
+    /// A viewer of this track wants a keyframe at `now` (on the injected
+    /// clock): forwarded to the source feeding the track, unless one was
+    /// within [`KEYFRAME_REQUEST_INTERVAL`], whose keyframe this request
+    /// then waits for too. Either way it stays wanted until a keyframe
+    /// broadcast after it (`crate::keyframe` has the rules). A live track
+    /// fed by a standby since a switch forwards to the standby's source.
+    pub fn request_keyframe(&self, now: Instant) -> KeyframeOutcome {
+        self.counters
+            .keyframe_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let mut gate = self
+            .keyframe_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Wanted before the sequence is read (`keyframe_wanted`).
+        self.keyframe_wanted.store(true, Ordering::SeqCst);
+        gate.wanted_from = self.frame_seq.load(Ordering::SeqCst);
+        if !spaced(gate.last_forwarded, now) {
+            drop(gate);
+            self.counters
+                .keyframe_requests_coalesced
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(track = %self.id, "keyframe request coalesced: one is due");
+            return KeyframeOutcome::Coalesced;
+        }
+        let outcome = self.forward_keyframe_request(&mut gate, now, "a viewer asked");
+        drop(gate);
+        outcome
+    }
+
+    /// Frame `seq`, arrived at `arrival`, was broadcast while a request
+    /// was wanted: a `keyframe` numbered at or after the latest request
+    /// answers it; any other frame, a keyframe before it included, asks
+    /// again once the interval since the last request sent has passed.
+    fn settle_keyframe_request(&self, keyframe: bool, seq: u64, arrival: Instant) {
+        let mut gate = self
+            .keyframe_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.keyframe_wanted.load(Ordering::SeqCst) {
+            return;
+        }
+        if keyframe && seq >= gate.wanted_from {
+            self.keyframe_wanted.store(false, Ordering::SeqCst);
+            tracing::trace!(track = %self.id, "keyframe request answered by a keyframe");
+        } else if spaced(gate.last_forwarded, arrival) {
+            let _outcome = self.forward_keyframe_request(
+                &mut gate,
+                arrival,
+                "no keyframe since the request within the interval",
+            );
+        }
+    }
+
+    /// Whether a request was made that no keyframe broadcast after it
+    /// answered yet ([`KeyframeRequests::is_wanted`]). A staging track's
+    /// is its live counterpart's: the viewers ask that one, which hands
+    /// their requests to the standby's source after a switch and takes
+    /// the standby's keyframes that answer them.
+    pub(crate) fn keyframe_wanted(&self) -> bool {
+        match self.forwarded() {
+            Some(target) => target.keyframe_wanted(),
+            None => self.keyframe_wanted.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Hands a request to the source feeding the track at `now`, for
+    /// `reason`, with `gate` held: forwarded, and still wanted until its
+    /// keyframe; or dropped and counted when that source takes none, and
+    /// then no longer wanted, so a track no source asks for is not asked
+    /// again at every frame.
+    fn forward_keyframe_request(
+        &self,
+        gate: &mut KeyframeGate,
+        now: Instant,
+        reason: &'static str,
+    ) -> KeyframeOutcome {
+        let sent = if self.fed() {
+            self.signal_keyframe()
+        } else {
+            self.feeds
+                .feeder(self.id)
+                .is_some_and(|feeder| feeder.signal_keyframe())
+        };
+        if !sent {
+            self.keyframe_wanted.store(false, Ordering::SeqCst);
+            self.counters
+                .keyframe_requests_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(count) = gate.drops.hit(now) {
+                tracing::debug!(
+                    track = %self.id,
+                    count,
+                    "keyframe request dropped: the source feeding the track cannot ask for one; viewers wait for its next keyframe"
+                );
+            }
+            return KeyframeOutcome::Dropped;
+        }
+        gate.last_forwarded = Some(now);
+        self.counters
+            .keyframe_requests_forwarded
+            .fetch_add(1, Ordering::Relaxed);
+        // At most once per interval: no throttle needed.
+        tracing::debug!(track = %self.id, reason, "keyframe requested from the source");
+        KeyframeOutcome::Forwarded
+    }
+
+    /// Wakes this track's own source with a request; `false` when it holds
+    /// no [`KeyframeRequests`].
+    fn signal_keyframe(&self) -> bool {
+        if self.keyframe_tx.is_closed() {
+            return false;
+        }
+        self.keyframe_tx
+            .send_modify(|count| *count = count.wrapping_add(1));
+        true
+    }
+
+    /// The requests this track's source takes for the connection attempt
+    /// that holds the result: the source that declared it calls this when
+    /// its protocol can ask the camera for a keyframe and waits on
+    /// [`KeyframeRequests::requested`]. A source that cannot never calls
+    /// it, and the track drops the requests ([`Self::request_keyframe`]).
+    pub fn keyframe_requests(self: &Arc<Self>) -> KeyframeRequests {
+        KeyframeRequests::new(self.keyframe_tx.subscribe(), Arc::clone(self))
     }
 
     /// Publishes the next GOP snapshot for `frame`: a keyframe starts a
@@ -1582,6 +1971,7 @@ impl Track {
                 frames: 1,
                 bytes,
                 truncated: false,
+                codec: self.codec(),
             })));
             return;
         }
@@ -1619,13 +2009,7 @@ impl Track {
                     "gop cache: GOP exceeds the cache, keeping only the keyframe"
                 );
             }
-            GopSnapshot {
-                keyframe: Arc::clone(&current.keyframe),
-                newest: None,
-                frames: 1,
-                bytes: current.keyframe.payload.len(),
-                truncated: true,
-            }
+            current.cut()
         } else {
             GopSnapshot {
                 keyframe: Arc::clone(&current.keyframe),
@@ -1636,6 +2020,7 @@ impl Track {
                 frames: count,
                 bytes: total,
                 truncated: false,
+                codec: Arc::clone(&current.codec),
             }
         };
         self.gop.store(Some(Arc::new(next)));
@@ -1656,11 +2041,17 @@ impl Track {
     }
 }
 
+/// Whether a keyframe request may go out at `now` after the last one
+/// forwarded at `last`: none yet, or [`KEYFRAME_REQUEST_INTERVAL`] since.
+fn spaced(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= KEYFRAME_REQUEST_INTERVAL)
+}
+
 impl fmt::Debug for Track {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Track")
             .field("id", &self.id)
-            .field("clock_rate", &self.clock_rate)
+            .field("clock_rate", &self.clock_rate())
             .field("codec", &self.codec.load())
             .field("packet_subscribers", &self.packets.receiver_count())
             .field("frame_subscribers", &self.frames.receiver_count())
@@ -1735,11 +2126,74 @@ mod tests {
 
     #[test]
     fn track_ids_display_as_letter_and_index() {
-        let id = TrackId::new(Kind::Audio, 1);
-        assert_eq!(id.to_string(), "a1");
+        let id = TrackId::new(Kind::Audio, 2);
+        assert_eq!(id.to_string(), "a2");
         assert_eq!(id.kind(), Kind::Audio);
-        assert_eq!(id.index(), 1);
+        assert_eq!(id.index(), 2);
+        assert_eq!(TrackId::new(Kind::Video, 0).index(), 0);
         assert_eq!(TrackId::new(Kind::Video, 0).to_string(), "v0");
+    }
+
+    /// A keyframe answers only the requests made before its broadcast.
+    /// `publish_frame` broadcasts a frame, then settles the requests, so
+    /// a viewer's request can come in between: the viewer lost the
+    /// keyframe just broadcast and asks again (a PLI, RFC 4585 §6.3.1).
+    /// The keyframe's settlement, after that request, must not answer it:
+    /// it stays wanted and is asked again at the interval's end. Replays
+    /// the two halves of `publish_frame` around the request, in the order
+    /// two tasks can run them.
+    #[test]
+    fn rfc4585_6_3_1_a_keyframe_broadcast_before_a_request_never_answers_it() {
+        let t0 = SystemClock.now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let video = Arc::new(video_track(TrackLimits::default()));
+        let requests = video.keyframe_requests();
+        assert_eq!(video.request_keyframe(t0), KeyframeOutcome::Forwarded);
+        // The camera's keyframe is numbered and broadcast…
+        let keyframe = video.frame_seq();
+        // …a viewer that lost it asks within the interval…
+        assert_eq!(video.request_keyframe(at(100)), KeyframeOutcome::Coalesced);
+        // …and only then does the keyframe's settlement run.
+        video.settle_keyframe_request(true, keyframe, at(100));
+        assert!(requests.is_wanted(), "the keyframe came before the request");
+        // A frame before the interval's end asks nothing; the first one at
+        // its end asks again.
+        assert!(video.publish_frame(timed(t0, 999, false, 10)));
+        assert_eq!(video.stats().keyframe_requests_forwarded, 1);
+        assert!(video.publish_frame(timed(t0, 1_000, false, 10)));
+        assert_eq!(video.stats().keyframe_requests_forwarded, 2);
+        // A keyframe broadcast after the request answers it.
+        assert!(video.publish_frame(timed(t0, 1_100, true, 10)));
+        assert!(!requests.is_wanted());
+        assert!(video.publish_frame(timed(t0, 2_100, false, 10)));
+        assert_eq!(video.stats().keyframe_requests_forwarded, 2);
+    }
+
+    /// A frame whose lock-free look saw a request wanted settles nothing
+    /// once a request in between was dropped (the attempt that took them
+    /// ended) and so no longer wanted: no second drop for the same
+    /// request. Replays `publish_frame`'s settlement after that drop.
+    #[test]
+    fn a_frame_settled_after_a_drop_asks_nothing_more() {
+        let t0 = SystemClock.now();
+        let video = Arc::new(video_track(TrackLimits::default()));
+        let requests = video.keyframe_requests();
+        assert_eq!(video.request_keyframe(t0), KeyframeOutcome::Forwarded);
+        // The frame saw the request wanted; the attempt ends and a viewer's
+        // request a second later is dropped before the frame settles.
+        let seq = video.frame_seq();
+        drop(requests);
+        let later = t0 + Duration::from_secs(1);
+        assert_eq!(video.request_keyframe(later), KeyframeOutcome::Dropped);
+        video.settle_keyframe_request(false, seq, later);
+        assert_eq!(video.stats().keyframe_requests_dropped, 1);
+    }
+
+    #[test]
+    fn default_limits_hold_a_4_mib_frame_and_a_4_mib_gop() {
+        let limits = TrackLimits::default();
+        assert_eq!(limits.max_frame_bytes, 4 << 20);
+        assert_eq!(limits.gop_cache_bytes, 4 << 20);
     }
 
     #[tokio::test]
@@ -1844,6 +2298,24 @@ mod tests {
             ..frame(true, 1)
         }));
         assert_eq!(track.gop().unwrap().age(now), Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_join_from_the_gop_takes_every_frame_once_with_the_codec() {
+        let track = Arc::new(video_track(TrackLimits::default()));
+        let (mut sub, gop, codec, rate) = track.subscribe_from_gop();
+        assert!(gop.is_none(), "no keyframe yet");
+        assert_eq!((codec, rate), (track.codec(), 90_000));
+        assert!(track.publish_frame(frame(true, 10)));
+        assert!(track.publish_frame(frame(false, 20)));
+        let (mut joined, gop, ..) = track.subscribe_from_gop();
+        assert!(track.publish_frame(frame(false, 30)));
+        let held: Vec<usize> = gop.unwrap().frames().map(|f| f.payload.len()).collect();
+        assert_eq!(held, [10, 20], "the GOP holds what came before");
+        crate::let_assert!(Some(TrackEvent::Frame(next)) = joined.next().await);
+        assert_eq!(next.payload.len(), 30, "the subscription what came after");
+        crate::let_assert!(Some(TrackEvent::Frame(first)) = sub.next().await);
+        assert_eq!(first.payload.len(), 10);
     }
 
     #[tokio::test]
@@ -2033,6 +2505,84 @@ mod tests {
         assert_eq!(gop.frame_count(), 1);
         assert_eq!(gop.bytes(), 1000);
         assert!(gop.keyframe().keyframe);
+    }
+
+    /// A frame the track dropped over `max_frame_bytes` is a hole the
+    /// frames after it may reference: the cache keeps its GOP's keyframe
+    /// alone, cut short, until the next keyframe, as it does for a GOP
+    /// that outgrew it, so no joiner sends frames past the hole.
+    #[test]
+    fn a_frame_dropped_over_max_frame_bytes_cuts_the_gop_cache_back_to_its_keyframe() {
+        let track = video_track(TrackLimits {
+            max_frame_bytes: 100,
+            ..TrackLimits::default()
+        });
+        assert!(!track.publish_frame(frame(false, 101)));
+        assert!(track.gop().is_none(), "no keyframe yet: nothing to cut");
+        assert!(track.publish_frame(frame(true, 10)));
+        assert!(track.publish_frame(frame(false, 20)));
+        assert!(!track.publish_frame(frame(false, 101)), "dropped");
+        let sizes = |gop: &GopSnapshot| gop.frames().map(|f| f.payload.len()).collect::<Vec<_>>();
+        let gop = track.gop().unwrap();
+        assert!(gop.truncated());
+        assert_eq!(
+            (sizes(&gop), gop.frame_count(), gop.bytes()),
+            (vec![10], 1, 10)
+        );
+        assert!(track.publish_frame(frame(false, 30)));
+        let gop = track.gop().unwrap();
+        assert!(
+            gop.truncated(),
+            "the frames after the hole may reference it"
+        );
+        assert_eq!(sizes(&gop), [10]);
+        assert!(track.publish_frame(frame(true, 40)));
+        assert!(track.publish_frame(frame(false, 50)));
+        let gop = track.gop().unwrap();
+        assert!(!gop.truncated(), "the next keyframe starts a whole GOP");
+        assert_eq!(sizes(&gop), [40, 50]);
+    }
+
+    /// A join after a codec family or clock-rate change and before the
+    /// next keyframe gets no GOP: the cached one's frames are of the old
+    /// family or timed at the old rate (RFC 3550 §5.1), and the descriptor
+    /// it comes with is the new one. A change within the family keeps the
+    /// GOP, whose keyframe carries its parameter sets in band.
+    #[test]
+    fn rfc3550_5_1_a_codec_family_or_clock_rate_change_empties_the_gop_cache() {
+        let track = Arc::new(video_track(TrackLimits::default()));
+        let joined = |track: &Arc<Track>| {
+            let (_sub, gop, codec, rate) = track.subscribe_from_gop();
+            let sizes = gop.map(|gop| gop.frames().map(|f| f.payload.len()).collect::<Vec<_>>());
+            (sizes, codec.family().name(), rate)
+        };
+        assert!(track.publish_frame(frame(true, 10)));
+        assert!(track.publish_frame(frame(false, 20)));
+        track.set_codec(Codec::H264 {
+            profile_level_id: None,
+            sps: Some(Bytes::from_static(&[0x67])),
+            pps: None,
+        });
+        assert_eq!(
+            joined(&track),
+            (Some(vec![10, 20]), "h264", 90_000),
+            "the same family keeps it"
+        );
+        track.set_codec(Codec::H265 {
+            vps: None,
+            sps: None,
+            pps: None,
+        });
+        assert_eq!(joined(&track), (None, "h265", 90_000), "another family");
+        assert!(track.publish_frame(frame(false, 30)));
+        assert!(
+            track.gop().is_none(),
+            "nothing to decode from before a keyframe"
+        );
+        assert!(track.publish_frame(frame(true, 40)));
+        assert_eq!(joined(&track), (Some(vec![40]), "h265", 90_000));
+        track.redeclare((*track.codec()).clone(), 45_000);
+        assert_eq!(joined(&track), (None, "h265", 45_000), "another clock rate");
     }
 
     #[test]
@@ -2238,7 +2788,10 @@ mod tests {
         assert_eq!(track.codec().family(), CodecFamily::H265);
         assert_eq!(
             sub.next().await,
-            Some(TrackEvent::TrackChanged(Arc::new(h265)))
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(h265),
+                clock_rate: 90_000,
+            })
         );
         assert_eq!(track.id(), TrackId::new(Kind::Video, 0));
         assert_eq!(track.limits(), TrackLimits::default());
@@ -2298,7 +2851,7 @@ mod tests {
         assert_eq!(*track.codec(), h264_with_sps(1));
         // Every change reached the subscriber.
         let mut changes = 0;
-        while let Some(TrackEvent::TrackChanged(_)) = queued(&mut sub) {
+        while let Some(TrackEvent::TrackChanged { .. }) = queued(&mut sub) {
             changes += 1;
         }
         assert_eq!(changes, 12);
@@ -2410,13 +2963,19 @@ mod tests {
         assert_eq!(queued(&mut frames), Some(TrackEvent::Gap { skipped: 1 }));
         assert_eq!(
             queued(&mut frames),
-            Some(TrackEvent::TrackChanged(Arc::new(h265.clone())))
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(h265.clone()),
+                clock_rate: 90_000,
+            })
         );
         crate::let_assert!(Some(TrackEvent::Frame(new)) = queued(&mut frames));
         assert_eq!(new.payload.len(), 20);
         assert_eq!(
             queued(&mut frames),
-            Some(TrackEvent::TrackChanged(Arc::new(h264_with_sps(1))))
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(h264_with_sps(1)),
+                clock_rate: 90_000,
+            })
         );
         nothing_queued(&mut frames);
 
@@ -2431,7 +2990,10 @@ mod tests {
         assert_eq!(before.payload.len(), 30);
         assert_eq!(
             queued(&mut frames),
-            Some(TrackEvent::TrackChanged(Arc::new(h265.clone())))
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(h265.clone()),
+                clock_rate: 90_000,
+            })
         );
         for n in 0..=CONTROL_CAPACITY {
             track.set_codec(h264_with_sps(u8::try_from(n).unwrap()));
@@ -2442,7 +3004,7 @@ mod tests {
         );
         crate::let_assert!(Some(TrackEvent::Frame(after)) = queued(&mut frames));
         assert_eq!(after.payload.len(), 40);
-        crate::let_assert!(Some(TrackEvent::TrackChanged(_)) = queued(&mut frames));
+        crate::let_assert!(Some(TrackEvent::TrackChanged { .. }) = queued(&mut frames));
 
         // A subscriber that lagged gets the lag first, then the change,
         // then the frame after it.
@@ -2458,7 +3020,10 @@ mod tests {
         assert_eq!(queued(&mut frames), Some(TrackEvent::Gap { skipped: 2 }));
         assert_eq!(
             queued(&mut frames),
-            Some(TrackEvent::TrackChanged(Arc::new(h265)))
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(h265),
+                clock_rate: 90_000,
+            })
         );
         crate::let_assert!(Some(TrackEvent::Frame(new)) = queued(&mut frames));
         assert_eq!(new.payload.len(), 20);
@@ -2622,8 +3187,14 @@ mod tests {
     fn control_events_convert_to_track_events() {
         let codec = Arc::new(Codec::Pcmu);
         assert_eq!(
-            TrackEvent::from_control(TrackControlEvent::TrackChanged(Arc::clone(&codec))),
-            Some(TrackEvent::TrackChanged(codec))
+            TrackEvent::from_control(TrackControlEvent::TrackChanged {
+                codec: Arc::clone(&codec),
+                clock_rate: 8_000,
+            }),
+            Some(TrackEvent::TrackChanged {
+                codec,
+                clock_rate: 8_000,
+            })
         );
         assert_eq!(
             TrackEvent::from_control(TrackControlEvent::EpochStart { epoch: 3 }),
@@ -2857,7 +3428,7 @@ mod tests {
         let lines = logs.lines(tracing::Level::INFO, "track codec changed");
         assert_eq!(
             lines[0].fields,
-            " track=v0 codec=\"h265\" prerecord_cleared=true count=1"
+            " track=v0 codec=\"h265\" prerecord_cleared=true gop_cleared=true count=1"
         );
 
         assert!(track.publish_frame(timed(t0, 1000, true, 10)));
@@ -2875,6 +3446,11 @@ mod tests {
             track.prerecord_shared.floor(),
             Some(t0 + Duration::from_secs(1))
         );
+        // Another clock rate (RFC 3550 §5.1) on the same descriptor clears
+        // the ring all the same: its timestamps tick at the old one.
+        track.redeclare((*track.codec()).clone(), 45_000);
+        assert_eq!(prerecord(&track, t0), Vec::<i64>::new());
+        assert_eq!(track.prerecord_shared.floor(), None);
     }
 
     #[test]
@@ -2921,10 +3497,102 @@ mod tests {
         let lines = logs.lines(tracing::Level::INFO, "track codec changed");
         assert_eq!(
             lines[0].fields,
-            " track=a0 codec=\"aac_lc\" prerecord_cleared=true count=1"
+            " track=a0 codec=\"aac_lc\" prerecord_cleared=true gop_cleared=false count=1"
         );
         assert!(track.publish_frame(timed(t0, 128, true, 10)));
         assert_eq!(prerecord(&track, t0), [128]);
+    }
+
+    /// A redeclaration at another RTP clock rate (RFC 3550 §5.1), even
+    /// with the same descriptor, is a change: the rate follows, the
+    /// pre-record timed at the old rate goes, the `TrackChanged` carries
+    /// the new rate and a new epoch follows it, and lateness is measured at
+    /// the new rate. The same rate and descriptor change nothing, and
+    /// [`Track::set_codec`] leaves the rate as it is.
+    #[test]
+    fn rfc3550_5_1_a_new_clock_rate_is_a_change_in_a_new_epoch_measured_at_that_rate() {
+        let (logs, _guard) = Logs::capture();
+        let t0 = SystemClock.now();
+        let aac = Codec::AacLc {
+            sample_rate: 16_000,
+            channels: 1,
+            config: Bytes::from_static(&[0x14, 0x08]),
+        };
+        let track = Arc::new(Track::new(
+            TrackId::new(Kind::Audio, 0),
+            aac.clone(),
+            16_000,
+            TrackLimits::default(),
+            t0,
+        ));
+        track.set_prerecord(Some(Duration::from_secs(10)));
+        for ms in [0, 64] {
+            assert!(track.publish_frame(timed(t0, ms, true, 10)));
+        }
+        let mut sub = track.subscribe(Unit::Frames);
+        track.redeclare(aac.clone(), 16_000);
+        nothing_queued(&mut sub);
+        assert_eq!(prerecord(&track, t0), [0, 64], "nothing changed");
+
+        track.redeclare(aac.clone(), 32_000);
+        assert_eq!(track.clock_rate(), 32_000);
+        assert_eq!(
+            queued(&mut sub),
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(aac),
+                clock_rate: 32_000,
+            })
+        );
+        assert_eq!(queued(&mut sub), Some(TrackEvent::EpochStart { epoch: 1 }));
+        nothing_queued(&mut sub);
+        assert!(prerecord(&track, t0).is_empty(), "timed at the old rate");
+        let lines = logs.lines(
+            tracing::Level::INFO,
+            "track clock rate changed; a new epoch at the new rate",
+        );
+        assert_eq!(
+            lines[0].fields,
+            " track=a0 codec=\"aac_lc\" was=16000 now=32000 epoch=1 prerecord_cleared=true gop_cleared=false"
+        );
+        assert!(
+            logs.lines(tracing::Level::INFO, "track codec changed")
+                .is_empty(),
+            "the descriptor is the same"
+        );
+
+        // 100 ms of audio at 32 kHz read 400 ms later: 300 ms late, where
+        // the old rate would read the same ticks as 200 ms.
+        let mut packets = track.subscribe_packets();
+        let at = |ms: u64, ts: u32| MediaPacket {
+            arrival: t0 + Duration::from_millis(ms),
+            rtp: RtpHeaderFields {
+                ts,
+                ..packet(0).rtp
+            },
+            frame_start: true,
+            ..packet(0)
+        };
+        track.publish_packet(at(500, 0));
+        track.publish_packet(at(900, 3_200));
+        let lateness: Vec<_> = std::iter::from_fn(|| packets.try_recv().unwrap())
+            .map(|p| (p.epoch, p.lateness))
+            .collect();
+        assert_eq!(
+            lateness,
+            [(1, Duration::ZERO), (1, Duration::from_millis(300))]
+        );
+
+        track.set_codec(Codec::Pcmu);
+        assert_eq!(track.clock_rate(), 32_000, "a codec change alone keeps it");
+        assert_eq!(
+            queued(&mut sub),
+            Some(TrackEvent::TrackChanged {
+                codec: Arc::new(Codec::Pcmu),
+                clock_rate: 32_000,
+            })
+        );
+        nothing_queued(&mut sub);
+        assert_eq!(track.epoch(), 1, "and starts no epoch");
     }
 
     #[test]
@@ -2939,7 +3607,7 @@ mod tests {
         let lines = logs.lines(tracing::Level::INFO, "track codec changed");
         assert_eq!(
             lines[0].fields,
-            " track=v0 codec=\"h265\" prerecord_cleared=false count=1"
+            " track=v0 codec=\"h265\" prerecord_cleared=false gop_cleared=false count=1"
         );
     }
 
@@ -2964,7 +3632,7 @@ mod tests {
         assert!(track.publish_frame(timed(t0, 0, true, 10)));
         assert!(track.publish_frame(timed(t0, 40, false, 10)));
         assert!(track.publish_frame(timed(t0, 80, true, 10)));
-        let (mut sub, snapshot, _, _) =
+        let (mut sub, snapshot, _, _, _) =
             track.subscribe_from_prerecord(t0 + Duration::from_millis(80));
         let ts: Vec<_> = snapshot
             .unwrap()
@@ -2979,7 +3647,7 @@ mod tests {
         nothing_queued(&mut sub);
 
         let track = video_track_at(t0);
-        let (mut sub, snapshot, _, _) = track.subscribe_from_prerecord(t0);
+        let (mut sub, snapshot, _, _, _) = track.subscribe_from_prerecord(t0);
         assert!(snapshot.is_none(), "no window, no ring");
         assert!(track.publish_frame(timed(t0, 0, true, 10)));
         crate::let_assert!(Some(TrackEvent::Frame(frame)) = queued(&mut sub));
@@ -3004,7 +3672,7 @@ mod tests {
             .declare(Kind::Video, h264_with_sps(1), 90_000);
         v0.set_prerecord(Some(Duration::from_secs(10)));
         assert!(v0.publish_frame(timed(t0, 0, true, 10)));
-        let (_, _, _, source) = v0.subscribe_from_prerecord(t0);
+        let (_, _, _, _, source) = v0.subscribe_from_prerecord(t0);
         assert_eq!(source, 0, "the live set's own source");
         let mut before = v0.subscribe(Unit::Frames);
         let staging = crate::source::TrackSet::staging(&live);
@@ -3017,17 +3685,20 @@ mod tests {
         // ...and pauses while the standby's first keyframe switches.
         assert!(sv0.publish_frame(timed(t0, 1_000, true, 10)));
         assert!(!v0.publish_frame_inner(v0.tag, timed(t0, 40, true, 10)));
-        v0.set_codec_inner(v0.tag, h264_with_sps(2));
+        v0.set_format_inner(v0.tag, h264_with_sps(2), None);
 
         assert_eq!(*v0.codec(), h264_with_sps(1));
-        let (mut after, snapshot, codec, source) = v0.subscribe_from_prerecord(t0);
+        let (mut after, snapshot, codec, rate, source) = v0.subscribe_from_prerecord(t0);
         let held: Vec<_> = snapshot
             .unwrap()
             .frames()
             .map(|frame| (frame.ts.ticks(), frame.epoch, frame.discontinuity))
             .collect();
         assert_eq!(held, [(1_000, 1, true)], "the standby's keyframe alone");
-        assert_eq!((*codec == h264_with_sps(1), source), (true, 1));
+        assert_eq!(
+            (*codec == h264_with_sps(1), rate, source),
+            (true, 90_000, 1)
+        );
         nothing_queued(&mut after);
         assert_eq!(queued(&mut before), Some(TrackEvent::SourceSwitched));
         assert_eq!(

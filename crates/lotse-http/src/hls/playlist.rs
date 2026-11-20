@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(start_index(&first), None);
         let mut tracker = Tracker::new();
         let update = tracker.update(&first);
-        assert!(update.segments.is_empty());
+        assert_eq!(update.segments, []);
         assert_eq!(update.reload_after, Some(Duration::from_secs(1)));
         let update = tracker.update(&parse_media(include_str!(
             "../../testdata/mediamtx_mpegts_1.m3u8"
@@ -689,7 +689,7 @@ mod tests {
     #[test]
     fn rfc8216_4_3_3_empty_live_playlist_parses() {
         let playlist = parse_media(&media_with(""));
-        assert!(playlist.segments.is_empty());
+        assert_eq!(playlist.segments, []);
         assert_eq!(playlist.media_sequence, 0);
     }
 
@@ -816,7 +816,7 @@ mod tests {
         text.push_str(&"#".repeat(MAX_PLAYLIST_BYTES - text.len() - 1));
         text.push('\n');
         assert_eq!(text.len(), MAX_PLAYLIST_BYTES);
-        assert!(parse_media(&text).segments.is_empty());
+        assert_eq!(parse_media(&text).segments, []);
         text.push('\n');
         assert_eq!(
             refused(&text),

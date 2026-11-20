@@ -448,6 +448,7 @@ fuzz_target!(|data: &[u8]| {
             clock: clock_input,
             time: clock,
             backchannel: slot.clone(),
+            signaling: None,
             cancel: CancellationToken::new(),
         };
         // The runner's half: Sender Reports reach the mapper while the

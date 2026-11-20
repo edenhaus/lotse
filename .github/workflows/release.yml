@@ -38,11 +38,11 @@ jobs:
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "::error::$TAG is not v<SemVer>; Release Drafter names releases v<version>"
+          if ! printf '%s\n' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::$TAG is not a bare SemVer; Release Drafter tags releases <version>, no v"
             exit 1
           fi
-          echo "version=${TAG#v}" | tee -a "$GITHUB_OUTPUT"
+          echo "version=$TAG" | tee -a "$GITHUB_OUTPUT"
 
   build:
     name: Build
@@ -66,9 +66,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@9149ea85001c7435d5a66bb127d6a1b6227cb0a5 # v5.0.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
-          version: 2026.9.15
+          version: 2026.11.8
           install_args: rust github:EmbarkStudios/cargo-about github:CycloneDX/cyclonedx-rust-cargo
           cache: false
       - run: mise run set-version "$VERSION"
@@ -76,7 +76,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
       - run: mise run sbom
       - run: mise run licenses
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: notices
           path: target/dist/
@@ -98,7 +98,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: lotse-*
           path: artifacts
@@ -119,14 +119,22 @@ jobs:
           ACTOR: ${{ github.actor }}
           TOKEN: ${{ github.token }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
-      # The same binaries give the same image.
+      # The same binaries give the same image, byte for byte: buildx takes SOURCE_DATE_EPOCH from
+      # the environment for the image's timestamps, and rewrite-timestamp (below) clamps the
+      # layers' file times to it (checked 2026-11-09: two BuildKit v0.33.1 builds, one digest).
+      # `created` is the same instant in RFC 3339 (UTC), for the label and the index annotation.
       - name: Image timestamp
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+        run: |
+          epoch="$(git log -1 --format=%ct)"
+          {
+            echo "SOURCE_DATE_EPOCH=$epoch"
+            echo "CREATED=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee -a "$GITHUB_ENV"
       # mirror.gcr.io: Docker Hub's anonymous pull limit. No cache-binary: this workflow restores
       # no cache.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
-          driver-opts: image=mirror.gcr.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          driver-opts: image=mirror.gcr.io/moby/buildkit:v0.35.0@sha256:aa632b921ef07411d2cb77292cd34213d4f7b384001d6fceef1e1f25bf9752bb
           cache-binary: false
       # No `latest`: consumers pin by digest. No SBOM or provenance: attested below, and the
       # SBOMs are the binaries'.
@@ -145,10 +153,27 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.created=${{ env.CREATED }}
           annotations: |
+            index:org.opencontainers.image.created=${{ env.CREATED }}
             index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             index:org.opencontainers.image.description=Memory-safe media daemon for IP cameras.
             index:org.opencontainers.image.licenses=MIT OR Apache-2.0
+      # The pushed image, each platform, before it is attested: a HIGH or CRITICAL vulnerability
+      # with a fix stops the release (scripts/scan-image.sh). Grype reads the registry with the
+      # login above; mise installs it without its cache, as everything in this workflow.
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.11.8
+          install_args: grype
+          cache: false
+      - name: Scan the pushed image
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}@${{ steps.push.outputs.digest }}
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            scripts/scan-image.sh "registry:$IMAGE" "$platform"
+          done
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.name.outputs.image }}
@@ -171,7 +196,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.event.release.tag_name }}
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
       - name: Name the assets

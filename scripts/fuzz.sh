@@ -6,7 +6,7 @@
 # Usage: scripts/fuzz.sh <target> [secs]. With FUZZ_BIN_DIR naming a directory of built targets
 # (CI's Fuzz build job builds them all with `cargo fuzz build`), it runs that build of the target;
 # without, it builds the target the same way first, with NIGHTLY naming the pinned nightly
-# (mise.toml's fuzz task sets it) and fuzz/Cargo.lock already fetched `--locked`.
+# (mise.toml's fuzz task sets it) and Cargo.lock already fetched `--locked`.
 #
 # The target runs as `cargo fuzz run` would run it (cargo-fuzz 0.13.2, src/project.rs): its corpus
 # in fuzz/corpus/<target>/, a failing input written to fuzz/artifacts/<target>/, and
@@ -44,7 +44,7 @@ secs=${2:-60}
 if [ -z "${FUZZ_BIN_DIR:-}" ]; then
   : "${NIGHTLY:?NIGHTLY names the pinned nightly toolchain (mise.toml, ci.yml)}"
   cargo "+$NIGHTLY" fuzz build "$target"
-  FUZZ_BIN_DIR=fuzz/target/$(rustc "+$NIGHTLY" -vV | sed -n 's/^host: //p')/release
+  FUZZ_BIN_DIR=target/$(rustc "+$NIGHTLY" -vV | sed -n 's/^host: //p')/release
 fi
 
 ASAN_OPTIONS="quarantine_size_mb=64${ASAN_OPTIONS:+:$ASAN_OPTIONS}:detect_odr_violation=0"

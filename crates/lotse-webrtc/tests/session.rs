@@ -37,7 +37,7 @@ use lotse_core::codec::{Codec, CodecFamily, Kind};
 use lotse_core::media::{MediaFrame, MediaPacket, MediaTime, RtpHeaderFields};
 use lotse_core::output::{OutputFactory as _, TalkbackRequest};
 use lotse_core::session::{
-    IceCredentials, RenegotiateError, SessionEngine, SessionEvent, SessionLimits, SessionOpenError,
+    IceCredentials, ReofferError, SessionEngine, SessionEvent, SessionLimits, SessionOpenError,
     SessionOutput, SessionRequest, SessionStats, TalkbackClaim, TalkbackTarget, Transport,
 };
 use lotse_core::source::TrackSet;
@@ -440,7 +440,7 @@ fn the_answer_carries_credentials_h264_candidates_and_playout_delay_rfc8829() {
 #[test]
 fn rfc9143_9_1_1_a_payload_type_with_two_codecs_is_invalid_sdp_not_a_crash() {
     // Opus on 109, which the video m-line of the same BUNDLE group uses for
-    // H.264's retransmissions: str0m 0.24 locked 109 twice and panicked,
+    // H.264's retransmissions: str0m 0.25 locks 109 twice and panics,
     // which aborts the worker. Refused before it sees the offer, whether
     // the session sends audio or not.
     let now = SystemClock.now();
@@ -594,7 +594,7 @@ fn rfc6184_8_1_safari_gets_a_high_camera_under_its_constrained_high_payload_type
         .open_session(request(&safari, h264(Some([0x42, 0xe0, 0x1f]))), now)
         .expect("answered");
     assert!(answer.contains("profile-level-id=42e01f"), "{answer}");
-    assert!(warnings(engine.as_mut()).is_empty());
+    assert_eq!(warnings(engine.as_mut()), Vec::<&str>::new());
 }
 
 #[test]
@@ -2072,7 +2072,7 @@ fn rfc3264_6_an_audio_m_line_without_a_known_codec_is_still_rejected() {
         section(&answer, "audio")[0].starts_with("m=audio 0 "),
         "{answer}"
     );
-    assert!(warnings(&mut session).is_empty());
+    assert_eq!(warnings(&mut session), Vec::<&str>::new());
     // An offer that names the stream's codec in a form the engine does not
     // match (two-channel PCMU): rejected too, and the stream audio warns.
     let offer = with_audio_codecs(viewer.offer(), "a=rtpmap:0 PCMU/8000/2\n");
@@ -2196,7 +2196,7 @@ fn rfc8829_5_3_1_the_viewer_plays_video_beside_an_inactive_audio_m_line() {
     for _ in 0..50 {
         pair.step();
     }
-    assert!(pair.viewer.audio_packets().is_empty());
+    assert_eq!(pair.viewer.audio_packets(), []);
     assert_eq!(pair.session.stats().audio_dropped, 1);
 }
 
@@ -2707,16 +2707,14 @@ impl Pair {
     /// applied to the viewer and the datagrams in flight moved; or why
     /// the session refused it, the viewer then left with its offer
     /// pending.
-    fn renegotiate(
+    fn reoffer(
         &mut self,
         what: Reoffer,
         backchannel: Option<TalkbackTarget>,
         claim: TalkbackClaim,
-    ) -> Result<String, RenegotiateError> {
+    ) -> Result<String, ReofferError> {
         let offer = self.viewer.reoffer(what).expect("a re-offer");
-        let answer = self
-            .session
-            .renegotiate(self.now, &offer, backchannel, claim)?;
+        let answer = self.session.reoffer(self.now, &offer, backchannel, claim)?;
         self.viewer
             .accept_answer(&answer, &mut self.to_daemon)
             .expect("the answer applies");
@@ -2765,7 +2763,7 @@ fn rfc8829_5_3_2_a_re_offer_adds_and_drops_dedicated_talk_back() {
     pair.play_audio(0, 5, "audio before");
 
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             Some(chained(Codec::Pcma)),
             TalkbackClaim::Granted,
@@ -2809,7 +2807,7 @@ fn rfc8829_5_3_2_a_re_offer_adds_and_drops_dedicated_talk_back() {
     // sends there (against the answer) is refused and counted, and the
     // downlink goes on.
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Drop,
             Some(chained(Codec::Pcma)),
             TalkbackClaim::Granted,
@@ -2826,7 +2824,7 @@ fn rfc8829_5_3_2_a_re_offer_adds_and_drops_dedicated_talk_back() {
 
     // Claimed again by the next re-offer.
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             Some(chained(Codec::Pcma)),
             TalkbackClaim::Granted,
@@ -2840,7 +2838,7 @@ fn rfc8829_5_3_2_a_re_offer_adds_and_drops_dedicated_talk_back() {
 
     // Stopped: port 0, out of the bundle.
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Stop,
             Some(chained(Codec::Pcma)),
             TalkbackClaim::Granted,
@@ -2917,7 +2915,7 @@ fn rfc3264_6_a_re_offer_that_stops_talk_back_with_a_padded_port_is_answered_with
     for port in ["00", "000/2", "0/2"] {
         let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
         pair.connect(&answer);
-        pair.renegotiate(
+        pair.reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             Some(chained(Codec::Pcma)),
             TalkbackClaim::Granted,
@@ -2930,7 +2928,7 @@ fn rfc3264_6_a_re_offer_that_stops_talk_back_with_a_padded_port_is_answered_with
         let padded = format!("{head}m=audio {port} {stopped}");
         let answer = pair
             .session
-            .renegotiate(
+            .reoffer(
                 pair.now,
                 &padded,
                 Some(chained(Codec::Pcma)),
@@ -2973,7 +2971,7 @@ fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
         let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Pcmu));
         pair.connect(&answer);
         let answer = pair
-            .renegotiate(
+            .reoffer(
                 Reoffer::Talkback(TalkbackOffer::Dedicated),
                 backchannel.clone(),
                 claim,
@@ -2997,7 +2995,7 @@ fn rfc3264_6_1_a_declined_re_offer_is_answered_inactive_or_sendonly() {
         pair.play_audio(0, 5, &what);
         // The downlink m-line turned `sendrecv`: `sendonly`, PCMU down.
         let answer = pair
-            .renegotiate(
+            .reoffer(
                 Reoffer::Talkback(TalkbackOffer::SendRecv),
                 backchannel,
                 claim,
@@ -3065,7 +3063,7 @@ fn rfc3264_7_a_re_offer_claimed_after_a_declined_one_names_the_backchannels_code
     let mut pair = opened_before_the_backchannel();
     let target = Some(chained(Codec::Pcmu));
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             target.clone(),
             TalkbackClaim::Busy,
@@ -3080,7 +3078,7 @@ fn rfc3264_7_a_re_offer_claimed_after_a_declined_one_names_the_backchannels_code
     );
     assert_eq!(pair.session.talkback(), None);
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             target,
             TalkbackClaim::Granted,
@@ -3115,7 +3113,7 @@ fn rfc3264_7_talk_back_on_an_m_line_answered_before_is_received_in_the_codec_it_
     // Dedicated: declined for want of a backchannel, then granted.
     let mut pair = opened_before_the_backchannel();
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             None,
             TalkbackClaim::Granted,
@@ -3129,7 +3127,7 @@ fn rfc3264_7_talk_back_on_an_m_line_answered_before_is_received_in_the_codec_it_
         "G.722 reaches no camera: {answer}"
     );
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             Some(chained(Codec::Pcmu)),
             TalkbackClaim::Granted,
@@ -3150,7 +3148,7 @@ fn rfc3264_7_talk_back_on_an_m_line_answered_before_is_received_in_the_codec_it_
     let (mut pair, answer) = Pair::with_audio(h264(None), Arc::new(Codec::Opus { channels: 2 }));
     pair.connect(&answer);
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::SendRecv),
             Some(chained(Codec::Pcmu)),
             TalkbackClaim::Granted,
@@ -3201,7 +3199,7 @@ fn without_opus_up(offer: &str) -> String {
 fn rfc3264_7_talk_back_on_a_kept_m_line_is_received_in_a_codec_the_re_offer_lists_or_declined() {
     use lotse_core::session::SessionEngine as _;
     let mut pair = opened_before_the_backchannel();
-    pair.renegotiate(
+    pair.reoffer(
         Reoffer::Talkback(TalkbackOffer::Dedicated),
         None,
         TalkbackClaim::Granted,
@@ -3236,7 +3234,7 @@ fn rfc3264_7_talk_back_on_a_kept_m_line_is_received_in_a_codec_the_re_offer_list
     // still names Opus first.
     let answer = pair
         .session
-        .renegotiate(pair.now, &narrowed, Some(chained), TalkbackClaim::Granted)
+        .reoffer(pair.now, &narrowed, Some(chained), TalkbackClaim::Granted)
         .expect("answered");
     let up = audio_sections(&answer).pop().unwrap();
     assert!(up.contains(&"a=recvonly"), "{answer}");
@@ -3245,7 +3243,7 @@ fn rfc3264_7_talk_back_on_a_kept_m_line_is_received_in_a_codec_the_re_offer_list
     // PCMA would never reach a forwarded PCMU camera: declined.
     let answer = pair
         .session
-        .renegotiate(
+        .reoffer(
             pair.now,
             &narrowed,
             Some(forwarded.clone()),
@@ -3281,7 +3279,7 @@ fn rfc8829_5_3_1_a_re_offer_shares_the_downlink_m_line_for_talk_back() {
     pair.connect(&answer);
     pair.play_audio(0, 5, "before");
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::SendRecv),
             Some(chained(Codec::Pcma)),
             TalkbackClaim::Granted,
@@ -3300,7 +3298,7 @@ fn rfc8829_5_3_1_a_re_offer_shares_the_downlink_m_line_for_talk_back() {
     assert_eq!(pair.uplink.len(), 2);
     pair.play_audio(5, 10, "while talking");
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Drop,
             Some(chained(Codec::Pcma)),
             TalkbackClaim::Granted,
@@ -3328,7 +3326,7 @@ fn rfc8829_5_2_2_a_re_offer_moves_talk_back_between_the_dedicated_and_the_downli
     let (mut pair, answer) = Pair::with_audio_on(h264(None), Arc::new(Codec::Pcmu), target.clone());
     pair.connect(&answer);
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             target.clone(),
             TalkbackClaim::Granted,
@@ -3339,7 +3337,7 @@ fn rfc8829_5_2_2_a_re_offer_moves_talk_back_between_the_dedicated_and_the_downli
     assert_eq!(pair.uplink.len(), 1);
 
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::SendRecv),
             target.clone(),
             TalkbackClaim::Granted,
@@ -3360,7 +3358,7 @@ fn rfc8829_5_2_2_a_re_offer_moves_talk_back_between_the_dedicated_and_the_downli
     pair.play_audio(0, 5, "audio on the shared m-line");
 
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             target,
             TalkbackClaim::Granted,
@@ -3398,10 +3396,10 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
     let target = Some(chained(Codec::Pcmu));
     let refused = |pair: &mut Pair, offer: &str| {
         pair.session
-            .renegotiate(pair.now, offer, target.clone(), TalkbackClaim::Granted)
+            .reoffer(pair.now, offer, target.clone(), TalkbackClaim::Granted)
             .expect_err("refused")
     };
-    let changed = |what: &str| RenegotiateError::VideoChanged(what.to_owned());
+    let changed = |what: &str| ReofferError::VideoChanged(what.to_owned());
     // `reoffer` with `from` replaced by `to` within its video section.
     let in_video = |from: &str, to: &str| {
         let start = reoffer.find("m=video").expect("the video m-line");
@@ -3448,15 +3446,12 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
     );
     // No video m-line at all.
     let audio_only = reoffer[..reoffer.find("m=video").unwrap()].to_owned();
-    assert_eq!(
-        refused(&mut pair, &audio_only),
-        RenegotiateError::NoVideoTrack
-    );
+    assert_eq!(refused(&mut pair, &audio_only), ReofferError::NoVideoTrack);
     // Not an SDP, and one the engine refuses: the new audio m-line
     // before the video one changes the order of the m-lines.
     assert!(matches!(
         refused(&mut pair, "nonsense"),
-        RenegotiateError::InvalidSdp(_)
+        ReofferError::InvalidSdp(_)
     ));
     let sections: Vec<&str> = reoffer.split("m=").collect();
     let reordered = format!(
@@ -3464,10 +3459,7 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
         sections[0], sections[3], sections[1], sections[2]
     );
     assert!(
-        matches!(
-            refused(&mut pair, &reordered),
-            RenegotiateError::InvalidSdp(_)
-        ),
+        matches!(refused(&mut pair, &reordered), ReofferError::InvalidSdp(_)),
         "{reordered}"
     );
     // A payload type with two codecs across the bundle (RFC 9143
@@ -3482,7 +3474,7 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
     assert_ne!(conflict, reoffer);
     assert!(matches!(
         refused(&mut pair, &conflict),
-        RenegotiateError::InvalidSdp(_)
+        ReofferError::InvalidSdp(_)
     ));
 
     // The session plays on as it was.
@@ -3493,7 +3485,7 @@ fn a_re_offer_that_changes_the_video_m_line_or_is_no_sdp_is_refused() {
     pair.drain();
     assert_eq!(
         refused(&mut pair, &reoffer),
-        RenegotiateError::InvalidSdp("the session is closed".into())
+        ReofferError::InvalidSdp("the session is closed".into())
     );
 }
 
@@ -3554,17 +3546,14 @@ fn rfc9143_9_1_1_a_payload_type_refusal_logs_the_browser_s_text_capped() {
     );
     assert_ne!(conflict, reoffer);
     let (logs, captured) = capture_logs(tracing::Level::DEBUG);
-    let err = pair.session.renegotiate(
+    let err = pair.session.reoffer(
         pair.now,
         &conflict,
         Some(chained(Codec::Pcmu)),
         TalkbackClaim::Granted,
     );
     drop(logs);
-    assert!(
-        matches!(&err, Err(RenegotiateError::InvalidSdp(_))),
-        "{err:?}"
-    );
+    assert!(matches!(&err, Err(ReofferError::InvalidSdp(_))), "{err:?}");
     capped(&captured.text(), "re-offer refused: payload types conflict");
 }
 
@@ -3607,8 +3596,8 @@ fn rfc9143_9_1_1_a_payload_type_conflict_where_the_engine_is_not_offered_it_is_r
     assert_ne!(g722_up, reoffer);
     let err = pair
         .session
-        .renegotiate(pair.now, &g722_up, None, TalkbackClaim::Granted);
-    let Err(RenegotiateError::InvalidSdp(reason)) = err else {
+        .reoffer(pair.now, &g722_up, None, TalkbackClaim::Granted);
+    let Err(ReofferError::InvalidSdp(reason)) = err else {
         panic!("{err:?}")
     };
     assert!(reason.contains("one BUNDLE group"), "{reason}");
@@ -3668,7 +3657,7 @@ fn rfc4855_3_a_re_offer_that_recases_the_video_encoding_name_is_taken() {
     assert_ne!(recased, reoffer, "{reoffer}");
     let answer = pair
         .session
-        .renegotiate(
+        .reoffer(
             pair.now,
             &recased,
             Some(chained(Codec::Pcmu)),
@@ -3729,13 +3718,13 @@ fn rfc3264_8_2_a_re_offer_that_stops_the_video_m_line_is_refused_and_video_plays
         assert!(stopped.contains(&format!("m=video {port} ")), "{stopped}");
         assert!(!stopped.contains("a=bundle-only"), "{stopped}");
         assert_eq!(
-            pair.session.renegotiate(
+            pair.session.reoffer(
                 pair.now,
                 &stopped,
                 Some(chained(Codec::Pcmu)),
                 TalkbackClaim::Granted
             ),
-            Err(RenegotiateError::VideoChanged("its port".to_owned())),
+            Err(ReofferError::VideoChanged("its port".to_owned())),
             "{port}"
         );
         assert_eq!(pair.session.state(), State::Connected, "{port}");
@@ -3766,7 +3755,7 @@ fn rfc3264_6_1_a_re_offer_may_drop_the_downlink_and_take_it_back() {
     assert_ne!(silenced, reoffer);
     let answer = pair
         .session
-        .renegotiate(pair.now, &silenced, None, TalkbackClaim::Granted)
+        .reoffer(pair.now, &silenced, None, TalkbackClaim::Granted)
         .expect("answered");
     assert!(
         audio_sections(&answer)[0].contains(&"a=inactive"),
@@ -3801,7 +3790,7 @@ fn rfc3264_6_1_a_re_offer_may_drop_the_downlink_and_take_it_back() {
     assert_ne!(restored, reoffer);
     let answer = pair
         .session
-        .renegotiate(pair.now, &restored, None, TalkbackClaim::Granted)
+        .reoffer(pair.now, &restored, None, TalkbackClaim::Granted)
         .expect("answered");
     assert!(
         audio_sections(&answer)[0].contains(&"a=sendonly"),
@@ -3893,7 +3882,7 @@ fn rfc3550_5_1_audio_moved_off_an_m_line_and_back_runs_its_sequence_numbers_on()
     assert_ne!(to_b, reoffer);
     let answer = pair
         .session
-        .renegotiate(pair.now, &to_b, None, TalkbackClaim::Granted)
+        .reoffer(pair.now, &to_b, None, TalkbackClaim::Granted)
         .expect("answered");
     let sections = audio_sections(&answer);
     assert!(sections[0].contains(&"a=inactive"), "{answer}");
@@ -3920,7 +3909,7 @@ fn rfc3550_5_1_audio_moved_off_an_m_line_and_back_runs_its_sequence_numbers_on()
     assert!(offered[0].contains(&"a=recvonly"), "{to_a}");
     let answer = pair
         .session
-        .renegotiate(pair.now, &to_a, None, TalkbackClaim::Granted)
+        .reoffer(pair.now, &to_a, None, TalkbackClaim::Granted)
         .expect("answered");
     let sections = audio_sections(&answer);
     assert!(sections[0].contains(&"a=sendonly"), "{answer}");
@@ -3983,7 +3972,7 @@ fn rfc3264_6_1_stream_audio_moved_to_an_m_line_whose_first_answer_left_its_codec
         panic!("one audio SSRC: {:?}", audio_ssrcs(&pair));
     };
     let answer = pair
-        .renegotiate(
+        .reoffer(
             Reoffer::Talkback(TalkbackOffer::Dedicated),
             None,
             TalkbackClaim::Granted,
@@ -4014,7 +4003,7 @@ fn rfc3264_6_1_stream_audio_moved_to_an_m_line_whose_first_answer_left_its_codec
     pair.events.clear();
     let answer = pair
         .session
-        .renegotiate(pair.now, &to_b, None, TalkbackClaim::Granted)
+        .reoffer(pair.now, &to_b, None, TalkbackClaim::Granted)
         .expect("answered");
     let sections = audio_sections(&answer);
     assert!(sections[0].contains(&"a=inactive"), "{answer}");
@@ -4105,7 +4094,7 @@ fn rfc3264_6_a_stopped_downlink_m_line_offered_again_carries_no_stream_audio() {
         };
         let answer = pair
             .session
-            .renegotiate(pair.now, &stopped, None, TalkbackClaim::Granted)
+            .reoffer(pair.now, &stopped, None, TalkbackClaim::Granted)
             .expect("answered");
         let sections = audio_sections(&answer);
         assert!(sections[0][0].starts_with("m=audio 0 "), "{what}: {answer}");
@@ -4119,7 +4108,7 @@ fn rfc3264_6_a_stopped_downlink_m_line_offered_again_carries_no_stream_audio() {
         assert!(section(&reoffer, "audio")[0].starts_with("m=audio 9 "));
         let answer = pair
             .session
-            .renegotiate(pair.now, &reoffer, None, TalkbackClaim::Granted)
+            .reoffer(pair.now, &reoffer, None, TalkbackClaim::Granted)
             .expect("answered");
         let sections = audio_sections(&answer);
         assert!(sections[0][0].starts_with("m=audio 0 "), "{what}: {answer}");
@@ -4155,7 +4144,7 @@ fn rfc3264_6_1_a_re_offer_that_drops_the_streams_codec_from_the_downlink_stops_t
     assert_ne!(opus_only, reoffer);
     let answer = pair
         .session
-        .renegotiate(pair.now, &opus_only, None, TalkbackClaim::Granted)
+        .reoffer(pair.now, &opus_only, None, TalkbackClaim::Granted)
         .expect("answered");
     let down = &audio_sections(&answer)[0];
     assert!(
@@ -4212,7 +4201,7 @@ fn rfc8829_5_3_2_a_re_offer_adds_the_downlink_audio_m_line() {
     pair.connect(&answer);
     assert_eq!(pair.viewer.audio_direction(), None);
     let answer = pair
-        .renegotiate(Reoffer::Audio, None, TalkbackClaim::Granted)
+        .reoffer(Reoffer::Audio, None, TalkbackClaim::Granted)
         .expect("answered");
     let down = &audio_sections(&answer)[0];
     assert!(down.contains(&"a=sendonly"), "{answer}");
@@ -4268,7 +4257,7 @@ fn rfc8829_5_3_2_playout_delay_0_0_follows_a_re_offer_that_adds_or_drops_the_aud
         str0m::media::Frequency::HUNDREDTHS,
     ));
     let delays = |packets: &[str0m::rtp::RtpPacket]| {
-        assert!(!packets.is_empty());
+        assert_ne!(packets, []);
         packets
             .iter()
             .map(|packet| {
@@ -4302,7 +4291,7 @@ fn rfc8829_5_3_2_playout_delay_0_0_follows_a_re_offer_that_adds_or_drops_the_aud
     let mut received = play_keyframe(&mut pair, &mut normalizer, &mut seq, 90_000);
     assert_eq!(delays(&received), [(zero, zero)]);
     let before = received.len();
-    pair.renegotiate(Reoffer::Audio, None, TalkbackClaim::Granted)
+    pair.reoffer(Reoffer::Audio, None, TalkbackClaim::Granted)
         .expect("answered");
     received.extend(play_keyframe(&mut pair, &mut normalizer, &mut seq, 93_000));
     assert_eq!(delays(&received[before..]), [(None, None)]);
@@ -4332,7 +4321,7 @@ fn rfc8829_5_3_2_playout_delay_0_0_follows_a_re_offer_that_adds_or_drops_the_aud
         assert_ne!(changed, reoffer);
         let answer = pair
             .session
-            .renegotiate(pair.now, &changed, None, TalkbackClaim::Granted)
+            .reoffer(pair.now, &changed, None, TalkbackClaim::Granted)
             .expect("answered");
         pair.viewer
             .accept_answer(&answer, &mut pair.to_daemon)
@@ -4902,7 +4891,11 @@ fn itu_t_h265_7_4_4_a_new_sps_outside_the_negotiated_profile_or_tier_closes_stre
         &mut session,
         now,
         CodecFamily::H265,
-        Some(TrackEvent::TrackChanged(h265(2))),
+        Some(TrackEvent::TrackChanged {
+            codec: h265(2),
+            clock_rate: 90_000,
+        }),
+        &mut lotse_core::throttle::Throttle::default(),
         |_| now,
     );
     let closed = std::iter::from_fn(|| match session.poll() {
@@ -5153,7 +5146,7 @@ fn ts_26_114_6_2_3_3_no_cvo_unless_offered_and_none_sent_without_an_orientation(
 
 #[test]
 fn ts_26_114_7_4_5_a_mirrored_orientation_sends_its_rotation_without_the_flip_bit() {
-    // SPEC-DEVIATION: str0m 0.24 carries R1 R0 only.
+    // SPEC-DEVIATION: str0m 0.25 carries R1 R0 only.
     let (mut pair, answer, logs) = oriented(Orientation::RotateRightAndFlip, str::to_owned);
     assert!(logs.contains("cvo=7 sent=Deg90"), "{logs}");
     let received = join_and_play(&mut pair, &answer);
@@ -5263,11 +5256,20 @@ fn captured_at(start: Instant, n: u32, per_second: u32) -> Instant {
     start + Duration::from_nanos(u64::from(n) * 1_000_000_000 / u64::from(per_second))
 }
 
+/// When [`play_timed`] wrote each video frame and each audio packet, by
+/// their number into the play.
+#[derive(Default)]
+struct Written {
+    video: Vec<Instant>,
+    audio: Vec<Instant>,
+}
+
 /// Connects `pair` and plays it for `frames` video frames at 30 fps and
 /// the audio beside them, 20 ms PCMU packets, each written 20 ms after its
-/// capture. The keyframe comes first; every P frame is a full FU-A packet
-/// and a short one. Returns the capture times' origin.
-fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> Instant {
+/// capture or as the engine's timeouts step the clock past that. The
+/// keyframe comes first; every P frame is a full FU-A packet and a short
+/// one. Returns the capture times' origin and when each was written.
+fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> (Instant, Written) {
     pair.viewer
         .accept_answer(answer, &mut pair.to_daemon)
         .expect("the answer applies");
@@ -5277,6 +5279,7 @@ fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> Instant {
         "connected",
     );
     let start = pair.now;
+    let mut written = Written::default();
     let mut normalizer = normalizer();
     let (mut seq, mut audio_seq, mut audio) = (0, 0, 0);
     for n in 0..frames {
@@ -5288,8 +5291,10 @@ fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> Instant {
             let at = captured_at(start, audio, 50);
             let packet = audio_packet(audio_seq, audio * 160, 0, at);
             pair.session.write_audio(pair.now, &packet, at);
+            written.audio.push(pair.now);
             (audio, audio_seq) = (audio + 1, audio_seq + 1);
         }
+        written.video.push(pair.now);
         let bytes = if n == 0 {
             300
         } else {
@@ -5312,7 +5317,7 @@ fn play_timed(pair: &mut Pair, answer: &str, frames: u32) -> Instant {
         500,
         "the play",
     );
-    start
+    (start, written)
 }
 
 /// The packets that carry `abs-capture-time`, with their value.
@@ -5356,12 +5361,23 @@ fn abs_capture_time_carries_the_written_capture_time_on_the_session_wall_clock_o
         );
     }
     // 2.3 s of play.
-    let start = play_timed(&mut pair, &answer, 70);
+    let (start, written) = play_timed(&mut pair, &answer, 70);
     let on_wall = |capture: Instant| wall + capture.duration_since(opened);
-    for (kind, packets, per_tick) in [
-        ("video", pair.viewer.packets(), 90_000_u64),
-        ("audio", pair.viewer.audio_packets(), 8_000),
+    for (kind, packets, per_tick, times) in [
+        ("video", pair.viewer.packets(), 90_000_u64, &written.video),
+        ("audio", pair.viewer.audio_packets(), 8_000, &written.audio),
     ] {
+        // A packet's number into the play: its frame's, or its own.
+        let per_second = if kind == "video" { 30 } else { 50 };
+        let number = |packet: &str0m::rtp::RtpPacket| {
+            let ticks = u64::from(
+                packet
+                    .header
+                    .timestamp
+                    .wrapping_sub(packets[0].header.timestamp),
+            );
+            usize::try_from(ticks * per_second / per_tick).unwrap()
+        };
         let sent = carriers(packets);
         // libwebrtc's sender: the first packet, then once more than a
         // second has passed; 2.3 s hold three.
@@ -5376,17 +5392,14 @@ fn abs_capture_time_carries_the_written_capture_time_on_the_session_wall_clock_o
             "{kind}: the first packet"
         );
         for pair in sent.windows(2) {
-            let ticks = u64::from(
-                pair[1]
-                    .0
-                    .header
-                    .timestamp
-                    .wrapping_sub(pair[0].0.header.timestamp),
-            );
-            let gap = Duration::from_nanos(ticks * 1_000_000_000 / per_tick);
+            // Written more than a second after the last carrier, and the
+            // frame or packet before, which had room too, not.
+            let (last, next) = (number(pair[0].0), number(pair[1].0));
+            let after = times[next] - times[last];
+            let before = times[next - 1] - times[last];
             assert!(
-                gap > Duration::from_secs(1) && gap < Duration::from_millis(1_100),
-                "{kind}: {gap:?} apart"
+                after > Duration::from_secs(1) && before <= Duration::from_secs(1),
+                "{kind}: written {after:?} after the last carrier, {before:?} before"
             );
         }
         for (packet, value) in &sent {
@@ -5509,8 +5522,8 @@ fn rfc8285_6_abs_capture_time_is_answered_under_chromes_id_and_not_unless_offere
     assert!(!answer.contains(ABS_CAPTURE_TIME_URI), "{answer}");
     play_timed(&mut pair, &answer, 40);
     assert!(!pair.viewer.packets().is_empty() && !pair.viewer.audio_packets().is_empty());
-    assert!(carriers(pair.viewer.packets()).is_empty());
-    assert!(carriers(pair.viewer.audio_packets()).is_empty());
+    assert_eq!(carriers(pair.viewer.packets()), []);
+    assert_eq!(carriers(pair.viewer.audio_packets()), []);
 }
 
 /// The viewer's offer with every line `edit` maps, lines it drops left out.
@@ -5753,8 +5766,8 @@ fn rfc8829_5_3_1_a_talk_only_offer_is_answered_without_video_and_its_talk_back_h
             "no video, so no codec it cannot carry"
         );
         pair.settle_talkback();
-        assert!(pair.viewer.packets().is_empty());
-        assert!(pair.viewer.audio_packets().is_empty());
+        assert_eq!(pair.viewer.packets(), []);
+        assert_eq!(pair.viewer.audio_packets(), []);
         let stats = pair.session.stats();
         assert_eq!(
             stats,
@@ -5797,24 +5810,21 @@ fn rfc8829_5_2_2_a_talk_only_session_takes_talk_back_re_offers_but_no_video() {
     let backchannel = request.backchannel;
     let err = pair
         .session
-        .renegotiate(
+        .reoffer(
             pair.now,
             &with_video,
             backchannel.clone(),
             TalkbackClaim::Granted,
         )
         .unwrap_err();
-    assert_eq!(
-        err,
-        RenegotiateError::VideoChanged("it adds one".to_owned())
-    );
+    assert_eq!(err, ReofferError::VideoChanged("it adds one".to_owned()));
     assert_eq!(err.code(), "invalid_sdp");
     assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcmu));
 
     let drop = pair.viewer.reoffer(Reoffer::Drop).expect("a re-offer");
     let answer = pair
         .session
-        .renegotiate(pair.now, &drop, backchannel.clone(), TalkbackClaim::Granted)
+        .reoffer(pair.now, &drop, backchannel.clone(), TalkbackClaim::Granted)
         .expect("answered");
     assert!(ports(&answer, "video").is_empty(), "{answer}");
     assert_eq!(talkback_answered(&answer).0, "a=inactive");
@@ -5829,7 +5839,7 @@ fn rfc8829_5_2_2_a_talk_only_session_takes_talk_back_re_offers_but_no_video() {
         .expect("a re-offer");
     let answer = pair
         .session
-        .renegotiate(pair.now, &again, backchannel, TalkbackClaim::Granted)
+        .reoffer(pair.now, &again, backchannel, TalkbackClaim::Granted)
         .expect("answered");
     assert_eq!(talkback_answered(&answer).0, "a=recvonly");
     assert_eq!(pair.session.talkback(), Some(UplinkCodec::Pcmu));
@@ -5858,5 +5868,42 @@ fn rfc8829_5_3_1_a_listen_only_offer_gets_the_stream_audio_and_no_video() {
     pair.run_until(|p| p.viewer.audio_packets().len() >= 5, 500, "audio");
     let stats = pair.session.stats();
     assert_eq!((stats.audio_packets, stats.packets), (5, 0));
-    assert!(pair.viewer.packets().is_empty());
+    assert_eq!(pair.viewer.packets(), []);
+}
+
+/// A session checks the browser's candidates on its own, paced by its
+/// timeouts (RFC 8445 §6.1.4.2), before anything arrives from the
+/// browser: a relay candidate's checks are what open the TURN
+/// permission the browser's own checks need (RFC 8656 §9).
+#[test]
+fn rfc8445_6_1_4_2_a_session_checks_the_browser_before_hearing_from_it() {
+    let now = SystemClock.now();
+    lotse_webrtc::install_crypto_provider();
+    let viewer = Viewer::new(BROWSER.parse().unwrap(), now).expect("a viewer");
+    let (mut session, _answer) =
+        Session::answer(&request(viewer.offer(), h264(None)), now).unwrap();
+    let browser: SocketAddr = BROWSER.parse().unwrap();
+    let mut at = now;
+    let mut checked = None;
+    while checked.is_none() && at < now + Duration::from_secs(1) {
+        match session.poll() {
+            SessionOutput::Timeout(next) => {
+                at = next;
+                session.handle_timeout(at);
+            }
+            // A STUN Binding request (RFC 8489 §5: class and method 0x0001).
+            SessionOutput::Transmit {
+                destination,
+                payload,
+                ..
+            } if destination == browser && payload.starts_with(&[0x00, 0x01]) => {
+                checked = Some(at);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        checked.is_some(),
+        "a connectivity check to the browser within 1 s"
+    );
 }

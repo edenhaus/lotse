@@ -88,7 +88,7 @@ pub enum SessionEvent {
         dtls: String,
     },
     /// Non-fatal. Each code comes at most once per session, but `backchannel_declined`, which
-    /// comes once per offer (`webrtc/offer` or `webrtc/renegotiate`) that
+    /// comes once per offer (`webrtc/offer` or `webrtc/reoffer`) that
     /// asked for talk-back the session did not get: the talk-back m-line
     /// was answered `inactive` (or `sendonly` when it carries the
     /// stream's audio too, RFC 3264 §6.1), and `reason` says why.
@@ -141,7 +141,8 @@ pub enum SessionEvent {
 pub enum WarningCode {
     /// Audio omitted from the session; the rest of it continues.
     AudioCodecUnsupported,
-    /// A `turns:` entry of `ice_servers` was ignored.
+    /// A `turns:` entry of `ice_servers` over DTLS (`?transport=udp`, RFC
+    /// 7350) was ignored; TURN over TLS (`turns:` over TCP) is supported.
     TurnUnsupported,
     /// Audio withdrawn because sync could not be held.
     AvSyncLost,
@@ -307,10 +308,10 @@ impl DeclineReason {
     }
 }
 
-/// `webrtc/renegotiate`'s result.
+/// `webrtc/reoffer`'s result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
-pub struct WebrtcRenegotiateResult {
+pub struct WebrtcReofferResult {
     /// The SDP answer to the re-offer.
     pub sdp: String,
 }
@@ -544,11 +545,11 @@ mod tests {
             assert_eq!(DeclineReason::parse(name), Some(reason));
         }
         assert_eq!(DeclineReason::parse("tired"), None);
-        let result = WebrtcRenegotiateResult { sdp: "v=0".into() };
+        let result = WebrtcReofferResult { sdp: "v=0".into() };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json, json!({ "sdp": "v=0" }));
         assert_eq!(
-            serde_json::from_value::<WebrtcRenegotiateResult>(json).unwrap(),
+            serde_json::from_value::<WebrtcReofferResult>(json).unwrap(),
             result
         );
     }

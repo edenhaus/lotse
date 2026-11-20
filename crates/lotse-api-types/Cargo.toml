@@ -15,6 +15,9 @@ categories.workspace = true
 # The JSON Schema generator (`schema::bundle`): the `schema` example and the test that the
 # committed bundle is not stale. The daemon serves the committed bundle and leaves it out.
 schema = ["dep:schemars"]
+# The `fake` and `fake-signaled` sources of `stream/put`, which `lotse_core::test_util`'s fake
+# factories serve: for tests and the daemon's `source-fake` builds only, and never in the schema.
+test-util = []
 
 [dependencies]
 schemars = { workspace = true, optional = true }

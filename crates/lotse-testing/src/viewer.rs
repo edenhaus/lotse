@@ -367,7 +367,7 @@ impl Viewer {
     }
 
     /// A re-offer, as a browser makes one after the answer: the SDP to
-    /// send as `webrtc/renegotiate`, which [`Viewer::accept_answer`] then
+    /// send as `webrtc/reoffer`, which [`Viewer::accept_answer`] then
     /// takes the answer to. `Err` when the engine has nothing to offer
     /// (dropping talk-back that was never offered, the downlink turned
     /// `sendrecv` without an audio m-line) or the answer to the last

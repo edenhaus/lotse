@@ -37,7 +37,11 @@ pub enum SandboxError {
         source: io::Error,
     },
     /// The mode is `require` and a layer is unavailable on this kernel.
-    #[error("sandbox layer {layer} is unavailable and the mode is `require`: {reason}")]
+    /// The message names the layer and the way out: `require` is the
+    /// default, so whoever meets this error may never have chosen it.
+    #[error(
+        "sandbox layer {layer} is unavailable and the sandbox mode is `require`, the default: {reason}; to run with only the layers this host offers, set the mode to `on` (`--sandbox on`, `LOTSE_SANDBOX=on` or `sandbox = \"on\"` in the config file)"
+    )]
     Required {
         /// The layer (`seccomp`, `landlock.fs`, `landlock.net`, or
         /// `sandbox` where no layer exists at all).

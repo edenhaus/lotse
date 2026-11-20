@@ -269,7 +269,7 @@ impl Run<'_> {
                 .command(json!({
                     "type": "stream/put",
                     "stream_id": stream_id(index),
-                    "sources": [{ "url": camera.url() }],
+                    "sources": [crate::source(&camera.url(), json!({}))],
                     "preload": true,
                 }))
                 .await

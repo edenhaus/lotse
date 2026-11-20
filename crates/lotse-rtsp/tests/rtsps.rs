@@ -1,7 +1,7 @@
 //! The RTSP source over TLS against the fake camera in TLS mode: a pinned
 //! self-signed camera plays over TLS 1.3 and TLS 1.2, a wrong pin and an
 //! untrusted certificate are `auth_failed` before any RTSP request,
-//! `insecure_tls` plays and warns, a camera that does not speak TLS fails
+//! `"tls": "insecure"` plays and warns, a camera that does not speak TLS fails
 //! the handshake, a silent one times out in it, a pin mismatch is
 //! retried only after the reconnect backoff, the camera sees the source
 //! URL as the Request-URI, and a live555 camera that hangs up is torn
@@ -108,10 +108,10 @@ async fn rtsps_plays_with_a_pinned_certificate_rfc7826_19_2() {
     let cam = tls_camera(tls).await;
     // Two attempts in a row, each on a connection of its own.
     let factory = RtspFactory;
-    let options = json!({ "tls_fingerprint": pin });
+    let options = json!({ "tls": { "pin": pin } });
     let source = source(&factory, &url(&cam), &options);
     assert_eq!(
-        source.connection_options()["tls_fingerprint"],
+        source.connection_options()["tls"]["pin"],
         pin.to_lowercase()
     );
     plays(source.as_ref(), peer(&cam)).await;
@@ -136,7 +136,7 @@ async fn rtsps_plays_with_a_pinned_certificate_rfc7826_19_2() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rfc2326_10_7_a_live555_camera_that_hangs_up_is_torn_down_on_a_fresh_tls_connection() {
     let tls = CameraTls::self_signed(&["elsewhere.test"]).unwrap();
-    let options = json!({ "tls_fingerprint": tls.fingerprint() });
+    let options = json!({ "tls": { "pin": tls.fingerprint() } });
     let cam = FakeCamera::start(
         CameraConfig {
             tls: Some(tls),
@@ -165,7 +165,7 @@ async fn rfc2326_10_7_a_live555_camera_that_hangs_up_is_torn_down_on_a_fresh_tls
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tls_1_2_only_camera_plays_rfc5246() {
     let tls = CameraTls::tls12_only(&["elsewhere.test"]).unwrap();
-    let options = json!({ "tls_fingerprint": tls.fingerprint() });
+    let options = json!({ "tls": { "pin": tls.fingerprint() } });
     let cam = tls_camera(tls).await;
     let source = source(&RtspFactory, &url(&cam), &options);
     plays(source.as_ref(), peer(&cam)).await;
@@ -182,13 +182,13 @@ async fn a_wrong_pin_is_auth_failed_before_any_request() {
     let source = source(
         &RtspFactory,
         &url(&cam),
-        &json!({ "tls_fingerprint": wrong }),
+        &json!({ "tls": { "pin": wrong } }),
     );
     let SourceError::AuthFailed(message) = fails(source.as_ref(), peer(&cam)).await else {
         panic!("auth_failed");
     };
     assert!(
-        message.contains("does not match tls_fingerprint")
+        message.contains("does not match its pin")
             && message.contains(&wrong)
             && message.contains(&presented),
         "{message}"
@@ -230,7 +230,7 @@ impl std::io::Write for Captured {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn insecure_tls_plays_and_warns() {
+async fn insecure_trust_plays_and_warns() {
     let captured = Captured::default();
     let writer = captured.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -242,13 +242,13 @@ async fn insecure_tls_plays_and_warns() {
     let tls = CameraTls::self_signed(&["camera.test"]).unwrap();
     let presented = tls.fingerprint().to_lowercase();
     let cam = tls_camera(tls).await;
-    let source = source(&RtspFactory, &url(&cam), &json!({ "insecure_tls": true }));
+    let source = source(&RtspFactory, &url(&cam), &json!({ "tls": "insecure" }));
     plays(source.as_ref(), peer(&cam)).await;
     cam.stop().await;
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     let warnings: Vec<&str> = logs
         .lines()
-        .filter(|l| l.contains("insecure_tls"))
+        .filter(|l| l.contains("tls: insecure"))
         .collect();
     assert_eq!(warnings.len(), 1, "{logs}");
     assert!(
@@ -268,7 +268,7 @@ async fn a_camera_without_tls_fails_the_handshake_and_a_silent_one_times_out() {
     let plain = FakeCamera::start(CameraConfig::default(), clock())
         .await
         .unwrap();
-    let options = json!({ "insecure_tls": true });
+    let options = json!({ "tls": "insecure" });
     let hangs_up = source(&RtspFactory, &url(&plain), &options);
     let err = fails(hangs_up.as_ref(), peer(&plain)).await;
     assert!(
@@ -280,7 +280,7 @@ async fn a_camera_without_tls_fails_the_handshake_and_a_silent_one_times_out() {
     // A peer that accepts and never answers meets the read deadline.
     let quiet = StdListener::bind("127.0.0.1:0").unwrap();
     let addr = quiet.local_addr().unwrap();
-    let options = json!({ "insecure_tls": true, "timeout_ms": 300 });
+    let options = json!({ "tls": "insecure", "timeout_ms": 300 });
     let silent = source(
         &RtspFactory,
         &format!("rtsps://camera.test:{}/stream", addr.port()),
@@ -316,7 +316,7 @@ async fn a_camera_without_tls_fails_the_handshake_and_a_silent_one_times_out() {
     let not_tls = source(
         &RtspFactory,
         &format!("rtsps://camera.test:{}/stream", addr.port()),
-        &json!({ "insecure_tls": true }),
+        &json!({ "tls": "insecure" }),
     );
     let err = fails(
         not_tls.as_ref(),
@@ -338,7 +338,7 @@ async fn without_an_address_or_a_listening_camera_rtsps_is_unreachable() {
     let source = source(
         &RtspFactory,
         "rtsps://camera.test/stream",
-        &json!({ "insecure_tls": true }),
+        &json!({ "tls": "insecure" }),
     );
     let err = fails(
         source.as_ref(),
@@ -381,12 +381,13 @@ async fn a_pin_mismatch_waits_for_the_reconnect_backoff() {
         source(
             &RtspFactory,
             &url(&cam),
-            &json!({ "tls_fingerprint": wrong }),
+            &json!({ "tls": { "pin": wrong } }),
         ),
         peer(&cam),
         Arc::clone(&tracks),
         Arc::new(ClockMapper::new()),
         BackchannelSlot::default(),
+        None,
         clock(),
         RunnerConfig::default(),
         ReconnectBackoff::new(1),

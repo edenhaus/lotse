@@ -1,20 +1,40 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "config:best-practices",
-    ":semanticCommits",
-    "group:allNonMajor",
-    "schedule:weekly"
-  ],
-  "ignorePresets": [":pinDevDependencies"],
+  "extends": ["config:best-practices", ":semanticCommits"],
+  "ignorePresets": [":ignoreModulesAndTests", ":pinDevDependencies"],
   "labels": ["dependencies"],
-  "lockFileMaintenance": { "enabled": true },
+  "lockFileMaintenance": { "enabled": true, "schedule": ["* * * * 1"] },
   "pre-commit": { "enabled": true },
   "packageRules": [
     {
       "description": "retina is pinned by hand to a revision of the edenhaus/retina fork (Cargo.toml says which and why); Renovate would move it to the fork's default branch, which is behind it",
       "matchDepNames": ["retina"],
       "enabled": false
+    },
+    {
+      "description": "ruff in the pre-commit hook and in tests/browser/pyproject.toml, updated together so the hook and `uv run ruff` never disagree",
+      "matchPackageNames": ["ruff", "astral-sh/ruff-pre-commit"],
+      "groupName": "ruff"
+    },
+    {
+      "description": "go2rtc-client stays at the version its common deployment pins (tests/browser/pyproject.toml), moved by hand when that changes",
+      "matchPackageNames": ["go2rtc-client"],
+      "enabled": false
+    },
+    {
+      "description": "rustls and tokio-rustls, which is built against one rustls minor",
+      "matchPackageNames": ["rustls", "tokio-rustls"],
+      "groupName": "rustls"
+    },
+    {
+      "description": "str0m, its DTLS stack dimpl and the RustCrypto crates lotse-webrtc's crypto provider implements str0m's traits with: a release of one needs the matching releases of the others",
+      "matchPackageNames": ["str0m", "dimpl", "aes", "aes-gcm", "ctr", "hmac", "sha1", "sha2"],
+      "groupName": "str0m and RustCrypto"
+    },
+    {
+      "description": "The fuzzing nightly has a release every day; one bump a week, on Monday, is enough to follow it",
+      "matchDepNames": ["rust-nightly"],
+      "schedule": ["* * * * 1"]
     }
   ],
   "customManagers": [

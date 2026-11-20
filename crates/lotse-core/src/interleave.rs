@@ -1112,7 +1112,10 @@ mod tests {
         });
         queue.push(
             Kind::Video,
-            TrackEvent::TrackChanged(Arc::clone(&codec)),
+            TrackEvent::TrackChanged {
+                codec: Arc::clone(&codec),
+                clock_rate: 90_000,
+            },
             recording.now(),
         );
         assert_eq!(
@@ -1123,7 +1126,13 @@ mod tests {
                 "vSourceRestored".to_owned(),
                 "vEpochStart { epoch: 1 }".to_owned(),
                 "v5000".to_owned(),
-                format!("v{:?}", TrackEvent::TrackChanged(codec)),
+                format!(
+                    "v{:?}",
+                    TrackEvent::TrackChanged {
+                        codec,
+                        clock_rate: 90_000,
+                    }
+                ),
             ],
             "a packet is no frame and is not queued"
         );
@@ -1451,7 +1460,10 @@ mod tests {
             &snapshot(&recording, &audio, usize::MAX),
             recording.now(),
         );
-        assert!(drain(&mut queue, Kind::Audio, &recording).is_empty());
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &recording),
+            Vec::<String>::new()
+        );
 
         let video = [recording.frame(10, true, 10)];
         queue.prerecord(
@@ -1491,7 +1503,10 @@ mod tests {
             &snapshot(&recording, &audio, usize::MAX),
             recording.now(),
         );
-        assert!(drain(&mut queue, Kind::Audio, &recording).is_empty());
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &recording),
+            Vec::<String>::new()
+        );
 
         recording.push(&mut queue, Kind::Video, 40, false);
         queue.end(Kind::Video);
@@ -1647,7 +1662,7 @@ mod tests {
             "the late audio still goes first"
         );
         recording.advance(599);
-        assert!(release(&mut merged, &recording).is_empty());
+        assert_eq!(release(&mut merged, &recording), Vec::<String>::new());
         assert_eq!(merged.deadline(), Some(deadline));
         recording.advance(1);
         assert_eq!(
@@ -1790,7 +1805,8 @@ mod tests {
             assert!(track.publish_frame(MediaFrame::clone(&recording.frame(ms, keyframe, 10))));
         };
         publish(0, true);
-        let (mut subscription, snapshot, _, _) = track.subscribe_from_prerecord(recording.at(80));
+        let (mut subscription, snapshot, _, _, _) =
+            track.subscribe_from_prerecord(recording.at(80));
         publish(40, false);
         publish(80, true);
         publish(120, false);
@@ -1840,7 +1856,7 @@ mod tests {
             },
             recording.now(),
         ));
-        let (mut subscription, snapshot, _, _) = track.subscribe_from_prerecord(recording.at(0));
+        let (mut subscription, snapshot, _, _, _) = track.subscribe_from_prerecord(recording.at(0));
         assert!(snapshot.is_none(), "no window, no pre-record");
         let publish = |ms: u64, keyframe: bool, bytes: usize| {
             track.publish_frame(MediaFrame::clone(&recording.frame(ms, keyframe, bytes)))
@@ -1942,7 +1958,10 @@ mod tests {
             last = Arc::new(if i % 2 == 0 { Codec::Pcmu } else { Codec::Pcma });
             queue.push(
                 Kind::Video,
-                TrackEvent::TrackChanged(Arc::clone(&last)),
+                TrackEvent::TrackChanged {
+                    codec: Arc::clone(&last),
+                    clock_rate: 90_000,
+                },
                 recording.now(),
             );
             queue.push(Kind::Video, TrackEvent::SourceLost, recording.now());
@@ -1954,7 +1973,13 @@ mod tests {
             [
                 "v0".to_owned(),
                 "vEpochStart { epoch: 500 }".to_owned(),
-                format!("v{:?}", TrackEvent::TrackChanged(last)),
+                format!(
+                    "v{:?}",
+                    TrackEvent::TrackChanged {
+                        codec: last,
+                        clock_rate: 90_000,
+                    }
+                ),
                 "vSourceLost".to_owned(),
                 "vSourceRestored".to_owned(),
             ]
@@ -2063,7 +2088,10 @@ mod tests {
         recording.push(&mut queue, Kind::Audio, 0, true);
         queue.end(Kind::Video);
         recording.push(&mut queue, Kind::Audio, 20, true);
-        assert!(drain(&mut queue, Kind::Audio, &recording).is_empty());
+        assert_eq!(
+            drain(&mut queue, Kind::Audio, &recording),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -2210,7 +2238,7 @@ mod tests {
         recording.advance(1000);
         assert_eq!(release(&mut merged, &recording), ["v0", "v3600000"]);
         recording.push(merged.queue_mut(), Kind::Audio, 1040, true);
-        assert!(release(&mut merged, &recording).is_empty());
+        assert_eq!(release(&mut merged, &recording), Vec::<String>::new());
         recording.push(merged.queue_mut(), Kind::Video, 1020, false);
         assert_eq!(release(&mut merged, &recording), ["v1020"]);
     }

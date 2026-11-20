@@ -174,7 +174,8 @@ pub struct Shutdown {
 }
 
 /// An empty result (`stream/delete`, `unsubscribe`, the subscriptions,
-/// `webrtc/candidate`, `session/close`).
+/// `webrtc/candidate`, `session/close`, `signaling/answer`,
+/// `signaling/candidate`, `signaling/error`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct Empty {}
@@ -209,11 +210,11 @@ mod tests {
             serde_json::to_value(Success::new(3, json!({ "created": true }))).unwrap(),
             json!({ "id": 3, "type": "result", "success": true, "result": { "created": true } })
         );
-        let failure = Failure::new(Some(3), ApiError::new(ErrorCode::SchemeUnsupported, "no"));
+        let failure = Failure::new(Some(3), ApiError::new(ErrorCode::ProtocolUnsupported, "no"));
         assert_eq!(
             serde_json::to_value(&failure).unwrap(),
             json!({ "id": 3, "type": "result", "success": false,
-                    "error": { "code": "scheme_unsupported", "message": "no" } })
+                    "error": { "code": "protocol_unsupported", "message": "no" } })
         );
         assert_eq!(
             serde_json::to_value(EventFrame::new(

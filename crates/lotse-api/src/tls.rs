@@ -41,6 +41,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use lotse_api_types::clients::ClientRole;
 use lotse_core::backoff::AcceptBackoff;
 use lotse_core::clock::Clock;
 use lotse_core::fingerprint::Fingerprint;
@@ -65,9 +66,10 @@ use tokio_util::sync::CancellationToken;
 use crate::clients::ClientStore;
 use crate::identity::ServerIdentity;
 use crate::listener::{BindError, PeerInfo, accept_retrying};
+use crate::owners::Owners;
 use crate::pairing::{self, CODE_LIFETIME, PairContext, Pairing, Unpaired};
 use crate::recording::{BodyWatch, Watched};
-use crate::{UPGRADE_TIMEOUT, upgrade_slot};
+use crate::{LimitLines, UPGRADE_TIMEOUT, upgrade_slot};
 
 /// From accept to the end of the TLS handshake: 3 s. A TLS 1.3 handshake
 /// is one round trip and the client's flight.
@@ -102,9 +104,14 @@ const VERIFY_SCHEMES: [SignatureScheme; 2] = [
 pub struct TlsConfig {
     /// The address to listen on.
     pub listen: SocketAddr,
-    /// The pins of the client certificates the configuration allows. They
-    /// are fixed: pairing adds pins of its own and removes none of these.
+    /// The pins of the client certificates the configuration allows as
+    /// `control` clients. They are fixed: pairing and `clients/add` add pins
+    /// of their own and remove none of these.
     pub clients: Vec<Fingerprint>,
+    /// The pins the configuration allows as `metrics` clients, which may
+    /// read `GET /v0/metrics` and nothing else; fixed alike. A pin in both
+    /// lists stops the start.
+    pub metrics_clients: Vec<Fingerprint>,
     /// Where the [`ServerIdentity`] and the enrolled clients are kept.
     pub data_dir: PathBuf,
     /// The uid and gid the daemon runs as after the privilege drop (the
@@ -128,11 +135,11 @@ pub(crate) struct BoundTls {
 }
 
 /// Loads (or makes) the server identity in `settings.data_dir`, which
-/// `owner_uid` must own, opens the client allowlist, and binds the
+/// one of `owners` must own, opens the client allowlist, and binds the
 /// listener. Without any client the listener still starts: only pairing
 /// is reachable then, and only while a code is open.
-pub(crate) fn bind(settings: &TlsConfig, owner_uid: u32) -> Result<BoundTls, BindError> {
-    let identity = ServerIdentity::load_or_create(&settings.data_dir, owner_uid)?;
+pub(crate) fn bind(settings: &TlsConfig, owners: Owners) -> Result<BoundTls, BindError> {
+    let identity = ServerIdentity::load_or_create(&settings.data_dir, owners)?;
     let certified = CertifiedKey::from_der(
         vec![identity.certificate.clone()],
         identity.key.clone_key(),
@@ -141,13 +148,19 @@ pub(crate) fn bind(settings: &TlsConfig, owner_uid: u32) -> Result<BoundTls, Bin
     .map_err(BindError::Tls)?;
     // Checked as the identity's was, and used through this descriptor
     // from here on.
-    let data = crate::identity::checked_directory(&settings.data_dir, owner_uid, false)?;
-    let store = ClientStore::open(
-        &data,
-        &settings.data_dir,
-        &settings.clients,
-        settings.state_owner,
-    )?;
+    let data = crate::identity::checked_directory(&settings.data_dir, owners, false)?;
+    let fixed: Vec<(Fingerprint, ClientRole)> = settings
+        .clients
+        .iter()
+        .map(|pin| (*pin, ClientRole::Control))
+        .chain(
+            settings
+                .metrics_clients
+                .iter()
+                .map(|pin| (*pin, ClientRole::Metrics)),
+        )
+        .collect();
+    let store = ClientStore::open(&data, &settings.data_dir, &fixed, settings.state_owner)?;
     let tcp = |source| BindError::TlsListen {
         addr: settings.listen,
         source,
@@ -159,7 +172,9 @@ pub(crate) fn bind(settings: &TlsConfig, owner_uid: u32) -> Result<BoundTls, Bin
     tracing::info!(
         addr = %local,
         server_pin = %identity.pin(),
+        names_server = identity.names_server(),
         clients = settings.clients.len(),
+        metrics_clients = settings.metrics_clients.len(),
         "control TLS listener bound"
     );
     Ok(BoundTls {
@@ -506,6 +521,8 @@ pub(crate) struct Handshakes {
     /// The places of the connections awaiting the upgrade, shared with
     /// the Unix socket.
     pub(crate) upgrades: Arc<Semaphore>,
+    /// The rate limits of the limit warnings, shared with the Unix socket.
+    pub(crate) limit_lines: Arc<LimitLines>,
     /// Where an authenticated connection goes.
     pub(crate) admitted: mpsc::Sender<Authenticated>,
     /// Who may connect.
@@ -591,7 +608,7 @@ async fn handshake(tcp: TcpStream, addr: SocketAddr, ticket: Ticket, h: Handshak
                 "control client authenticated"
             );
             let peer = PeerInfo::Tls { pin, addr };
-            let Some(slot) = upgrade_slot(&h.upgrades, &peer) else {
+            let Some(slot) = upgrade_slot(&h.upgrades, &peer, &h.limit_lines) else {
                 return;
             };
             let deadline = h.clock.sleep(UPGRADE_TIMEOUT);
@@ -744,6 +761,7 @@ mod tests {
         let settings = TlsConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             clients: vec![],
+            metrics_clients: vec![],
             data_dir: dir.clone(),
             state_owner: (
                 rustix::process::getuid().as_raw(),
@@ -751,7 +769,7 @@ mod tests {
             ),
         };
         (
-            bind(&settings, rustix::process::getuid().as_raw()).unwrap(),
+            bind(&settings, Owners::only(rustix::process::getuid().as_raw())).unwrap(),
             dir,
         )
     }

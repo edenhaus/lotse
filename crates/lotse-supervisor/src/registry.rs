@@ -1,7 +1,8 @@
 //! The registry: every stream's desired state, the source connections
 //! streams share, each connection's demand and its latest snapshot as the
 //! driver reports it, the viewer sessions, the event recordings
-//! ([`crate::recording`]), and the subscribers of `stream/subscribe`.
+//! ([`crate::recording`]), the subscribers of `stream/subscribe`, and the
+//! signaled sources' signaling ([`crate::signaling`]).
 //!
 //! One mutex over the maps, taken only on control-plane operations and
 //! never held across an await. Drivers publish snapshots into it, the
@@ -9,7 +10,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -17,6 +17,8 @@ use lotse_api::{ConnectionId, Event, EventClass};
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::info::{ProcessMetrics, WorkerMetrics};
 use lotse_api_types::session::{CloseCode, Session, SessionEvent};
+use lotse_api_types::signaling::SignalCloseCode;
+use lotse_api_types::source::SourceSpec;
 use lotse_api_types::stream::{
     AudioMode, BackchannelState, ConnectionInfo, LastError, Orientation, SourceBackchannel,
     SourceInfo, Stream, StreamBackchannel, StreamEvent, StreamState, StreamStats, TalkerReason,
@@ -27,6 +29,7 @@ use lotse_core::clock::Clock;
 use lotse_core::connection::{ConnectionError, ConnectionState};
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
+use lotse_core::throttle::Throttle;
 use lotse_ipc::{
     PrerecordStats, SessionEvent as WorkerSessionEvent, SessionSpec, TalkbackStats,
     TrackInfo as IpcTrackInfo, WorkerStats,
@@ -37,9 +40,10 @@ use tokio_util::task::TaskTracker;
 use crate::connect::ConnectPermits;
 use crate::driver::{Demand, DriverCommand, DriverSpec};
 use crate::gather::Relayed;
+use crate::host_cache::HostCache;
+use crate::live::{LiveEntry, LiveLimits};
 use crate::memory::MemoryProbe;
 use crate::millis;
-use crate::net::allocation::Transport;
 use crate::net::demux::{DatagramSink, Registrations};
 use crate::net::stun_client::StunClient;
 use crate::net::turn_client::TurnClient;
@@ -47,6 +51,7 @@ use crate::recording::{
     FinishedRecording, RecordingCounters, RecordingEntry, RecordingLimits, StoppingRecording,
 };
 use crate::session::{ChannelRequest, SessionEntry, api_event, close_code};
+use crate::signaling::Signaling;
 use crate::worker::WorkerManager;
 
 /// Events a subscription may hold before the server's forwarder drains
@@ -174,17 +179,79 @@ pub(crate) struct WorkerProcess {
     pub(crate) memory: Option<MemoryProbe>,
 }
 
+/// What names a source: the URL lotse connects to, or, for a source whose
+/// signaling the control-API client relays, its protocol and the stream
+/// it belongs to, which is its identity, as it has no address. `Debug` and
+/// `Display` show the URL redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum SourceTarget {
+    /// A source lotse connects to: its URL, credentials included.
+    Url(SourceUrl),
+    /// A signaled source.
+    Signaled {
+        /// Its protocol (`webrtc`).
+        protocol: &'static str,
+        /// The stream it belongs to.
+        stream: String,
+    },
+}
+
+impl SourceTarget {
+    /// The URL of a source lotse connects to; `None` for a signaled one.
+    pub(crate) const fn url(&self) -> Option<&SourceUrl> {
+        match self {
+            Self::Url(url) => Some(url),
+            Self::Signaled { .. } => None,
+        }
+    }
+
+    /// Whether the client relays the source's signaling: it has no host
+    /// to look up and no port, and never switches in place.
+    pub(crate) const fn signaled(&self) -> bool {
+        matches!(self, Self::Signaled { .. })
+    }
+
+    /// The protocol of a signaled source, which its offers name; `None`
+    /// for a source lotse connects to, whose worker opens no signal.
+    pub(crate) const fn signaled_protocol(&self) -> Option<&'static str> {
+        match self {
+            Self::Url(_) => None,
+            Self::Signaled { protocol, .. } => Some(protocol),
+        }
+    }
+}
+
+/// The redacted URL, or `<protocol> of stream <stream>`.
+impl fmt::Display for SourceTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Url(url) => write!(f, "{url}"),
+            Self::Signaled { protocol, stream } => write!(f, "{protocol} of stream {stream}"),
+        }
+    }
+}
+
+/// As `Display`.
+impl fmt::Debug for SourceTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 /// What streams share a connection by: the canonical source spec.
-/// The URL compares scheme, host, port, path, query and credentials; the
-/// options are the source's [`connection_options`](lotse_core::source::Source::connection_options),
+/// The URL compares scheme, host, port, path, query and credentials; a
+/// signaled source's target is its protocol and stream, so each stream
+/// has its own connection; the options are the source's
+/// [`connection_options`](lotse_core::source::Source::connection_options),
 /// normalized by its factory (defaults applied, key order irrelevant) and
 /// without options that do not change what is received. Holds the
 /// credentials and unredacted options, so `Debug` shows the redacted URL
 /// and the option names only.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConnectionKey {
-    /// The URL, credentials included.
-    pub(crate) url: SourceUrl,
+    /// The URL, credentials included, or the signaled source's protocol
+    /// and stream.
+    pub(crate) target: SourceTarget,
     /// The normalized receive-relevant options.
     pub(crate) options: serde_json::Value,
 }
@@ -197,7 +264,7 @@ impl fmt::Debug for ConnectionKey {
             .map(|fields| fields.keys().map(String::as_str).collect())
             .unwrap_or_default();
         f.debug_struct("ConnectionKey")
-            .field("url", &self.url)
+            .field("target", &self.target)
             .field("options", &names)
             .finish()
     }
@@ -206,12 +273,13 @@ impl fmt::Debug for ConnectionKey {
 /// One source of a stream, bound to its connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamSource {
-    /// The URL, as `stream/get` reports it.
-    pub(crate) url: SourceUrl,
-    /// The per-scheme options as given.
+    /// What names it: its URL, as `stream/get` reports it redacted, or
+    /// its protocol.
+    pub(crate) target: SourceTarget,
+    /// The protocol's fields but the URL, defaults filled in.
     pub(crate) options: serde_json::Map<String, serde_json::Value>,
-    /// The protocol name the factory reports.
-    pub(crate) protocol: &'static str,
+    /// The source as `stream/get` reports it: as put, the URL redacted.
+    pub(crate) reported: SourceSpec,
     /// The connection's id.
     pub(crate) connection: String,
     /// What the connection's driver runs for this source; its
@@ -333,8 +401,21 @@ pub(crate) struct State {
     pub(crate) last_recording: u64,
     /// The limits on recordings and the pre-record window.
     pub(crate) recording_limits: RecordingLimits,
+    /// Live outputs that are open, by id.
+    pub(crate) lives: BTreeMap<String, LiveEntry>,
+    /// The serial of the last live output created.
+    pub(crate) last_live: u64,
+    /// The limits on live outputs.
+    pub(crate) live_limits: LiveLimits,
+    /// The warning of a `live/create` refused at a limit, which a client
+    /// can repeat: the first, then a summary per interval.
+    pub(crate) full_lives: Throttle,
+    /// The LL-HLS outputs and sessions.
+    pub(crate) hls: crate::hls::Hls,
     /// The demux's sessions; `None` without a front door (tests).
     pub(crate) registrations: Option<Arc<Registrations>>,
+    /// The signaled sources' signaling: subscriptions, opens and signals.
+    pub(crate) signaling: Signaling,
 }
 
 impl State {
@@ -354,10 +435,12 @@ impl State {
             .iter()
             .find(|(id, entry)| {
                 id.as_str() != except
-                    && entry
-                        .sources
-                        .iter()
-                        .any(|source| source.url.expose_url() == url.expose_url())
+                    && entry.sources.iter().any(|source| {
+                        source
+                            .target
+                            .url()
+                            .is_some_and(|own| own.expose_url() == url.expose_url())
+                    })
             })
             .map(|(id, _)| id.clone())
     }
@@ -489,7 +572,8 @@ impl State {
 
     /// Recomputes which streams reference connection `id` and its demand
     /// from them; a connection nothing references any more is dropped,
-    /// which stops its driver.
+    /// which stops its driver, and one that still serves streams ends the
+    /// signals of those that left it ([`State::signals_left_streams`]).
     pub(crate) fn refresh_connection(&mut self, id: &str) {
         let Some(entry) = self.connections.get_mut(id) else {
             return;
@@ -504,6 +588,13 @@ impl State {
             tracing::info!(connection.id = id, "connection released");
             self.connections.remove(id);
             self.forget_stopping_recordings(id);
+            // Its driver goes, and the workers' reports with it.
+            self.lives_connection_released(id);
+            self.signals_ended(
+                id,
+                SignalCloseCode::SourceStopped,
+                "the stream's source was removed",
+            );
             return;
         }
         let preloads = entry
@@ -511,7 +602,8 @@ impl State {
             .iter()
             .filter(|stream| streams.get(*stream).is_some_and(|s| s.preload))
             .count();
-        // A recording is a viewer: it keeps the connection up while it runs.
+        // A recording and a live output are viewers: each keeps the
+        // connection up while it runs.
         let viewers = self
             .sessions
             .values()
@@ -521,6 +613,12 @@ impl State {
                 self.recordings
                     .values()
                     .filter(|recording| recording.connection == id)
+                    .count(),
+            )
+            .saturating_add(
+                self.lives
+                    .values()
+                    .filter(|live| live.connection == id)
                     .count(),
             );
         let demand = Demand {
@@ -537,6 +635,7 @@ impl State {
             );
             entry.demand.send_replace(demand);
         }
+        self.signals_left_streams(id);
     }
 
     /// Opens a subscription and queues the current state of every matching
@@ -579,8 +678,8 @@ impl State {
         rx
     }
 
-    /// Drops the subscriptions of a control connection that closed and
-    /// orphans its sessions; returns each orphan's id, serial and epoch
+    /// Drops the subscriptions of a control connection that closed (its
+    /// signaling ones end their signals) and orphans its sessions; returns each orphan's id, serial and epoch
     /// for its grace timer.
     pub(crate) fn connection_closed(
         &mut self,
@@ -588,6 +687,7 @@ impl State {
     ) -> Vec<(String, u64, u64)> {
         self.subscribers
             .retain(|subscriber| subscriber.connection != connection);
+        self.signaling_connection_closed(connection);
         let mut orphans = Vec::new();
         for (id, session) in &mut self.sessions {
             if session.owned_by_connection(connection) {
@@ -894,16 +994,12 @@ impl State {
         self.deliver_session(session_id, events, "worker");
     }
 
-    /// A TURN gather of session `serial` finished: a lease goes to the
-    /// worker as a relay candidate, whose line the worker reports; without
-    /// one, or once end-of-candidates went out, the gather just ends and a
-    /// lease is released.
-    pub(crate) fn session_relayed(
-        &mut self,
-        session_id: &str,
-        serial: u64,
-        relayed: Option<Relayed>,
-    ) {
+    /// A TURN attempt of session `serial` yielded `relayed`: the lease goes
+    /// to the worker as a relay candidate, whose line the worker reports
+    /// and end-of-candidates waits for; once the gather deadline passed or
+    /// end-of-candidates went out, or when the worker's queue is full, it
+    /// is released.
+    pub(crate) fn session_relayed(&mut self, session_id: &str, serial: u64, relayed: Relayed) {
         let Some(entry) = self
             .sessions
             .get_mut(session_id)
@@ -911,38 +1007,56 @@ impl State {
         else {
             return;
         };
-        if let Some(relayed) = relayed.filter(|_| !entry.candidates_done()) {
-            let address = relayed.lease.relayed();
-            let command = DriverCommand::RelayCandidate {
-                session_id: session_id.to_owned(),
-                relayed: address,
-                server: relayed.server,
-                local: relayed.local,
-                tcp: relayed.transport == Transport::Tcp,
-                grant: relayed.lease.grant(),
-            };
-            let queued = self
-                .connections
-                .get(&entry.connection)
-                .is_some_and(|connection| connection.commands.try_send(command).is_ok());
-            if queued {
-                tracing::info!(
-                    session.id = session_id,
-                    relayed = %address,
-                    server = %relayed.server,
-                    transport = ?relayed.transport,
-                    "relay candidate handed to the worker"
-                );
-                entry.relay_handed_over(relayed.lease);
-                return;
-            }
-            tracing::warn!(
+        if entry.gathering_over() {
+            tracing::debug!(
                 session.id = session_id,
-                "driver queue full; relay candidate dropped"
+                server = %relayed.server,
+                "relay lease after the gather deadline released"
             );
+            return;
         }
-        let events = entry.gathered(None);
-        self.deliver_session(session_id, events, "gathering");
+        let address = relayed.lease.relayed();
+        let command = DriverCommand::RelayCandidate {
+            session_id: session_id.to_owned(),
+            relayed: address,
+            server: relayed.server,
+            local: relayed.local,
+            tcp: relayed.transport.is_stream(),
+            grant: relayed.lease.grant(),
+        };
+        let queued = self
+            .connections
+            .get(&entry.connection)
+            .is_some_and(|connection| connection.commands.try_send(command).is_ok());
+        if queued {
+            tracing::info!(
+                session.id = session_id,
+                relayed = %address,
+                server = %relayed.server,
+                transport = ?relayed.transport,
+                "relay candidate handed to the worker"
+            );
+            entry.relay_handed_over(relayed.lease);
+            return;
+        }
+        tracing::warn!(
+            session.id = session_id,
+            "driver queue full; relay candidate dropped"
+        );
+    }
+
+    /// The TURN attempts of session `serial` ended, at the latest at the
+    /// gather deadline: end-of-candidates waits only for the relays handed
+    /// to the worker.
+    pub(crate) fn session_relays_done(&mut self, session_id: &str, serial: u64) {
+        if let Some(entry) = self
+            .sessions
+            .get_mut(session_id)
+            .filter(|s| s.serial == serial)
+        {
+            let events = entry.gathered(None);
+            self.deliver_session(session_id, events, "gathering");
+        }
     }
 
     /// A STUN gather of session `serial` finished.
@@ -1090,7 +1204,7 @@ impl State {
                 .is_some_and(|session| session.connection == id),
             TalkerReason::SessionClosed
             | TalkerReason::Released
-            | TalkerReason::Renegotiated
+            | TalkerReason::Reoffered
             | TalkerReason::Refused
             | TalkerReason::OptedOut => entry.talker.session.as_deref() == Some(session_id),
         };
@@ -1304,8 +1418,7 @@ impl State {
                     .and_then(|s| s.worker.as_ref())
                     .and_then(|worker| worker.memory.clone());
                 let info = SourceInfo {
-                    url: source.url.to_string(),
-                    protocol: source.protocol.to_owned(),
+                    source: source.reported.clone(),
                     state: snapshot.map_or(StreamState::Idle, |s| api_state(s.state)),
                     reconnects: snapshot.map_or(0, |s| s.reconnects),
                     backchannel: connection.and_then(source_backchannel),
@@ -1515,11 +1628,11 @@ pub(crate) struct Shared {
     pub(crate) shutdown_budget: Duration,
     /// The connect permits every driver's attempts share.
     pub(crate) connects: ConnectPermits,
-    /// The host candidates' addresses every session answers with.
-    pub(crate) hosts: Vec<SocketAddr>,
-    /// The passive ICE-TCP host candidates' addresses; empty with the
-    /// listener off.
-    pub(crate) tcp_hosts: Vec<SocketAddr>,
+    /// The host addresses sessions answer with, and what follows from
+    /// them: the ICE-TCP ones and what `webrtc.advertise` makes of a
+    /// session, its candidates and the host filter; each offer takes the
+    /// current ones ([`HostCache::current`]).
+    pub(crate) hosts: Arc<HostCache>,
     /// The STUN client of srflx gathering; `None` without a front door.
     pub(crate) stun: Option<Arc<StunClient>>,
     /// The TURN client of relay gathering; `None` without a front door.
@@ -1613,6 +1726,8 @@ mod tests {
         reason = "test code"
     )]
 
+    use std::net::SocketAddr;
+
     use lotse_core::let_assert;
     use lotse_ipc::{TrackParams, TrackStats};
 
@@ -1640,7 +1755,7 @@ mod tests {
     fn spec_on(connection: &str, backchannel: bool) -> DriverSpec {
         DriverSpec {
             connection_id: connection.into(),
-            url: "fake://127.0.0.1/".into(),
+            target: lotse_ipc::SourceTarget::Url("fake://127.0.0.1/".into()),
             options: "{}".into(),
             host: "127.0.0.1".into(),
             port: None,
@@ -1653,9 +1768,12 @@ mod tests {
         StreamEntry {
             sources: vec![StreamSource {
                 spec: spec_on("c1", false),
-                url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                 options: serde_json::Map::new(),
-                protocol: "fake",
+                reported: serde_json::from_value(
+                    serde_json::json!({ "protocol": "fake", "url": "fake://127.0.0.1/" }),
+                )
+                .unwrap(),
                 connection: "c1".into(),
             }],
             preload,
@@ -1736,7 +1854,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -1821,7 +1939,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -2022,11 +2140,11 @@ mod tests {
         );
         let _claimed = front.try_recv().unwrap();
         assert_eq!(
-            state.talker_changed("c1", "s2", TalkerReason::Renegotiated, later),
+            state.talker_changed("c1", "s2", TalkerReason::Reoffered, later),
             None
         );
         assert_eq!(
-            state.talker_changed("c1", "s1", TalkerReason::Renegotiated, later),
+            state.talker_changed("c1", "s1", TalkerReason::Reoffered, later),
             Some(Talker {
                 session: None,
                 since: Some(later),
@@ -2035,7 +2153,7 @@ mod tests {
         let event = front.try_recv().unwrap().payload;
         assert_eq!(
             (&event["talker"], &event["reason"]),
-            (&serde_json::Value::Null, &serde_json::json!("renegotiated"))
+            (&serde_json::Value::Null, &serde_json::json!("reoffered"))
         );
         // The camera refuses s1's backchannel session: free again, from
         // s1 only.
@@ -2072,7 +2190,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -2134,7 +2252,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -2257,7 +2375,7 @@ mod tests {
                 port,
             ))),
             server: "192.0.2.3:3478".parse().unwrap(),
-            transport: Transport::Tcp,
+            transport: crate::net::allocation::Transport::Tcp,
             local: "192.0.2.1:18556".parse().unwrap(),
         }
     }
@@ -2270,7 +2388,7 @@ mod tests {
         let (demand, _demand) = watch::channel(Demand::default());
         let (commands, mut rx) = mpsc::channel(1);
         let key = ConnectionKey {
-            url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+            target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
             options: serde_json::Value::Null,
         };
         state.connections.insert(
@@ -2367,12 +2485,12 @@ mod tests {
         let _logs = captured.install();
         let (mut state, mut rx) = relay_state(0);
         let key = |url: &str| ConnectionKey {
-            url: SourceUrl::parse(url).unwrap(),
+            target: SourceTarget::Url(SourceUrl::parse(url).unwrap()),
             options: serde_json::Value::Null,
         };
         let spec = |url: &str| DriverSpec {
             connection_id: "c1".into(),
-            url: url.into(),
+            target: lotse_ipc::SourceTarget::Url(url.into()),
             options: "{}".into(),
             host: "127.0.0.1".into(),
             port: None,
@@ -2409,7 +2527,10 @@ mod tests {
             "the key follows the put"
         );
         let_assert!(Ok(DriverCommand::SwitchSource(sent)) = rx.try_recv());
-        assert_eq!(sent.url, "fake://127.0.0.1/b");
+        assert_eq!(
+            sent.target,
+            lotse_ipc::SourceTarget::Url("fake://127.0.0.1/b".into())
+        );
         assert!(rx.try_recv().is_err());
         assert_eq!(captured.lines("driver queue full").len(), 1);
     }
@@ -2459,7 +2580,7 @@ mod tests {
                 backchannel: false,
                 prerecord_ms: 0,
                 key: ConnectionKey {
-                    url: SourceUrl::parse("fake://127.0.0.1/").unwrap(),
+                    target: SourceTarget::Url(SourceUrl::parse("fake://127.0.0.1/").unwrap()),
                     options: serde_json::Value::Null,
                 },
                 demand,
@@ -2542,12 +2663,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_relay_lease_goes_to_the_worker_unless_too_late_or_its_queue_is_full() {
-        let (mut state, mut rx) = relay_state(4);
+        // The session's one gather: its TURN queue.
+        let (mut state, mut rx) = relay_state(1);
         // Another session, or an earlier one under the same id: released.
-        state.session_relayed("ghost", 1, Some(relayed(1)));
-        state.session_relayed("s1", 2, Some(relayed(1)));
+        state.session_relayed("ghost", 1, relayed(1));
+        state.session_relayed("s1", 2, relayed(1));
         assert!(rx.try_recv().is_err());
-        state.session_relayed("s1", 1, Some(relayed(1)));
+        state.session_relayed("s1", 1, relayed(1));
         let_assert!(
             Ok(DriverCommand::RelayCandidate {
                 session_id,
@@ -2569,7 +2691,7 @@ mod tests {
                 true
             )
         );
-        // A full queue: the gather ends without it; so does a failed one.
+        // A full queue: the lease is dropped.
         state
             .connections
             .get("c1")
@@ -2580,8 +2702,11 @@ mod tests {
                 candidate: String::new(),
             })
             .unwrap();
-        state.session_relayed("s1", 1, Some(relayed(2)));
-        state.session_relayed("s1", 1, None);
+        state.session_relayed("s1", 1, relayed(2));
+        // The queue ends; another session's end changes nothing.
+        state.session_relays_done("ghost", 1);
+        state.session_relays_done("s1", 2);
+        state.session_relays_done("s1", 1);
         let session = state.sessions.get_mut("s1").unwrap();
         session
             .apply(lotse_ipc::SessionEvent::Answer {
@@ -2597,13 +2722,13 @@ mod tests {
             .unwrap();
         assert!(
             !session.candidates_done(),
-            "the first relay and one more gather"
+            "the relay handed to the worker is a gather"
         );
         session.gather_deadline();
         assert!(session.candidates_done());
         // After end-of-candidates a lease is too late.
         let _queued = rx.try_recv();
-        state.session_relayed("s1", 1, Some(relayed(3)));
+        state.session_relayed("s1", 1, relayed(3));
         assert!(rx.try_recv().is_err());
         // A channel on the relay the worker has: bound on its lease, which
         // here holds no allocation, so it is refused and logged.
@@ -2621,9 +2746,52 @@ mod tests {
     }
 
     #[test]
+    fn end_of_candidates_waits_for_the_turn_queue_of_its_own_session_rfc_8838_13() {
+        let (mut state, _rx) = relay_state(1);
+        let end = lotse_ipc::SessionEvent::Candidate {
+            candidate: String::new(),
+            mid: None,
+        };
+        let session = state.sessions.get_mut("s1").unwrap();
+        assert_eq!(session.apply(end).unwrap(), []);
+        // The end of another session's queue, or of an earlier one under
+        // the same id, ends nothing.
+        state.session_relays_done("ghost", 1);
+        state.session_relays_done("s1", 2);
+        assert!(!state.sessions["s1"].candidates_done());
+        state.session_relays_done("s1", 1);
+        assert!(state.sessions["s1"].candidates_done());
+    }
+
+    #[test]
+    fn a_lease_after_the_gather_deadline_is_released_rfc_8838_13() {
+        let (mut state, mut rx) = relay_state(1);
+        let session = state.sessions.get_mut("s1").unwrap();
+        // The deadline passed before the worker's end-of-candidates: the
+        // session no longer waits for a relay, so a late lease is
+        // released, not handed to the worker.
+        assert_eq!(session.gather_deadline(), []);
+        assert!(!session.candidates_done());
+        state.session_relayed("s1", 1, relayed(1));
+        assert!(rx.try_recv().is_err());
+        let session = state.sessions.get_mut("s1").unwrap();
+        assert_eq!(
+            session
+                .apply(lotse_ipc::SessionEvent::Candidate {
+                    candidate: String::new(),
+                    mid: None,
+                })
+                .unwrap()
+                .len(),
+            1,
+            "end-of-candidates waits for nothing"
+        );
+    }
+
+    #[test]
     fn a_connection_key_compares_url_and_options_and_debug_keeps_their_secrets() {
         let key = |url: &str, options: serde_json::Value| ConnectionKey {
-            url: SourceUrl::parse(url).unwrap(),
+            target: SourceTarget::Url(SourceUrl::parse(url).unwrap()),
             options,
         };
         let secret = key(
@@ -2640,7 +2808,7 @@ mod tests {
         assert_eq!(
             format!("{:?}", key("fake://cam/", serde_json::Value::Null)),
             format!(
-                "ConnectionKey {{ url: {:?}, options: [] }}",
+                "ConnectionKey {{ target: {}, options: [] }}",
                 SourceUrl::parse("fake://cam/").unwrap()
             )
         );
@@ -2658,6 +2826,31 @@ mod tests {
                 "rtsp://admin:other@cam/main",
                 serde_json::json!({ "token": "sesame-open", "timeout_ms": 5000 })
             )
+        );
+        // A signaled source's key is its protocol and stream: one
+        // connection per stream, and no URL.
+        let signaled = |protocol: &'static str, stream: &str| ConnectionKey {
+            target: SourceTarget::Signaled {
+                protocol,
+                stream: stream.into(),
+            },
+            options: serde_json::Value::Null,
+        };
+        let front = signaled("webrtc", "front");
+        assert_eq!(front, signaled("webrtc", "front"));
+        assert_ne!(front, signaled("webrtc", "back"));
+        assert_ne!(front, signaled("other", "front"));
+        assert_eq!(front.target.url(), None);
+        assert!(front.target.signaled() && !secret.target.signaled());
+        assert_eq!(front.target.signaled_protocol(), Some("webrtc"));
+        assert_eq!(
+            secret.target.signaled_protocol(),
+            None,
+            "a URL source opens no signal"
+        );
+        assert_eq!(
+            format!("{front:?}"),
+            "ConnectionKey { target: webrtc of stream front, options: [] }"
         );
     }
 

@@ -3,7 +3,7 @@
 //! DTLS, and `rcgen` on `ring` for each session's self-signed DTLS
 //! certificate.
 //!
-//! str0m 0.24 ships the same choice as its `rust-crypto` feature
+//! str0m 0.25 ships the same choice as its `rust-crypto` feature
 //! (`str0m-rust-crypto`), but that crate enables `dimpl`'s `rcgen` feature,
 //! which enables `dimpl`'s `aws-lc-rs` feature: aws-lc is then compiled
 //! and linked, and `dimpl` prefers it over `RustCrypto` for every handshake
@@ -14,26 +14,27 @@
 //!
 //! Standards: RFC 3711 §4.1.1 (AES-CM) and §4.3 (key derivation), RFC 7714
 //! (AEAD AES-GCM for SRTP), RFC 5764 (DTLS-SRTP), RFC 8489 §14.5 (STUN
-//! MESSAGE-INTEGRITY), RFC 8122 §5 (certificate fingerprints), RFC 8827
-//! §6.5 (self-signed DTLS certificates).
+//! MESSAGE-INTEGRITY), RFC 8122 §5 (certificate fingerprints, SHA-256 for
+//! ours and SHA-1 among the remote's), RFC 8827 §6.5 (self-signed DTLS
+//! certificates).
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use aes::cipher::consts::{U12, U16};
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockEncrypt, BlockSizeUser, KeyInit, KeyIvInit, StreamCipher};
-use aes_gcm::{AeadInPlace, Aes128Gcm, Aes256Gcm, Tag};
+use aes::cipher::{Array, BlockCipherEncrypt, BlockSizeUser, KeyInit, KeyIvInit, StreamCipher};
+use aes_gcm::{AeadInOut, Aes128Gcm, Aes256Gcm, Tag};
 use hmac::{Hmac, Mac};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SignatureAlgorithm};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use str0m::crypto::dtls::{
     DtlsCert, DtlsImplError, DtlsInstance, DtlsOutput, DtlsProvider, DtlsVersion, ProtocolVersion,
 };
 use str0m::crypto::{
     AeadAes128GcmCipher, AeadAes256GcmCipher, Aes128CmSha1_80Cipher, CryptoError, CryptoProvider,
-    Sha1HmacProvider, Sha256Provider, SrtpProvider, SupportedAeadAes128Gcm, SupportedAeadAes256Gcm,
-    SupportedAes128CmSha1_80,
+    Sha1HmacProvider, Sha1Provider, Sha256Provider, SrtpProvider, SupportedAeadAes128Gcm,
+    SupportedAeadAes256Gcm, SupportedAes128CmSha1_80,
 };
 
 /// The length of an AES-GCM authentication tag (RFC 7714 §5.2.2: 16 octets).
@@ -51,7 +52,7 @@ const CERTIFICATE_NAME: &str = "lotse";
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
 /// HMAC-SHA1, the STUN MESSAGE-INTEGRITY MAC (RFC 8489 §14.5).
-type HmacSha1 = Hmac<sha1::Sha1>;
+type HmacSha1 = Hmac<Sha1>;
 
 /// The provider every session's `Rtc` runs on; `install_crypto_provider`
 /// makes it the process default.
@@ -59,6 +60,7 @@ pub(crate) fn provider() -> CryptoProvider {
     CryptoProvider {
         srtp_provider: &Srtp,
         sha1_hmac_provider: &StunMac,
+        sha1_provider: &LegacyFingerprint,
         sha256_provider: &Fingerprint,
         dtls_provider: &Dtls,
     }
@@ -97,7 +99,7 @@ impl SrtpProvider for Srtp {
 /// passes one.
 fn encrypt_block<C>(key: &[u8], input: &[u8], output: &mut [u8])
 where
-    C: KeyInit + BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+    C: KeyInit + BlockCipherEncrypt + BlockSizeUser<BlockSize = U16>,
 {
     let (Ok(cipher), Ok(block), Some(out)) = (
         C::new_from_slice(key),
@@ -113,7 +115,7 @@ where
         );
         return;
     };
-    let mut block = GenericArray::from(block);
+    let mut block = Array::from(block);
     cipher.encrypt_block(&mut block);
     out.copy_from_slice(&block);
 }
@@ -212,7 +214,7 @@ impl<C> std::fmt::Debug for GcmCipher<C> {
     }
 }
 
-impl<C: AeadInPlace<NonceSize = U12, TagSize = U16>> GcmCipher<C> {
+impl<C: AeadInOut<NonceSize = U12, TagSize = U16>> GcmCipher<C> {
     /// Writes the ciphertext of `input` followed by its tag
     /// (RFC 7714 §5.2.1) to the front of `output`.
     fn seal(
@@ -230,7 +232,7 @@ impl<C: AeadInPlace<NonceSize = U12, TagSize = U16>> GcmCipher<C> {
         body.copy_from_slice(input);
         let tag = self
             .0
-            .encrypt_in_place_detached(&(*iv).into(), aad, body)
+            .encrypt_inout_detached(&(*iv).into(), aad, body.into())
             .map_err(gcm_failed("AES-GCM input too long"))?;
         rest.copy_from_slice(&tag);
         Ok(())
@@ -256,7 +258,7 @@ impl<C: AeadInPlace<NonceSize = U12, TagSize = U16>> GcmCipher<C> {
         body.copy_from_slice(ciphertext);
         let aad = aads.concat();
         self.0
-            .decrypt_in_place_detached(&(*iv).into(), &aad, body, &Tag::from(*tag))
+            .decrypt_inout_detached(&(*iv).into(), &aad, body.into(), &Tag::from(*tag))
             .map_err(gcm_failed("AES-GCM authentication failed"))?;
         Ok(ciphertext.len())
     }
@@ -318,12 +320,24 @@ struct StunMac;
 impl Sha1HmacProvider for StunMac {
     fn sha1_hmac(&self, key: &[u8], payloads: &[&[u8]]) -> [u8; 20] {
         // HMAC takes a key of any length (RFC 2104 §2), so this never fails.
-        <HmacSha1 as Mac>::new_from_slice(key).map_or([0; 20], |mut mac| {
+        <HmacSha1 as KeyInit>::new_from_slice(key).map_or([0; 20], |mut mac| {
             for payload in payloads {
                 mac.update(payload);
             }
             mac.finalize().into_bytes().into()
         })
+    }
+}
+
+/// SHA-1, a remote certificate fingerprint's hash that str0m still
+/// accepts (RFC 8122 §5 lists it; RFC 8827 §6.5 has a WebRTC endpoint
+/// offer SHA-256, which `Fingerprint` makes ours).
+#[derive(Debug)]
+struct LegacyFingerprint;
+
+impl Sha1Provider for LegacyFingerprint {
+    fn sha1(&self, data: &[u8]) -> [u8; 20] {
+        Sha1::digest(data).into()
     }
 }
 
@@ -369,7 +383,7 @@ impl DtlsProvider for Dtls {
             DtlsVersion::Dtls13 => dimpl::Dtls::new_13(config, cert, now),
             DtlsVersion::Auto => dimpl::Dtls::new_auto(config, cert, now),
             // `Dtls12`, str0m's default. The enum is non-exhaustive, but
-            // str0m 0.24 has no other variant; an upgrade revisits this.
+            // str0m 0.25 has no other variant; an upgrade revisits this.
             _ => dimpl::Dtls::new_12(config, cert, now),
         };
         Ok(Box::new(DtlsSession(dtls)))
@@ -427,7 +441,7 @@ impl DtlsInstance for DtlsSession {
         self.0.handle_timeout(now)
     }
 
-    fn send_application_data(&mut self, data: &[u8]) -> Result<(), DtlsImplError> {
+    fn send_application_data(&mut self, data: &[u8]) -> Result<usize, DtlsImplError> {
         self.0.send_application_data(data)
     }
 
@@ -683,17 +697,6 @@ mod tests {
         );
     }
 
-    /// `aes` 0.8 and `polyval` 0.6 use the `ARMv8` crypto extensions (by
-    /// runtime detection) only under these cfgs, which `.cargo/config.toml`
-    /// sets for every aarch64 target; without them SRTP runs on software
-    /// AES-GCM. The test vectors above then check the hardware backends.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn aarch64_builds_use_the_armv8_crypto_backends() {
-        let set = [cfg!(aes_armv8), cfg!(polyval_armv8)];
-        assert_eq!(set, [true, true], "--cfg aes_armv8, --cfg polyval_armv8");
-    }
-
     #[test]
     fn rfc8122_5_the_fingerprint_hash_is_sha_256() {
         // FIPS 180-2 Appendix B.1.
@@ -704,11 +707,24 @@ mod tests {
     }
 
     #[test]
+    fn rfc8122_5_a_remote_sha_1_fingerprint_hashes_with_sha_1() {
+        // FIPS 180-1 Appendix A.
+        assert_eq!(
+            LegacyFingerprint.sha1(b"abc"),
+            array("a9993e364706816aba3e25717850c26c9cd0d89d")
+        );
+    }
+
+    #[test]
     fn the_provider_hands_out_these_implementations() {
         let provider = provider();
         assert_eq!(
             provider.sha256_provider.sha256(b"abc"),
             Fingerprint.sha256(b"abc")
+        );
+        assert_eq!(
+            provider.sha1_provider.sha1(b"abc"),
+            LegacyFingerprint.sha1(b"abc")
         );
         assert_eq!(
             provider.sha1_hmac_provider.sha1_hmac(b"k", &[b"m"]),
@@ -877,8 +893,9 @@ mod tests {
         assert_eq!(*client_keys, *server_keys);
         assert_eq!(client_profile, server_profile);
 
-        // Application data (SCTP's carrier) goes through.
-        client.send_application_data(b"ping").unwrap();
+        // Application data (SCTP's carrier) goes through, all of it
+        // accepted at once.
+        assert_eq!(client.send_application_data(b"ping").unwrap(), 4);
         exchange(&mut *client, &mut *server, &mut now, &mut out, |(_, s)| {
             !s.app_data.is_empty()
         });

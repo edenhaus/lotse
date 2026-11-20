@@ -109,8 +109,11 @@ pub struct InfoResult {
     pub version: String,
     /// The build.
     pub build: BuildInfo,
-    /// The URL schemes a client may route here.
-    pub schemes: Vec<String>,
+    /// The source protocols this build registered, sorted: the
+    /// `protocol`s `stream/put` takes here. A URL protocol's sources take
+    /// URLs of the scheme of its name (`rtsps`); the client relays the
+    /// signaling of the others (`webrtc`) through `signaling/subscribe`.
+    pub protocols: Vec<String>,
     /// The output kinds compiled in.
     pub outputs: Vec<String>,
     /// Capabilities inside outputs.
@@ -268,7 +271,7 @@ mod tests {
                 target: "aarch64-unknown-linux-musl".into(),
                 rustc: "1.98.0".into(),
             },
-            schemes: vec!["rtsp".into(), "rtsps".into()],
+            protocols: vec!["rtsp".into(), "rtsps".into(), "webrtc".into()],
             outputs: vec!["webrtc".into()],
             features: vec![],
             codecs: Codecs {
@@ -304,6 +307,7 @@ mod tests {
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["build"]["rustc"], "1.98.0");
         assert_eq!(json["limits"]["session_grace_ms"], 10_000);
+        assert_eq!(json["protocols"], json!(["rtsp", "rtsps", "webrtc"]));
 
         assert_eq!(
             json["sandbox"],

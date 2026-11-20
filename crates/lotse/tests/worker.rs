@@ -48,15 +48,17 @@ fn manager_with_sandbox(sandbox: &str) -> WorkerManager {
             worker_address_space: 1 << 30,
             max_sessions: 256,
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
+            live: lotse_supervisor::LiveLimits::DEFAULT,
         },
         Some(Arc::new(udp)),
+        Arc::new(SystemClock),
     )
 }
 
 fn spec(options: &str) -> SourceSpec {
     SourceSpec {
         connection_id: "c1".into(),
-        url: "fake://cam/".into(),
+        target: lotse_ipc::SourceTarget::Url("fake://cam/".into()),
         options: options.into(),
         peer_host: "cam".into(),
         peer_addrs: vec![],
@@ -67,7 +69,6 @@ fn spec(options: &str) -> SourceSpec {
 
 #[tokio::test]
 async fn a_worker_runs_the_fake_source_and_stops_within_the_budget() {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut worker = manager().spawn(&[554]).expect("spawns");
     let pid = worker.pid();
     let WorkerEvent::Ready { pid: ready, memory } = worker.next_event().await else {
@@ -98,7 +99,7 @@ async fn a_worker_runs_the_fake_source_and_stops_within_the_budget() {
     };
     assert_eq!(stats.tracks[0].0, "v0");
 
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
 }
 
@@ -133,7 +134,9 @@ async fn a_worker_crash_is_observed_and_contained() {
             | WorkerEvent::ProbeConnecting(_)
             | WorkerEvent::ProbeEnded(_)
             | WorkerEvent::Talker { .. }
-            | WorkerEvent::Recording { .. }) => {
+            | WorkerEvent::Recording { .. }
+            | WorkerEvent::Live { .. }
+            | WorkerEvent::Signal(_)) => {
                 panic!("unexpected {other:?}")
             }
         }
@@ -141,10 +144,9 @@ async fn a_worker_crash_is_observed_and_contained() {
     assert!(!status.success());
     assert_eq!(status.signal(), Some(6), "SIGABRT, got {status:?}");
     // The supervisor side is unaffected: it can start another worker.
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut next = manager().spawn(&[]).expect("spawns again");
     assert!(matches!(next.next_event().await, WorkerEvent::Ready { .. }));
-    assert!(next.stop(Duration::from_secs(5), &clock).await.success());
+    assert!(next.stop(Duration::from_secs(5)).await.success());
 }
 
 /// A recording's pipe crosses into a worker under its sandbox with its
@@ -154,7 +156,6 @@ async fn a_worker_crash_is_observed_and_contained() {
 /// container and refuses every recording `internal_error` first.
 #[tokio::test]
 async fn a_sandboxed_worker_takes_a_recording_s_pipe_and_closes_it() {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut worker = manager_with_sandbox("on").spawn(&[]).expect("spawns");
     assert!(matches!(
         worker.next_event().await,
@@ -194,8 +195,8 @@ async fn a_sandboxed_worker_takes_a_recording_s_pipe_and_closes_it() {
     );
     let mut rest = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut rest).expect("reads to the end");
-    assert!(rest.is_empty());
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    assert_eq!(rest, b"");
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
 }
 
@@ -243,8 +244,8 @@ async fn a_sandboxed_worker_plays_rtsps_on_its_own_connection() {
     assert_eq!(read, cfg!(target_os = "linux").then_some(true));
     let spec = SourceSpec {
         connection_id: "c1".into(),
-        url: format!("rtsps://camera.test:{port}/stream"),
-        options: format!("{{\"tls_fingerprint\": \"{pin}\"}}"),
+        target: lotse_ipc::SourceTarget::Url(format!("rtsps://camera.test:{port}/stream")),
+        options: format!("{{\"tls\": {{\"pin\": \"{pin}\"}}}}"),
         peer_host: "camera.test".into(),
         peer_addrs: vec![cam.addr()],
         backoff: lotse_ipc::BackoffPosition::default(),
@@ -264,7 +265,7 @@ async fn a_sandboxed_worker_plays_rtsps_on_its_own_connection() {
         worker.next_event().await,
         WorkerEvent::Report(WorkerReport::Live)
     );
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     cam.stop().await;
 }
@@ -292,7 +293,7 @@ async fn a_sandboxed_worker_receives_rtsp_media_over_udp() {
     ));
     let spec = SourceSpec {
         connection_id: "c1".into(),
-        url: cam.url(),
+        target: lotse_ipc::SourceTarget::Url(cam.url()),
         options: r#"{"transport": "udp"}"#.into(),
         peer_host: "127.0.0.1".into(),
         peer_addrs: vec![cam.addr()],
@@ -314,7 +315,7 @@ async fn a_sandboxed_worker_receives_rtsp_media_over_udp() {
         WorkerEvent::Report(WorkerReport::Live)
     );
     assert_eq!(Stats::get(&cam.stats().udp_setups), 1);
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     cam.stop().await;
 }
@@ -352,7 +353,6 @@ async fn play_http_in_sandbox(
     url: String,
     options: String,
 ) {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut worker = manager_with_sandbox("on")
         .spawn(&[server.addr().port()])
         .expect("spawns");
@@ -362,7 +362,7 @@ async fn play_http_in_sandbox(
     ));
     let spec = SourceSpec {
         connection_id: "c1".into(),
-        url,
+        target: lotse_ipc::SourceTarget::Url(url),
         options,
         peer_host: "camera.test".into(),
         peer_addrs: vec![server.addr()],
@@ -384,7 +384,7 @@ async fn play_http_in_sandbox(
         worker.next_event().await,
         WorkerEvent::Report(WorkerReport::Live)
     );
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
 }
 
@@ -403,10 +403,10 @@ async fn a_sandboxed_worker_plays_hls_over_http() {
     play_http_in_sandbox(
         &server,
         format!("http://camera.test:{port}/live/index.m3u8"),
-        "null".into(),
+        "{}".into(),
     )
     .await;
-    assert!(!server.requests().is_empty());
+    assert_ne!(server.requests(), []);
     server.stop().await;
 }
 
@@ -427,7 +427,7 @@ async fn a_sandboxed_worker_plays_hls_over_https_with_a_pinned_certificate() {
     play_http_in_sandbox(
         &server,
         format!("https://camera.test:{port}/live/index.m3u8"),
-        format!("{{\"tls_fingerprint\": \"{pin}\"}}"),
+        format!("{{\"tls\": {{\"pin\": \"{pin}\"}}}}"),
     )
     .await;
     server.stop().await;
@@ -443,7 +443,6 @@ async fn a_sandboxed_worker_plays_hls_over_https_with_a_pinned_certificate() {
 #[cfg(all(feature = "source-http", feature = "output-recording"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sandboxed_worker_records_a_recording_into_its_pipe() {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let server = lotse_testing::fake_http::FakeHttp::start()
         .await
         .expect("server binds");
@@ -456,8 +455,8 @@ async fn a_sandboxed_worker_records_a_recording_into_its_pipe() {
     ));
     let spec = SourceSpec {
         connection_id: "c1".into(),
-        url: format!("http://camera.test:{port}/live/index.m3u8"),
-        options: "null".into(),
+        target: lotse_ipc::SourceTarget::Url(format!("http://camera.test:{port}/live/index.m3u8")),
+        options: "{}".into(),
         peer_host: "camera.test".into(),
         peer_addrs: vec![server.addr()],
         backoff: lotse_ipc::BackoffPosition::default(),
@@ -543,7 +542,7 @@ async fn a_sandboxed_worker_records_a_recording_into_its_pipe() {
     assert_eq!(*bytes, u64::try_from(file.len()).unwrap());
     // ISO/IEC 14496-12 §4.3: the file begins with its `ftyp` box.
     assert_eq!(file.get(4..8), Some(&b"ftyp"[..]), "{} bytes", file.len());
-    let exit = worker.stop(Duration::from_secs(5), &clock).await;
+    let exit = worker.stop(Duration::from_secs(5)).await;
     assert!(exit.success(), "clean exit, got {exit:?}");
     server.stop().await;
 }
