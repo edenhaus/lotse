@@ -1,11 +1,16 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:best-practices", ":semanticCommits"],
-  "ignorePresets": [":ignoreModulesAndTests"],
+  "ignorePresets": [":ignoreModulesAndTests", ":pinDevDependencies"],
   "labels": ["dependencies"],
   "lockFileMaintenance": { "enabled": true, "schedule": ["* * * * 1"] },
   "pre-commit": { "enabled": true },
   "packageRules": [
+    {
+      "description": "retina is pinned by hand to a revision of the edenhaus/retina fork (Cargo.toml says which and why); Renovate would move it to the fork's default branch, which is behind it",
+      "matchDepNames": ["retina"],
+      "enabled": false
+    },
     {
       "description": "ruff in the pre-commit hook and in tests/browser/pyproject.toml, updated together so the hook and `uv run ruff` never disagree",
       "matchPackageNames": ["ruff", "astral-sh/ruff-pre-commit"],
