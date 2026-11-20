@@ -39,9 +39,9 @@ use bytes::Bytes;
 use futures_util::StreamExt as _;
 use futures_util::stream;
 use lotse_core::task::spawn_named;
-// md-5 0.10 and sha2 0.11 implement `Digest` of digest 0.10 and 0.11.
+// md-5 0.11 and sha2 0.11 share the `Digest` trait of digest 0.11.
 use md5::{Digest as _, Md5};
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;

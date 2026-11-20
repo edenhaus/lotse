@@ -51,7 +51,7 @@ url = "https://github.com/Kitware/CMake/releases/download/v4.5.0/cmake-4.5.0-mac
 url_api = "https://api.github.com/repos/Kitware/CMake/releases/assets/740688616"
 
 [[tools."github:AlexxIT/go2rtc"]]
-version = "1.9.15"
+version = "v1.9.15"
 backend = "github:AlexxIT/go2rtc"
 specifiers = ["v1.9.15"]
 
@@ -65,7 +65,7 @@ url = "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.15/go2rtc_linux_
 url_api = "https://api.github.com/repos/AlexxIT/go2rtc/releases/assets/674996355"
 
 [[tools."github:AlexxIT/go2rtc"]]
-version = "1.9.15"
+version = "v1.9.15"
 backend = "github:AlexxIT/go2rtc"
 specifiers = ["v1.9.15"]
 
