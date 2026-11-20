@@ -136,6 +136,7 @@ fn daemon(linger: Duration, advertise: Vec<AdvertisedAddress>) -> Daemon {
             worker_address_space: 1 << 30,
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
             live: lotse_supervisor::LiveLimits::DEFAULT,
+            hls: None,
         },
         linger,
         connect_concurrency: lotse_supervisor::DEFAULT_CONNECT_CONCURRENCY,

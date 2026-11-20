@@ -18,6 +18,7 @@
 pub mod channel;
 pub mod codec;
 pub mod datagram;
+pub mod fragments;
 pub mod message;
 mod pair;
 

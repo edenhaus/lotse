@@ -424,6 +424,50 @@ pub struct LiveClose {
     pub live_id: String,
 }
 
+/// `hls/create`: an LL-HLS session of a stream, its video and, when asked
+/// and the container carries it, its audio as a Media Playlist of fragmented
+/// MP4 segments and parts (draft-pantos-hls-rfc8216bis-22), whose playlist
+/// `GET /v0/hls/{hls_id}/index.m3u8` serves (the result's `playlist`) for as
+/// long as the session runs; the subscription's events say how it goes,
+/// `closed` last.
+///
+/// The sessions of one stream and audio choice share one live output and its
+/// window: the first one starts it and waits, as `live/create` does, for the
+/// init segment, for at most `limits.live_start_timeout_ms`, so the result
+/// can carry the MIME type with its `codecs`; later ones join it. A session
+/// keeps the source connected, as a viewer does, until it ends: `hls/close`,
+/// its subscription or control connection gone, or no request for
+/// `limits.hls_idle_timeout_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct HlsCreate {
+    /// The command id, which becomes the subscription id.
+    pub id: u64,
+    /// The stream to play.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub stream_id: String,
+    /// Take the stream's audio, as `live/create`'s `audio`: when the live
+    /// container carries it as it is (AAC-LC, Opus); any other codec is left
+    /// out with an `audio_omitted` warning. `false` makes a video-only
+    /// session.
+    #[serde(default = "with_audio")]
+    pub audio: bool,
+}
+
+/// `hls/close`: ends an LL-HLS session, `closed`; its routes answer 404 from
+/// then on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct HlsClose {
+    /// The command id.
+    pub id: u64,
+    /// The session.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub hls_id: String,
+}
+
 /// `signaling/subscribe`: a subscription to the signaling of one stream's
 /// signaled sources, or of every stream's; its events carry each signal's
 /// offer, candidates and close (`SignalingEvent`).
@@ -655,6 +699,15 @@ pub enum Command {
     #[serde(rename = "live/close")]
     #[cfg_attr(feature = "schema", schemars(title = "LiveCloseCommand"))]
     LiveClose(LiveClose),
+    /// `hls/create`: an LL-HLS session of a stream; its playlist is
+    /// fetched with `GET /v0/hls/{hls_id}/index.m3u8`.
+    #[serde(rename = "hls/create")]
+    #[cfg_attr(feature = "schema", schemars(title = "HlsCreateCommand"))]
+    HlsCreate(HlsCreate),
+    /// `hls/close`: ends an LL-HLS session.
+    #[serde(rename = "hls/close")]
+    #[cfg_attr(feature = "schema", schemars(title = "HlsCloseCommand"))]
+    HlsClose(HlsClose),
     /// `signaling/subscribe`: a subscription to the offers of one
     /// stream's signaled sources, or of every stream's. Its end
     /// (`unsubscribe`, the connection's close, a supersede) ends every
@@ -706,6 +759,8 @@ impl Command {
         "recording/create",
         "live/create",
         "live/close",
+        "hls/create",
+        "hls/close",
         "signaling/subscribe",
         "signaling/answer",
         "signaling/candidate",
@@ -738,6 +793,8 @@ impl Command {
             Self::RecordingCreate(c) => c.id,
             Self::LiveCreate(c) => c.id,
             Self::LiveClose(c) => c.id,
+            Self::HlsCreate(c) => c.id,
+            Self::HlsClose(c) => c.id,
             Self::SignalingSubscribe(c) => c.id,
             Self::SignalingAnswer(c) => c.id,
             Self::SignalingCandidate(c) => c.id,
@@ -773,6 +830,8 @@ impl Command {
             Self::RecordingCreate(_) => "recording/create",
             Self::LiveCreate(_) => "live/create",
             Self::LiveClose(_) => "live/close",
+            Self::HlsCreate(_) => "hls/create",
+            Self::HlsClose(_) => "hls/close",
             Self::SignalingSubscribe(_) => "signaling/subscribe",
             Self::SignalingAnswer(_) => "signaling/answer",
             Self::SignalingCandidate(_) => "signaling/candidate",
@@ -1016,6 +1075,8 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
         Command::ClientsRemove(remove) => cap_chars("pin", &remove.pin, MAX_PIN_CHARS)?,
         Command::LiveCreate(create) => cap_stream_id(&create.stream_id)?,
         Command::LiveClose(close) => cap_chars("live_id", &close.live_id, MAX_ID_CHARS)?,
+        Command::HlsCreate(create) => cap_stream_id(&create.stream_id)?,
+        Command::HlsClose(close) => cap_chars("hls_id", &close.hls_id, MAX_ID_CHARS)?,
         Command::ClientsAdd(add) => cap_chars("pin", &add.pin, MAX_PIN_CHARS)?,
         Command::RecordingCreate(start) => check_recording(start)?,
         Command::Ping(_)
@@ -1147,7 +1208,17 @@ mod tests {
 
     #[test]
     fn every_command_parses_from_the_contract_shape() {
-        let cases = [
+        let cases = contract_shapes();
+        for (index, (text, name)) in cases.iter().enumerate() {
+            round_trips(text, name, u64::try_from(index).unwrap() + 1);
+        }
+        assert_eq!(Command::NAMES.len(), cases.len());
+    }
+
+    /// One command of each type, as the contract shapes it, with its name;
+    /// the ids count up from 1.
+    fn contract_shapes() -> Vec<(&'static str, &'static str)> {
+        vec![
             (r#"{"id":1,"type":"ping"}"#, "ping"),
             (r#"{"id":2,"type":"info"}"#, "info"),
             (r#"{"id":3,"type":"metrics/get"}"#, "metrics/get"),
@@ -1234,20 +1305,28 @@ mod tests {
                 "live/close",
             ),
             (
-                r#"{"id":29,"type":"clients/add","pin":"00","role":"metrics"}"#,
+                r#"{"id":29,"type":"hls/create","stream_id":"front","audio":false}"#,
+                "hls/create",
+            ),
+            (
+                r#"{"id":30,"type":"hls/close","hls_id":"01JH"}"#,
+                "hls/close",
+            ),
+            (
+                r#"{"id":31,"type":"clients/add","pin":"00","role":"metrics"}"#,
                 "clients/add",
             ),
-        ];
-        for (index, (text, name)) in cases.iter().enumerate() {
-            let_assert!(Ok(command) = parse_command(text), "{text}");
-            assert_eq!(command.name(), *name);
-            assert_eq!(command.id(), u64::try_from(index).unwrap() + 1);
-            // Commands serialize back into the same shape, for `lotse ctl`.
-            let json = serde_json::to_value(&command).unwrap();
-            assert_eq!(json["type"], *name);
-            assert_eq!(serde_json::from_value::<Command>(json).unwrap(), command);
-        }
-        assert_eq!(Command::NAMES.len(), cases.len());
+        ]
+    }
+
+    /// `text` parses as command `name` with `id`, and serializes back into
+    /// the same shape, for `lotse ctl`.
+    fn round_trips(text: &str, name: &str, id: u64) {
+        let_assert!(Ok(command) = parse_command(text), "{text}");
+        assert_eq!((command.name(), command.id()), (name, id));
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["type"], name);
+        assert_eq!(serde_json::from_value::<Command>(json).unwrap(), command);
     }
 
     #[test]
@@ -1265,6 +1344,29 @@ mod tests {
             ),
             (
                 format!(r#"{{"id":3,"type":"live/close","live_id":"{long}"}}"#),
+                ErrorCode::InvalidRequest,
+            ),
+        ] {
+            let_assert!(Err(err) = parse_command(&text), "{text}");
+            assert_eq!(err.error.code, code, "{text}");
+        }
+    }
+
+    #[test]
+    fn an_hls_session_takes_the_audio_unless_asked_otherwise_and_its_ids_are_capped() {
+        let_assert!(
+            Ok(Command::HlsCreate(create)) =
+                parse_command(r#"{"id":1,"type":"hls/create","stream_id":"front"}"#)
+        );
+        assert!(create.audio, "audio by default");
+        let long = "x".repeat(MAX_ID_CHARS + 1);
+        for (text, code) in [
+            (
+                format!(r#"{{"id":2,"type":"hls/create","stream_id":"{long}"}}"#),
+                ErrorCode::InvalidStreamId,
+            ),
+            (
+                format!(r#"{{"id":3,"type":"hls/close","hls_id":"{long}"}}"#),
                 ErrorCode::InvalidRequest,
             ),
         ] {

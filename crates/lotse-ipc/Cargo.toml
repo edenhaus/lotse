@@ -17,6 +17,7 @@ postcard = { workspace = true }
 # not build with `net` alone on macOS (its sockopt code needs the `timespec` type `time` gates).
 rustix = { workspace = true, features = ["net", "time"] }
 serde = { workspace = true }
+bytes = { workspace = true } # the live records' bytes, which the supervisor hands on without a copy
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net"] } # `AsyncFd` readiness on the socketpair
 tracing = { workspace = true }

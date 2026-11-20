@@ -64,13 +64,14 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use lotse_core::clock::Clock;
 use lotse_core::codec::Kind;
-use lotse_core::live::{LiveMuxer, LiveMuxerFactory, LiveStep};
+use lotse_core::live::{LiveFragment, LiveMuxer, LiveMuxerFactory, LiveStep};
 use lotse_core::media::MediaFrame;
 use lotse_core::recording::RecordingTrack;
 use lotse_core::source::TrackSet;
 use lotse_core::task::spawn_named;
 use lotse_core::throttle::Throttle;
 use lotse_core::track::{Track, TrackEvent, TrackSubscription, Unit};
+use lotse_ipc::fragments::{self, RecordKind};
 use lotse_ipc::{LiveReport, LiveSpec};
 use tokio::io::Interest;
 use tokio::net::unix::pipe;
@@ -347,12 +348,12 @@ async fn run(
         id: spec.live_id.clone(),
         muxer: factory.muxer(),
         pipe,
+        framed: spec.framed,
         pending: VecDeque::new(),
         pending_bytes: 0,
         buffer_bytes: usize::try_from(spec.buffer_bytes).unwrap_or(usize::MAX),
         written: 0,
-        dropping: false,
-        after_drop: false,
+        drop: Dropping::No,
         drops: 0,
         dropped_frames: 0,
         drop_lines: Throttle::default(),
@@ -374,6 +375,20 @@ async fn run(
     output.finish(reason).await;
 }
 
+/// Where an output is in a drop to the next keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dropping {
+    /// Not dropping: every frame goes to the container.
+    No,
+    /// Every frame is left out until the queue went into the pipe, then the
+    /// container leaves them out until the next keyframe; a frame lost
+    /// meanwhile keeps it.
+    Draining,
+    /// The container leaves frames out until the next keyframe; those count
+    /// as dropped.
+    ToKeyframe,
+}
+
 /// The tracks an output writes.
 struct Media {
     /// The video track.
@@ -390,6 +405,9 @@ struct Output {
     muxer: Box<dyn LiveMuxer>,
     /// The write end of the pipe.
     pipe: pipe::Sender,
+    /// Whether each record goes behind its header ([`lotse_ipc::fragments`]):
+    /// an LL-HLS output, whose supervisor cuts parts and segments.
+    framed: bool,
     /// The container's bytes the pipe has not taken yet, in order.
     pending: VecDeque<Bytes>,
     /// Their length.
@@ -398,12 +416,8 @@ struct Output {
     buffer_bytes: usize,
     /// The bytes the pipe took.
     written: u64,
-    /// Whether the output leaves frames out until its queue went into the
-    /// pipe.
-    dropping: bool,
-    /// Whether the container waits for a keyframe after a drop: the frames
-    /// it leaves out until then count as dropped.
-    after_drop: bool,
+    /// Where the output is in a drop.
+    drop: Dropping,
     /// How often the output dropped to the next keyframe.
     drops: u32,
     /// The frames left out by the drops.
@@ -488,7 +502,7 @@ impl Output {
                 tracing::warn!(live.id = %self.id, error = %err, "live: the container refused the tracks");
                 LiveEnd::InternalError
             })?;
-        self.queue(vec![init.bytes]);
+        self.queue_record(RecordKind::Init, vec![init.bytes])?;
         self.write()?;
         tracing::info!(
             live.id = %self.id,
@@ -753,17 +767,17 @@ impl Output {
     /// (`live`: a live frame; the GOP's burst at the join is not held to
     /// the bound) or the output drops until it went into the pipe.
     fn offer(&mut self, kind: Kind, frame: Arc<MediaFrame>, live: bool) -> Result<(), LiveEnd> {
-        if self.dropping {
+        if self.drop == Dropping::Draining {
             if !self.pending.is_empty() {
                 self.dropped_frames = self.dropped_frames.saturating_add(1);
                 return Ok(());
             }
-            self.dropping = false;
+            self.drop = Dropping::ToKeyframe;
             tracing::debug!(live.id = %self.id, "live: the reader caught up; going on at the next keyframe");
         }
         if live && self.pending_bytes > self.buffer_bytes {
             self.drop_to_keyframe(1, "the reader fell behind")?;
-            self.dropping = true;
+            self.drop = Dropping::Draining;
             return Ok(());
         }
         let keyframe = kind == Kind::Video && frame.keyframe;
@@ -782,12 +796,12 @@ impl Output {
         match step {
             LiveStep::Fragment(fragment) => {
                 if fragment.independent {
-                    self.after_drop = false;
+                    self.drop = Dropping::No;
                 }
-                self.queue(fragment.bytes);
+                self.queue_fragment(fragment)?;
             }
             LiveStep::Dropped => {
-                if self.after_drop {
+                if self.drop != Dropping::No {
                     self.dropped_frames = self.dropped_frames.saturating_add(1);
                 }
             }
@@ -798,13 +812,17 @@ impl Output {
 
     /// Drops to the next keyframe for `why`, `skipped` frames lost already:
     /// the container finishes the frames it holds and leaves out the rest
-    /// until then.
+    /// until then. A drain under way stays one, as it already goes on at
+    /// the next keyframe once the queue went into the pipe: a keyframe
+    /// before that would go out behind the backlog.
     fn drop_to_keyframe(&mut self, skipped: u64, why: &'static str) -> Result<(), LiveEnd> {
         let finished = self.muxer.skip().map_err(|err| self.failed(&err))?;
         if let Some(fragment) = finished {
-            self.queue(fragment.bytes);
+            self.queue_fragment(fragment)?;
         }
-        self.after_drop = true;
+        if self.drop != Dropping::Draining {
+            self.drop = Dropping::ToKeyframe;
+        }
         self.drops = self.drops.saturating_add(1);
         self.dropped_frames = self.dropped_frames.saturating_add(skipped);
         if let Some(count) = self.drop_lines.hit(self.clock.now()) {
@@ -832,6 +850,46 @@ impl Output {
     fn gone(&self) -> LiveEnd {
         tracing::info!(live.id = %self.id, "live: the reader is gone");
         LiveEnd::ClientGone
+    }
+
+    /// Queues `fragment`'s bytes for the pipe, behind its record header in a
+    /// framed output, which says the fragment's real duration: one over
+    /// what a header may say (a minute: a camera whose timestamps jumped)
+    /// ends a framed output rather than tell the LL-HLS window a duration
+    /// the media it serves does not have ([`Self::queue_record`]). An
+    /// output that is not framed writes no header and goes on.
+    fn queue_fragment(&mut self, fragment: LiveFragment) -> Result<(), LiveEnd> {
+        let kind = RecordKind::Fragment {
+            independent: fragment.independent,
+            duration: fragment.duration,
+        };
+        self.queue_record(kind, fragment.bytes)
+    }
+
+    /// Queues `bytes` for the pipe, in a framed output behind the header of
+    /// a record of `kind` ([`lotse_ipc::fragments`]); one the header cannot
+    /// describe (its length or its video's duration over the framing's
+    /// bounds, far above any frame of a working camera) ends the output
+    /// `internal_error`, logged with both.
+    fn queue_record(&mut self, kind: RecordKind, bytes: Vec<Bytes>) -> Result<(), LiveEnd> {
+        if self.framed {
+            let len = bytes
+                .iter()
+                .map(Bytes::len)
+                .fold(0_usize, usize::saturating_add);
+            let Some(header) = fragments::header(kind, len) else {
+                tracing::warn!(
+                    live.id = %self.id,
+                    len,
+                    duration = ?video_duration(kind),
+                    "live: a record's length or its video's duration is over the framing's bound"
+                );
+                return Err(LiveEnd::InternalError);
+            };
+            self.queue(vec![Bytes::copy_from_slice(&header)]);
+        }
+        self.queue(bytes);
+        Ok(())
     }
 
     /// Queues the container's `bytes` for the pipe, in order; an empty
@@ -934,6 +992,15 @@ fn entry(track: &Arc<Track>) -> RecordingTrack {
     RecordingTrack {
         codec: (*track.codec()).clone(),
         clock_rate: track.clock_rate(),
+    }
+}
+
+/// How long the video of a record of `kind` lasts, for the log: `None` for
+/// the init segment.
+const fn video_duration(kind: RecordKind) -> Option<Duration> {
+    match kind {
+        RecordKind::Fragment { duration, .. } => Some(duration),
+        RecordKind::Init => None,
     }
 }
 

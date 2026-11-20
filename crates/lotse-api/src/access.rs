@@ -1,14 +1,15 @@
 //! What a TLS client's role reaches. A `metrics` client
 //! ([`ClientRole::Metrics`]) may read `GET /v0/metrics` and nothing else:
-//! every other route that exists, the WebSocket upgrade and a recording's
-//! or a live output's bytes included and whatever the method, is refused
-//! before its handler runs with 403 `not_permitted` (RFC 9110 §15.5.4: the
-//! client presented credentials, and they do not grant this), in the error
-//! body of every other refusal. A path no route has is 404 for every client, as the
-//! router answers it; a pairing connection never reaches the router. A
-//! `control` client and a peer on the Unix socket pass, and so does a TLS
-//! client removed since its handshake: each route refuses that one itself
-//! (the upgrade closes it at once, a recording is refused 403).
+//! every other route that exists, the WebSocket upgrade, a recording's or
+//! a live output's bytes and an LL-HLS session's included and whatever the
+//! method, is refused before its handler runs with 403 `not_permitted`
+//! (RFC 9110 §15.5.4: the client presented credentials, and they do not
+//! grant this), in the error body of every other refusal. A path no route
+//! has is 404 for every client, as the router answers it; a pairing
+//! connection never reaches the router. A `control` client and a peer on
+//! the Unix socket pass, and so does a TLS client removed since its
+//! handshake: each route refuses that one itself (the upgrade closes it at
+//! once, a recording is refused 403).
 //!
 //! The role is looked up in the client store on every request, never taken
 //! from the certificate, which the client made itself. A refusal is a

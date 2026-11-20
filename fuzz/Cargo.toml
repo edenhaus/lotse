@@ -283,8 +283,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "hls_route"
+path = "fuzz_targets/hls_route.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "live_path"
 path = "fuzz_targets/live_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "live_records"
+path = "fuzz_targets/live_records.rs"
 test = false
 doc = false
 bench = false

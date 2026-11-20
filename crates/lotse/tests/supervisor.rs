@@ -61,6 +61,7 @@ fn supervisor_with(connects: NonZeroUsize) -> Supervisor {
             worker_address_space: 1 << 30,
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
             live: lotse_supervisor::LiveLimits::DEFAULT,
+            hls: None,
         },
         linger: Duration::from_millis(200),
         connect_concurrency: connects,

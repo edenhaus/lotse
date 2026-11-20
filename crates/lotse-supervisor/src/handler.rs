@@ -24,15 +24,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lotse_api::{
-    ConnectionId, Event, Handler, LiveBody, LiveBodyError, Outcome, RecordingBody,
-    RecordingBodyError,
+    ConnectionId, Event, Handler, HlsAnswer, HlsRequest, LiveBody, LiveBodyError, Outcome,
+    RecordingBody, RecordingBodyError,
 };
 use lotse_api_types::API_VERSION;
 use lotse_api_types::command::{
-    Command, LiveCreate, RecordingCreate, StreamPut, WebrtcCandidate, WebrtcOffer, WebrtcReoffer,
+    Command, HlsCreate, LiveCreate, RecordingCreate, StreamPut, WebrtcCandidate, WebrtcOffer,
+    WebrtcReoffer,
 };
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Hello, HelloTag};
+use lotse_api_types::hls::{HlsCloseReason, HlsCreateResult};
 use lotse_api_types::info::{
     BuildInfo, Codecs, DemuxMetrics, InfoResult, Limits, Metrics, ProcessMetrics, SandboxInfo,
     SupervisorMetrics,
@@ -45,7 +47,7 @@ use lotse_api_types::stream::{AudioMode, BackchannelReleaseResult, StreamList, S
 use lotse_core::clock::Clock;
 use lotse_core::codec::{CodecFamily, Kind};
 use lotse_core::connection::{ConnectionConfig, ConnectionError, ConnectionState};
-use lotse_core::id::{LiveId, RecordingId, StreamId};
+use lotse_core::id::{HlsId, LiveId, RecordingId, StreamId};
 use lotse_core::registry::Registries;
 use lotse_core::source::SourceConfigError;
 use lotse_core::source_url::SourceUrl;
@@ -58,6 +60,7 @@ use tracing::Instrument as _;
 use crate::connect::ConnectPermits;
 use crate::driver::{COMMAND_QUEUE, Demand, Driver, DriverCommand, DriverSpec};
 use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnEntry};
+use crate::hls::Hls;
 use crate::host_cache::{HostCache, HostScan, HostSnapshot};
 use crate::live::{LIVE_QUEUE, LiveEntry, LiveLimits, LiveOwner};
 use crate::memory::{Memory, MemoryProbe};
@@ -90,11 +93,16 @@ const RECORDING: &str = "recording";
 /// live container (`Registries::live`).
 const LIVE: &str = "live";
 
+/// The output kind of LL-HLS, announced when the build has a live container
+/// and LL-HLS (`Limits::hls`).
+const HLS: &str = "hls";
+
 /// How much longer than `limits.live_start_timeout_ms` `live/create` waits
 /// for the worker's init segment: the worker's own timeout ends the output
 /// first and says why; this only bounds a start that never reached a worker
 /// (its host lookup keeps failing, a backoff holds the worker back).
-const LIVE_CREATE_SLACK: Duration = Duration::from_secs(2);
+/// `hls/create` waits as long for its output's.
+pub(crate) const LIVE_CREATE_SLACK: Duration = Duration::from_secs(2);
 
 /// What `hello` and `info` always announce beyond the outputs.
 const FEATURES: [&str; 1] = ["session_adopt"];
@@ -217,7 +225,7 @@ pub struct Supervisor {
     /// The build and sandbox.
     identity: Identity,
     /// The registry and what the drivers need.
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     /// When the supervisor started, for `metrics/get`.
     started: Instant,
     /// Its own `smaps_rollup`; `None` without `/proc`.
@@ -269,6 +277,13 @@ impl Supervisor {
         } else {
             LiveLimits::NONE
         };
+        // LL-HLS windows are filled from live outputs: none without them.
+        state.hls = Hls::new(
+            settings
+                .limits
+                .hls
+                .filter(|_| environment.registries.live.is_some()),
+        );
         let shared = Arc::new(Shared {
             manager: WorkerManager::new(environment.worker, environment.udp, Arc::clone(&clock))
                 .with_turn(turn.clone()),
@@ -293,7 +308,8 @@ impl Supervisor {
     }
 
     /// Closes every session and ends every recording and live output with
-    /// `shutting_down`, and ends the signaling (each offered signal closes
+    /// `shutting_down`, an LL-HLS output and its sessions among the live
+    /// outputs, and ends the signaling (each offered signal closes
     /// `source_stopped`, each signaling subscription ends); the first step
     /// of the shutdown, before the control connections say goodbye. A
     /// recording's worker writes its last fragment while it stops, but its
@@ -393,14 +409,17 @@ impl Supervisor {
     }
 
     /// The output kinds compiled in: the session outputs, then `recording` with
-    /// a recording container and `live` with a live one.
+    /// a recording container, `live` with a live one, and `hls` with LL-HLS
+    /// besides.
     fn outputs(&self) -> Vec<String> {
+        let hls = self.registries.live.is_some() && self.settings.limits.hls.is_some();
         self.registries
             .outputs
             .kinds()
             .into_iter()
             .chain(self.registries.recording.is_some().then_some(RECORDING))
             .chain(self.registries.live.is_some().then_some(LIVE))
+            .chain(hls.then_some(HLS))
             .map(str::to_owned)
             .collect()
     }
@@ -1519,7 +1538,7 @@ impl Supervisor {
         let limits = {
             let mut state = self.shared.lock();
             let limits = state.live_limits;
-            check_live_limits(&mut state, stream_id.as_str(), limits)?;
+            check_live_limits(&mut state, stream_id.as_str(), limits, "live/create")?;
             let stream = state.streams.get(stream_id.as_str()).ok_or_else(|| {
                 ApiError::new(ErrorCode::StreamNotFound, "no such stream")
                     .with_detail("stream_id", stream_id.as_str())
@@ -1533,6 +1552,7 @@ impl Supervisor {
                 live_id: live_id.as_str().to_owned(),
                 audio: create.audio,
                 buffer_bytes: limits.buffer_bytes,
+                framed: false,
             };
             let (fetch_slot, stop_slot) = hand_over_live(&commands, spec, writer.into())?;
             let serial = state.last_live.saturating_add(1);
@@ -1631,6 +1651,32 @@ impl Supervisor {
         Ok(())
     }
 
+    /// `hls/close`: ends an LL-HLS session `closed`; one not open is
+    /// `hls_not_found`.
+    fn hls_close(&self, hls_id: &str) -> Result<(), ApiError> {
+        if self
+            .shared
+            .lock()
+            .close_hls_session(hls_id, HlsCloseReason::Closed, true)
+        {
+            Ok(())
+        } else {
+            Err(
+                ApiError::new(ErrorCode::HlsNotFound, "no open LL-HLS session has this id")
+                    .with_detail("hls_id", hls_id),
+            )
+        }
+    }
+
+    /// `hls/create` ([`crate::hls::create`]).
+    async fn hls_create(
+        &self,
+        connection: ConnectionId,
+        create: &HlsCreate,
+    ) -> Result<(HlsCreateResult, mpsc::Receiver<Event>), ApiError> {
+        crate::hls::create(&self.shared, connection, create).await
+    }
+
     /// The fetch deadline of recording `serial`, `recording_id`, `timeout` from now on
     /// the injected clock ([`State::recording_fetch_deadline`]).
     fn fetch_deadline(&self, recording_id: &str, serial: u64, timeout: Duration) -> RecordingTimer {
@@ -1697,6 +1743,17 @@ impl Supervisor {
                 }
             },
             Command::LiveClose(close) => empty(self.live_close(&close.live_id)),
+            Command::HlsCreate(create) => match self.hls_create(connection, &create).await {
+                Ok((result, events)) => Outcome::SubscribedWith {
+                    result: serde_json::to_value(result).unwrap_or_default(),
+                    events,
+                },
+                Err(error) => {
+                    tracing::debug!(code = error.code.as_str(), detail = %error.message, "hls/create refused");
+                    Outcome::Error(error)
+                }
+            },
+            Command::HlsClose(close) => empty(self.hls_close(&close.hls_id)),
             Command::SignalingSubscribe(subscribe) => {
                 self.signaling_subscribe(connection, subscribe.id, subscribe.stream_id)
             }
@@ -1755,6 +1812,7 @@ impl Handler for Supervisor {
         let mut state = self.shared.lock();
         if state.unsubscribe_recording(connection, subscription)
             || state.unsubscribe_live(connection, subscription)
+            || state.unsubscribe_hls(connection, subscription)
             || state.signaling_unsubscribed(connection, subscription)
         {
             return None;
@@ -1779,6 +1837,7 @@ impl Handler for Supervisor {
             let mut state = self.shared.lock();
             state.recordings_connection_closed(connection);
             state.lives_connection_closed(connection);
+            state.hls_connection_closed(connection);
             state.connection_closed(connection)
         };
         for (id, serial, epoch) in orphans {
@@ -1813,6 +1872,14 @@ impl Handler for Supervisor {
             tracing::debug!(live.id = %live_id, %error, "live body refused");
         }
         body
+    }
+
+    /// Answers an LL-HLS request from its session's window, waiting,
+    /// bounded, for what it does not hold yet (`crate::hls::serve`).
+    fn hls(&self, hls_id: &HlsId, request: HlsRequest) -> impl Future<Output = HlsAnswer> + Send {
+        let shared = Arc::clone(&self.shared);
+        let hls_id = hls_id.clone();
+        async move { crate::hls::serve(&shared, &hls_id, request).await }
     }
 
     /// The snapshot `metrics/get` answers with, for `GET /v0/metrics`: the
@@ -2091,12 +2158,14 @@ fn hand_over_recording(
 }
 
 /// `limit_reached` when another live output would exceed `limits.max_live`
-/// or, on `stream_id`, `limits.max_live_per_stream`; the refusal is logged
+/// or, on `stream_id`, `limits.max_live_per_stream`; the refusal of
+/// `command` (`live/create`, or `hls/create` starting an output) is logged
 /// at warn, rate-limited, since a client can ask again and again.
-fn check_live_limits(
+pub(crate) fn check_live_limits(
     state: &mut State,
     stream_id: &str,
     limits: LiveLimits,
+    command: &'static str,
 ) -> Result<(), ApiError> {
     let (on_stream, total) = state.lives_open(stream_id);
     let (limit, refused) = if total >= usize::try_from(limits.max_live).unwrap_or(usize::MAX) {
@@ -2113,7 +2182,8 @@ fn check_live_limits(
             on_stream,
             total,
             count,
-            "live/create refused at its limit"
+            command,
+            "live output refused at its limit"
         );
     }
     Err(ApiError::new(ErrorCode::LimitReached, refused).with_detail("limit", limit))
@@ -2153,7 +2223,7 @@ fn live_start_error(reason: LiveCloseReason) -> ApiError {
 /// Hands the start of live output `spec`, with `pipe`, to its connection's
 /// driver, and returns the slots reserved behind it for its fetch and its
 /// stop; a queue without room for all three is `limit_reached`.
-fn hand_over_live(
+pub(crate) fn hand_over_live(
     commands: &mpsc::Sender<DriverCommand>,
     spec: LiveSpec,
     pipe: std::os::fd::OwnedFd,
@@ -2176,18 +2246,21 @@ fn hand_over_live(
 }
 
 /// The connection a session opens on, as [`session_connection`] finds it.
-struct SessionConnection {
+pub(crate) struct SessionConnection {
     /// The connection's id.
-    id: String,
+    pub(crate) id: String,
     /// The connection's command queue.
-    commands: mpsc::Sender<DriverCommand>,
+    pub(crate) commands: mpsc::Sender<DriverCommand>,
     /// The failure a session waiting for its answer closes with, and the
     /// connection's state with it; none while the connection can answer.
     failure: Option<(ConnectionError, ConnectionState)>,
 }
 
 /// The connection a session of `stream` opens on: its first source's.
-fn session_connection(state: &State, stream: &StreamEntry) -> Result<SessionConnection, ApiError> {
+pub(crate) fn session_connection(
+    state: &State,
+    stream: &StreamEntry,
+) -> Result<SessionConnection, ApiError> {
     stream
         .sources
         .first()
@@ -2241,7 +2314,7 @@ fn invalid_session_id(session_id: &str) -> ApiError {
 }
 
 /// `internal_error` for a failure that is a bug or a broken host.
-fn internal(error: impl std::fmt::Display) -> ApiError {
+pub(crate) fn internal(error: impl std::fmt::Display) -> ApiError {
     tracing::error!(error = %error, "internal error");
     ApiError::new(ErrorCode::InternalError, error.to_string())
 }
@@ -2264,7 +2337,7 @@ fn demux_metrics(stats: &DemuxStats) -> DemuxMetrics {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::arithmetic_side_effects,
         clippy::missing_docs_in_private_items,
@@ -2307,17 +2380,17 @@ mod tests {
         Supervisor::new(settings, environment(binary), clock)
     }
 
-    async fn call(supervisor: &Supervisor, command: &str) -> Outcome {
+    pub(crate) async fn call(supervisor: &Supervisor, command: &str) -> Outcome {
         let command = parse_command(command).expect(command);
         supervisor.handle(ConnectionId(1), command).await
     }
 
-    fn result(outcome: Outcome) -> Value {
+    pub(crate) fn result(outcome: Outcome) -> Value {
         let_assert!(Outcome::Result(value) = outcome);
         value
     }
 
-    fn error(outcome: Outcome) -> ApiError {
+    pub(crate) fn error(outcome: Outcome) -> ApiError {
         let_assert!(Outcome::Error(err) = outcome);
         err
     }
@@ -2329,7 +2402,7 @@ mod tests {
 
     /// The next event, failing the test after 10 s instead of hanging it
     /// (a lost event is a failure, not a timeout of the mutation run).
-    async fn next(rx: &mut mpsc::Receiver<Event>) -> Value {
+    pub(crate) async fn next(rx: &mut mpsc::Receiver<Event>) -> Value {
         tokio::select! {
             event = rx.recv() => event.expect("an event").payload,
             () = SystemClock.sleep(Duration::from_secs(10)) => panic!("no event in 10 s"),
@@ -2337,7 +2410,7 @@ mod tests {
     }
     /// `future`'s output, or a failed test after five seconds of real
     /// time: a command whose answer never comes fails instead of hanging.
-    async fn within<T>(future: impl Future<Output = T>) -> T {
+    pub(crate) async fn within<T>(future: impl Future<Output = T>) -> T {
         tokio::select! {
             output = future => output,
             () = SystemClock.sleep(Duration::from_secs(5)) => panic!("nothing within 5 s"),
@@ -2345,7 +2418,7 @@ mod tests {
     }
 
     /// A `stream/put` of one source at `url`, named by its scheme.
-    fn put(stream_id: &str, url: &str, preload: bool) -> String {
+    pub(crate) fn put(stream_id: &str, url: &str, preload: bool) -> String {
         let protocol = url.split_once("://").map_or(url, |(scheme, _)| scheme);
         json!({ "id": 1, "type": "stream/put", "stream_id": stream_id,
                 "sources": [{ "protocol": protocol, "url": url }], "preload": preload })
@@ -2354,7 +2427,7 @@ mod tests {
 
     /// A worker that ignores its arguments and blocks, standing in for a
     /// worker that never reports.
-    fn blocking_worker(dir: &std::path::Path) -> String {
+    pub(crate) fn blocking_worker(dir: &std::path::Path) -> String {
         let path = dir.join("worker.sh");
         std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2362,7 +2435,7 @@ mod tests {
     }
 
     /// Settings with at most two sessions per stream and three in all.
-    fn session_settings() -> Settings {
+    pub(crate) fn session_settings() -> Settings {
         let mut settings = settings(PathBuf::from("/nonexistent/lotse.sock"));
         settings.shutdown_budget = Duration::from_millis(200);
         settings.limits.max_sessions = 3;
@@ -2397,7 +2470,11 @@ mod tests {
         Supervisor::new(session_settings(), webrtc_environment(binary, door), clock)
     }
 
-    async fn call_on(supervisor: &Supervisor, connection: u64, command: &Value) -> Outcome {
+    pub(crate) async fn call_on(
+        supervisor: &Supervisor,
+        connection: u64,
+        command: &Value,
+    ) -> Outcome {
         let command = parse_command(&command.to_string()).unwrap();
         supervisor.handle(ConnectionId(connection), command).await
     }
@@ -4672,7 +4749,7 @@ mod tests {
 
     /// Lets the connection's driver run up to its first wait, so its first
     /// snapshot is in before the test publishes its own.
-    async fn settle() {
+    pub(crate) async fn settle() {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
@@ -6359,7 +6436,7 @@ mod tests {
     }
 
     /// A subscription's result and events.
-    fn started(outcome: Outcome) -> (Value, mpsc::Receiver<Event>) {
+    pub(crate) fn started(outcome: Outcome) -> (Value, mpsc::Receiver<Event>) {
         let_assert!(Outcome::SubscribedWith { result, events } = outcome);
         (result, events)
     }
@@ -6383,7 +6460,7 @@ mod tests {
 
     /// The commands `c1`'s driver would get from now on, on a queue of
     /// `capacity`.
-    fn intercept(s: &Supervisor, capacity: usize) -> mpsc::Receiver<DriverCommand> {
+    pub(crate) fn intercept(s: &Supervisor, capacity: usize) -> mpsc::Receiver<DriverCommand> {
         let (tx, rx) = mpsc::channel(capacity);
         s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
         rx
@@ -6402,7 +6479,7 @@ mod tests {
         )
     }
 
-    fn demand(s: &Supervisor) -> Demand {
+    pub(crate) fn demand(s: &Supervisor) -> Demand {
         *s.shared.lock().connections["c1"].demand.borrow()
     }
 
@@ -7291,7 +7368,7 @@ mod tests {
     }
 
     /// A supervisor with the fake live container, whose workers run `binary`.
-    fn with_live(binary: &str, clock: Arc<dyn Clock>) -> Supervisor {
+    pub(crate) fn with_live(binary: &str, clock: Arc<dyn Clock>) -> Supervisor {
         let mut environment = environment(binary);
         environment.registries.live = Some(Arc::new(
             lotse_core::test_util::FakeLiveMuxerFactory::default(),
@@ -7303,7 +7380,7 @@ mod tests {
         json!({ "id": id, "type": "live/create", "stream_id": stream_id }).to_string()
     }
 
-    const LIVE_MIME: &str = "video/mp4; codecs=\"avc1.42c028\"";
+    pub(crate) const LIVE_MIME: &str = "video/mp4; codecs=\"avc1.42c028\"";
 
     /// Waits for the start the driver's queue `commands` gets; its live id.
     async fn live_start(commands: &mut mpsc::Receiver<DriverCommand>) -> String {
@@ -7311,11 +7388,11 @@ mod tests {
         spec.live_id
     }
 
-    fn live_report(s: &Supervisor, live_id: &str, report: lotse_ipc::LiveReport) {
+    pub(crate) fn live_report(s: &Supervisor, live_id: &str, report: lotse_ipc::LiveReport) {
         s.shared.lock().live_report("c1", live_id, report);
     }
 
-    fn live_started() -> lotse_ipc::LiveReport {
+    pub(crate) fn live_started() -> lotse_ipc::LiveReport {
         lotse_ipc::LiveReport::Started {
             mime: LIVE_MIME.into(),
             video: "h264".into(),
@@ -7323,7 +7400,7 @@ mod tests {
         }
     }
 
-    fn live_closed(reason: &str) -> lotse_ipc::LiveReport {
+    pub(crate) fn live_closed(reason: &str) -> lotse_ipc::LiveReport {
         lotse_ipc::LiveReport::Closed {
             reason: reason.into(),
             bytes: 10,
@@ -7341,7 +7418,7 @@ mod tests {
         let dir = private_dir("live-start");
         let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
         let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
-        assert_eq!(info["outputs"], json!(["live"]));
+        assert_eq!(info["outputs"], json!(["live", "hls"]));
         result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
         let mut commands = intercept(&s, 16);
         let create = spawn_named("test.live_create", {
@@ -7548,7 +7625,7 @@ mod tests {
         let err = error(call(&s, &live_create(7, "back")).await);
         assert_eq!(err.details["limit"], "max_live");
         assert_eq!(
-            captured.lines("live/create refused at its limit").len(),
+            captured.lines("live output refused at its limit").len(),
             2,
             "the first and none more within the interval"
         );

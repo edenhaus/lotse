@@ -252,6 +252,9 @@ pub struct LiveSpec {
     /// (`limits.live_buffer_bytes`): past them it drops to the next video
     /// keyframe.
     pub buffer_bytes: u32,
+    /// Each record goes behind a header ([`crate::fragments`]): an LL-HLS
+    /// output, whose supervisor cuts parts and segments from the records.
+    pub framed: bool,
 }
 
 /// A session to open: the browser's offer, the ICE credentials the
@@ -1575,6 +1578,7 @@ mod tests {
                     live_id: "01JL".into(),
                     audio: true,
                     buffer_bytes: 1 << 20,
+                    framed: false,
                 }),
                 "start_live",
             ),
