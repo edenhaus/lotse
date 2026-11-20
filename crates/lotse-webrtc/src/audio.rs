@@ -496,15 +496,13 @@ impl<'a> AudioPlan<'a> {
             .map(Codec::family)
             .filter(|family| downlink.is_some_and(|(section, _, _)| lists(section, *family)));
         let uplink = uplink(&lines);
-        let reaching: Vec<CodecFamily> = backchannel
-            .map(|backchannel| {
-                backchannel
-                    .takes
-                    .iter()
-                    .map(|codec| codec.family())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let reaching: Vec<CodecFamily> = backchannel.map_or_default(|backchannel| {
+            backchannel
+                .takes
+                .iter()
+                .map(|codec| codec.family())
+                .collect()
+        });
         let talkback = match (
             uplink,
             backchannel.map(|backchannel| backchannel.codec.family()),

@@ -531,7 +531,7 @@ fn digest_accepts(challenge: Challenge, given: &str, target: &str, user: &str, p
         return false;
     };
     let params = digest_params(params);
-    let param = |name: &str| params.get(name).map(String::as_str).unwrap_or_default();
+    let param = |name: &str| params.get(name).map_or_default(String::as_str);
     let hash = |input: String| match challenge {
         Challenge::DigestSha256 => hex(&Sha256::digest(input.as_bytes())),
         Challenge::Basic | Challenge::DigestMd5 => hex(&Md5::digest(input.as_bytes())),

@@ -1190,8 +1190,7 @@ impl Reader {
                 .defaults
                 .iter()
                 .find(|(track, _)| *track == id)
-                .map(|(_, defaults)| *defaults)
-                .unwrap_or_default();
+                .map_or_default(|(_, defaults)| *defaults);
             let default_duration = traf.tfhd.default_sample_duration.unwrap_or(trex.duration);
             let default_size = traf.tfhd.default_sample_size.unwrap_or(trex.size);
             let track = index.and_then(|index| Some((index, self.tracks.get(index)?)));

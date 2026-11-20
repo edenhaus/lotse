@@ -1408,7 +1408,7 @@ async fn next_arbitration(pending: &mut Option<PendingOffer>) -> (String, Arbitr
         return std::future::pending().await;
     };
     let arbitration = offer.arbitration.as_mut().await;
-    let sdp = pending.take().map(|offer| offer.sdp).unwrap_or_default();
+    let sdp = pending.take().map_or_default(|offer| offer.sdp);
     (sdp, arbitration)
 }
 

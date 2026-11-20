@@ -269,8 +269,7 @@ pub fn leaks(samples: &[Sample], cycle_latency_p50_ms: &[Option<f64>]) -> Option
     let (early, late) = thirds(&quiet);
     let names: Vec<&str> = quiet
         .first()
-        .map(|s| s.processes.iter().map(|p| p.name.as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|s| s.processes.iter().map(|p| p.name.as_str()).collect());
     let figure = |samples: &[&Sample], name: &str, pick: fn(&ProcessSample) -> Option<u64>| {
         samples
             .iter()

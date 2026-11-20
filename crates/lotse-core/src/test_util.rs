@@ -206,8 +206,7 @@ impl BackchannelCapture {
         packets
             .wait_for(|packets| packets.len() >= count)
             .await
-            .map(|packets| Self::bare(&packets))
-            .unwrap_or_default()
+            .map_or_default(|packets| Self::bare(&packets))
     }
 
     /// The packets of `captured`, without their arrival.

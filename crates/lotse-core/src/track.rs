@@ -3246,8 +3246,7 @@ mod tests {
     fn prerecord(track: &Track, t0: Instant) -> Vec<i64> {
         track
             .prerecord_snapshot(t0)
-            .map(|snapshot| snapshot.frames().map(|f| f.ts.ticks()).collect())
-            .unwrap_or_default()
+            .map_or_default(|snapshot| snapshot.frames().map(|f| f.ts.ticks()).collect())
     }
 
     /// Asserts nothing is queued for `sub`: polled once, it is pending.

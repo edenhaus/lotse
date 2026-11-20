@@ -444,10 +444,7 @@ impl CameraBackchannel {
     /// camera's frame of reference (ONVIF Streaming Specification §5.3.2).
     fn sdp(&self, base: &str) -> String {
         let pt = self.payload_type();
-        let ptime = self
-            .ptime
-            .map(|ms| format!("a=ptime:{ms}\r\n"))
-            .unwrap_or_default();
+        let ptime = self.ptime.map_or_default(|ms| format!("a=ptime:{ms}\r\n"));
         format!(
             "m=audio 0 RTP/AVP {pt}\r\na=rtpmap:{pt} {}\r\n{}{ptime}a=sendonly\r\na=control:{base}{BACKCHANNEL_CONTROL}\r\n",
             self.codec.rtpmap(),
@@ -1282,10 +1279,8 @@ fn sdp(
         "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fake camera\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
          {session_lines}a=control:{base}\r\n{}{}{}{media_lines}",
         video.sdp(base, video_fmtp),
-        audio.map(|audio| audio.sdp(base)).unwrap_or_default(),
-        backchannel
-            .map(|backchannel| backchannel.sdp(base))
-            .unwrap_or_default(),
+        audio.map_or_default(|audio| audio.sdp(base)),
+        backchannel.map_or_default(|backchannel| backchannel.sdp(base)),
     )
 }
 
@@ -1822,8 +1817,7 @@ impl Connection {
     fn answer(&mut self, request: &Request<Vec<u8>>) -> (Response<Vec<u8>>, bool) {
         let cseq = request
             .header(&CSEQ)
-            .map(|v| v.as_str().to_owned())
-            .unwrap_or_default();
+            .map_or_default(|v| v.as_str().to_owned());
         let method = request.method().clone();
         if matches!(method, Method::Describe | Method::Setup | Method::Play)
             && !self.authorized(request)
@@ -1959,8 +1953,7 @@ impl Connection {
         let asked = asks_backchannel(request);
         let uri = request
             .request_uri()
-            .map(|uri| uri.as_str().to_owned())
-            .unwrap_or_default();
+            .map_or_default(|uri| uri.as_str().to_owned());
         self.stats.log(self.index, |log| {
             log.describes.push(asked);
             log.describe_uris.push(uri);
@@ -2056,8 +2049,7 @@ impl Connection {
     fn setup(&mut self, request: &Request<Vec<u8>>, cseq: &str) -> Response<Vec<u8>> {
         let transport = request
             .header(&TRANSPORT)
-            .map(|v| v.as_str().to_owned())
-            .unwrap_or_default();
+            .map_or_default(|v| v.as_str().to_owned());
         let backchannel = request
             .request_uri()
             .is_some_and(|uri| uri.as_str().ends_with(BACKCHANNEL_CONTROL));
