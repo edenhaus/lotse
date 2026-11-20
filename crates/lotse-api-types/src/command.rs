@@ -378,6 +378,52 @@ const fn with_audio() -> bool {
     true
 }
 
+/// `live/create`: a live output of a stream, its video and, when asked and
+/// the container carries it, its audio as live fragmented MP4 from the
+/// cached keyframe on, whose bytes `GET /v0/live/{live_id}` serves once (the
+/// result's `url`) for as long as the output runs; the subscription's
+/// events say how it goes, `closed` last.
+///
+/// The command waits for the stream's worker to write the init segment,
+/// which needs the video's parameter sets, for at most
+/// `limits.live_start_timeout_ms`, so the result can carry the MIME type
+/// with its `codecs`. Meanwhile the connection reads and answers further
+/// commands, so the result may follow theirs: a signaled source's
+/// `signaling/answer`, which its output may be waiting for, is never held up
+/// behind it. It holds its subscription's place under the connection's cap
+/// from the start. A running live output keeps the source connected, as a
+/// viewer does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LiveCreate {
+    /// The command id, which becomes the subscription id.
+    pub id: u64,
+    /// The stream to play.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub stream_id: String,
+    /// Take the stream's audio, when the live container carries it as it
+    /// is (AAC-LC, Opus); any other codec is left out with an
+    /// `audio_omitted` warning and nothing is transcoded. `false` makes a
+    /// video-only output, for a player that cannot play the stream's
+    /// audio.
+    #[serde(default = "with_audio")]
+    pub audio: bool,
+}
+
+/// `live/close`: ends a live output, `closed`; its body ends with its last
+/// chunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LiveClose {
+    /// The command id.
+    pub id: u64,
+    /// The live output.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = ID_PATTERN)))]
+    pub live_id: String,
+}
+
 /// `signaling/subscribe`: a subscription to the signaling of one stream's
 /// signaled sources, or of every stream's; its events carry each signal's
 /// offer, candidates and close (`SignalingEvent`).
@@ -600,6 +646,15 @@ pub enum Command {
     #[serde(rename = "recording/create")]
     #[cfg_attr(feature = "schema", schemars(title = "RecordingCreateCommand"))]
     RecordingCreate(RecordingCreate),
+    /// `live/create`: a live output of a stream; its bytes are fetched
+    /// with `GET /v0/live/{live_id}`.
+    #[serde(rename = "live/create")]
+    #[cfg_attr(feature = "schema", schemars(title = "LiveCreateCommand"))]
+    LiveCreate(LiveCreate),
+    /// `live/close`: ends a live output.
+    #[serde(rename = "live/close")]
+    #[cfg_attr(feature = "schema", schemars(title = "LiveCloseCommand"))]
+    LiveClose(LiveClose),
     /// `signaling/subscribe`: a subscription to the offers of one
     /// stream's signaled sources, or of every stream's. Its end
     /// (`unsubscribe`, the connection's close, a supersede) ends every
@@ -649,6 +704,8 @@ impl Command {
         "session/adopt",
         "backchannel/release",
         "recording/create",
+        "live/create",
+        "live/close",
         "signaling/subscribe",
         "signaling/answer",
         "signaling/candidate",
@@ -679,6 +736,8 @@ impl Command {
             Self::SessionList(c) => c.id,
             Self::BackchannelRelease(c) => c.id,
             Self::RecordingCreate(c) => c.id,
+            Self::LiveCreate(c) => c.id,
+            Self::LiveClose(c) => c.id,
             Self::SignalingSubscribe(c) => c.id,
             Self::SignalingAnswer(c) => c.id,
             Self::SignalingCandidate(c) => c.id,
@@ -712,6 +771,8 @@ impl Command {
             Self::SessionAdopt(_) => "session/adopt",
             Self::BackchannelRelease(_) => "backchannel/release",
             Self::RecordingCreate(_) => "recording/create",
+            Self::LiveCreate(_) => "live/create",
+            Self::LiveClose(_) => "live/close",
             Self::SignalingSubscribe(_) => "signaling/subscribe",
             Self::SignalingAnswer(_) => "signaling/answer",
             Self::SignalingCandidate(_) => "signaling/candidate",
@@ -857,6 +918,22 @@ pub fn parse_command(text: &str) -> Result<Command, CommandError> {
     Ok(command)
 }
 
+/// [`check_limits`] of a `recording/create`: its ids capped, a recording of
+/// some time.
+fn check_recording(start: &RecordingCreate) -> Result<(), ApiError> {
+    cap_stream_id(&start.stream_id)?;
+    let recording_id = start.recording_id.as_deref().unwrap_or_default();
+    cap_chars("recording_id", recording_id, MAX_ID_CHARS)?;
+    if start.duration_ms == 0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidRequest,
+            "`duration_ms` must be at least 1",
+        )
+        .with_detail("field", "duration_ms"));
+    }
+    Ok(())
+}
+
 /// Holds a parsed command to the caps of [`crate::limits`], which the
 /// schema advertises; the first field over its cap is named, its value is
 /// not repeated.
@@ -937,19 +1014,10 @@ fn check_limits(command: &Command) -> Result<(), ApiError> {
             cap_chars("message", &error.message, MAX_TEXT_CHARS)?;
         }
         Command::ClientsRemove(remove) => cap_chars("pin", &remove.pin, MAX_PIN_CHARS)?,
+        Command::LiveCreate(create) => cap_stream_id(&create.stream_id)?,
+        Command::LiveClose(close) => cap_chars("live_id", &close.live_id, MAX_ID_CHARS)?,
         Command::ClientsAdd(add) => cap_chars("pin", &add.pin, MAX_PIN_CHARS)?,
-        Command::RecordingCreate(start) => {
-            cap_stream_id(&start.stream_id)?;
-            let recording_id = start.recording_id.as_deref().unwrap_or_default();
-            cap_chars("recording_id", recording_id, MAX_ID_CHARS)?;
-            if start.duration_ms == 0 {
-                return Err(ApiError::new(
-                    ErrorCode::InvalidRequest,
-                    "`duration_ms` must be at least 1",
-                )
-                .with_detail("field", "duration_ms"));
-            }
-        }
+        Command::RecordingCreate(start) => check_recording(start)?,
         Command::Ping(_)
         | Command::Info(_)
         | Command::MetricsGet(_)
@@ -1158,7 +1226,15 @@ mod tests {
                 "signaling/error",
             ),
             (
-                r#"{"id":27,"type":"clients/add","pin":"00","role":"metrics"}"#,
+                r#"{"id":27,"type":"live/create","stream_id":"front","audio":false}"#,
+                "live/create",
+            ),
+            (
+                r#"{"id":28,"type":"live/close","live_id":"01JL"}"#,
+                "live/close",
+            ),
+            (
+                r#"{"id":29,"type":"clients/add","pin":"00","role":"metrics"}"#,
                 "clients/add",
             ),
         ];
@@ -1172,6 +1248,29 @@ mod tests {
             assert_eq!(serde_json::from_value::<Command>(json).unwrap(), command);
         }
         assert_eq!(Command::NAMES.len(), cases.len());
+    }
+
+    #[test]
+    fn a_live_output_takes_the_audio_unless_asked_otherwise_and_its_ids_are_capped() {
+        let_assert!(
+            Ok(Command::LiveCreate(create)) =
+                parse_command(r#"{"id":1,"type":"live/create","stream_id":"front"}"#)
+        );
+        assert!(create.audio, "audio by default");
+        let long = "x".repeat(MAX_ID_CHARS + 1);
+        for (text, code) in [
+            (
+                format!(r#"{{"id":2,"type":"live/create","stream_id":"{long}"}}"#),
+                ErrorCode::InvalidStreamId,
+            ),
+            (
+                format!(r#"{{"id":3,"type":"live/close","live_id":"{long}"}}"#),
+                ErrorCode::InvalidRequest,
+            ),
+        ] {
+            let_assert!(Err(err) = parse_command(&text), "{text}");
+            assert_eq!(err.error.code, code, "{text}");
+        }
     }
 
     #[test]

@@ -98,6 +98,10 @@ pub struct WorkerConfig {
     /// supervisor checks against: `--max-prerecord-bytes`, `--max-recording-ms`,
     /// `--recording-queue-bytes`, `--recording-start-timeout-ms` and `--max-recordings`.
     pub recordings: RecordingLimits,
+    /// The worker's share of the live limits: `--live-start-timeout-ms` and
+    /// `--max-live`, the per-stream bound, one worker running one stream's
+    /// connection.
+    pub live: crate::LiveLimits,
 }
 
 /// What a worker tells the supervisor, mapped onto trusted types.
@@ -286,7 +290,11 @@ impl WorkerManager {
             .arg("--recording-start-timeout-ms")
             .arg(recordings.start_timeout.as_millis().to_string())
             .arg("--max-recordings")
-            .arg(recordings.max_recordings.to_string());
+            .arg(recordings.max_recordings.to_string())
+            .arg("--live-start-timeout-ms")
+            .arg(self.config.live.start_timeout.as_millis().to_string())
+            .arg("--max-live")
+            .arg(self.config.live.max_live_per_stream.to_string());
         if !connect_ports.is_empty() {
             let ports: Vec<String> = connect_ports.iter().map(u16::to_string).collect();
             command.arg("--connect-ports").arg(ports.join(","));
@@ -703,6 +711,28 @@ impl Worker {
     pub async fn stop_recording(&mut self, recording_id: &str) -> Result<(), IpcError> {
         let message = ToWorker::StopRecording {
             recording_id: recording_id.to_owned(),
+        };
+        self.send(&message, &[]).await
+    }
+
+    /// Starts live output `spec`, its bytes going into `pipe`'s write end.
+    pub async fn start_live(&mut self, spec: &LiveSpec, pipe: OwnedFd) -> Result<(), IpcError> {
+        self.send(&ToWorker::StartLive(spec.clone()), &[pipe.as_fd()])
+            .await
+    }
+
+    /// Tells the worker a reader took live output `live_id`'s body.
+    pub async fn fetch_live(&mut self, live_id: &str) -> Result<(), IpcError> {
+        let message = ToWorker::FetchLive {
+            live_id: live_id.to_owned(),
+        };
+        self.send(&message, &[]).await
+    }
+
+    /// Ends live output `live_id`; the worker ignores one it does not run.
+    pub async fn stop_live(&mut self, live_id: &str) -> Result<(), IpcError> {
+        let message = ToWorker::StopLive {
+            live_id: live_id.to_owned(),
         };
         self.send(&message, &[]).await
     }
@@ -1587,6 +1617,11 @@ mod tests {
             max_recordings: 3,
             ..RecordingLimits::DEFAULT
         };
+        config.live = crate::LiveLimits {
+            start_timeout: Duration::from_millis(3_500),
+            max_live_per_stream: 4,
+            ..crate::LiveLimits::DEFAULT
+        };
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
         let manager = WorkerManager::new(config, Some(udp), Arc::new(SystemClock));
         let mut worker = manager.spawn(&[554, 8554]).unwrap();
@@ -1655,9 +1690,10 @@ mod tests {
         assert!(
             args.contains(
                 "--max-prerecord-bytes\n1048576\n--max-recording-ms\n45000\n--recording-queue-bytes\n65536\n\
-                 --recording-start-timeout-ms\n2500\n--max-recordings\n3\n"
+                 --recording-start-timeout-ms\n2500\n--max-recordings\n3\n\
+                 --live-start-timeout-ms\n3500\n--max-live\n4\n"
             ),
-            "the recording limits as the supervisor holds them: {args}"
+            "the recording and live limits as the supervisor holds them: {args}"
         );
         // A kill is sent once, however often it is asked for.
         let captured = Captured::default();
@@ -1996,6 +2032,7 @@ mod tests {
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
                 recordings: RecordingLimits::DEFAULT,
+                live: crate::LiveLimits::DEFAULT,
             },
             None,
             Arc::new(SystemClock),

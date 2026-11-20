@@ -23,10 +23,13 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lotse_api::{ConnectionId, Event, Handler, Outcome, RecordingBody, RecordingBodyError};
+use lotse_api::{
+    ConnectionId, Event, Handler, LiveBody, LiveBodyError, Outcome, RecordingBody,
+    RecordingBodyError,
+};
 use lotse_api_types::API_VERSION;
 use lotse_api_types::command::{
-    Command, RecordingCreate, StreamPut, WebrtcCandidate, WebrtcOffer, WebrtcReoffer,
+    Command, LiveCreate, RecordingCreate, StreamPut, WebrtcCandidate, WebrtcOffer, WebrtcReoffer,
 };
 use lotse_api_types::error::{ApiError, ErrorCode};
 use lotse_api_types::frame::{Hello, HelloTag};
@@ -34,6 +37,7 @@ use lotse_api_types::info::{
     BuildInfo, Codecs, DemuxMetrics, InfoResult, Limits, Metrics, ProcessMetrics, SandboxInfo,
     SupervisorMetrics,
 };
+use lotse_api_types::live::{LiveCloseReason, LiveCreateResult, live_path};
 use lotse_api_types::recording::{RecordingCloseReason, RecordingCreateResult, recording_path};
 use lotse_api_types::session::{CloseCode, SessionEvent, SessionList, WebrtcReofferResult};
 use lotse_api_types::source::SourceSpec;
@@ -41,12 +45,12 @@ use lotse_api_types::stream::{AudioMode, BackchannelReleaseResult, StreamList, S
 use lotse_core::clock::Clock;
 use lotse_core::codec::{CodecFamily, Kind};
 use lotse_core::connection::{ConnectionConfig, ConnectionError, ConnectionState};
-use lotse_core::id::{RecordingId, StreamId};
+use lotse_core::id::{LiveId, RecordingId, StreamId};
 use lotse_core::registry::Registries;
 use lotse_core::source::SourceConfigError;
 use lotse_core::source_url::SourceUrl;
 use lotse_core::task::spawn_named;
-use lotse_ipc::{RecordingSpec, SessionSpec};
+use lotse_ipc::{LiveSpec, RecordingSpec, SessionSpec};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
@@ -55,6 +59,7 @@ use crate::connect::ConnectPermits;
 use crate::driver::{COMMAND_QUEUE, Demand, Driver, DriverCommand, DriverSpec};
 use crate::gather::{GATHER_DEADLINE, IcePlan, StunServer, TurnEntry};
 use crate::host_cache::{HostCache, HostScan, HostSnapshot};
+use crate::live::{LIVE_QUEUE, LiveEntry, LiveLimits, LiveOwner};
 use crate::memory::{Memory, MemoryProbe};
 use crate::net::demux::{DemuxStats, Registrations};
 use crate::net::stun_client::StunClient;
@@ -80,6 +85,16 @@ const WEBRTC: &str = "webrtc";
 /// The output kind of event recordings, announced when the build has a recording
 /// container (`Registries::recording`).
 const RECORDING: &str = "recording";
+
+/// The output kind of live fMP4 over HTTP, announced when the build has a
+/// live container (`Registries::live`).
+const LIVE: &str = "live";
+
+/// How much longer than `limits.live_start_timeout_ms` `live/create` waits
+/// for the worker's init segment: the worker's own timeout ends the output
+/// first and says why; this only bounds a start that never reached a worker
+/// (its host lookup keeps failing, a backoff holds the worker back).
+const LIVE_CREATE_SLACK: Duration = Duration::from_secs(2);
 
 /// What `hello` and `info` always announce beyond the outputs.
 const FEATURES: [&str; 1] = ["session_adopt"];
@@ -248,6 +263,12 @@ impl Supervisor {
         } else {
             RecordingLimits::NONE
         };
+        // Likewise without a live container: no live output is accepted.
+        state.live_limits = if environment.registries.live.is_some() {
+            settings.limits.live
+        } else {
+            LiveLimits::NONE
+        };
         let shared = Arc::new(Shared {
             manager: WorkerManager::new(environment.worker, environment.udp, Arc::clone(&clock))
                 .with_turn(turn.clone()),
@@ -271,12 +292,13 @@ impl Supervisor {
         }
     }
 
-    /// Closes every session and ends every recording with `shutting_down`,
-    /// and ends the signaling (each offered signal closes `source_stopped`,
-    /// each signaling subscription ends); the first step of the shutdown,
-    /// before the control connections say goodbye. A recording's worker
-    /// writes its last fragment while it stops, but its report is not
-    /// waited for, so the body is cut.
+    /// Closes every session and ends every recording and live output with
+    /// `shutting_down`, and ends the signaling (each offered signal closes
+    /// `source_stopped`, each signaling subscription ends); the first step
+    /// of the shutdown, before the control connections say goodbye. A
+    /// recording's worker writes its last fragment while it stops, but its
+    /// report is not waited for, so the body is cut; a live output's
+    /// `closed` goes out at once, its counters zero, for the same reason.
     pub fn close_sessions(&self) {
         let mut state = self.shared.lock();
         state.close_sessions_where(
@@ -286,6 +308,7 @@ impl Supervisor {
             CloseBy::Supervisor,
         );
         state.end_recordings_where(|_| true, RecordingCloseReason::ShuttingDown);
+        state.close_lives_now(LiveCloseReason::ShuttingDown);
         state.signaling_shutdown();
     }
 
@@ -370,13 +393,14 @@ impl Supervisor {
     }
 
     /// The output kinds compiled in: the session outputs, then `recording` with
-    /// a recording container.
+    /// a recording container and `live` with a live one.
     fn outputs(&self) -> Vec<String> {
         self.registries
             .outputs
             .kinds()
             .into_iter()
             .chain(self.registries.recording.is_some().then_some(RECORDING))
+            .chain(self.registries.live.is_some().then_some(LIVE))
             .map(str::to_owned)
             .collect()
     }
@@ -702,15 +726,20 @@ impl Supervisor {
         state.next_connection = state.next_connection.saturating_add(1);
         let id = format!("c{}", state.next_connection);
         let (demand, demand_rx) = watch::channel(Demand::default());
-        // Room besides the rest for the close each session reserves and
-        // the stop each recording does.
+        // Room besides the rest for the close each session reserves, the
+        // stop each recording does, and the fetch and stop each live output
+        // does.
         let sessions = usize::try_from(self.settings.limits.max_sessions).unwrap_or(usize::MAX);
         let recordings =
             usize::try_from(state.recording_limits.max_recordings).unwrap_or(usize::MAX);
+        let lives = usize::try_from(state.live_limits.max_live)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2);
         let (commands, commands_rx) = mpsc::channel(
             COMMAND_QUEUE
                 .saturating_add(sessions)
-                .saturating_add(recordings),
+                .saturating_add(recordings)
+                .saturating_add(lives),
         );
         state.connections.insert(
             id.clone(),
@@ -787,6 +816,10 @@ impl Supervisor {
             state.end_recordings_where(
                 |recording| recording.stream_id == stream_id,
                 RecordingCloseReason::StreamDeleted,
+            );
+            state.end_lives_where(
+                |live| live.stream_id == stream_id,
+                LiveCloseReason::StreamDeleted,
             );
             state.streams.remove(stream_id).map(|entry| {
                 for source in entry.sources {
@@ -1453,6 +1486,151 @@ impl Supervisor {
         Ok((result, rx))
     }
 
+    /// `live/create`: validates against the limits, creates the output's
+    /// pipe, hands its start with the write end to the stream's
+    /// connection's driver (which raises its demand: a live output is a
+    /// viewer), and waits for the worker's init segment, whose MIME type the
+    /// result carries, for at most `limits.live_start_timeout_ms` and
+    /// [`LIVE_CREATE_SLACK`]: the one command that waits on the camera,
+    /// bounded, as `webrtc/reoffer` waits on a worker. The control
+    /// connection reads and answers its further commands meanwhile, so an
+    /// on-demand signaled source this output starts can be answered on the
+    /// same connection (its `signaling/answer`) and send the init segment.
+    /// Then the fetch deadline runs until the body is taken. The command's
+    /// future may be dropped at its wait (the client removed, shutdown, the
+    /// connection closed): the output stays registered with its owner,
+    /// whose connection's close ends it.
+    async fn live_create(
+        &self,
+        connection: ConnectionId,
+        create: &LiveCreate,
+    ) -> Result<(LiveCreateResult, mpsc::Receiver<Event>), ApiError> {
+        let stream_id = StreamId::new(&create.stream_id).map_err(|err| {
+            ApiError::new(ErrorCode::InvalidStreamId, err.to_string())
+                .with_detail("stream_id", create.stream_id.as_str())
+        })?;
+        let live_id = LiveId::new(&ulid(self.shared.clock.wall_now()).map_err(internal)?)
+            .map_err(internal)?;
+        let (reader, writer) = std::io::pipe().map_err(internal)?;
+        let reader =
+            tokio::net::unix::pipe::Receiver::from_owned_fd(reader.into()).map_err(internal)?;
+        let (events, rx) = mpsc::channel(LIVE_QUEUE);
+        let (waiting, started) = oneshot::channel();
+        let limits = {
+            let mut state = self.shared.lock();
+            let limits = state.live_limits;
+            check_live_limits(&mut state, stream_id.as_str(), limits)?;
+            let stream = state.streams.get(stream_id.as_str()).ok_or_else(|| {
+                ApiError::new(ErrorCode::StreamNotFound, "no such stream")
+                    .with_detail("stream_id", stream_id.as_str())
+            })?;
+            let SessionConnection {
+                id: connection_id,
+                commands,
+                ..
+            } = session_connection(&state, stream)?;
+            let spec = LiveSpec {
+                live_id: live_id.as_str().to_owned(),
+                audio: create.audio,
+                buffer_bytes: limits.buffer_bytes,
+            };
+            let (fetch_slot, stop_slot) = hand_over_live(&commands, spec, writer.into())?;
+            let serial = state.last_live.saturating_add(1);
+            state.last_live = serial;
+            state.lives.insert(
+                live_id.as_str().to_owned(),
+                LiveEntry {
+                    serial,
+                    stream_id: stream_id.as_str().to_owned(),
+                    connection: connection_id.clone(),
+                    owner: Some(LiveOwner {
+                        connection,
+                        subscription: create.id,
+                        events,
+                    }),
+                    waiting: Some(waiting),
+                    mime: None,
+                    body: Some(reader),
+                    fetch_slot: Some(fetch_slot),
+                    stop_slot: Some(stop_slot),
+                    ending: None,
+                    warned: false,
+                    timer: None,
+                },
+            );
+            state.refresh_connection(&connection_id);
+            drop(state);
+            tracing::info!(
+                event = "live_opened",
+                live.id = %live_id,
+                stream.id = %stream_id,
+                connection.id = %connection_id,
+                control.connection = connection.0,
+                audio = create.audio,
+                "live output opened; waiting for its init segment"
+            );
+            limits
+        };
+        let wait = limits.start_timeout.saturating_add(LIVE_CREATE_SLACK);
+        let outcome = tokio::select! {
+            outcome = started => outcome.unwrap_or(Err(LiveCloseReason::InternalError)),
+            () = self.shared.clock.sleep(wait) => Err(LiveCloseReason::SourceNotLive),
+        };
+        let mime = match outcome {
+            Ok(mime) => mime,
+            Err(reason) => {
+                self.shared.lock().end_live(live_id.as_str(), reason);
+                tracing::info!(live.id = %live_id, reason = reason.as_str(), "live output ended before its init segment");
+                return Err(live_start_error(reason).with_detail("live_id", live_id.as_str()));
+            }
+        };
+        let timer = self.live_fetch_deadline(live_id.as_str(), limits.fetch_timeout);
+        if let Some(entry) = self.shared.lock().lives.get_mut(live_id.as_str()) {
+            entry.timer = Some(timer);
+        }
+        let result = LiveCreateResult {
+            url: live_path(live_id.as_str()),
+            live_id: live_id.as_str().to_owned(),
+            mime,
+        };
+        Ok((result, rx))
+    }
+
+    /// The fetch deadline of live output `live_id`, `timeout` from now on the
+    /// injected clock ([`State::live_fetch_deadline`]).
+    fn live_fetch_deadline(&self, live_id: &str, timeout: Duration) -> RecordingTimer {
+        let sleep = self.shared.clock.sleep(timeout);
+        let serial = self
+            .shared
+            .lock()
+            .lives
+            .get(live_id)
+            .map_or(0, |entry| entry.serial);
+        let shared = Arc::clone(&self.shared);
+        let id = live_id.to_owned();
+        let timer = spawn_named("live.fetch", async move {
+            sleep.await;
+            shared.lock().live_fetch_deadline(&id, serial);
+        });
+        RecordingTimer(timer.abort_handle())
+    }
+
+    /// `live/close`: ends a live output `closed`; one not open is
+    /// `live_not_found`.
+    fn live_close(&self, live_id: &str) -> Result<(), ApiError> {
+        let open = self.shared.lock().lives.contains_key(live_id);
+        if !open {
+            return Err(
+                ApiError::new(ErrorCode::LiveNotFound, "no open live output has this id")
+                    .with_detail("live_id", live_id),
+            );
+        }
+        self.shared
+            .lock()
+            .end_live(live_id, LiveCloseReason::Closed);
+        Ok(())
+    }
+
     /// The fetch deadline of recording `serial`, `recording_id`, `timeout` from now on
     /// the injected clock ([`State::recording_fetch_deadline`]).
     fn fetch_deadline(&self, recording_id: &str, serial: u64, timeout: Duration) -> RecordingTimer {
@@ -1508,6 +1686,17 @@ impl Supervisor {
                     Outcome::Error(error)
                 }
             },
+            Command::LiveCreate(create) => match self.live_create(connection, &create).await {
+                Ok((result, events)) => Outcome::SubscribedWith {
+                    result: serde_json::to_value(result).unwrap_or_default(),
+                    events,
+                },
+                Err(error) => {
+                    tracing::debug!(code = error.code.as_str(), detail = %error.message, "live/create refused");
+                    Outcome::Error(error)
+                }
+            },
+            Command::LiveClose(close) => empty(self.live_close(&close.live_id)),
             Command::SignalingSubscribe(subscribe) => {
                 self.signaling_subscribe(connection, subscribe.id, subscribe.stream_id)
             }
@@ -1565,6 +1754,7 @@ impl Handler for Supervisor {
     fn unsubscribed(&self, connection: ConnectionId, subscription: u64) -> Option<Event> {
         let mut state = self.shared.lock();
         if state.unsubscribe_recording(connection, subscription)
+            || state.unsubscribe_live(connection, subscription)
             || state.signaling_unsubscribed(connection, subscription)
         {
             return None;
@@ -1588,6 +1778,7 @@ impl Handler for Supervisor {
         let orphans = {
             let mut state = self.shared.lock();
             state.recordings_connection_closed(connection);
+            state.lives_connection_closed(connection);
             state.connection_closed(connection)
         };
         for (id, serial, epoch) in orphans {
@@ -1612,6 +1803,16 @@ impl Handler for Supervisor {
                 },
             );
         }
+    }
+
+    /// Hands out the read end of a live output's pipe once, with its MIME
+    /// type; the worker is told a reader took it.
+    fn live_body(&self, live_id: &LiveId) -> Result<LiveBody, LiveBodyError> {
+        let body = self.shared.lock().take_live_body(live_id.as_str());
+        if let Err(error) = &body {
+            tracing::debug!(live.id = %live_id, %error, "live body refused");
+        }
+        body
     }
 
     /// The snapshot `metrics/get` answers with, for `GET /v0/metrics`: the
@@ -1752,6 +1953,10 @@ fn close_moved_sessions(state: &mut State, stream_id: &str) {
         },
         RecordingCloseReason::StreamChanged,
     );
+    state.end_lives_where(
+        |live| live.stream_id == stream_id && current.as_ref() != Some(&live.connection),
+        LiveCloseReason::StreamChanged,
+    );
 }
 
 /// `limit_reached` when another session would exceed `max_sessions` or,
@@ -1883,6 +2088,91 @@ fn hand_over_recording(
     let stop = commands.clone().try_reserve_owned().map_err(busy)?;
     drop(start.send(DriverCommand::StartRecording { spec, serial, pipe }));
     Ok(stop)
+}
+
+/// `limit_reached` when another live output would exceed `limits.max_live`
+/// or, on `stream_id`, `limits.max_live_per_stream`; the refusal is logged
+/// at warn, rate-limited, since a client can ask again and again.
+fn check_live_limits(
+    state: &mut State,
+    stream_id: &str,
+    limits: LiveLimits,
+) -> Result<(), ApiError> {
+    let (on_stream, total) = state.lives_open(stream_id);
+    let (limit, refused) = if total >= usize::try_from(limits.max_live).unwrap_or(usize::MAX) {
+        ("max_live", "too many live outputs")
+    } else if on_stream >= usize::try_from(limits.max_live_per_stream).unwrap_or(usize::MAX) {
+        ("max_live_per_stream", "too many live outputs of the stream")
+    } else {
+        return Ok(());
+    };
+    if let Some(count) = state.full_lives.hit(state.signaling.clock.now()) {
+        tracing::warn!(
+            stream.id = stream_id,
+            limit,
+            on_stream,
+            total,
+            count,
+            "live/create refused at its limit"
+        );
+    }
+    Err(ApiError::new(ErrorCode::LimitReached, refused).with_detail("limit", limit))
+}
+
+/// The error `live/create` answers with when its output ended for `reason`
+/// before its init segment.
+fn live_start_error(reason: LiveCloseReason) -> ApiError {
+    match reason {
+        LiveCloseReason::NoVideoTrack => {
+            ApiError::new(ErrorCode::NoVideoTrack, "the stream has no video track")
+        }
+        LiveCloseReason::SourceNotLive => ApiError::new(
+            ErrorCode::SourceNotLive,
+            "the stream showed no video the live container carries in time",
+        ),
+        LiveCloseReason::WorkerCrashed => ApiError::new(
+            ErrorCode::WorkerCrashed,
+            "the camera's worker process exited",
+        ),
+        LiveCloseReason::ShuttingDown => ApiError::new(ErrorCode::ShuttingDown, "shutting down"),
+        LiveCloseReason::StreamDeleted => {
+            ApiError::new(ErrorCode::StreamNotFound, "the stream was deleted")
+        }
+        LiveCloseReason::SessionClosed => ApiError::new(
+            ErrorCode::LiveNotFound,
+            "the live output was closed before it started: its subscription was unsubscribed",
+        ),
+        other => ApiError::new(
+            ErrorCode::InternalError,
+            "the live output ended before it started",
+        )
+        .with_detail("reason", other.as_str()),
+    }
+}
+
+/// Hands the start of live output `spec`, with `pipe`, to its connection's
+/// driver, and returns the slots reserved behind it for its fetch and its
+/// stop; a queue without room for all three is `limit_reached`.
+fn hand_over_live(
+    commands: &mpsc::Sender<DriverCommand>,
+    spec: LiveSpec,
+    pipe: std::os::fd::OwnedFd,
+) -> Result<
+    (
+        mpsc::OwnedPermit<DriverCommand>,
+        mpsc::OwnedPermit<DriverCommand>,
+    ),
+    ApiError,
+> {
+    let busy = |_| {
+        ApiError::new(ErrorCode::LimitReached, "the stream's connection is busy")
+            .with_detail("limit", "connection_queue")
+    };
+    let start = commands.clone().try_reserve_owned().map_err(busy)?;
+    let fetch = commands.clone().try_reserve_owned().map_err(busy)?;
+    let stop = commands.clone().try_reserve_owned().map_err(busy)?;
+    drop(start.send(DriverCommand::StartLive { spec, pipe }));
+    Ok((fetch, stop))
 }
 
 /// The connection a session opens on, as [`session_connection`] finds it.
@@ -6998,5 +7288,477 @@ mod tests {
         assert!(!s.shared.lock().recording_id_in_use("k1"));
         s.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A supervisor with the fake live container, whose workers run `binary`.
+    fn with_live(binary: &str, clock: Arc<dyn Clock>) -> Supervisor {
+        let mut environment = environment(binary);
+        environment.registries.live = Some(Arc::new(
+            lotse_core::test_util::FakeLiveMuxerFactory::default(),
+        ));
+        Supervisor::new(session_settings(), environment, clock)
+    }
+
+    fn live_create(id: u64, stream_id: &str) -> String {
+        json!({ "id": id, "type": "live/create", "stream_id": stream_id }).to_string()
+    }
+
+    const LIVE_MIME: &str = "video/mp4; codecs=\"avc1.42c028\"";
+
+    /// Waits for the start the driver's queue `commands` gets; its live id.
+    async fn live_start(commands: &mut mpsc::Receiver<DriverCommand>) -> String {
+        let_assert!(Some(DriverCommand::StartLive { spec, .. }) = within(commands.recv()).await);
+        spec.live_id
+    }
+
+    fn live_report(s: &Supervisor, live_id: &str, report: lotse_ipc::LiveReport) {
+        s.shared.lock().live_report("c1", live_id, report);
+    }
+
+    fn live_started() -> lotse_ipc::LiveReport {
+        lotse_ipc::LiveReport::Started {
+            mime: LIVE_MIME.into(),
+            video: "h264".into(),
+            audio: None,
+        }
+    }
+
+    fn live_closed(reason: &str) -> lotse_ipc::LiveReport {
+        lotse_ipc::LiveReport::Closed {
+            reason: reason.into(),
+            bytes: 10,
+            dropped_frames: 0,
+            drops: 0,
+        }
+    }
+
+    /// `live/create` hands the start to the stream's connection, which it
+    /// raises demand on, and answers once the worker's init segment is in,
+    /// with the MIME type; the body is taken once, the worker told; and
+    /// `live/close` ends it `closed`, the worker's `Closed` its last event.
+    #[tokio::test]
+    async fn a_live_output_is_answered_with_its_mime_type_once_its_worker_started_it() {
+        let dir = private_dir("live-start");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        let info = result(call(&s, r#"{"id":1,"type":"info"}"#).await);
+        assert_eq!(info["outputs"], json!(["live"]));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        assert_eq!(demand(&s).viewers, 1, "a live output is a viewer");
+        assert!(!create.is_finished(), "it waits for the init segment");
+        live_report(&s, &live_id, live_started());
+        let (answer, mut events) = started(within(create).await.unwrap());
+        assert_eq!(
+            answer,
+            json!({ "live_id": live_id, "mime": LIVE_MIME, "url": format!("/v0/live/{live_id}") })
+        );
+        let id = LiveId::new(&live_id).unwrap();
+        let body = s.live_body(&id).unwrap();
+        assert_eq!(body.mime, LIVE_MIME);
+        let_assert!(Some(DriverCommand::FetchLive { live_id: fetched }) = commands.recv().await);
+        assert_eq!(fetched, live_id);
+        assert_eq!(s.live_body(&id).unwrap_err(), LiveBodyError::AlreadyFetched);
+        let close = json!({ "id": 3, "type": "live/close", "live_id": live_id });
+        assert_eq!(result(call(&s, &close.to_string()).await), json!({}));
+        let_assert!(Some(DriverCommand::StopLive { live_id: stopped }) = commands.recv().await);
+        assert_eq!(stopped, live_id);
+        live_report(&s, &live_id, live_closed(lotse_ipc::STOPPED_AS_ASKED));
+        let closed = next(&mut events).await;
+        assert_eq!(
+            (&closed["type"], &closed["reason"]),
+            (&json!("closed"), &json!("closed"))
+        );
+        assert!(events.recv().await.is_none(), "closed is the last event");
+        assert_eq!(demand(&s).viewers, 0);
+        let err = error(call(&s, &close.to_string()).await);
+        assert_eq!(err.code, ErrorCode::LiveNotFound);
+        assert_eq!(
+            s.live_body(&LiveId::new("gone").unwrap()).unwrap_err(),
+            LiveBodyError::NotFound
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A shutdown closes a started live output `shutting_down` at once: its
+    /// owner gets `closed`, its last event, without the worker's report,
+    /// and the worker is asked to stop it.
+    #[tokio::test]
+    async fn a_shutdown_closes_a_live_output_shutting_down_without_its_worker_s_report() {
+        let dir = private_dir("live-shutdown");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        live_report(&s, &live_id, live_started());
+        let (_answer, mut events) = started(within(create).await.unwrap());
+        s.close_sessions();
+        let closed = next(&mut events).await;
+        assert_eq!(
+            (&closed["type"], &closed["reason"], &closed["bytes"]),
+            (&json!("closed"), &json!("shutting_down"), &json!(0))
+        );
+        assert!(events.recv().await.is_none(), "closed is the last event");
+        assert!(s.shared.lock().lives.is_empty());
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        // The worker's late report finds the output gone.
+        live_report(&s, &live_id, live_closed(lotse_ipc::STOPPED_AS_ASKED));
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `unsubscribe` of a live output's subscription ends it
+    /// `session_closed`, asked of its worker; nothing answers but the
+    /// unsubscribe itself.
+    #[tokio::test]
+    async fn unsubscribing_a_live_output_ends_it_session_closed() {
+        let dir = private_dir("live-unsubscribe");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        live_report(&s, &live_id, live_started());
+        let (_answer, _events) = started(within(create).await.unwrap());
+        assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        assert_eq!(
+            s.shared.lock().lives[&live_id].ending,
+            Some(LiveCloseReason::SessionClosed)
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `unsubscribe` of a `live/create` still waiting for its init segment
+    /// ends the output `session_closed`, asked of its worker, and refuses
+    /// the create `live_not_found`.
+    #[tokio::test]
+    async fn unsubscribing_a_waiting_live_create_ends_it_and_refuses_the_create() {
+        let dir = private_dir("live-unsubscribe-waiting");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        assert!(s.unsubscribed(ConnectionId(1), 2).is_none());
+        let err = error(within(create).await.unwrap());
+        assert_eq!(err.code, ErrorCode::LiveNotFound);
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `live/create` holds the request to its stream, a container to write
+    /// with, the limits (refused at either, logged rate-limited) and room in
+    /// the connection's queue for its start, fetch and stop.
+    #[tokio::test]
+    async fn live_create_holds_the_request_to_the_stream_the_limits_and_the_queue() {
+        let captured = Captured::default();
+        let _logs = captured.install();
+        let dir = private_dir("live-limits");
+        let none = Supervisor::new(
+            session_settings(),
+            environment(&blocking_worker(&dir)),
+            Arc::new(SystemClock),
+        );
+        result(call(&none, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let err = error(call(&none, &live_create(2, "front")).await);
+        assert_eq!(
+            (err.code, &err.details["limit"]),
+            (ErrorCode::LimitReached, &json!("max_live")),
+            "no live container: no live output"
+        );
+        none.shutdown().await;
+        let mut settings = session_settings();
+        settings.limits.live = LiveLimits {
+            max_live: 2,
+            max_live_per_stream: 1,
+            ..LiveLimits::DEFAULT
+        };
+        let mut environment = environment(&blocking_worker(&dir));
+        environment.registries.live = Some(Arc::new(
+            lotse_core::test_util::FakeLiveMuxerFactory::default(),
+        ));
+        let s = Arc::new(Supervisor::new(
+            settings,
+            environment,
+            Arc::new(SystemClock),
+        ));
+        let err = error(call(&s, &live_create(1, "bad id")).await);
+        assert_eq!(err.code, ErrorCode::InvalidStreamId);
+        let err = error(call(&s, &live_create(2, "front")).await);
+        assert_eq!(err.code, ErrorCode::StreamNotFound);
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
+        // A busy connection takes no start: one free slot is not three.
+        let (tx, _full) = mpsc::channel(2);
+        s.shared.lock().connections.get_mut("c1").unwrap().commands = tx;
+        let err = error(call(&s, &live_create(3, "front")).await);
+        assert_eq!(err.details["limit"], "connection_queue");
+        assert!(s.shared.lock().lives.is_empty());
+        let mut commands = intercept(&s, 16);
+        let front = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(4, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        let err = error(call(&s, &live_create(5, "front")).await);
+        assert_eq!(err.details["limit"], "max_live_per_stream");
+        // A second stream's output fills `max_live`.
+        let back_connection = s.shared.lock().streams["back"].sources[0]
+            .connection
+            .clone();
+        let (tx, mut back_commands) = mpsc::channel(16);
+        s.shared
+            .lock()
+            .connections
+            .get_mut(&back_connection)
+            .unwrap()
+            .commands = tx;
+        let back = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(6, "back")).await }
+        });
+        let back_id = live_start(&mut back_commands).await;
+        let err = error(call(&s, &live_create(7, "back")).await);
+        assert_eq!(err.details["limit"], "max_live");
+        assert_eq!(
+            captured.lines("live/create refused at its limit").len(),
+            2,
+            "the first and none more within the interval"
+        );
+        live_report(&s, &live_id, live_closed("source_not_live"));
+        let err = error(within(front).await.unwrap());
+        assert_eq!(err.code, ErrorCode::SourceNotLive);
+        s.shared
+            .lock()
+            .live_report(&back_connection, &back_id, live_closed("no_video_track"));
+        let err = error(within(back).await.unwrap());
+        assert_eq!(err.code, ErrorCode::NoVideoTrack);
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The queue of a connection holds the fetch and the stop every live
+    /// output the daemon allows reserves besides its own room: outputs up
+    /// to `max_live` never leave a create without room in an idle queue.
+    #[tokio::test]
+    async fn a_connection_s_queue_holds_the_slots_every_allowed_live_output_reserves() {
+        let dir = private_dir("live-room");
+        let mut settings = session_settings();
+        settings.limits.live = LiveLimits {
+            max_live: 3,
+            ..LiveLimits::DEFAULT
+        };
+        let mut environment = environment(&blocking_worker(&dir));
+        environment.registries.live = Some(Arc::new(
+            lotse_core::test_util::FakeLiveMuxerFactory::default(),
+        ));
+        let s = Supervisor::new(settings, environment, Arc::new(SystemClock));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let sessions = usize::try_from(s.settings.limits.max_sessions).unwrap();
+        let recordings = usize::try_from(s.shared.lock().recording_limits.max_recordings).unwrap();
+        assert_eq!(
+            s.shared.lock().connections["c1"].commands.max_capacity(),
+            COMMAND_QUEUE + sessions + recordings + 3 * 2
+        );
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A start no worker answers within the start timeout and its slack ends
+    /// the output `source_not_live`, its stop handed to the driver; an
+    /// answered one not fetched within the fetch timeout ends `not_fetched`.
+    #[tokio::test]
+    async fn a_live_output_not_started_or_not_fetched_in_time_ends() {
+        let dir = private_dir("live-deadlines");
+        let clock = Arc::new(FakeClock::from_system());
+        let s = Arc::new(with_live(&blocking_worker(&dir), clock.clone()));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let mut commands = intercept(&s, 16);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(1, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        clock.advance(LiveLimits::DEFAULT.start_timeout + LIVE_CREATE_SLACK);
+        let err = error(within(create).await.unwrap());
+        assert_eq!(err.code, ErrorCode::SourceNotLive);
+        assert_eq!(err.details["live_id"], json!(live_id));
+        let_assert!(Some(DriverCommand::StopLive { .. }) = commands.recv().await);
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let second = live_start(&mut commands).await;
+        live_report(&s, &second, live_started());
+        let (_answer, mut events) = started(within(create).await.unwrap());
+        clock.advance(LiveLimits::DEFAULT.fetch_timeout);
+        settle().await;
+        let_assert!(Some(DriverCommand::StopLive { live_id: stopped }) = commands.recv().await);
+        assert_eq!(stopped, second);
+        live_report(&s, &second, live_closed(lotse_ipc::STOPPED_AS_ASKED));
+        assert_eq!(next(&mut events).await["reason"], "not_fetched");
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A live output of a stream moved to another source ends
+    /// `stream_changed` as its old connection goes, one of a deleted stream
+    /// `stream_deleted`, asked of its worker first.
+    #[tokio::test]
+    async fn a_moved_or_deleted_stream_ends_its_live_outputs() {
+        let dir = private_dir("live-moved");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        let delete = json!({ "id": 1, "type": "stream/delete", "stream_id": "front" }).to_string();
+        for (id, change, reason) in [
+            (
+                1,
+                put("front", "fake://127.0.0.1:9/", false),
+                "stream_changed",
+            ),
+            (2, delete, "stream_deleted"),
+        ] {
+            result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+            let connection = s.shared.lock().streams["front"].sources[0]
+                .connection
+                .clone();
+            let (tx, mut commands) = mpsc::channel(16);
+            s.shared
+                .lock()
+                .connections
+                .get_mut(&connection)
+                .unwrap()
+                .commands = tx;
+            let create = spawn_named("test.live_create", {
+                let s = Arc::clone(&s);
+                async move { call(&s, &live_create(id, "front")).await }
+            });
+            let live_id = live_start(&mut commands).await;
+            s.shared
+                .lock()
+                .live_report(&connection, &live_id, live_started());
+            let (_answer, mut events) = started(within(create).await.unwrap());
+            result(call(&s, &change).await);
+            assert_eq!(next(&mut events).await["reason"], reason);
+            assert!(!s.shared.lock().lives.contains_key(&live_id));
+        }
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A live output of a stream whose first source moves to another
+    /// connection, the old one kept as a later source, is asked to stop at
+    /// once and ends `stream_changed` with its worker's `Closed`.
+    #[tokio::test]
+    async fn a_live_output_of_a_stream_whose_first_source_moved_ends_stream_changed() {
+        let dir = private_dir("live-moved-first");
+        let s = Arc::new(with_live(&blocking_worker(&dir), Arc::new(SystemClock)));
+        result(call(&s, &put("front", "fake://127.0.0.1:1/", false)).await);
+        let connection = s.shared.lock().streams["front"].sources[0]
+            .connection
+            .clone();
+        let (tx, mut commands) = mpsc::channel(16);
+        s.shared
+            .lock()
+            .connections
+            .get_mut(&connection)
+            .unwrap()
+            .commands = tx;
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(2, "front")).await }
+        });
+        let live_id = live_start(&mut commands).await;
+        s.shared
+            .lock()
+            .live_report(&connection, &live_id, live_started());
+        let (_answer, mut events) = started(within(create).await.unwrap());
+        // Another stream's output, on a connection of its own, stays.
+        result(call(&s, &put("back", "fake://127.0.0.1:2/", false)).await);
+        let back = s.shared.lock().streams["back"].sources[0]
+            .connection
+            .clone();
+        let (tx, mut back_commands) = mpsc::channel(16);
+        s.shared.lock().connections.get_mut(&back).unwrap().commands = tx;
+        let create = spawn_named("test.live_create", {
+            let s = Arc::clone(&s);
+            async move { call(&s, &live_create(4, "back")).await }
+        });
+        let back_live = live_start(&mut back_commands).await;
+        s.shared
+            .lock()
+            .live_report(&back, &back_live, live_started());
+        let (_answer, _back_events) = started(within(create).await.unwrap());
+        let failover = json!({ "id": 3, "type": "stream/put", "stream_id": "front",
+                               "sources": [{ "protocol": "fake", "url": "fake://127.0.0.1:9/" },
+                                           { "protocol": "fake", "url": "fake://127.0.0.1:1/" }] });
+        result(call(&s, &failover.to_string()).await);
+        assert_eq!(
+            s.shared.lock().streams["front"].sources[1].connection,
+            connection,
+            "the old connection stays, as the second source's"
+        );
+        let_assert!(
+            Some(DriverCommand::StopLive { live_id: stopped }) = within(commands.recv()).await
+        );
+        assert_eq!(stopped, live_id);
+        s.shared.lock().live_report(
+            &connection,
+            &live_id,
+            live_closed(lotse_ipc::STOPPED_AS_ASKED),
+        );
+        assert_eq!(next(&mut events).await["reason"], "stream_changed");
+        assert!(!s.shared.lock().lives.contains_key(&live_id));
+        assert!(s.shared.lock().lives.contains_key(&back_live));
+        assert!(back_commands.try_recv().is_err(), "nothing asked of it");
+        s.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Why an output that ended before its init segment refuses its
+    /// `live/create`.
+    #[test]
+    fn a_live_output_ended_before_its_start_refuses_its_create_with_why() {
+        for (reason, code) in [
+            (LiveCloseReason::NoVideoTrack, ErrorCode::NoVideoTrack),
+            (LiveCloseReason::SourceNotLive, ErrorCode::SourceNotLive),
+            (LiveCloseReason::WorkerCrashed, ErrorCode::WorkerCrashed),
+            (LiveCloseReason::ShuttingDown, ErrorCode::ShuttingDown),
+            (LiveCloseReason::StreamDeleted, ErrorCode::StreamNotFound),
+            (LiveCloseReason::SessionClosed, ErrorCode::LiveNotFound),
+            (LiveCloseReason::CodecChanged, ErrorCode::InternalError),
+        ] {
+            assert_eq!(live_start_error(reason).code, code, "{reason}");
+        }
+        assert_eq!(
+            live_start_error(LiveCloseReason::ClientGone).details["reason"],
+            "client_gone"
+        );
     }
 }

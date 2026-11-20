@@ -1870,6 +1870,7 @@ impl Api {
                 worker_threads: 1,
                 worker_address_space: 1 << 30,
                 recordings: lotse_supervisor::RecordingLimits::DEFAULT,
+                live: lotse_supervisor::LiveLimits::DEFAULT,
             },
             linger: Duration::from_millis(200),
             connect_concurrency: lotse_supervisor::DEFAULT_CONNECT_CONCURRENCY,
@@ -1893,6 +1894,7 @@ impl Api {
                 worker_address_space: 1 << 30,
                 max_sessions: 256,
                 recordings: lotse_supervisor::RecordingLimits::DEFAULT,
+                live: lotse_supervisor::LiveLimits::DEFAULT,
             },
             udp: Some(Arc::clone(&bound.socket)),
             front_door: Some(FrontDoor {

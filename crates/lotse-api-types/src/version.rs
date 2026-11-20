@@ -12,7 +12,7 @@
 //! API change does not bump it.
 
 /// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`], [`RECORDING_PATH`],
-/// [`PAIR_PATH`] and [`METRICS_PATH`]
+/// [`LIVE_PATH`], [`PAIR_PATH`] and [`METRICS_PATH`]
 /// from one `major, minor, patch`, so they cannot disagree.
 macro_rules! api_version {
     ($major:literal, $minor:literal, $patch:literal) => {
@@ -32,6 +32,10 @@ macro_rules! api_version {
         /// Where event recordings' bytes are served: `/v<major>/recording`, each
         /// recording at `/v<major>/recording/{recording_id}` ([`crate::recording::recording_path`]).
         pub const RECORDING_PATH: &str = concat!("/v", $major, "/recording");
+
+        /// Where live outputs' bytes are served: `/v<major>/live`, each at
+        /// `/v<major>/live/{live_id}` ([`crate::live::live_path`]).
+        pub const LIVE_PATH: &str = concat!("/v", $major, "/live");
 
         /// Where a pairing connection sends its secret: `POST
         /// /v<major>/pair`. Versioned with the API like every other path;
@@ -120,6 +124,7 @@ mod tests {
         assert_eq!(WS_PATH, "/v0/ws");
         assert_eq!(PAIR_PATH, "/v0/pair");
         assert_eq!(RECORDING_PATH, "/v0/recording");
+        assert_eq!(LIVE_PATH, "/v0/live");
         assert_eq!(METRICS_PATH, "/v0/metrics");
         assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
     }

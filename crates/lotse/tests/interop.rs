@@ -1395,4 +1395,151 @@ mod recording {
         assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
         camera.stop();
     }
+
+    /// The `codecs` a live output of `video` and `audio` names (RFC 6381):
+    /// the video's sample entry, then the audio's when the container carries
+    /// it as it is.
+    #[cfg(feature = "output-live")]
+    fn live_codecs(video: Video, audio: Audio) -> (&'static str, Option<&'static str>) {
+        let video = match video {
+            Video::H264 => "avc1.",
+            Video::H265 => "hvc1.",
+        };
+        let audio = match audio {
+            Audio::Aac => Some("mp4a.40.2"),
+            Audio::Opus => Some("Opus"),
+            Audio::None | Audio::Pcmu | Audio::G722 => None,
+        };
+        (video, audio)
+    }
+
+    /// Every movie fragment of `body` holds at most one video sample (ISO/IEC
+    /// 14496-12 §8.8.4, track 1 the video's).
+    #[cfg(feature = "output-live")]
+    fn check_one_frame_per_fragment(body: &[u8]) {
+        use mp4_atom::{Any, Decode as _};
+
+        let mut rest = body;
+        while !rest.is_empty() {
+            if let Any::Moof(moof) = Any::decode(&mut rest).expect("a box") {
+                let video_samples: usize = moof
+                    .traf
+                    .iter()
+                    .filter(|traf| traf.tfhd.track_id == 1)
+                    .flat_map(|traf| &traf.trun)
+                    .map(|trun| trun.samples.len())
+                    .sum();
+                assert!(video_samples <= 1, "one video frame per fragment");
+            }
+        }
+    }
+
+    /// A live output of a camera sending `video` and `audio`
+    /// (`live/create`), fetched (`GET /v0/live/{live_id}`) for a few seconds
+    /// and closed (`live/close`): its body ends with its last chunk, its
+    /// type is the result's MIME type, every fragment holds at most one
+    /// video frame (ISO/IEC 14496-12 §8.8.4), and ffprobe decodes every
+    /// frame, the video from a keyframe on at the camera's rate without a
+    /// hole; audio the container does not carry is left out with
+    /// `audio_omitted`.
+    #[cfg(feature = "output-live")]
+    async fn live(video: Video, audio: Audio) {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let camera = Camera::start_video(video, audio, Arc::clone(&clock))
+            .await
+            .expect("MediaMTX and ffmpeg (run through `mise run interop`)");
+        let (daemon, control, dir) =
+            daemon(&format!("live-{}-{}", video.name(), audio.name())).await;
+        put_and_fill(&control, &camera, 1_000, &*clock).await;
+        let (_id, result, mut events) = control
+            .subscribe(json!({ "type": "live/create", "stream_id": STREAM }))
+            .await
+            .expect("live/create");
+        let mime = result["mime"].as_str().unwrap().to_owned();
+        let (video_codec, audio_codec) = live_codecs(video, audio);
+        assert!(
+            mime.starts_with(&format!("video/mp4; codecs=\"{video_codec}")),
+            "{mime}"
+        );
+        assert_eq!(
+            audio_codec.is_some_and(|codec| mime.ends_with(&format!(",{codec}\""))),
+            audio_codec.is_some(),
+            "{mime}"
+        );
+        let fetch = fetch_on_socket(&dir.join("lotse.sock"), result["url"].as_str().unwrap()).await;
+        clock.sleep(PLAY).await;
+        control
+            .command(json!({ "type": "live/close", "live_id": result["live_id"] }))
+            .await
+            .expect("live/close");
+        let events = until_closed(&mut events, &*clock).await;
+        let closed = events.last().unwrap();
+        assert_eq!(closed["reason"], "closed", "{events:?}");
+        let warned = events.iter().any(|event| event["code"] == "audio_omitted");
+        assert_eq!(
+            warned,
+            audio != Audio::None && audio_codec.is_none(),
+            "{events:?}"
+        );
+        let fetched = fetch.await.expect("the fetch");
+        assert_eq!(fetched.status, 200, "{fetched:?}");
+        assert_eq!(fetched.content_type.as_deref(), Some(mime.as_str()));
+        assert!(fetched.whole, "the body ends with its last chunk");
+        assert_eq!(
+            closed["bytes"].as_u64(),
+            u64::try_from(fetched.bytes.len()).ok()
+        );
+
+        check_one_frame_per_fragment(&fetched.bytes);
+        let file = dir.join("live.mp4");
+        std::fs::write(&file, &fetched.bytes).unwrap();
+        let (video_frames, audio_frames) = ffprobe(&file);
+        check_video(&video_frames, video);
+        assert!(
+            video_frames.span_ms() >= PLAY.as_millis().try_into().unwrap(),
+            "at least what played: {} ms",
+            video_frames.span_ms()
+        );
+        assert_eq!(
+            audio_frames.is_some(),
+            audio_codec.is_some(),
+            "an audio stream"
+        );
+        if let Some(sound) = audio_frames {
+            assert_eq!(sound.holes(), [], "the audio runs without a hole");
+        }
+
+        Arc::into_inner(control).expect("one owner").close().await;
+        let (code, rest) = daemon.terminate();
+        assert_eq!(code, Some(0), "clean exit\n{}", rest.join("\n"));
+        camera.stop();
+    }
+
+    #[cfg(feature = "output-live")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_live_h264_aac() {
+        live(Video::H264, Audio::Aac).await;
+    }
+
+    #[cfg(feature = "output-live")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_live_h265() {
+        live(Video::H265, Audio::None).await;
+    }
+
+    #[cfg(feature = "output-live")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_live_opus() {
+        live(Video::H264, Audio::Opus).await;
+    }
+
+    #[cfg(feature = "output-live")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs MediaMTX, ffmpeg and ffprobe: mise run interop"]
+    async fn mediamtx_iso14496_12_live_leaves_out_pcmu_with_a_warning() {
+        live(Video::H264, Audio::Pcmu).await;
+    }
 }

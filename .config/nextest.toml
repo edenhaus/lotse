@@ -23,3 +23,10 @@ slow-timeout = { period = "20s", terminate-after = 3 }
 [[profile.default.overrides]]
 filter = 'package(lotse-worker) & test(/^live::tests::/)'
 slow-timeout = { period = "20s", terminate-after = 3 }
+
+# The live bodies' tests (lotse-api, `live` in their names) take under a second each. A mutant
+# whose body never ends (`next_chunk` always another empty chunk) keeps hyper polling it without
+# yielding, so the routing test's own 5 s bound cannot fire. nextest ends them after 60 s.
+[[profile.default.overrides]]
+filter = 'package(lotse-api) & test(/live/)'
+slow-timeout = { period = "20s", terminate-after = 3 }

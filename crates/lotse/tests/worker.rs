@@ -48,6 +48,7 @@ fn manager_with_sandbox(sandbox: &str) -> WorkerManager {
             worker_address_space: 1 << 30,
             max_sessions: 256,
             recordings: lotse_supervisor::RecordingLimits::DEFAULT,
+            live: lotse_supervisor::LiveLimits::DEFAULT,
         },
         Some(Arc::new(udp)),
         Arc::new(SystemClock),

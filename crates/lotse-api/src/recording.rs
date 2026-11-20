@@ -66,6 +66,7 @@ use tokio::sync::{oneshot, watch};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::clients::ClientStore;
 use crate::connection::refuse;
 use crate::listener::PeerInfo;
 use crate::{AppState, BODY_STALL_TIMEOUT, CLOSE_TIMEOUT, Handler, RECORDING_REPORT_TIMEOUT};
@@ -146,7 +147,7 @@ impl BodyWatch {
     }
 
     /// Records what the body does now.
-    fn set(&self, state: BodyState) {
+    pub(crate) fn set(&self, state: BodyState) {
         self.0.send_replace(state);
     }
 
@@ -284,10 +285,7 @@ pub(crate) async fn fetch<H: Handler>(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let removed = match (state.clients.as_deref(), &peer) {
-        (Some(clients), PeerInfo::Tls { pin, .. }) => !clients.allows(pin),
-        _ => false,
-    };
+    let removed = client_removed(state.clients.as_deref(), &peer);
     let request = Request {
         peer: &peer,
         removed,
@@ -302,6 +300,15 @@ pub(crate) async fn fetch<H: Handler>(
     answer(&request, &|recording_id| {
         handler.recording_body(recording_id)
     })
+}
+
+/// Whether `peer` is a TLS listener's client that `clients` no longer
+/// allows: one removed since its handshake. A body route refuses it.
+pub(crate) fn client_removed(clients: Option<&ClientStore>, peer: &PeerInfo) -> bool {
+    match (clients, peer) {
+        (Some(clients), PeerInfo::Tls { pin, .. }) => !clients.allows(pin),
+        _ => false,
+    }
 }
 
 /// Any other method on a recording's path, HEAD included: 405 with `Allow: GET`

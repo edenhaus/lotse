@@ -131,6 +131,16 @@ pub(crate) struct WorkerArgs {
     /// The most recordings at once: the daemon's `limits.max_recordings`.
     #[arg(long, value_name = "N", default_value_t = lotse_worker::DEFAULT_MAX_RECORDINGS)]
     pub(crate) max_recordings: usize,
+
+    /// How long a live output waits for the stream's video and, once
+    /// fetched, its first keyframe: the daemon's `limits.live_start_timeout_ms`.
+    #[arg(long, value_name = "MS", default_value_t = 10_000)]
+    pub(crate) live_start_timeout_ms: u64,
+
+    /// The most live outputs at once: the daemon's
+    /// `limits.max_live_per_stream`, a worker running one stream's connection.
+    #[arg(long, value_name = "N", default_value_t = lotse_worker::DEFAULT_MAX_LIVE_PER_STREAM)]
+    pub(crate) max_live: usize,
 }
 
 /// `lotse serve`. Every flag has a `LOTSE_*` variable; both override the
@@ -287,6 +297,28 @@ pub(crate) struct ServeArgs {
     /// Recordings at once on one stream.
     #[arg(long, env = "LOTSE_MAX_RECORDINGS_PER_STREAM", value_name = "N")]
     pub(crate) max_recordings_per_stream: Option<u32>,
+
+    /// What one live output holds that its reader has not taken, in bytes;
+    /// beyond it the output drops to the next keyframe.
+    #[arg(long, env = "LOTSE_LIVE_BUFFER_BYTES", value_name = "BYTES")]
+    pub(crate) live_buffer_bytes: Option<u32>,
+
+    /// How long a live output's body waits for its `GET`; then the output ends.
+    #[arg(long, env = "LOTSE_LIVE_FETCH_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) live_fetch_timeout_ms: Option<u64>,
+
+    /// How long a live output waits for the stream's video and, once
+    /// fetched, its first keyframe; and `live/create` for its init segment.
+    #[arg(long, env = "LOTSE_LIVE_START_TIMEOUT_MS", value_name = "MS")]
+    pub(crate) live_start_timeout_ms: Option<u64>,
+
+    /// Live outputs at once, over every stream.
+    #[arg(long, env = "LOTSE_MAX_LIVE", value_name = "N")]
+    pub(crate) max_live: Option<u32>,
+
+    /// Live outputs at once on one stream.
+    #[arg(long, env = "LOTSE_MAX_LIVE_PER_STREAM", value_name = "N")]
+    pub(crate) max_live_per_stream: Option<u32>,
 
     /// Source connection attempts at once, across every camera; at least 1.
     #[arg(long, env = "LOTSE_CONNECT_CONCURRENCY", value_name = "N")]
@@ -463,6 +495,32 @@ mod tests {
                 recordings.max_recordings
             ),
             (1 << 20, 45_000, 1 << 16, 2_500, 3)
+        );
+    }
+
+    #[test]
+    fn a_worker_started_by_hand_holds_the_daemon_s_default_live_limits() {
+        let bare: WorkerArgs = args_of(&["lotse", "worker"], "worker");
+        assert_eq!(
+            (
+                Duration::from_millis(bare.live_start_timeout_ms),
+                bare.max_live
+            ),
+            (
+                lotse_worker::DEFAULT_LIVE_START_TIMEOUT,
+                lotse_worker::DEFAULT_MAX_LIVE_PER_STREAM
+            )
+        );
+        assert_eq!(
+            (
+                lotse_supervisor::LiveLimits::DEFAULT.start_timeout,
+                usize::try_from(lotse_supervisor::LiveLimits::DEFAULT.max_live_per_stream).unwrap()
+            ),
+            (
+                lotse_worker::DEFAULT_LIVE_START_TIMEOUT,
+                lotse_worker::DEFAULT_MAX_LIVE_PER_STREAM
+            ),
+            "the supervisor's are the worker's"
         );
     }
 
