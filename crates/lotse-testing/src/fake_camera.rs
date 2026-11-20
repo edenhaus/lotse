@@ -1699,7 +1699,7 @@ impl Connection {
             let (message, consumed) = match Message::<Vec<u8>>::parse(inbound.as_slice()) {
                 Ok(parsed) => parsed,
                 Err(ParseError::Incomplete(_)) => return true,
-                Err(ParseError::Error) => return false,
+                Err(ParseError::Error | ParseError::Invalid(_)) => return false,
             };
             inbound.drain(..consumed);
             let request = match message {
@@ -2602,7 +2602,7 @@ mod tests {
                         continue;
                     }
                     Err(ParseError::Incomplete(_)) => {}
-                    Err(ParseError::Error) => panic!("unparsable answer"),
+                    Err(ParseError::Error | ParseError::Invalid(_)) => panic!("unparsable answer"),
                 }
                 let mut buf = [0_u8; 4096];
                 tokio::select! {
