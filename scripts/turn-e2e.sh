@@ -16,7 +16,7 @@ set -eu
 
 # coturn 4.18.0 (2026-09-08), the multi-arch index digest, from the project's own registry on
 # GitHub: Docker Hub's anonymous pull limit ran out on GitHub's shared runners (2026-10-09).
-IMAGE="ghcr.io/coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3"
+IMAGE="ghcr.io/coturn/coturn:4.19.2@sha256:ccdbc51e6f072130b0fc9eebda21f8d026d0a25581746c52557e887818011a3f"
 STATIC=lotse-turn-e2e-static
 REST=lotse-turn-e2e-rest
 SECRET=lotse-rest-secret
