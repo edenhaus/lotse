@@ -60,7 +60,7 @@ seccompiler = { version = "0.5", default-features = false }
 # The supervisor's interface enumeration (`getifaddrs(3)`) for the host candidates, and the DSCP a
 # datagram arrived with in lotse-testing on Linux only: `recvmsg` with the `IP_TOS` and
 # `IPV6_TCLASS` control messages. Neither rustix nor socket2 has either without `unsafe`.
-nix = { version = "0.31", default-features = false }
+nix = { version = "0.32", default-features = false }
 # Syscall numbers for the seccomp allowlists, and the worker's DSCP control message (`cmsghdr`,
 # `IP_TOS`, `IPV6_TCLASS`), which rustix cannot send; everything else goes through rustix.
 libc = { version = "0.2", default-features = false }
