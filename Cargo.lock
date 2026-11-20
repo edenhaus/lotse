@@ -1668,6 +1668,7 @@ dependencies = [
  "lotse-api-types",
  "lotse-codec",
  "lotse-core",
+ "lotse-hls",
  "lotse-http",
  "lotse-ipc",
  "lotse-mux",
@@ -1682,6 +1683,14 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+]
+
+[[package]]
+name = "lotse-hls"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

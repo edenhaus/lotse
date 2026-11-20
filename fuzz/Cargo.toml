@@ -21,6 +21,7 @@ lotse-api.workspace = true
 lotse-api-types.workspace = true
 lotse-codec = { workspace = true, features = ["test-util"] }
 lotse-core = { workspace = true, features = ["test-util"] }
+lotse-hls.workspace = true
 lotse-http.workspace = true
 lotse-ipc.workspace = true
 lotse-mux.workspace = true
@@ -270,6 +271,13 @@ bench = false
 [[bin]]
 name = "fmp4_live"
 path = "fuzz_targets/fmp4_live.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hls_request"
+path = "fuzz_targets/hls_request.rs"
 test = false
 doc = false
 bench = false
