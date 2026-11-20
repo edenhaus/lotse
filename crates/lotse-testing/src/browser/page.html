@@ -5,7 +5,7 @@
 <title>lotse browser test</title>
 <style>
   body { margin: 0; background: #000; color: #ccc; font: 12px/1.4 ui-monospace, monospace; }
-  video { display: block; width: 320px; height: 240px; background: #000; }
+  video { display: inline-block; width: 320px; height: 240px; background: #000; }
   canvas { display: none; }
   button { margin: 8px; }
 </style>
@@ -23,10 +23,17 @@
      plays a window, disrupts the stream (a keyframe request of its own,
      or the harness acting at `lotseTest.checkpoint`), waits for the
      recovery and plays a second window, which the checks take; the
-     first is kept as `before`. -->
+     first is kept as `before`.
+     With `mse` in the configuration the page also plays the stream as live
+     fMP4 (`live/create`, its bytes fetched through the dev viewer) through
+     the browser's own Media Source Extensions in a second element, beside
+     the WebRTC session, and measures both the same way, so the test can
+     place the MSE picture against the WebRTC one. -->
 <video id="video" autoplay playsinline></video>
+<video id="mse" playsinline></video>
 <button id="start" type="button">Start</button>
 <canvas id="canvas" width="16" height="12"></canvas>
+<canvas id="mse-canvas" width="16" height="12"></canvas>
 <pre id="log"></pre>
 <script>
 "use strict";
@@ -39,6 +46,9 @@ const out = {
   log: [], errors: [],
 };
 const t0 = performance.now();
+// The page's clock on the wall clock: `time_origin + t0 + ms` is ms since
+// the Unix epoch, as the capture samples' times are.
+out.clock = { time_origin: performance.timeOrigin, t0 };
 const since = () => Math.round(performance.now() - t0);
 function log(text) { out.log.push(`${since()} ${text}`); $("log").textContent += `${text}\n`; }
 function fail(text) { out.errors.push(text); log(`error: ${text}`); }
@@ -54,6 +64,9 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // `on.closed(text)`; `close()` ends the session's signaling.
 let ws, nextId = 1;
 const pending = new Map();
+// The events of a command that subscribed, by its id (a live output's);
+// the others go to `onEvent` (the WebRTC session's).
+const subscribers = new Map();
 let onEvent = () => {};
 function relay() {
   return new Promise((resolve, reject) => {
@@ -66,7 +79,7 @@ function relay() {
         const done = pending.get(frame.id);
         pending.delete(frame.id);
         if (done) done(frame);
-      } else if (frame.type === "event") onEvent(frame);
+      } else if (frame.type === "event") (subscribers.get(frame.id) ?? onEvent)(frame);
     };
   });
 }
@@ -196,11 +209,9 @@ class Marks extends AudioWorkletProcessor {
 }
 registerProcessor("marks", Marks);
 `;
-let audio;
-async function prepareAudio() {
-  const context = new AudioContext();
-  await context.resume();
-  await context.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" })));
+// A node of the worklet on `context` that writes what it hears to
+// `target`: the beeps' onsets on the page's clock, the RMS and the peak.
+function marksNode(context, target) {
   const node = new AudioWorkletNode(context, "marks");
   // Pulled through a muted gain to the destination, so it always runs.
   const mute = context.createGain();
@@ -214,12 +225,19 @@ async function prepareAudio() {
       const at = stamp && stamp.performanceTime
         ? stamp.performanceTime + (data.onset - stamp.contextTime) * 1000
         : performance.now() - (context.currentTime - data.onset) * 1000 + (context.outputLatency || 0) * 1000;
-      out.audio.beeps.push(at - t0);
+      target.beeps.push(at - t0);
     } else {
-      out.audio.rms = data.count ? Math.sqrt(data.sum / data.count) : 0;
-      out.audio.peak = data.peak;
+      target.rms = data.count ? Math.sqrt(data.sum / data.count) : 0;
+      target.peak = data.peak;
     }
   };
+  return node;
+}
+async function prepareAudio() {
+  const context = new AudioContext();
+  await context.resume();
+  await context.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" })));
+  const node = marksNode(context, out.audio);
   out.audio.sample_rate = context.sampleRate;
   out.audio.context_state = context.state;
   out.audio.output_latency_ms = context.outputLatency !== undefined ? context.outputLatency * 1000 : null;
@@ -260,6 +278,30 @@ let sampling = false;
 
 // Flashes: each presented frame drawn to a 16×12 canvas, its mean
 // luma compared to the middle (the camera sends 16 and 235).
+function lumaOf(video, canvas) {
+  canvas.drawImage(video, 0, 0, 16, 12);
+  const data = canvas.getImageData(0, 0, 16, 12).data;
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 4) sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  return sum / (data.length / 4);
+}
+// Calls `sample(now, meta)` for each frame `video` presents: by
+// requestVideoFrameCallback (WICG video-rvfc, with the frame's metadata),
+// else on every animation frame whose video time moved, without; says which.
+function onEachFrame(video, sample) {
+  if (video.requestVideoFrameCallback) {
+    const next = (now, meta) => { sample(now, meta); video.requestVideoFrameCallback(next); };
+    video.requestVideoFrameCallback(next);
+    return "requestVideoFrameCallback";
+  }
+  let last = -1;
+  const next = (now) => {
+    if (video.currentTime !== last && video.readyState >= 2) { last = video.currentTime; sample(now); }
+    requestAnimationFrame(next);
+  };
+  requestAnimationFrame(next);
+  return "requestAnimationFrame";
+}
 // Who waits for the next frame presented (`nextFrame`).
 const frameWaiters = [];
 const nextFrame = () => new Promise((resolve) => frameWaiters.push(resolve));
@@ -272,11 +314,7 @@ function watchFrames() {
   let wasWhite;
   const sample = (now, meta) => {
     out.video.presented++;
-    canvas.drawImage(video, 0, 0, 16, 12);
-    const data = canvas.getImageData(0, 0, 16, 12).data;
-    let sum = 0;
-    for (let i = 0; i < data.length; i += 4) sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    const luma = sum / (data.length / 4);
+    const luma = lumaOf(video, canvas);
     out.video.luma_min = Math.min(out.video.luma_min ?? 255, luma);
     out.video.luma_max = Math.max(out.video.luma_max ?? 0, luma);
     const white = luma > 128;
@@ -305,20 +343,7 @@ function watchFrames() {
       } else out.video.no_capture_time = (out.video.no_capture_time ?? 0) + 1;
     }
   };
-  if (video.requestVideoFrameCallback) {
-    out.video.frame_callback = "requestVideoFrameCallback";
-    const next = (now, meta) => { sample(now, meta); video.requestVideoFrameCallback(next); };
-    video.requestVideoFrameCallback(next);
-  } else {
-    // Without it, every animation frame whose video time moved.
-    out.video.frame_callback = "requestAnimationFrame";
-    let last = -1;
-    const next = (now) => {
-      if (video.currentTime !== last && video.readyState >= 2) { last = video.currentTime; sample(now); }
-      requestAnimationFrame(next);
-    };
-    requestAnimationFrame(next);
-  }
+  out.video.frame_callback = onEachFrame(video, sample);
 }
 
 // Every stats object of the connection but the certificates, as plain
@@ -519,6 +544,241 @@ async function disrupt(session, signaling, marks) {
   return session;
 }
 
+// Live fMP4 through the browser's own Media Source Extensions (W3C Media
+// Source Extensions; `ManagedMediaSource`, its managed variant, where the
+// browser has that alone, as iOS Safari 17.1 and later), beside the WebRTC
+// session, as a client plays it where WebRTC cannot connect: `live/create`,
+// its MIME type checked with `isTypeSupported` (a type the browser refuses
+// is closed and asked again without the audio, `"audio": false`), its
+// bytes fetched through the dev viewer, which proxies them from the daemon,
+// and appended as they come to one SourceBuffer of that type in the
+// `segments` mode (MSE §3.1 `mode`; the output's decode times run on
+// without a hole). Once the GOP burst is in it plays `MSE_MARGIN_S` behind
+// the end of what is buffered: a little faster (`MSE_CATCH_UP_RATE`) from
+// when it is more than `MSE_SLACK_S` further behind, as a player starting
+// late is, until it is back at the margin, and with a seek back whenever it
+// falls `MSE_DRIFT_S` further behind;
+// it keeps `MSE_KEEP_S` behind the playhead
+// and removes the rest, and on a `QuotaExceededError` (MSE §3.5.10, the
+// buffer full) all but the last second, then appends again. The frames it
+// presents are measured as the WebRTC element's; its sound, taken from the
+// element (Web Audio §1.21 createMediaElementSource), by its own node of
+// the worklet.
+const MSE_MARGIN_S = 0.2;
+const MSE_SLACK_S = 0.1;
+const MSE_CATCH_UP_RATE = 1.1;
+const MSE_DRIFT_S = 0.5;
+const MSE_KEEP_S = 10;
+// Removed in steps of this much at least, so not after every append.
+const MSE_TRIM_S = 5;
+// What the page asks `isTypeSupported` of, besides the output's own type:
+// H.264 alone and with each audio codec a camera sends, in the spellings
+// in use (RFC 6381 `mp4a.40.2`; the Opus sample entry `Opus`, Opus in
+// ISOBMFF §4.3, and the lower case browsers document; QuickTime's `ulaw`
+// and `alaw`, and `g722`), and H.265.
+const MSE_TYPES = [
+  'video/mp4; codecs="avc1.42e01e"',
+  'video/mp4; codecs="avc1.42e01e,mp4a.40.2"',
+  'video/mp4; codecs="avc1.42e01e,Opus"',
+  'video/mp4; codecs="avc1.42e01e,opus"',
+  'audio/mp4; codecs="mp4a.40.2"',
+  'audio/mp4; codecs="Opus"',
+  'audio/mp4; codecs="opus"',
+  'audio/mp4; codecs="ulaw"',
+  'audio/mp4; codecs="alaw"',
+  'audio/mp4; codecs="g722"',
+  'video/mp4; codecs="hvc1.1.6.L93.B0"',
+];
+const mseApis = () => [["MediaSource", window.MediaSource], ["ManagedMediaSource", window.ManagedMediaSource]];
+function mseSupport(extra) {
+  const types = [...new Set([...MSE_TYPES, ...extra])];
+  return Object.fromEntries(mseApis().map(([name, api]) => [
+    name, api ? Object.fromEntries(types.map((type) => [type, api.isTypeSupported(type)])) : null,
+  ]));
+}
+function ranges(buffered) {
+  const list = [];
+  for (let i = 0; i < buffered.length; i++) list.push([buffered.start(i), buffered.end(i)]);
+  return list;
+}
+function concat(chunks) {
+  const all = new Uint8Array(chunks.reduce((n, c) => n + c.byteLength, 0));
+  let at = 0;
+  for (const chunk of chunks) { all.set(chunk, at); at += chunk.byteLength; }
+  return all;
+}
+
+// Starts the live output and its player; `ready` settles once its first
+// frame is shown, `stop()` closes the output and records how it ended.
+// Its failures go to `out.mse.errors`, not the page's: the WebRTC session
+// plays on and is judged on its own.
+function startMse(marks) {
+  const [api, Source] = mseApis().find(([, a]) => a) ?? [null, undefined];
+  const mse = {
+    api, errors: [], warnings: [], timings: {}, appends: 0, bytes: 0, seeks: 0, catch_ups: 0, removes: 0,
+    quota_exceeded: 0, waiting: 0, video: { frames: [], flashes: [] }, audio: { beeps: [] },
+  };
+  out.mse = mse;
+  const error = (text) => { mse.errors.push(text); log(`mse error: ${text}`); };
+  const video = $("mse");
+  let stopping = false, reader, live;
+  video.addEventListener("waiting", () => { mse.waiting++; });
+  video.addEventListener("error", () => error(`the element: ${video.error?.code} ${video.error?.message ?? ""}`));
+
+  // One live output; `closed` resolves with its `closed` event.
+  const create = async (audio) => {
+    let closed;
+    const ended = new Promise((resolve) => { closed = resolve; });
+    const sent = command({ type: "live/create", stream_id: config.stream_id, audio });
+    subscribers.set(sent.id, ({ event }) => {
+      if (event.type === "warning") { mse.warnings.push(event.code); log(`live warning ${event.code}: ${event.message}`); }
+      else if (event.type === "closed") { subscribers.delete(sent.id); closed(event); }
+    });
+    const frame = await sent.result;
+    if (!frame.success) throw new Error(`live/create: ${frame.error.code}: ${frame.error.message}`);
+    return { ...frame.result, closed: ended };
+  };
+  const close = async (output) => {
+    await must({ type: "live/close", live_id: output.live_id });
+    return Promise.race([output.closed, timeout(5000, "the live output's closed")]);
+  };
+
+  const ready = (async () => {
+    if (!Source) throw new Error("no MediaSource or ManagedMediaSource");
+    live = await create(true);
+    mse.support = mseSupport([live.mime]);
+    mse.mime = live.mime;
+    if (!Source.isTypeSupported(live.mime)) {
+      mse.refused_mime = live.mime;
+      mse.refused_closed = await close(live);
+      live = await create(false);
+      mse.mime = live.mime;
+      if (!Source.isTypeSupported(live.mime)) throw new Error(`${api} plays neither ${mse.refused_mime} nor ${live.mime}`);
+    }
+    mse.timings.created = since();
+    const source = new Source();
+    // A managed source opens only without remote playback, or with an
+    // AirPlay alternative (WebKit, observed in Safari 17).
+    if (api === "ManagedMediaSource") video.disableRemotePlayback = true;
+    video.src = URL.createObjectURL(source);
+    await Promise.race([new Promise((resolve) => source.addEventListener("sourceopen", resolve, { once: true })), timeout(5000, "sourceopen")]);
+    const buffer = source.addSourceBuffer(live.mime);
+    buffer.mode = "segments";
+    const queue = [];
+    const trim = (keep) => {
+      if (buffer.updating || !buffer.buffered.length) return false;
+      const start = buffer.buffered.start(0), until = video.currentTime - keep;
+      if (until - start < 0.5) return false;
+      buffer.remove(start, until);
+      mse.removes++;
+      return true;
+    };
+    const pump = () => {
+      if (buffer.updating || !queue.length || source.readyState !== "open") return;
+      const chunk = concat(queue.splice(0));
+      try {
+        buffer.appendBuffer(chunk);
+        mse.appends++;
+      } catch (err) {
+        if (err.name !== "QuotaExceededError") { error(`appendBuffer: ${err}`); return; }
+        mse.quota_exceeded++;
+        queue.unshift(chunk);
+        trim(1);
+      }
+    };
+    let jumped = false;
+    buffer.addEventListener("error", () => error("an append failed"));
+    buffer.addEventListener("updateend", () => {
+      const buffered = buffer.buffered;
+      if (buffered.length && video.readyState >= 1) {
+        const edge = buffered.end(buffered.length - 1);
+        if (!jumped || edge - video.currentTime > MSE_MARGIN_S + MSE_DRIFT_S) {
+          video.currentTime = Math.max(buffered.start(buffered.length - 1), edge - MSE_MARGIN_S);
+          if (jumped) mse.seeks++;
+          else {
+            jumped = true;
+            mse.timings.jumped = since();
+            mse.jumped_to = { buffered: ranges(buffered), current_time: video.currentTime };
+            video.play().catch((err) => error(`play: ${err}`));
+          }
+        } else {
+          const behind = edge - video.currentTime;
+          if (video.playbackRate === 1 && behind > MSE_MARGIN_S + MSE_SLACK_S) {
+            video.playbackRate = MSE_CATCH_UP_RATE;
+            mse.catch_ups++;
+          } else if (video.playbackRate !== 1 && behind <= MSE_MARGIN_S) video.playbackRate = 1;
+        }
+        if (video.currentTime - buffered.start(0) > MSE_KEEP_S + MSE_TRIM_S) trim(MSE_KEEP_S);
+      }
+      pump();
+    });
+    const response = await fetch(live.url, { cache: "no-store" });
+    if (!response.ok) throw new Error(`GET ${live.url}: ${response.status} ${(await response.text()).trim()}`);
+    mse.content_type = response.headers.get("content-type");
+    mse.timings.response = since();
+    reader = response.body.getReader();
+    (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) { mse.timings.body_ended = since(); return; }
+        if (mse.timings.first_bytes === undefined) mse.timings.first_bytes = since();
+        mse.bytes += value.byteLength;
+        queue.push(value);
+        pump();
+      }
+    })().catch((err) => { if (!stopping) error(`the body: ${err}`); });
+
+    // Its frames, as the WebRTC element's: each flash with how far behind
+    // the end of the buffer it was shown, which tells the test which
+    // WebRTC flash is the same second's.
+    const canvas = $("mse-canvas").getContext("2d", { willReadFrequently: true });
+    let wasWhite, first;
+    const shown = new Promise((resolve) => { first = resolve; });
+    mse.video.frame_callback = onEachFrame(video, (now, meta) => {
+      const at = (meta?.expectedDisplayTime ?? now) - t0;
+      mse.video.frames.push(Math.round(at * 10) / 10);
+      first(at);
+      const luma = lumaOf(video, canvas);
+      mse.video.luma_min = Math.min(mse.video.luma_min ?? 255, luma);
+      mse.video.luma_max = Math.max(mse.video.luma_max ?? 0, luma);
+      const white = luma > 128;
+      if (white && wasWhite === false) {
+        const media = meta?.mediaTime ?? video.currentTime;
+        const buffered = video.buffered;
+        const edge = buffered.length ? buffered.end(buffered.length - 1) : undefined;
+        mse.video.flashes.push({ at, media_time: media, behind_ms: edge === undefined ? null : (edge - media) * 1000 });
+      }
+      wasWhite = white;
+    });
+    if (marks) {
+      try {
+        marks.context.createMediaElementSource(video).connect(marksNode(marks.context, mse.audio));
+        mse.audio.tap = "createMediaElementSource";
+      } catch (err) { mse.audio.tap = `refused: ${err}`; }
+    }
+    mse.timings.first_frame = await Promise.race([shown, timeout(15000, "the first MSE frame")]);
+  })();
+
+  return {
+    ready: ready.catch((err) => error(String(err && err.message ? err.message : err))),
+    async stop() {
+      await ready.catch(() => {});
+      const quality = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : undefined;
+      mse.end = {
+        at: since(), current_time: video.currentTime, buffered: ranges(video.buffered),
+        total_video_frames: quality?.totalVideoFrames ?? null, dropped_video_frames: quality?.droppedVideoFrames ?? null,
+        audio_decoded_bytes: video.webkitAudioDecodedByteCount ?? null,
+        video_decoded_bytes: video.webkitVideoDecodedByteCount ?? null,
+        moz_has_audio: video.mozHasAudio ?? null, audio_tracks: video.audioTracks?.length ?? null,
+      };
+      stopping = true;
+      if (live) mse.closed = await close(live).catch((err) => { error(`live/close: ${err.message ?? err}`); return undefined; });
+      if (reader) await reader.cancel().catch(() => {});
+      video.pause();
+    },
+  };
+}
+
 // The audio running, or an error in 5 s: AudioContext.resume() resolves
 // once the context runs, or rejects when it cannot acquire its audio
 // output (Web Audio API §1.2.3 resume()), but headless Firefox 159 with no
@@ -534,6 +794,8 @@ async function run() {
   await signaling.prepare();
   out.timings.live = since();
   await delay(config.warm_ms);
+  // The live output runs from here; the window waits for its first frame.
+  const mse = config.mse && out.signaling === "lotse" ? startMse(marks) : undefined;
 
   // Firefox fetches its H.264 codec (OpenH264) after it starts; until
   // then its offer lacks H.264, so the offer waits for it, a while.
@@ -555,7 +817,9 @@ async function run() {
     out.before = { stats: out.stats, presented_at_start: out.video.presented_at_start, presented_at_end: out.video.presented_at_end };
     session = await disrupt(session, signaling, marks);
   }
+  if (mse) await mse.ready;
   await measure(session);
+  if (mse) await mse.stop();
   out.stream_end = await streamState().catch((err) => { fail(`stream/get: ${err}`); return undefined; });
   out.video.width = $("video").videoWidth;
   out.video.height = $("video").videoHeight;
@@ -580,6 +844,7 @@ window.lotseTest = {
       // (Safari's autoplay policy); it has no source yet, so it settles
       // either way.
       $("video").play().catch(() => {});
+      $("mse").play().catch(() => {});
       run().catch((err) => fail(String(err && err.message ? err.message : err))).finally(() => resolve(out));
     }, { once: true });
   }),

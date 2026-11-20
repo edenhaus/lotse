@@ -185,11 +185,11 @@ arg "[cycle]" help="one cycle of viewers and a camera hang-up; over a minute, af
 run = 'scripts/load.sh --cameras 4 --viewers 2 --duration "$usage_duration" --cycle "$usage_cycle" --drop --sample 10s --report target/soak-report.json'
 
 [tasks.browser]
-description = "The browser test: Selenium has Chrome, Firefox or Safari play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash); report and logs in target/browser-<engine>/<case>/"
+description = "The browser test: Selenium has Chrome, Firefox or Safari play ffmpeg's stream from MediaMTX through a release daemon, one pytest test for all, per case (PCMU and AAC after join, after a PLI, a camera reconnect and a worker crash; live fMP4 through MSE beside WebRTC with AAC, PCMU and Opus, its latency reported); report and logs in target/browser-<engine>/<case>/"
 usage = '''
 arg "[engine]" help="chrome, firefox or safari" default="chrome"
 arg "[play]" help="how long each window plays (20s); a case with a disruption plays one before it and one after" default="20s"
-arg "[case]" help="join, aac, pli, reconnect, crash or all" default="all"
+arg "[case]" help="join, aac, pli, reconnect, crash, mse, mse-pcmu, mse-opus or all" default="all"
 '''
 run = 'scripts/browser.sh "$usage_engine" "$usage_play" --case "$usage_case"'
 

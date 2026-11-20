@@ -25,12 +25,15 @@ class Case:
 
     name: str
     audio: str
-    """The synthetic camera's audio (`lotse-browser --audio`): `pcmu` or `aac`."""
+    """The synthetic camera's audio (`lotse-browser --audio`): `pcmu`, `aac` or `opus`."""
     disrupt: str | None
     """What the page does after a first window, before the window the checks take: `pli` (a
     keyframe request of its own), `reconnect` (the harness restarts the camera's publisher) or
     `crash` (the harness kills the worker); `None` plays one window after join."""
     about: str
+    mse: bool = False
+    """Whether the page also plays the stream as live fMP4 through the browser's Media Source
+    Extensions, beside the WebRTC session, and the test places the one picture against the other."""
 
 
 CASES = {
@@ -46,6 +49,27 @@ CASES = {
             about="PCMU, after the camera's publisher restarts",
         ),
         Case(name="crash", audio="pcmu", disrupt="crash", about="PCMU, after a worker crash"),
+        Case(
+            name="mse",
+            audio="aac",
+            disrupt=None,
+            mse=True,
+            about="AAC, live fMP4 through MSE beside WebRTC",
+        ),
+        Case(
+            name="mse-pcmu",
+            audio="pcmu",
+            disrupt=None,
+            mse=True,
+            about="PCMU, live fMP4 through MSE without the audio, beside WebRTC",
+        ),
+        Case(
+            name="mse-opus",
+            audio="opus",
+            disrupt=None,
+            mse=True,
+            about="Opus, live fMP4 through MSE beside WebRTC",
+        ),
     )
 }
 """Every case, the order `--case all` runs them in."""

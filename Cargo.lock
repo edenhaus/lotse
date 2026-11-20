@@ -1812,6 +1812,8 @@ dependencies = [
  "bytes",
  "futures-util",
  "hmac",
+ "hyper",
+ "hyper-util",
  "libc",
  "lotse-api-types",
  "lotse-codec",

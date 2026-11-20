@@ -16,6 +16,8 @@ from checks import (
     check,
     diagnostics,
     disruption_failures,
+    latency,
+    latency_summary,
     parse_duration,
     transcoded,
 )
@@ -492,3 +494,240 @@ def test_a_kind_without_stats_at_the_start_counts_from_zero() -> None:
     verdict = check(page, STREAM)
     assert verdict.failures == []
     assert verdict.measured["audio_packets_received"] == 1_020
+
+
+AAC = copy.replace(STREAM, audio_codec="MPEG4-GENERIC")
+OPUS = copy.replace(STREAM, audio_codec="opus")
+AAC_MIME = 'video/mp4; codecs="avc1.42c01e,mp4a.40.2"'
+ORIGIN_MS = 1_763_200_000_000.0
+"""The page's `performance.timeOrigin` in the MSE pages, Unix ms."""
+T0_MS = 500.0
+"""The page's `t0` in the MSE pages: its times are ms since then."""
+
+
+def mse_page(*, behind_ms: float | None = 230.0, lag_ms: float = 300.0) -> dict[str, Any]:
+    """A page that played 20 s through WebRTC and, beside it, through MSE `lag_ms` later.
+
+    Every WebRTC flash has its capture sample, 40 ms from capture to render; each MSE flash was
+    shown `behind_ms` behind the end of its buffer, its sound 50 ms after the picture.
+    """
+    page = good_page()
+    page["clock"] = {"time_origin": ORIGIN_MS, "t0": T0_MS}
+    page["video"]["capture"] = [
+        {
+            "shown": ORIGIN_MS + T0_MS + flash,
+            "capture": ORIGIN_MS + T0_MS + flash - 40.0 + NTP_1970,
+            "frame_rtp": 90_000,
+            "source_rtp": 90_000,
+        }
+        for flash in page["video"]["flashes"]
+    ]
+    page["mse"] = {
+        "api": "MediaSource",
+        "errors": [],
+        "warnings": [],
+        "mime": AAC_MIME,
+        "support": {"MediaSource": {'audio/mp4; codecs="ulaw"': False}, "ManagedMediaSource": None},
+        "content_type": AAC_MIME,
+        "seeks": 0,
+        "catch_ups": 1,
+        "video": {
+            "frames": [2_000.0 + i * 100 / 3 for i in range(600)],
+            "flashes": [
+                {"at": 2_000.0 + lag_ms + 1_000 * s, "behind_ms": behind_ms, "media_time": s}
+                for s in range(20)
+            ],
+            "frame_callback": "requestVideoFrameCallback",
+        },
+        "audio": {
+            "tap": "createMediaElementSource",
+            "peak": 0.26,
+            "beeps": [2_050.0 + lag_ms + 1_000 * s for s in range(20)],
+        },
+        "end": {"audio_decoded_bytes": 9_192, "moz_has_audio": None, "audio_tracks": None},
+        "closed": {"type": "closed", "reason": "closed", "bytes": 95_336, "dropped_frames": 0},
+    }
+    return page
+
+
+def test_an_mse_page_that_played_passes_and_reports_both_latencies() -> None:
+    verdict = check(mse_page(), AAC, mse=True)
+    assert verdict.failures == []
+    assert verdict.measured["mse_frames_shown"] == 600
+    assert verdict.measured["mse_longest_gap_ms"] == pytest.approx(100 / 3)
+    assert verdict.measured["mse_flashes"] == 20
+    report = verdict.mse
+    assert report is not None
+    assert report["api"] == "MediaSource"
+    assert report["is_type_supported"]["MediaSource"]['audio/mp4; codecs="ulaw"'] is False
+    assert report["audio"]["in_output"] is True
+    assert report["audio"]["heard"] is True
+    assert report["audio"]["av_sync_median_ms"] == pytest.approx(50.0)
+    latency = verdict.latency
+    assert latency is not None
+    assert latency["webrtc_ms"] == {"median": 40.0, "p90": 40.0, "count": 20}
+    assert latency["mse_minus_webrtc_ms"]["median"] == pytest.approx(300.0)
+    assert latency["mse_ms"]["median"] == pytest.approx(340.0)
+    assert latency["mse_ms"]["count"] == 20
+    assert latency["method"].startswith("glass to glass")
+    assert latency_summary(latency) == (
+        "WebRTC 40 ms (p90 40, 20), MSE 340 ms (p90 340, 20), MSE minus WebRTC 300 ms (p90 300, 20)"
+    )
+    # Beside MSE the WebRTC element may show fewer frames; alone, not.
+    page = mse_page()
+    page["video"]["presented_at_end"] = 400
+    assert check(page, AAC, mse=True).failures == []
+    assert check(page, AAC).failures[0].startswith("frames shown at 80%")
+    page["video"]["presented_at_end"] = 300
+    assert check(page, AAC, mse=True).failures[0].startswith("frames shown at 60%")
+    # Without `mse` the MSE player is neither checked nor reported.
+    plain = check(mse_page(), AAC)
+    assert (plain.mse, plain.latency) == (None, None)
+    assert "mse_frames_shown" not in plain.measured
+
+
+def test_an_mse_flash_pairs_with_the_webrtc_flash_its_buffer_distance_points_at() -> None:
+    # 1.2 s later than WebRTC: by its distance from the buffer's end the flash is the second
+    # before's, not the nearest.
+    page = mse_page(behind_ms=1_130.0, lag_ms=1_200.0)
+    found = latency(page, AAC)
+    assert found["mse_minus_webrtc_ms"]["median"] == pytest.approx(1_200.0)
+    assert found["mse_ms"]["median"] == pytest.approx(1_240.0)
+    assert found["mse_ms"]["count"] == 19, "the last MSE flash is after the window"
+    # Without the distance, the nearest flash before the frame it holds.
+    found = latency(mse_page(behind_ms=None, lag_ms=300.0), AAC)
+    assert found["mse_minus_webrtc_ms"]["median"] == pytest.approx(300.0)
+    # A flash with no WebRTC flash near where it points is left out.
+    page = mse_page()
+    page["video"]["flashes"] = []
+    found = latency(page, AAC)
+    assert found["mse_minus_webrtc_ms"] == {"median": None, "p90": None, "count": 0}
+    assert found["mse_ms"] is None
+    assert found["mse_flashes"] == 20
+
+
+def test_without_capture_times_the_mse_latency_is_its_difference_from_webrtc() -> None:
+    page = mse_page()
+    page["video"]["capture"] = []
+    found = latency(page, AAC)
+    assert found["webrtc_ms"] is None
+    assert found["mse_ms"] is None
+    assert found["mse_minus_webrtc_ms"]["median"] == pytest.approx(300.0)
+    assert found["method"] == "MSE minus WebRTC only: the browser reports no captureTimestamp"
+    assert latency_summary(found).startswith("WebRTC none, MSE none, MSE minus WebRTC 300 ms")
+
+
+def test_latency_leaves_out_malformed_samples_and_flashes() -> None:
+    expected = latency(mse_page(), AAC)
+    page = mse_page()
+    page["video"]["capture"] += [
+        "not a sample",
+        {"shown": 1_000_050.0},
+        {"capture": NTP_1970 + 1_000_000},
+        {"shown": "late", "capture": NTP_1970 + 1_000_000},
+        {"shown": 1_000_050.0, "capture": None},
+    ]
+    page["video"]["flashes"] += ["not a time", None]
+    found = latency(page, AAC)
+    assert found["webrtc_ms"] == expected["webrtc_ms"] == {"median": 40.0, "p90": 40.0, "count": 20}
+    assert found["mse_ms"] == expected["mse_ms"]
+    assert found["mse_minus_webrtc_ms"] == expected["mse_minus_webrtc_ms"]
+
+
+def test_the_p90_is_the_nearest_rank() -> None:
+    page = mse_page()
+    for sample, delay in zip(page["video"]["capture"], range(20), strict=True):
+        sample["capture"] = sample["shown"] - delay + NTP_1970
+    found = latency(page, AAC)["webrtc_ms"]
+    assert found == {"median": 9.5, "p90": 17.0, "count": 20}
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "failure"),
+    [
+        ("/mse/errors", ["no MediaSource or ManagedMediaSource"], "MSE: no MediaSource"),
+        (
+            "/mse/video/frames",
+            [2_000.0 + i * 57 for i in range(350)],
+            "MSE frames shown at 60% of the camera's 600 or more (got 350)",
+        ),
+        (
+            "/mse/video/frames",
+            [2_000.0 + i * 100 / 3 for i in range(600) if not 240 < i < 330],
+            "MSE never without a new frame for over 2000 ms (got 3",
+        ),
+        (
+            "/mse/video/flashes",
+            [{"at": 2_300.0 + 1_000 * s, "behind_ms": 230.0} for s in range(15)],
+            "a flash a second seen through MSE, 16 or more (got 15)",
+        ),
+        (
+            "/mse/mime",
+            'video/mp4; codecs="avc1.42c01e"',
+            "the live output's type names the camera's mp4a.40.2",
+        ),
+        ("/mse/warnings", ["audio_omitted"], "an audio_omitted warning not sent"),
+        ("/mse/closed/reason", "client_gone", "the live output closed by live/close"),
+    ],
+)
+def test_each_mse_shortfall_fails_alone(path: str, value: object, failure: str) -> None:
+    page = mse_page()
+    set_path(page, path, value)
+    failures = check(page, AAC, mse=True).failures
+    assert len(failures) == 1, failures
+    assert failures[0].startswith(failure), failures
+
+
+def test_an_mse_page_that_played_nothing_fails() -> None:
+    page = good_page()
+    assert check(page, AAC, mse=True).failures == ["the page played no live fMP4 through MSE"]
+    page["mse"] = {"errors": []}
+    failures = check(page, AAC, mse=True).failures
+    assert [f.partition(" (got")[0] for f in failures] == [
+        "MSE frames shown at 60% of the camera's 600 or more",
+        "MSE never without a new frame for over 2000 ms",
+        "a flash a second seen through MSE, 16 or more",
+        "the live output's type names the camera's mp4a.40.2",
+        "the live output closed by live/close",
+    ]
+
+
+def test_a_pcmu_camera_plays_through_mse_without_its_audio() -> None:
+    page = mse_page()
+    page["mse"] |= {"mime": 'video/mp4; codecs="avc1.42c01e"', "warnings": ["audio_omitted"]}
+    page["mse"]["audio"] = {"tap": "createMediaElementSource", "peak": 0.0, "beeps": []}
+    verdict = check(page, STREAM, mse=True)
+    assert verdict.failures == []
+    assert verdict.mse is not None
+    assert verdict.mse["audio"]["in_output"] is False
+    assert verdict.mse["audio"]["heard"] is False
+    page["mse"]["warnings"] = []
+    assert check(page, STREAM, mse=True).failures == ["an audio_omitted warning sent (got [])"]
+    page["mse"] |= {"warnings": ["audio_omitted"], "mime": AAC_MIME}
+    failures = check(page, STREAM, mse=True).failures
+    assert failures == [f"the live output's type names the video alone (got {AAC_MIME!r})"]
+    # A camera without audio: no audio and no warning.
+    page["mse"] |= {"warnings": [], "mime": 'video/mp4; codecs="avc1.42c01e"'}
+    assert check(page, copy.replace(STREAM, audio_codec="none"), mse=True).failures == []
+
+
+def test_an_opus_camera_s_type_is_checked_even_when_the_browser_refused_it() -> None:
+    page = mse_page()
+    page["mse"]["mime"] = 'video/mp4; codecs="avc1.42c01e,Opus"'
+    assert check(page, OPUS, mse=True).failures == []
+    # Refused by `isTypeSupported` and played without the audio: the daemon's type still counts.
+    page["mse"] |= {
+        "refused_mime": 'video/mp4; codecs="avc1.42c01e,Opus"',
+        "mime": 'video/mp4; codecs="avc1.42c01e"',
+    }
+    verdict = check(page, OPUS, mse=True)
+    assert verdict.failures == []
+    assert verdict.mse is not None
+    assert verdict.mse["refused_mime"] == 'video/mp4; codecs="avc1.42c01e,Opus"'
+    assert verdict.mse["audio"]["in_output"] is False
+    page["mse"]["refused_mime"] = AAC_MIME
+    assert (
+        check(page, OPUS, mse=True)
+        .failures[0]
+        .startswith("the live output's type names the camera's opus")
+    )

@@ -26,10 +26,22 @@ A case with a disruption (`harness.CASES`: a keyframe request, a camera reconnec
 crash) plays two windows; the checks take the one after the recovery, check that the disruption
 happened as the case says (`disruption_failures`), and report the skew of the window before it
 too.
+
+An MSE case (`harness.Case.mse`) plays the stream as live fMP4 through the browser's Media Source
+Extensions beside the WebRTC session, which is checked as in any case. Of the MSE player only that
+it plays is gated (`mse_checks`): its frames advance, it shows the flashes, it reports no error
+and stalls no longer than `MSE_STALL_MS`, and the daemon's output carries the camera's audio where
+the container can (AAC, Opus) and leaves it out with `audio_omitted` where it cannot (PCMU). Its
+latency is a report, never a gate (`latency`): glass to glass, the WebRTC frames' capture to render
+(from `captureTimestamp`, as `capture_times`), and each MSE flash that much plus how much later it
+was shown than the same second's WebRTC flash; without capture times, the difference alone. So is
+what the browser's MSE says it plays (`isTypeSupported`) and whether the MSE element's sound was
+heard.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 import re
 from dataclasses import asdict, dataclass
@@ -125,6 +137,25 @@ EBU_R37_LEAD_MS = -40.0
 
 EBU_R37_LAG_MS = 60.0
 """EBU R37 (2007): sound may lag the picture by at most 60 ms."""
+
+TWO_ELEMENTS_FRAMES_SHOWN_SHARE = 0.6
+"""Frames shown over the play time by each element of an MSE case, the WebRTC one and the MSE one:
+at least this share of what the camera sends, in place of `FRAMES_SHOWN_SHARE`, so each picture
+moves on at the camera's pace, not in slow motion; that the MSE one never stops is
+`MSE_STALL_MS`'s and the flashes' to check. Headless Chrome skips more frames of each element
+when two play on one page, every frame decoded: 432-500 of 600 from WebRTC beside 468-506 from
+MSE, against 521 from WebRTC alone, on a busy 4-core host (Chrome 153, 2026-11-15)."""
+
+MSE_STALL_MS = 2_000.0
+"""The longest the MSE element may show no new frame within the play time: a player that waits for
+data longer than this has stalled (the camera sends a frame every 33 ms)."""
+
+MSE_PAIR_WITHIN_MS = 500.0
+"""An MSE flash is the same second's as the WebRTC flash nearest to where its distance from the end
+of the MSE buffer puts it, within this; the flashes are a second apart."""
+
+LATENCY_PERCENTILE = 0.9
+"""The high percentile of the latencies the report gives beside the median."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -249,6 +280,10 @@ class Verdict:
     failures: list[str]
     av_sync_before: AvSync | None = None
     """With a disruption, the A/V sync of the window before it."""
+    mse: dict[str, Json] | None = None
+    """In an MSE case, the MSE player's report (`mse_checks`)."""
+    latency: dict[str, Json] | None = None
+    """In an MSE case, WebRTC's and MSE's glass-to-glass latency (`latency`); a report."""
 
     def as_json(self) -> dict[str, Json]:
         """The verdict for the report."""
@@ -449,6 +484,22 @@ def _median_of(values: list[float]) -> float | None:
     return median(values) if values else None
 
 
+def _capture_to_render(sample: Json) -> tuple[float, float] | None:
+    """A capture sample's frame shown, on the wall clock, and its capture-to-render time, in ms.
+
+    `None` without its capture time or its time shown. See `capture_times`.
+    """
+    if not isinstance(sample, dict):
+        return None
+    capture, shown = sample.get("capture"), sample.get("shown")
+    if not isinstance(capture, int | float) or not isinstance(shown, int | float):
+        return None
+    frame = (
+        capture - NTP_UNIX_OFFSET_MS + _rtp_ms(sample.get("frame_rtp"), sample.get("source_rtp"))
+    )
+    return shown, shown - frame
+
+
 def capture_times(page: Json) -> dict[str, Json]:
     """Where the frames shown spent their time, from their capture time; a diagnostic.
 
@@ -502,6 +553,231 @@ def capture_times(page: Json) -> dict[str, Json]:
     }
 
 
+def _percentile(values: list[float], share: float) -> float | None:
+    """The nearest-rank percentile `share` of `values`; `None` without values."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(math.ceil(share * len(ordered)), 1)
+    return ordered[rank - 1]
+
+
+def _spread(values: list[float]) -> dict[str, Json]:
+    """The median and the `LATENCY_PERCENTILE` of `values`, and how many there are."""
+    return {
+        "median": _median_of(values),
+        "p90": _percentile(values, LATENCY_PERCENTILE),
+        "count": len(values),
+    }
+
+
+def _window(page: Json) -> tuple[float, float]:
+    """The play window the checks take, on the page's clock, in ms: its two stats snapshots."""
+    stats = page.get("stats") or {}
+    start, end = stats.get("start") or {}, stats.get("end") or {}
+    return float(start.get("at", 0.0)), float(end.get("at", math.inf))
+
+
+def _mse_flashes(page: Json) -> list[dict[str, Json]]:
+    """The flashes the MSE element showed within the play window."""
+    low, high = _window(page)
+    flashes = ((page.get("mse") or {}).get("video") or {}).get("flashes") or []
+    return [
+        f
+        for f in flashes
+        if isinstance(f, dict) and isinstance(f.get("at"), int | float) and low <= f["at"] <= high
+    ]
+
+
+def latency(page: Json, stream: Stream) -> dict[str, Json]:
+    """Glass-to-glass latency of WebRTC and of MSE, side by side on one page; a report.
+
+    WebRTC's is each frame's capture to render (`capture_times`), over the frames the page sampled:
+    from the moment the daemon took the frame in, the capture time it stamps, so the camera's own
+    encoder and MediaMTX are not in it, for either path.
+    Each MSE flash within the play window is paired with the WebRTC flash of the same second: the
+    one nearest to where the flash's distance from the end of the MSE buffer (`behind_ms`) and the
+    one frame the output holds each frame put it, within `MSE_PAIR_WITHIN_MS`, since the flashes
+    are a second apart and the MSE picture is later than WebRTC's by some fraction of one. Its
+    latency is that WebRTC flash's capture to render plus how much later the MSE flash was shown.
+    Without `captureTimestamp` (Firefox and Safari do not report it), only the difference.
+    The flash's display time less `behind_ms` is when its bytes reached the buffer, so the pairing
+    holds while those bytes arrive within `MSE_PAIR_WITHIN_MS` of one frame after the WebRTC
+    flash; bytes a second late are paired with the next second's, which nothing on the page
+    tells apart from the identical flash of that second. Only a marker that names its second, or
+    a source time both outputs carry, would remove that; latency is a report, so it is left.
+    """
+    clock = page.get("clock") or {}
+    origin = (clock.get("time_origin") or 0.0) + (clock.get("t0") or 0.0)
+    samples = [
+        timed
+        for timed in map(_capture_to_render, (page.get("video") or {}).get("capture") or [])
+        if timed
+    ]
+    by_shown = dict(samples)
+    webrtc = [delay for _, delay in samples]
+    webrtc_flashes = [
+        at for at in (page.get("video") or {}).get("flashes") or [] if isinstance(at, int | float)
+    ]
+    held_ms = 1000 / stream.fps
+    differences, mse = [], []
+    for flash in _mse_flashes(page):
+        behind = flash.get("behind_ms")
+        expected = flash["at"] - (behind if isinstance(behind, int | float) else 0.0) - held_ms
+        near = [w for w in webrtc_flashes if abs(w - expected) <= MSE_PAIR_WITHIN_MS]
+        if not near:
+            continue
+        paired = min(near, key=lambda w: abs(w - expected))
+        difference = flash["at"] - paired
+        differences.append(difference)
+        # The WebRTC flash's own frame among the capture samples: the same time shown.
+        shown = origin + paired
+        own = next((d for at, d in by_shown.items() if abs(at - shown) < 1.0), None)
+        if own is not None:
+            mse.append(own + difference)
+    return {
+        "method": "glass to glass: WebRTC by captureTimestamp, MSE by its flashes against "
+        "WebRTC's on the same page"
+        if webrtc
+        else "MSE minus WebRTC only: the browser reports no captureTimestamp",
+        "webrtc_ms": _spread(webrtc) if webrtc else None,
+        "mse_ms": _spread(mse) if mse else None,
+        "mse_minus_webrtc_ms": _spread(differences),
+        "mse_flashes": len(_mse_flashes(page)),
+    }
+
+
+def latency_summary(report: dict[str, Json]) -> str:
+    """The latency report in a few words: each path's median and p90, in ms."""
+
+    def spread(name: str) -> str:
+        value = report.get(name)
+        if not isinstance(value, dict) or value.get("median") is None:
+            return "none"
+        return f"{value['median']:.0f} ms (p90 {value['p90']:.0f}, {value['count']})"
+
+    return (
+        f"WebRTC {spread('webrtc_ms')}, MSE {spread('mse_ms')}, "
+        f"MSE minus WebRTC {spread('mse_minus_webrtc_ms')}"
+    )
+
+
+def _expected_mime(stream: Stream) -> tuple[str | None, bool]:
+    """The audio codec the live output's type must name, and whether `audio_omitted` is due.
+
+    The codec as it names the camera's audio, `None` for none.
+
+    The live container carries AAC-LC (RFC 6381 `mp4a.40.2`) and Opus (its sample entry `Opus`,
+    Opus in ISOBMFF §4.3) as the camera sends them and leaves anything else out with the warning.
+    """
+    match stream.audio_codec:
+        case "MPEG4-GENERIC":
+            return "mp4a.40.2", False
+        case "opus":
+            return "opus", False
+        case "none":
+            return None, False
+        case _:
+            return None, True
+
+
+def _codecs(mime: str) -> list[str]:
+    """The entries of a MIME type's `codecs` parameter (RFC 6381 §3)."""
+    match = re.search(r'codecs="([^"]*)"', mime)
+    return [c.strip() for c in match.group(1).split(",")] if match else []
+
+
+def mse_checks(page: Json, stream: Stream) -> tuple[dict[str, Json], dict[str, Json], list[str]]:
+    """The MSE player's checks: what is measured, the report, and each failure as a sentence.
+
+    Gated only that the picture plays (see the module) and that the output's MIME type names the
+    camera's audio as the container takes it; the rest is the report.
+    """
+    mse = page.get("mse")
+    if not isinstance(mse, dict):
+        return {}, {}, ["the page played no live fMP4 through MSE"]
+    failures = [f"MSE: {error}" for error in mse.get("errors") or []]
+    low, high = _window(page)
+    play_s = (high - low) / 1000 if math.isfinite(high) else 0.0
+    camera_frames = stream.fps * play_s
+    frames = [
+        at
+        for at in (mse.get("video") or {}).get("frames") or []
+        if isinstance(at, int | float) and low <= at <= high
+    ]
+    edges = [low, *frames, high] if math.isfinite(high) else frames
+    gap = max((b - a for a, b in itertools.pairwise(edges)), default=None)
+    flashes = _mse_flashes(page)
+    measured: dict[str, Json] = {
+        "mse_frames_shown": len(frames),
+        "mse_longest_gap_ms": gap,
+        "mse_flashes": len(flashes),
+    }
+    if len(frames) < TWO_ELEMENTS_FRAMES_SHOWN_SHARE * camera_frames or not frames:
+        failures.append(
+            f"MSE frames shown at {TWO_ELEMENTS_FRAMES_SHOWN_SHARE:.0%} of the camera's "
+            f"{camera_frames:.0f} or more (got {len(frames)})"
+        )
+    if gap is None or gap > MSE_STALL_MS:
+        failures.append(f"MSE never without a new frame for over {MSE_STALL_MS:.0f} ms (got {gap})")
+    wanted = math.floor(play_s * FLASH_SHARE)
+    if len(flashes) < wanted or not flashes:
+        failures.append(f"a flash a second seen through MSE, {wanted} or more (got {len(flashes)})")
+    mime = mse.get("refused_mime") or mse.get("mime") or ""
+    codecs = [c.lower() for c in _codecs(mime)]
+    audio, omitted = _expected_mime(stream)
+    warnings = mse.get("warnings") or []
+    if audio is not None and audio not in codecs[1:]:
+        failures.append(f"the live output's type names the camera's {audio} (got {mime!r})")
+    if audio is None and len(codecs) != 1:
+        failures.append(f"the live output's type names the video alone (got {mime!r})")
+    if omitted != ("audio_omitted" in warnings):
+        failures.append(
+            f"an audio_omitted warning {'' if omitted else 'not '}sent (got {warnings})"
+        )
+    closed = mse.get("closed") or {}
+    if closed.get("reason") != "closed":
+        failures.append(f"the live output closed by live/close (got {closed or None})")
+    sound = mse.get("audio") or {}
+    beeps = [b for b in sound.get("beeps") or [] if isinstance(b, int | float)]
+    sync = av_sync(
+        [f["at"] for f in flashes], beeps, (page.get("timings") or {}).get("first_frame", 0.0), None
+    )
+    report = {
+        "api": mse.get("api"),
+        "mime": mse.get("mime"),
+        "refused_mime": mse.get("refused_mime"),
+        "content_type": mse.get("content_type"),
+        "is_type_supported": mse.get("support"),
+        "warnings": warnings,
+        "audio": {
+            "in_output": len(_codecs(mse.get("mime") or "")) > 1,
+            "tap": sound.get("tap"),
+            "heard": (sound.get("peak") or 0.0) > BEEP_PEAK,
+            "peak": sound.get("peak"),
+            "beeps": len(beeps),
+            "av_sync_median_ms": sync.median_ms,
+            "av_sync_pairs": sync.pairs,
+            "decoded_bytes": (mse.get("end") or {}).get("audio_decoded_bytes"),
+            "moz_has_audio": (mse.get("end") or {}).get("moz_has_audio"),
+            "audio_tracks": (mse.get("end") or {}).get("audio_tracks"),
+        },
+        "frame_callback": (mse.get("video") or {}).get("frame_callback"),
+        "appends": mse.get("appends"),
+        "bytes": mse.get("bytes"),
+        "seeks": mse.get("seeks"),
+        "catch_ups": mse.get("catch_ups"),
+        "waiting": mse.get("waiting"),
+        "removes": mse.get("removes"),
+        "quota_exceeded": mse.get("quota_exceeded"),
+        "timings": mse.get("timings"),
+        "jumped_to": mse.get("jumped_to"),
+        "end": mse.get("end"),
+        "closed": mse.get("closed"),
+    }
+    return measured, report, failures
+
+
 def _browser_estimate(page: Json) -> float | None:
     """The browser's own A/V skew, where it reports one.
 
@@ -524,12 +800,18 @@ def jitter_buffer_bound_ms(kind: str, engine: str | None) -> float:
 
 
 def check(  # noqa: PLR0915 -- one check after another
-    page: Json, stream: Stream, disrupt: str | None = None, engine: str | None = None
+    page: Json,
+    stream: Stream,
+    disrupt: str | None = None,
+    engine: str | None = None,
+    *,
+    mse: bool = False,
 ) -> Verdict:
     """The checks on what the page measured; each failed one as a sentence.
 
     With `disrupt`, the case's disruption (`harness.Case.disrupt`), the window after the recovery;
-    `engine` is the browser (`chrome`, `firefox`, `safari`) where a bound depends on it.
+    `engine` is the browser (`chrome`, `firefox`, `safari`) where a bound depends on it; with `mse`
+    (`harness.Case.mse`), the MSE player's checks and the latency report as well.
     """
     failures = [f"the page: {error}" for error in page.get("errors", [])]
     failures += disruption_failures(page, disrupt)
@@ -560,10 +842,10 @@ def check(  # noqa: PLR0915 -- one check after another
     camera_frames = stream.fps * play_s
     shown = (video_page.get("presented_at_end") or 0) - (video_page.get("presented_at_start") or 0)
     measured["frames_shown"] = shown
+    share = TWO_ELEMENTS_FRAMES_SHOWN_SHARE if mse else FRAMES_SHOWN_SHARE
     expect(
-        shown > 0 and shown >= FRAMES_SHOWN_SHARE * camera_frames,
-        f"frames shown at {FRAMES_SHOWN_SHARE:.0%} of the camera's {camera_frames:.0f} or more "
-        f"(got {shown})",
+        shown > 0 and shown >= share * camera_frames,
+        f"frames shown at {share:.0%} of the camera's {camera_frames:.0f} or more (got {shown})",
     )
     size = (video_page.get("width"), video_page.get("height"))
     measured["picture"] = f"{size[0]}x{size[1]}"
@@ -695,10 +977,18 @@ def check(  # noqa: PLR0915 -- one check after another
         energy is not None and energy >= energy_wanted,
         f"totalAudioEnergy of the beeps, {energy_wanted:.4f} or more (got {energy})",
     )
+    mse_report = latencies = None
+    if mse:
+        mse_measured, mse_report, mse_failures = mse_checks(page, stream)
+        measured |= mse_measured
+        failures += mse_failures
+        latencies = latency(page, stream)
     return Verdict(
         measured=measured,
         diagnostics=diagnostics(page),
         av_sync=sync,
         failures=failures,
         av_sync_before=sync_before,
+        mse=mse_report,
+        latency=latencies,
     )
