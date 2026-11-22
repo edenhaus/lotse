@@ -4,7 +4,7 @@
 # Runs inside a container under Docker's default seccomp profile, as root, the way
 # a deployment's container may start the daemon: the supervisor binds its socket in a
 # root-owned 0700 directory, drops to 65534 and applies its sandbox; workers apply
-# theirs. Checks, through `lotse ctl`, that `info.sandbox` reports every layer, that a
+# theirs. Checks, through `rocko ctl`, that `info.sandbox` reports every layer, that a
 # sandboxed worker on the fake source goes live with every thread at a lower scheduling
 # priority than the supervisor's and an `RLIMIT_NICE` pinned to 0, that a crashing worker is
 # restarted without touching the other stream, and that the daemon stops cleanly on SIGTERM.
@@ -13,14 +13,14 @@
 # default, `require`, starts exactly where `on` found every layer enforced, and otherwise
 # refuses, naming the missing layer and `--sandbox on`.
 #
-# Needs a `lotse` built with `--features source-fake`, at $LOTSE (default /lotse), and a
+# Needs a `rocko` built with `--features source-fake`, at $ROCKO (default /rocko), and a
 # container started with `--ulimit nice=20:20`: a raised `RLIMIT_NICE` would let a worker undo
 # its lower priority, so the check proves the worker pins it to 0.
 set -eu
 
-LOTSE="${LOTSE:-/lotse}"
-DIR="${LOTSE_DIR:-/run/lotse}"
-SOCKET="$DIR/lotse.sock"
+ROCKO="${ROCKO:-/rocko}"
+DIR="${ROCKO_DIR:-/run/rocko}"
+SOCKET="$DIR/rocko.sock"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -29,7 +29,7 @@ fail() {
 
 # `ctl <args>`: the daemon's compact JSON answer on stdout.
 ctl() {
-  "$LOTSE" ctl --socket "$SOCKET" --compact "$@"
+  "$ROCKO" ctl --socket "$SOCKET" --compact "$@"
 }
 
 # `field <json> <key>`: the value of a top-level string, number or bool key.
@@ -42,13 +42,13 @@ field() {
 start() {
   mode="$1"
   if [ "$mode" = default ]; then set --; else set -- --sandbox "$mode"; fi
-  "$LOTSE" serve --socket "$SOCKET" "$@" --user 65534 --group 65534 \
-    --linger-ms 200 --log-format json --log-level debug 2>"$DIR/lotse.log" &
+  "$ROCKO" serve --socket "$SOCKET" "$@" --user 65534 --group 65534 \
+    --linger-ms 200 --log-format json --log-level debug 2>"$DIR/rocko.log" &
   DAEMON=$!
   i=0
   until [ -S "$SOCKET" ] && ctl info >/dev/null 2>&1; do
     i=$((i + 1))
-    [ "$i" -lt 100 ] || { cat "$DIR/lotse.log" >&2; fail "the daemon did not come up ($mode)"; }
+    [ "$i" -lt 100 ] || { cat "$DIR/rocko.log" >&2; fail "the daemon did not come up ($mode)"; }
     sleep 0.1
   done
 }
@@ -58,15 +58,15 @@ wait_live() {
   i=0
   until [ "$(field "$(ctl stream get "$1")" state)" = "live" ]; do
     i=$((i + 1))
-    [ "$i" -lt 200 ] || { cat "$DIR/lotse.log" >&2; fail "$1 never went live: $(ctl stream get "$1")"; }
+    [ "$i" -lt 200 ] || { cat "$DIR/rocko.log" >&2; fail "$1 never went live: $(ctl stream get "$1")"; }
     sleep 0.1
   done
 }
 
-# `all_unprivileged <count>`: at least <count> lotse processes (the supervisor and its
+# `all_unprivileged <count>`: at least <count> rocko processes (the supervisor and its
 # workers) run, and every one has real, effective, saved and filesystem uid 65534.
 all_unprivileged() {
-  name="$(basename "$LOTSE" | cut -c 1-15)" # the kernel's `comm`, at most 15 bytes
+  name="$(basename "$ROCKO" | cut -c 1-15)" # the kernel's `comm`, at most 15 bytes
   n=0
   for status in /proc/[0-9]*/status; do
     grep -q "^Name:[[:space:]]*$name\$" "$status" 2>/dev/null || continue
@@ -74,11 +74,11 @@ all_unprivileged() {
     [ "$uids" = "Uid: 65534 65534 65534 65534 " ] || fail "$status: $uids"
     n=$((n + 1))
   done
-  [ "$n" -ge "$1" ] || fail "expected at least $1 lotse processes, found $n"
-  echo "$n lotse processes, all uid 65534"
+  [ "$n" -ge "$1" ] || fail "expected at least $1 rocko processes, found $n"
+  echo "$n rocko processes, all uid 65534"
 }
 
-nice_increment=10 # lotse_sandbox::WORKER_NICE_INCREMENT
+nice_increment=10 # rocko_sandbox::WORKER_NICE_INCREMENT
 
 # `nice_limit <pid>`: the soft and hard `RLIMIT_NICE` of <pid>, as "<soft> <hard>" (proc(5)).
 nice_limit() {
@@ -91,7 +91,7 @@ nice_limit() {
 # worker's `RLIMIT_NICE` is 0, so it cannot lower its nice value again, while the supervisor keeps
 # the raised limit the container started it with, so the pin had a limit to undo.
 workers_niced() {
-  name="$(basename "$LOTSE" | cut -c 1-15)"
+  name="$(basename "$ROCKO" | cut -c 1-15)"
   own="$(sed 's/.*) //' "/proc/$DAEMON/stat" | cut -d ' ' -f 17)" # field 19, after `comm`
   lowered=$((own + nice_increment))
   [ "$lowered" -le 19 ] || lowered=19
@@ -169,7 +169,7 @@ ctl stream put crash --url fake://127.0.0.2/ --options '{"crash":true}' --preloa
 i=0
 until [ "$(field "$(ctl stream get crash)" state)" = "restarting" ]; do
   i=$((i + 1))
-  [ "$i" -lt 200 ] || { cat "$DIR/lotse.log" >&2; fail "crash never restarted: $(ctl stream get crash)"; }
+  [ "$i" -lt 200 ] || { cat "$DIR/rocko.log" >&2; fail "crash never restarted: $(ctl stream get crash)"; }
   sleep 0.1
 done
 crash="$(ctl stream get crash)"
@@ -184,7 +184,7 @@ ctl stream delete crash >/dev/null
 ctl stream delete front >/dev/null
 kill -TERM "$DAEMON"
 wait "$DAEMON" || fail "the daemon did not exit cleanly"
-grep -q '"event":"ready"' "$DIR/lotse.log" || fail "no ready event in the log"
+grep -q '"event":"ready"' "$DIR/rocko.log" || fail "no ready event in the log"
 echo "OK: sandbox enforced, workers isolated, clean stop"
 
 # No sandbox setting: `require`, the default. `on` above found seccomp and Landlock's filesystem
@@ -204,12 +204,12 @@ if [ "$net" = "enforced" ]; then
 else
   # Refused, it exits with 1 at once; one that starts is ended by `timeout`, with another status.
   status=0
-  timeout 10 "$LOTSE" serve --socket "$SOCKET" --user 65534 --group 65534 --log-format json \
-    2>"$DIR/lotse.log" || status=$?
-  [ "$status" = 1 ] || { cat "$DIR/lotse.log" >&2; fail "the default exited with $status, not 1"; }
-  grep -q 'sandbox layer landlock.net is unavailable' "$DIR/lotse.log" ||
-    { cat "$DIR/lotse.log" >&2; fail "the refusal does not name landlock.net"; }
-  grep -q -- '--sandbox on' "$DIR/lotse.log" ||
-    { cat "$DIR/lotse.log" >&2; fail "the refusal does not say how to choose on"; }
+  timeout 10 "$ROCKO" serve --socket "$SOCKET" --user 65534 --group 65534 --log-format json \
+    2>"$DIR/rocko.log" || status=$?
+  [ "$status" = 1 ] || { cat "$DIR/rocko.log" >&2; fail "the default exited with $status, not 1"; }
+  grep -q 'sandbox layer landlock.net is unavailable' "$DIR/rocko.log" ||
+    { cat "$DIR/rocko.log" >&2; fail "the refusal does not name landlock.net"; }
+  grep -q -- '--sandbox on' "$DIR/rocko.log" ||
+    { cat "$DIR/rocko.log" >&2; fail "the refusal does not say how to choose on"; }
   echo "OK: the default, require, refuses without landlock.net and names the way to on"
 fi

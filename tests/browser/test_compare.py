@@ -68,7 +68,7 @@ def test_summaries_skip_runs_without_the_metric() -> None:
     assert summarise([], ("measured", "frames_decoded")).p50 is None
 
 
-def test_a_delta_is_lotse_minus_the_other_and_none_without_both() -> None:
+def test_a_delta_is_rocko_minus_the_other_and_none_without_both() -> None:
     assert delta(12.0, 7.0) == 5.0
     assert delta(30.0, 230.0) == -200.0
     assert delta(None, 7.0) is None
@@ -103,15 +103,15 @@ def test_the_codecs_negotiated_leave_out_what_is_not_reported() -> None:
     }
 
 
-def test_the_report_sets_every_server_side_by_side_with_lotse_s_differences() -> None:
-    lotse = [run(30, 7, 50, 1.0), run(35, 8, 52, 1.2), run(32, 7, 55, 1.1)]
+def test_the_report_sets_every_server_side_by_side_with_rocko_s_differences() -> None:
+    rocko = [run(30, 7, 50, 1.0), run(35, 8, 52, 1.2), run(32, 7, 55, 1.1)]
     go2rtc = [run(230, 47, 80, 1.3), run(400, 45, 79, 1.4), run(120, 48, 81, 1.2)]
     ffmpeg = [run(250, 40, 90, 9.0), run(260, 41, 91, 9.5)]
-    comparison = compare(lotse, {"go2rtc": go2rtc, "go2rtc-ffmpeg": ffmpeg})
+    comparison = compare(rocko, {"go2rtc": go2rtc, "go2rtc-ffmpeg": ffmpeg})
     assert list(comparison) == ["metrics", "deltas", "negotiated", "outcomes"]
     ttff = comparison["metrics"]["time_to_first_frame_ms"]
-    assert list(ttff) == ["lotse", "go2rtc", "go2rtc-ffmpeg"]
-    assert (ttff["lotse"]["p50"], ttff["go2rtc"]["p50"], ttff["go2rtc"]["p95"]) == (32, 230, 400)
+    assert list(ttff) == ["rocko", "go2rtc", "go2rtc-ffmpeg"]
+    assert (ttff["rocko"]["p50"], ttff["go2rtc"]["p50"], ttff["go2rtc"]["p95"]) == (32, 230, 400)
     assert (ttff["go2rtc-ffmpeg"]["p50"], ttff["go2rtc-ffmpeg"]["runs"]) == (250, 2)
     assert comparison["deltas"]["time_to_first_frame_ms"] == {
         "go2rtc": {"p50": -198.0, "p95": -365.0},
@@ -120,7 +120,7 @@ def test_the_report_sets_every_server_side_by_side_with_lotse_s_differences() ->
     assert comparison["deltas"]["video_decode_ms"]["go2rtc"] == {"p50": None, "p95": None}
     assert list(comparison["deltas"]) == list(comparison["metrics"])
     assert comparison["negotiated"]["go2rtc"] == {"video": ["video/H264"], "audio": ["audio/PCMU"]}
-    assert list(comparison["negotiated"]) == ["lotse", "go2rtc", "go2rtc-ffmpeg"]
+    assert list(comparison["negotiated"]) == ["rocko", "go2rtc", "go2rtc-ffmpeg"]
     assert comparison["outcomes"]["go2rtc-ffmpeg"] == {
         "runs": 2,
         "played": 2,
@@ -130,7 +130,7 @@ def test_the_report_sets_every_server_side_by_side_with_lotse_s_differences() ->
     markdown = table(comparison)
     assert markdown.splitlines()[:2] == [
         (
-            "| metric | lotse p50 | lotse p95 | go2rtc p50 | go2rtc p95 "
+            "| metric | rocko p50 | rocko p95 | go2rtc p50 | go2rtc p95 "
             "| go2rtc-ffmpeg p50 | go2rtc-ffmpeg p95 | Δ go2rtc p50 | Δ go2rtc-ffmpeg p50 |"
         ),
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -143,13 +143,13 @@ def test_the_report_sets_every_server_side_by_side_with_lotse_s_differences() ->
     assert "| video_decode_ms | - | - | - | - | - | - | - | - |" in markdown
 
 
-def test_lotse_worse_than_another_server_is_reported_not_failed() -> None:
+def test_rocko_worse_than_another_server_is_reported_not_failed() -> None:
     comparison = compare(
         [run(300, 7, 50, 1.0)],
         {"go2rtc": [run(400, 7, 50, 1.0)], "go2rtc-ffmpeg": [run(200, 7, 50, 1.0)]},
     )
     assert comparison["deltas"]["time_to_first_frame_ms"]["go2rtc-ffmpeg"]["p50"] == 100.0
-    assert comparison["outcomes"]["lotse"]["failures"] == []
+    assert comparison["outcomes"]["rocko"]["failures"] == []
     assert "failures" not in comparison
 
 
@@ -169,7 +169,7 @@ def test_another_server_s_runs_that_did_not_play_are_reported_with_the_others() 
             "run 1: no end of candidates",
         ],
     }
-    assert comparison["outcomes"]["lotse"]["passed"] == 1
+    assert comparison["outcomes"]["rocko"]["passed"] == 1
     every_run_gone = compare([run(30, 7, 50, 1.0)], {"go2rtc": [gone]})
     assert every_run_gone["metrics"]["time_to_first_frame_ms"]["go2rtc"]["p50"] is None
     assert every_run_gone["deltas"]["time_to_first_frame_ms"]["go2rtc"]["p50"] is None

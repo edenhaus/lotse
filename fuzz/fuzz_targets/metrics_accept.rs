@@ -7,7 +7,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_api::exporter::{Format, negotiate_accept};
+use rocko_api::exporter::{Format, negotiate_accept};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {

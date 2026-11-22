@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::clock::{Clock, SystemClock};
-use lotse_supervisor::net::demux::{DatagramSink, Registrations};
-use lotse_supervisor::net::stun::{self, Builder, Class, METHOD_BINDING};
-use lotse_supervisor::net::tcp::{IceTcpConfig, IceTcpStats, accept_loop};
+use rocko_core::clock::{Clock, SystemClock};
+use rocko_supervisor::net::demux::{DatagramSink, Registrations};
+use rocko_supervisor::net::stun::{self, Builder, Class, METHOD_BINDING};
+use rocko_supervisor::net::tcp::{IceTcpConfig, IceTcpStats, accept_loop};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;

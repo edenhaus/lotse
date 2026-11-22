@@ -1544,376 +1544,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
-name = "lotse"
-version = "0.0.0-dev"
-dependencies = [
- "anyhow",
- "clap",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
- "log",
- "lotse-api-types",
- "lotse-codec",
- "lotse-core",
- "lotse-http",
- "lotse-ipc",
- "lotse-mux",
- "lotse-rtsp",
- "lotse-sandbox",
- "lotse-supervisor",
- "lotse-testing",
- "lotse-webrtc",
- "lotse-worker",
- "mp4-atom",
- "rustix",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "lotse-api"
-version = "0.0.0-dev"
-dependencies = [
- "axum",
- "futures-util",
- "hyper",
- "hyper-util",
- "lotse-api-types",
- "lotse-core",
- "lotse-hls",
- "lotse-testing",
- "mediatype",
- "pem",
- "prometheus-client",
- "rcgen",
- "rustix",
- "rustls",
- "rustls-webpki",
- "serde",
- "serde_json",
- "subtle",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "lotse-api-types"
-version = "0.0.0-dev"
-dependencies = [
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "lotse-codec"
-version = "0.0.0-dev"
-dependencies = [
- "adts-reader",
- "bytes",
- "divan",
- "h264-reader",
- "lotse-core",
- "nanoaudio-g722",
- "opus",
- "rubato",
- "symphonia-codec-aac",
- "symphonia-core",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "lotse-core"
-version = "0.0.0-dev"
-dependencies = [
- "allocation-counter",
- "arc-swap",
- "bytes",
- "percent-encoding",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "lotse-fuzz"
-version = "0.0.0-dev"
-dependencies = [
- "bytes",
- "libfuzzer-sys",
- "lotse-api",
- "lotse-api-types",
- "lotse-codec",
- "lotse-core",
- "lotse-hls",
- "lotse-http",
- "lotse-ipc",
- "lotse-mux",
- "lotse-rtsp",
- "lotse-supervisor",
- "lotse-testing",
- "lotse-webrtc",
- "lotse-worker",
- "mp4-atom",
- "serde_json",
- "str0m",
- "tokio",
- "tokio-util",
- "url",
-]
-
-[[package]]
-name = "lotse-hls"
-version = "0.0.0-dev"
-dependencies = [
- "bytes",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "lotse-http"
-version = "0.0.0-dev"
-dependencies = [
- "bytes",
- "divan",
- "http-auth",
- "http-body-util",
- "hyper",
- "hyper-util",
- "lotse-api-types",
- "lotse-codec",
- "lotse-core",
- "lotse-testing",
- "lotse-tls",
- "m3u8-rs",
- "mp4-atom",
- "mpeg2ts-reader",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "lotse-ipc"
-version = "0.0.0-dev"
-dependencies = [
- "bytes",
- "postcard",
- "rustix",
- "serde",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "lotse-mux"
-version = "0.0.0-dev"
-dependencies = [
- "bytes",
- "lotse-codec",
- "lotse-core",
- "mp4-atom",
- "serde_json",
-]
-
-[[package]]
-name = "lotse-rtsp"
-version = "0.0.0-dev"
-dependencies = [
- "bytes",
- "futures-util",
- "lotse-api-types",
- "lotse-codec",
- "lotse-core",
- "lotse-testing",
- "lotse-tls",
- "retina",
- "sdp-types",
- "serde",
- "serde_json",
- "socket2",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-core",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "lotse-sandbox"
-version = "0.0.0-dev"
-dependencies = [
- "landlock",
- "libc",
- "rustix",
- "seccompiler",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "lotse-supervisor"
-version = "0.0.0-dev"
-dependencies = [
- "allocation-counter",
- "divan",
- "futures-util",
- "getrandom 0.4.3",
- "hmac",
- "lotse-api",
- "lotse-api-types",
- "lotse-core",
- "lotse-hls",
- "lotse-ipc",
- "lotse-testing",
- "lotse-tls",
- "md-5 0.11.0",
- "nix",
- "quinn-udp",
- "rustix",
- "serde_json",
- "sha1 0.11.0",
- "sha2 0.11.1",
- "socket2",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "lotse-testing"
-version = "0.0.0-dev"
-dependencies = [
- "axum",
- "bytes",
- "futures-util",
- "hmac",
- "hyper",
- "hyper-util",
- "libc",
- "lotse-api-types",
- "lotse-codec",
- "lotse-core",
- "lotse-hls",
- "lotse-webrtc",
- "md-5 0.11.0",
- "nix",
- "rcgen",
- "rtsp-types",
- "rustix",
- "rustls",
- "serde",
- "serde_json",
- "sha1 0.11.0",
- "sha2 0.11.1",
- "str0m",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "lotse-tls"
-version = "0.0.0-dev"
-dependencies = [
- "lotse-api-types",
- "lotse-core",
- "lotse-testing",
- "rustls",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
- "webpki-roots",
-]
-
-[[package]]
-name = "lotse-webrtc"
-version = "0.0.0-dev"
-dependencies = [
- "aes",
- "aes-gcm",
- "allocation-counter",
- "bytes",
- "ctr",
- "dimpl",
- "hmac",
- "lotse-api-types",
- "lotse-codec",
- "lotse-core",
- "lotse-testing",
- "rcgen",
- "serde_json",
- "sha1 0.11.0",
- "sha2 0.11.1",
- "str0m",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "lotse-worker"
-version = "0.0.0-dev"
-dependencies = [
- "allocation-counter",
- "bytes",
- "libc",
- "lotse-codec",
- "lotse-core",
- "lotse-ipc",
- "lotse-testing",
- "rustix",
- "serde_json",
- "socket2",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "m3u8-rs"
 version = "6.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2679,6 +2309,376 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rocko"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "mp4-atom",
+ "rocko-api-types",
+ "rocko-codec",
+ "rocko-core",
+ "rocko-http",
+ "rocko-ipc",
+ "rocko-mux",
+ "rocko-rtsp",
+ "rocko-sandbox",
+ "rocko-supervisor",
+ "rocko-testing",
+ "rocko-webrtc",
+ "rocko-worker",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rocko-api"
+version = "0.0.0-dev"
+dependencies = [
+ "axum",
+ "futures-util",
+ "hyper",
+ "hyper-util",
+ "mediatype",
+ "pem",
+ "prometheus-client",
+ "rcgen",
+ "rocko-api-types",
+ "rocko-core",
+ "rocko-hls",
+ "rocko-testing",
+ "rustix",
+ "rustls",
+ "rustls-webpki",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rocko-api-types"
+version = "0.0.0-dev"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "rocko-codec"
+version = "0.0.0-dev"
+dependencies = [
+ "adts-reader",
+ "bytes",
+ "divan",
+ "h264-reader",
+ "nanoaudio-g722",
+ "opus",
+ "rocko-core",
+ "rubato",
+ "symphonia-codec-aac",
+ "symphonia-core",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rocko-core"
+version = "0.0.0-dev"
+dependencies = [
+ "allocation-counter",
+ "arc-swap",
+ "bytes",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "rocko-fuzz"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "libfuzzer-sys",
+ "mp4-atom",
+ "rocko-api",
+ "rocko-api-types",
+ "rocko-codec",
+ "rocko-core",
+ "rocko-hls",
+ "rocko-http",
+ "rocko-ipc",
+ "rocko-mux",
+ "rocko-rtsp",
+ "rocko-supervisor",
+ "rocko-testing",
+ "rocko-webrtc",
+ "rocko-worker",
+ "serde_json",
+ "str0m",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "rocko-hls"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "rocko-http"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "divan",
+ "http-auth",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "m3u8-rs",
+ "mp4-atom",
+ "mpeg2ts-reader",
+ "rocko-api-types",
+ "rocko-codec",
+ "rocko-core",
+ "rocko-testing",
+ "rocko-tls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "rocko-ipc"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "postcard",
+ "rustix",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rocko-mux"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "mp4-atom",
+ "rocko-codec",
+ "rocko-core",
+ "serde_json",
+]
+
+[[package]]
+name = "rocko-rtsp"
+version = "0.0.0-dev"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "retina",
+ "rocko-api-types",
+ "rocko-codec",
+ "rocko-core",
+ "rocko-testing",
+ "rocko-tls",
+ "sdp-types",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "rocko-sandbox"
+version = "0.0.0-dev"
+dependencies = [
+ "landlock",
+ "libc",
+ "rustix",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rocko-supervisor"
+version = "0.0.0-dev"
+dependencies = [
+ "allocation-counter",
+ "divan",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hmac",
+ "md-5 0.11.0",
+ "nix",
+ "quinn-udp",
+ "rocko-api",
+ "rocko-api-types",
+ "rocko-core",
+ "rocko-hls",
+ "rocko-ipc",
+ "rocko-testing",
+ "rocko-tls",
+ "rustix",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rocko-testing"
+version = "0.0.0-dev"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures-util",
+ "hmac",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "md-5 0.11.0",
+ "nix",
+ "rcgen",
+ "rocko-api-types",
+ "rocko-codec",
+ "rocko-core",
+ "rocko-hls",
+ "rocko-webrtc",
+ "rtsp-types",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "str0m",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "rocko-tls"
+version = "0.0.0-dev"
+dependencies = [
+ "rocko-api-types",
+ "rocko-core",
+ "rocko-testing",
+ "rustls",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots",
+]
+
+[[package]]
+name = "rocko-webrtc"
+version = "0.0.0-dev"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "allocation-counter",
+ "bytes",
+ "ctr",
+ "dimpl",
+ "hmac",
+ "rcgen",
+ "rocko-api-types",
+ "rocko-codec",
+ "rocko-core",
+ "rocko-testing",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "str0m",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rocko-worker"
+version = "0.0.0-dev"
+dependencies = [
+ "allocation-counter",
+ "bytes",
+ "libc",
+ "rocko-codec",
+ "rocko-core",
+ "rocko-ipc",
+ "rocko-testing",
+ "rustix",
+ "serde_json",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

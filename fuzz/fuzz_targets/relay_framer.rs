@@ -16,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use libfuzzer_sys::fuzz_target;
-use lotse_supervisor::net::turn::{CHANNEL_DATA_HEADER_LEN, parse_channel_data, stream_frame_len};
-use lotse_worker::relay::{Egress, Relays, channel_data};
+use rocko_supervisor::net::turn::{CHANNEL_DATA_HEADER_LEN, parse_channel_data, stream_frame_len};
+use rocko_worker::relay::{Egress, Relays, channel_data};
 
 /// The largest data a `ChannelData` length field carries.
 const MAX_DATA: usize = 65_535;

@@ -17,10 +17,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::{h264, h265};
-use lotse_core::Codec;
-use lotse_http::media::{Event, Layout};
-use lotse_http::ts::Demuxer;
+use rocko_codec::{h264, h265};
+use rocko_core::Codec;
+use rocko_http::media::{Event, Layout};
+use rocko_http::ts::Demuxer;
 
 /// The frame limit: small, so the limit is reached.
 const MAX_FRAME: usize = 4096;
@@ -33,9 +33,9 @@ const PAYLOAD: usize = 184;
 /// PAT, SDT, and the null packet.
 const PIDS: [u16; 8] = [0x100, 0x101, 0x102, 0x1000, 0x1001, 0x0000, 0x0011, 0x1fff];
 
-const H264_AAC: &[u8] = include_bytes!("../../crates/lotse-http/testdata/h264_aac.m2t");
-const H265: &[u8] = include_bytes!("../../crates/lotse-http/testdata/h265_v1.m2t");
-const PROGRAMS: &[u8] = include_bytes!("../../crates/lotse-http/testdata/programs.m2t");
+const H264_AAC: &[u8] = include_bytes!("../../crates/rocko-http/testdata/h264_aac.m2t");
+const H265: &[u8] = include_bytes!("../../crates/rocko-http/testdata/h265_v1.m2t");
+const PROGRAMS: &[u8] = include_bytes!("../../crates/rocko-http/testdata/programs.m2t");
 
 /// The rest of the input as transport packets, one per record.
 fn packets(records: &[u8]) -> Vec<u8> {

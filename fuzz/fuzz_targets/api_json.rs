@@ -8,7 +8,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_api_types::{Command, parse_command};
+use rocko_api_types::{Command, parse_command};
 
 /// Whether `value` holds a number that is not an integer.
 fn has_float(value: &serde_json::Value) -> bool {
@@ -39,7 +39,7 @@ fuzz_target!(|data: &[u8]| {
     let serde_json::Value::Object(mut fields) = json else {
         panic!("a command is an object");
     };
-    fields.insert("lotse_fuzz_unknown".into(), serde_json::Value::Null);
+    fields.insert("rocko_fuzz_unknown".into(), serde_json::Value::Null);
     assert!(
         parse_command(&serde_json::Value::Object(fields).to_string()).is_err(),
         "an unknown field is rejected"

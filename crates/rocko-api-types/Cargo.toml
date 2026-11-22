@@ -1,0 +1,33 @@
+[package]
+name = "rocko-api-types"
+description = "Serde DTOs of the control API, shared by the server, `rocko ctl` and generated clients, plus JSON Schema generation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# The JSON Schema generator (`schema::bundle`): the `schema` example and the test that the
+# committed bundle is not stale. The daemon serves the committed bundle and leaves it out.
+schema = ["dep:schemars"]
+# The `fake` and `fake-signaled` sources of `stream/put`, which `rocko_core::test_util`'s fake
+# factories serve: for tests and the daemon's `source-fake` builds only, and never in the schema.
+test-util = []
+
+[dependencies]
+schemars = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[[example]]
+name = "schema"
+required-features = ["schema"]
+
+[lints]
+workspace = true

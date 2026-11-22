@@ -5,7 +5,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::aac::parse_config;
+use rocko_codec::aac::parse_config;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(config) = parse_config(data) {

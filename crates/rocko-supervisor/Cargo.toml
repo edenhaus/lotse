@@ -1,0 +1,52 @@
+[package]
+name = "rocko-supervisor"
+description = "Registry and desired state, worker manager, UDP demux, ICE-TCP accept, STUN and TURN client, DNS."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+futures-util = { workspace = true } # the session's TURN attempts in flight, a `FuturesUnordered` its queue refills
+getrandom = { workspace = true }
+hmac = { workspace = true }
+md-5 = { workspace = true } # the TURN long-term key of the MD5 password algorithm (RFC 8489 §9.2.2)
+nix = { workspace = true, features = ["net"] } # getifaddrs(3): the host candidates on every interface
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true } # MESSAGE-INTEGRITY-SHA256, the SHA-256 password algorithm and USERHASH (RFC 8489 §14.6, §18.5.1.2, §14.4)
+rustix = { workspace = true, features = ["event"] } # the demux thread's poll(2) wait, independent of the shared socket's blocking mode
+quinn-udp = { workspace = true } # the receive thread: recvmmsg with GRO and each datagram's destination address
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "time", "process", "sync", "net", "io-util"] } # the control-plane runtime, SIGTERM/SIGINT, worker processes, host resolution; `io-util`: an LL-HLS output's pipe read
+tokio-util = { workspace = true, features = ["rt"] } # the cancellation token of the API server, the task tracker of the connection drivers
+tracing = { workspace = true }
+rocko-api = { workspace = true }
+rocko-api-types = { workspace = true }
+rocko-core = { workspace = true }
+rocko-hls = { workspace = true } # the LL-HLS window each LL-HLS output's records fill
+rocko-ipc = { workspace = true }
+rocko-tls = { workspace = true } # the TLS handshake of a TURN allocation over TLS (`turns:`), against the embedded roots
+
+[dev-dependencies]
+allocation-counter = { workspace = true } # the demux's allocation count (tests/allocations.rs)
+divan = { workspace = true } # the microbenchmarks (benches/)
+rocko-api-types = { workspace = true, features = ["test-util"] } # the `fake` and `fake-signaled` sources of `stream/put`
+rocko-core = { workspace = true, features = ["test-util"] } # the fake source and clock
+rocko-testing = { workspace = true } # the fake TURN server
+rustix = { workspace = true, features = ["process"] } # signals to `run`, a reaped worker and a descriptor limit in the tests
+tracing-subscriber = { workspace = true } # captures the demux's rate-limited log lines
+
+# The microbenchmarks (`mise run bench`): divan's harness, not libtest's.
+[[bench]]
+name = "demux"
+harness = false
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping build lotse. The short version:
+Thanks for helping build rocko. The short version:
 
 1. **Design first.** A new feature starts as a design discussion in an
    issue, not as code.

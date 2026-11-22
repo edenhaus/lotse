@@ -1,4 +1,4 @@
-"""The go2rtc comparison: the same browser, page and camera through lotse and through go2rtc.
+"""The go2rtc comparison: the same browser, page and camera through rocko and through go2rtc.
 
 go2rtc 1.9.14 is configured and driven as its common deployment configures it (`servers.py`,
 `go2rtc.yaml`), on both of its paths for an RTSP camera: its own RTSP client (`go2rtc`) and
@@ -10,7 +10,7 @@ The page and `checks.check` are the browser test's (`test_browser.py`); only the
 summarises them side by side. `compare.json` and `compare.md` go to `--out`, each run's logs and
 report to `run-<round>-<server>/` there.
 
-The comparison is a report: no figure of go2rtc's passes or fails anything. lotse's runs must pass
+The comparison is a report: no figure of go2rtc's passes or fails anything. rocko's runs must pass
 every check of the browser test, as there; go2rtc's failed checks and runs that did not play are
 recorded in the report (go2rtc sends no end of candidates, which the trickle check expects).
 """
@@ -29,7 +29,7 @@ import pytest
 
 import servers
 from checks import check
-from compare import LOTSE, compare, table
+from compare import ROCKO, compare, table
 from harness import versions
 from usage import Sampler, usage
 
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from harness import Settings
 
 SERVERS: dict[str, Callable[[Settings, Path], AbstractContextManager[servers.Running]]] = {
-    LOTSE: servers.lotse,
+    ROCKO: servers.rocko,
     "go2rtc": servers.go2rtc,
     "go2rtc-ffmpeg": partial(servers.go2rtc, ffmpeg=True),
 }
@@ -52,12 +52,12 @@ ones."""
 def _run(settings: Settings, server: str, round_: int) -> dict[str, Any]:
     """One play through `server`: what `checks.check` made of it, and the server's usage.
 
-    A run of lotse's that does not play fails the test there and then; one of another server's is
+    A run of rocko's that does not play fails the test there and then; one of another server's is
     recorded with its `error`, and the comparison goes on.
     """
     out = settings.out / f"run-{round_}-{server}"
     out.mkdir(parents=True, exist_ok=True)
-    if server == LOTSE:
+    if server == ROCKO:
         return _play(settings, server, round_, out)
     try:
         return _play(settings, server, round_, out)
@@ -113,7 +113,7 @@ def _machine() -> dict[str, object]:
     }
 
 
-def test_lotse_and_go2rtc_side_by_side(settings: Settings) -> None:
+def test_rocko_and_go2rtc_side_by_side(settings: Settings) -> None:
     if settings.go2rtc is None:
         pytest.fail("--go2rtc required for the comparison (scripts/compare.sh sets it)")
     results: dict[str, list[dict[str, Any]]] = {server: [] for server in SERVERS}
@@ -121,9 +121,9 @@ def test_lotse_and_go2rtc_side_by_side(settings: Settings) -> None:
         order = list(SERVERS) if round_ % 2 else list(reversed(SERVERS))
         for server in order:
             results[server].append(_run(settings, server, round_))
-    lotse, others = results[LOTSE], {s: r for s, r in results.items() if s != LOTSE}
-    comparison = compare(lotse, others)
-    first = lotse[0]
+    rocko, others = results[ROCKO], {s: r for s, r in results.items() if s != ROCKO}
+    comparison = compare(rocko, others)
+    first = rocko[0]
     report = {
         "engine": settings.engine,
         "browser": first["browser"],
@@ -138,7 +138,7 @@ def test_lotse_and_go2rtc_side_by_side(settings: Settings) -> None:
     browser = first["browser"]
     against = ", ".join(f"{s} {report['servers'][s]['version']}" for s in others)
     heading = (
-        f"lotse {report['servers'][LOTSE]['version']} against {against}, {settings.runs} runs of "
+        f"rocko {report['servers'][ROCKO]['version']} against {against}, {settings.runs} runs of "
         f"{settings.play_s:g} s each, {browser['name']} {browser['version']} on "
         f"{report['machine']['platform']}"
     )
@@ -148,11 +148,11 @@ def test_lotse_and_go2rtc_side_by_side(settings: Settings) -> None:
     )
     markdown = (
         f"{heading}\n\n{table(comparison)}\n\n"
-        "Δ: lotse's median minus the other server's.\n"
+        "Δ: rocko's median minus the other server's.\n"
         f"negotiated: {comparison['negotiated']}\nruns: {played}\n"
     )
     (settings.out / "compare.md").write_text(markdown)
     print(markdown)  # noqa: T201 -- the run's summary, shown by `-rA`
-    # lotse's own checks only: the comparison and the other servers' runs fail nothing.
-    failures = [f"lotse {failure}" for failure in comparison["outcomes"][LOTSE]["failures"]]
+    # rocko's own checks only: the comparison and the other servers' runs fail nothing.
+    failures = [f"rocko {failure}" for failure in comparison["outcomes"][ROCKO]["failures"]]
     assert not failures, "\n".join(failures)

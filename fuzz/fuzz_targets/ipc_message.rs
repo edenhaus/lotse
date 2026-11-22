@@ -5,7 +5,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_ipc::{ToSupervisor, ToWorker, decode, encode};
+use rocko_ipc::{ToSupervisor, ToWorker, decode, encode};
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(message) = decode::<ToSupervisor>(data) {

@@ -1,0 +1,190 @@
+//! The API version, which follows Semantic Versioning 2.0.0 and is separate
+//! from the daemon's version.
+//!
+//! Until rocko 1.0 the API is not stable and its major version is 0. As
+//! Cargo reads a 0.x version, a minor bump (0.1 to 0.2) is a breaking
+//! change and a patch bump an additive one; from 1.0 on, the major marks a
+//! breaking change and the minor an additive one. The WebSocket path
+//! carries the major version.
+//!
+//! The version stays at 0.1.0 until the first release of rocko or a
+//! client: before that no client exists to be incompatible with, so an
+//! API change does not bump it.
+
+/// Defines [`API_VERSION`], [`CURRENT`], [`WS_PATH`], [`RECORDING_PATH`],
+/// [`LIVE_PATH`], [`HLS_PATH`], [`PAIR_PATH`] and [`METRICS_PATH`]
+/// from one `major, minor, patch`, so they cannot disagree.
+macro_rules! api_version {
+    ($major:literal, $minor:literal, $patch:literal) => {
+        /// The API version in `hello.api` and the schema bundle's `api`.
+        pub const API_VERSION: &str = concat!($major, ".", $minor, ".", $patch);
+
+        /// [`API_VERSION`] as numbers, for [`ApiVersion::accepts`].
+        pub const CURRENT: ApiVersion = ApiVersion {
+            major: $major,
+            minor: $minor,
+            patch: $patch,
+        };
+
+        /// The WebSocket path: `/v<major>/ws`.
+        pub const WS_PATH: &str = concat!("/v", $major, "/ws");
+
+        /// Where event recordings' bytes are served: `/v<major>/recording`, each
+        /// recording at `/v<major>/recording/{recording_id}` ([`crate::recording::recording_path`]).
+        pub const RECORDING_PATH: &str = concat!("/v", $major, "/recording");
+
+        /// Where live outputs' bytes are served: `/v<major>/live`, each at
+        /// `/v<major>/live/{live_id}` ([`crate::live::live_path`]).
+        pub const LIVE_PATH: &str = concat!("/v", $major, "/live");
+
+        /// Where LL-HLS sessions' playlists and segments are served:
+        /// `/v<major>/hls`, each resource of a session at
+        /// `/v<major>/hls/{hls_id}/{name}` ([`crate::hls::hls_playlist_path`]).
+        pub const HLS_PATH: &str = concat!("/v", $major, "/hls");
+
+        /// Where a pairing connection sends its secret: `POST
+        /// /v<major>/pair`. Versioned with the API like every other path;
+        /// the pairing code's `ROCKO1` prefix versions the code's format,
+        /// not the route.
+        pub const PAIR_PATH: &str = concat!("/v", $major, "/pair");
+
+        /// Where the daemon's metrics are read, in OpenMetrics or the
+        /// Prometheus text format: `GET /v<major>/metrics`, by any client of either
+        /// listener, a `metrics` client of the TLS listener included.
+        pub const METRICS_PATH: &str = concat!("/v", $major, "/metrics");
+    };
+}
+
+api_version!(0, 1, 0);
+
+/// A `MAJOR.MINOR.PATCH` version (Semantic Versioning 2.0.0 §2, without pre-release or
+/// build metadata, which the API version never carries).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ApiVersion {
+    /// Breaking changes from 1.0 on.
+    pub major: u64,
+    /// Breaking changes while the major is 0, additive ones after.
+    pub minor: u64,
+    /// Additive changes while the major is 0, fixes after.
+    pub patch: u64,
+}
+
+impl ApiVersion {
+    /// Parses `MAJOR.MINOR.PATCH`: three non-negative integers without
+    /// leading zeros (Semantic Versioning 2.0.0 §2); anything else is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.split('.');
+        let version = Self {
+            major: number(parts.next()?)?,
+            minor: number(parts.next()?)?,
+            patch: number(parts.next()?)?,
+        };
+        parts.next().is_none().then_some(version)
+    }
+
+    /// Whether a client built for `self` can use a daemon speaking
+    /// `daemon`: the same major, the same minor while the major is 0 (a
+    /// 0.x minor is breaking), and the daemon not older, so every command
+    /// and field the client knows exists.
+    pub fn accepts(self, daemon: Self) -> bool {
+        daemon.major == self.major
+            && (self.major != 0 || daemon.minor == self.minor)
+            && daemon >= self
+    }
+}
+
+/// One numeric identifier: ASCII digits, no leading zero unless it is `0`.
+fn number(part: &str) -> Option<u64> {
+    let digits = !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let canonical = part == "0" || !part.starts_with('0');
+    if digits && canonical {
+        part.parse().ok()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::arithmetic_side_effects,
+        clippy::missing_docs_in_private_items,
+        reason = "test code"
+    )]
+
+    use super::*;
+
+    const fn v(major: u64, minor: u64, patch: u64) -> ApiVersion {
+        ApiVersion {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    #[test]
+    fn the_constants_render_the_version() {
+        assert_eq!(API_VERSION, "0.1.0");
+        assert_eq!(CURRENT, v(0, 1, 0));
+        assert_eq!(WS_PATH, "/v0/ws");
+        assert_eq!(PAIR_PATH, "/v0/pair");
+        assert_eq!(RECORDING_PATH, "/v0/recording");
+        assert_eq!(LIVE_PATH, "/v0/live");
+        assert_eq!(HLS_PATH, "/v0/hls");
+        assert_eq!(METRICS_PATH, "/v0/metrics");
+        assert_eq!(ApiVersion::parse(API_VERSION), Some(CURRENT));
+    }
+
+    #[test]
+    fn semver_2_0_0_section_2_versions_parse_and_others_do_not() {
+        assert_eq!(ApiVersion::parse("0.1.0"), Some(v(0, 1, 0)));
+        assert_eq!(ApiVersion::parse("10.20.30"), Some(v(10, 20, 30)));
+        for bad in [
+            "",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2.x",
+            "a.b.c",
+            "1..3",
+            "-1.2.3",
+            "+1.2.3",
+            "1.2.3-rc.1",
+            "1.2.3+build",
+            " 1.2.3",
+            "1.2.3 ",
+            "99999999999999999999.0.0",
+        ] {
+            assert_eq!(ApiVersion::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_0_x_client_accepts_the_same_minor_at_the_same_or_a_later_patch() {
+        let client = v(0, 1, 2);
+        assert!(client.accepts(v(0, 1, 2)));
+        assert!(client.accepts(v(0, 1, 9)), "a later patch only adds");
+        assert!(
+            !client.accepts(v(0, 1, 1)),
+            "an older daemon lacks what the client knows"
+        );
+        assert!(!client.accepts(v(0, 2, 2)), "a 0.x minor is breaking");
+        assert!(!client.accepts(v(0, 0, 9)));
+        assert!(!client.accepts(v(1, 1, 2)), "another major is breaking");
+    }
+
+    #[test]
+    fn a_stable_client_accepts_the_same_major_at_the_same_or_a_later_minor() {
+        let client = v(1, 2, 3);
+        assert!(client.accepts(v(1, 2, 3)));
+        assert!(client.accepts(v(1, 2, 4)));
+        assert!(client.accepts(v(1, 5, 0)), "a later minor only adds");
+        assert!(!client.accepts(v(1, 2, 2)));
+        assert!(!client.accepts(v(1, 1, 9)));
+        assert!(!client.accepts(v(2, 2, 3)));
+        assert!(!client.accepts(v(0, 2, 3)));
+    }
+}

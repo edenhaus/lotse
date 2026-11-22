@@ -1,4 +1,4 @@
-//! `hls_route`: the LL-HLS route's request parser (`lotse_api::hls::hls_request_of`),
+//! `hls_route`: the LL-HLS route's request parser (`rocko_api::hls::hls_request_of`),
 //! which reads an untrusted request path and query, never panics; what it
 //! takes is exactly `/v0/hls/{hls_id}/{name}` with an id of the identifier
 //! pattern (`^[A-Za-z0-9._-]{1,128}$`, never `.` or `..`, RFC 3986 §3.3) and
@@ -10,9 +10,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_api::hls::{HlsRequest, hls_request_of};
-use lotse_api_types::HLS_PATH;
-use lotse_api_types::hls::PLAYLIST_NAME;
+use rocko_api::hls::{HlsRequest, hls_request_of};
+use rocko_api_types::HLS_PATH;
+use rocko_api_types::hls::PLAYLIST_NAME;
 
 fuzz_target!(|data: &[u8]| {
     let (path, query) = match data.iter().position(|byte| *byte == 0) {

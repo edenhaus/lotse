@@ -3,7 +3,7 @@
 # (pr-title.yml), which sort them below and pick the next version. Publishing the draft on GitHub
 # is the release: CI's Release job builds, attests and attaches everything to it (release.yml).
 #
-# Only the `lotse` binary is released; the library crates share its version and are never released
+# Only the `rocko` binary is released; the library crates share its version and are never released
 # on their own. While the version is 0.x, a breaking change raises the minor version (Cargo's
 # reading of SemVer); from 1.0 it should raise the major one.
 

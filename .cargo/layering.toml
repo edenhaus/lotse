@@ -7,68 +7,68 @@
 
 [dependents]
 # crate = the workspace crates that may depend on it directly
-lotse-core = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-mux", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-supervisor", "lotse-worker", "lotse-testing", "lotse"]
-lotse-codec = ["lotse-rtsp", "lotse-http", "lotse-mux", "lotse-webrtc", "lotse-snapshot", "lotse-worker", "lotse-testing", "lotse"] # lotse-worker: the picture size of `stream/get`, read from a track's SPS
-lotse-ipc = ["lotse-supervisor", "lotse-worker", "lotse-snapshot", "lotse"] # lotse: dev-only, the talk-back tone test's in-process worker
-lotse-sandbox = ["lotse"]
-lotse-api-types = ["lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-api", "lotse-supervisor", "lotse", "lotse-testing"] # lotse-tls, lotse-rtsp, lotse-http, lotse-webrtc: the `stream/put` source fields, declared once there and parsed by the factories; lotse-testing: the load generator reads `metrics/get`
-lotse-api = ["lotse-supervisor"]
-lotse-tls = ["lotse-rtsp", "lotse-http", "lotse-supervisor"] # the sources' TLS client trust; the supervisor's TURN allocations over TLS (`turns:`)
-lotse-rtsp = ["lotse"]
-lotse-http = ["lotse"] # M6, the factory behind `source-http`
-lotse-mux = ["lotse"] # M6, the recording container behind `output-recording`, and the live one behind `output-live`
-lotse-hls = ["lotse-api", "lotse-supervisor", "lotse-testing"] # the LL-HLS window of a live output, in the supervisor that serves it; lotse-api: the route parses its names and directives, and sends its chunks; lotse-testing: the dev viewer checks the names it proxies
-lotse-webrtc = ["lotse", "lotse-testing"] # lotse: the factories behind `output-webrtc` and `source-webrtc`; lotse-testing: dev-only, its reproduction test of an open str0m issue (Safari's ICE)
-lotse-snapshot = ["lotse-supervisor", "lotse"] # M5
-lotse-supervisor = ["lotse"]
-lotse-worker = ["lotse"]
-# Never of lotse-core: it depends on core itself, and a dev-dependency cycle compiles two copies of
+rocko-core = ["rocko-codec", "rocko-tls", "rocko-rtsp", "rocko-http", "rocko-mux", "rocko-webrtc", "rocko-snapshot", "rocko-api", "rocko-supervisor", "rocko-worker", "rocko-testing", "rocko"]
+rocko-codec = ["rocko-rtsp", "rocko-http", "rocko-mux", "rocko-webrtc", "rocko-snapshot", "rocko-worker", "rocko-testing", "rocko"] # rocko-worker: the picture size of `stream/get`, read from a track's SPS
+rocko-ipc = ["rocko-supervisor", "rocko-worker", "rocko-snapshot", "rocko"] # rocko: dev-only, the talk-back tone test's in-process worker
+rocko-sandbox = ["rocko"]
+rocko-api-types = ["rocko-tls", "rocko-rtsp", "rocko-http", "rocko-webrtc", "rocko-api", "rocko-supervisor", "rocko", "rocko-testing"] # rocko-tls, rocko-rtsp, rocko-http, rocko-webrtc: the `stream/put` source fields, declared once there and parsed by the factories; rocko-testing: the load generator reads `metrics/get`
+rocko-api = ["rocko-supervisor"]
+rocko-tls = ["rocko-rtsp", "rocko-http", "rocko-supervisor"] # the sources' TLS client trust; the supervisor's TURN allocations over TLS (`turns:`)
+rocko-rtsp = ["rocko"]
+rocko-http = ["rocko"] # M6, the factory behind `source-http`
+rocko-mux = ["rocko"] # M6, the recording container behind `output-recording`, and the live one behind `output-live`
+rocko-hls = ["rocko-api", "rocko-supervisor", "rocko-testing"] # the LL-HLS window of a live output, in the supervisor that serves it; rocko-api: the route parses its names and directives, and sends its chunks; rocko-testing: the dev viewer checks the names it proxies
+rocko-webrtc = ["rocko", "rocko-testing"] # rocko: the factories behind `output-webrtc` and `source-webrtc`; rocko-testing: dev-only, its reproduction test of an open str0m issue (Safari's ICE)
+rocko-snapshot = ["rocko-supervisor", "rocko"] # M5
+rocko-supervisor = ["rocko"]
+rocko-worker = ["rocko"]
+# Never of rocko-core: it depends on core itself, and a dev-dependency cycle compiles two copies of
 # core whose types do not unify. Core's own fakes live behind its `test-util` feature.
-lotse-testing = ["lotse-codec", "lotse-tls", "lotse-rtsp", "lotse-http", "lotse-webrtc", "lotse-snapshot", "lotse-api", "lotse-api-types", "lotse-supervisor", "lotse-worker", "lotse"]
+rocko-testing = ["rocko-codec", "rocko-tls", "rocko-rtsp", "rocko-http", "rocko-webrtc", "rocko-snapshot", "rocko-api", "rocko-api-types", "rocko-supervisor", "rocko-worker", "rocko"]
 
 [harness]
-# lotse-fuzz: the fuzz targets reach into every crate they fuzz, fakes (lotse-testing) included, as
+# rocko-fuzz: the fuzz targets reach into every crate they fuzz, fakes (rocko-testing) included, as
 # normal dependencies (a bin has no dev-dependencies); nothing depends on them, nothing ships them.
-crates = ["lotse-fuzz"]
+crates = ["rocko-fuzz"]
 
 [dev-only]
 # allocation-counter: its global allocator replaces the daemon's in whatever links it. divan: the
 # benchmark harness, whose CLI and timers have no place in the daemon.
-crates = ["lotse-testing", "allocation-counter", "divan"]
+crates = ["rocko-testing", "allocation-counter", "divan"]
 
 [external]
 # protocol engines and process-specific crates stay inside the crate that owns them
-retina = ["lotse-rtsp"]
-rtsp-types = ["lotse-rtsp", "lotse-testing"]
-sdp-types = ["lotse-rtsp", "lotse-testing"]
-m3u8-rs = ["lotse-http"]
-mpeg2ts-reader = ["lotse-http"]
-mp4-atom = ["lotse-http", "lotse-mux", "lotse"] # reading the HTTP source's fragmented MP4; writing the event recordings'; lotse: dev-only, the end-to-end recording test reads the recordings back
-str0m = ["lotse-webrtc", "lotse-testing"]
-dimpl = ["lotse-webrtc"] # DTLS of str0m's crypto provider
-rustls = ["lotse-tls", "lotse-api", "lotse-testing"] # the sources' TLS client; the control API's TLS listener; the fake camera's TLS mode and the TLS listener's test client
-tokio-rustls = ["lotse-tls", "lotse-api", "lotse-testing"]
-webpki-roots = ["lotse-tls"]
-rustls-webpki = ["lotse-api"] # X.509 parsing of the control identity's certificate (rustls verifies through it on its own)
-prometheus-client = ["lotse-api"] # the metrics' exposition encoders
-mediatype = ["lotse-api"] # the metrics' `Accept` media ranges
-pem = ["lotse-api"] # the control identity's certificate as PEM (rcgen writes its own through it)
-rcgen = ["lotse-webrtc", "lotse-api", "lotse-testing"] # the DTLS certificate; the control API's server certificate; the test certificates
-axum = ["lotse-api", "lotse-testing"] # the control API; the dev viewer, a test crate never linked into the binary
-hyper = ["lotse-api", "lotse-http", "lotse", "lotse-testing"] # the control API's HTTP/1.1 connection, under axum; the HTTP source's client; `lotse ctl recording create`'s GET of the recording's body; the dev viewer's GET of a live output's bytes, a test crate never linked into the binary
-hyper-util = ["lotse-api", "lotse-http", "lotse", "lotse-testing"]
-http-auth = ["lotse-http"] # the HTTP source's Basic and Digest answers (retina uses it on its own for RTSP)
-postcard = ["lotse-ipc"]
-landlock = ["lotse-sandbox"]
-seccompiler = ["lotse-sandbox"]
-opus = ["lotse-codec"]
-symphonia = ["lotse-codec"]
-rubato = ["lotse-codec"]
-nanoaudio-g722 = ["lotse-codec"] # the G.722 decoder of the recordings' audio transcode
-adts-reader = ["lotse-codec"] # ADTS of the HTTP source's MPEG-TS, split into raw AAC frames
-openh264 = ["lotse-snapshot"]
-jpeg-encoder = ["lotse-snapshot"]
-clap = ["lotse"]
-anyhow = ["lotse"] # AGENTS.md: `anyhow` only in `main`
-mimalloc = ["lotse"]
-nix = ["lotse-supervisor", "lotse-testing"] # interface enumeration for the host candidates; the DSCP of received datagrams (`lotse_testing::dscp`)
+retina = ["rocko-rtsp"]
+rtsp-types = ["rocko-rtsp", "rocko-testing"]
+sdp-types = ["rocko-rtsp", "rocko-testing"]
+m3u8-rs = ["rocko-http"]
+mpeg2ts-reader = ["rocko-http"]
+mp4-atom = ["rocko-http", "rocko-mux", "rocko"] # reading the HTTP source's fragmented MP4; writing the event recordings'; rocko: dev-only, the end-to-end recording test reads the recordings back
+str0m = ["rocko-webrtc", "rocko-testing"]
+dimpl = ["rocko-webrtc"] # DTLS of str0m's crypto provider
+rustls = ["rocko-tls", "rocko-api", "rocko-testing"] # the sources' TLS client; the control API's TLS listener; the fake camera's TLS mode and the TLS listener's test client
+tokio-rustls = ["rocko-tls", "rocko-api", "rocko-testing"]
+webpki-roots = ["rocko-tls"]
+rustls-webpki = ["rocko-api"] # X.509 parsing of the control identity's certificate (rustls verifies through it on its own)
+prometheus-client = ["rocko-api"] # the metrics' exposition encoders
+mediatype = ["rocko-api"] # the metrics' `Accept` media ranges
+pem = ["rocko-api"] # the control identity's certificate as PEM (rcgen writes its own through it)
+rcgen = ["rocko-webrtc", "rocko-api", "rocko-testing"] # the DTLS certificate; the control API's server certificate; the test certificates
+axum = ["rocko-api", "rocko-testing"] # the control API; the dev viewer, a test crate never linked into the binary
+hyper = ["rocko-api", "rocko-http", "rocko", "rocko-testing"] # the control API's HTTP/1.1 connection, under axum; the HTTP source's client; `rocko ctl recording create`'s GET of the recording's body; the dev viewer's GET of a live output's bytes, a test crate never linked into the binary
+hyper-util = ["rocko-api", "rocko-http", "rocko", "rocko-testing"]
+http-auth = ["rocko-http"] # the HTTP source's Basic and Digest answers (retina uses it on its own for RTSP)
+postcard = ["rocko-ipc"]
+landlock = ["rocko-sandbox"]
+seccompiler = ["rocko-sandbox"]
+opus = ["rocko-codec"]
+symphonia = ["rocko-codec"]
+rubato = ["rocko-codec"]
+nanoaudio-g722 = ["rocko-codec"] # the G.722 decoder of the recordings' audio transcode
+adts-reader = ["rocko-codec"] # ADTS of the HTTP source's MPEG-TS, split into raw AAC frames
+openh264 = ["rocko-snapshot"]
+jpeg-encoder = ["rocko-snapshot"]
+clap = ["rocko"]
+anyhow = ["rocko"] # AGENTS.md: `anyhow` only in `main`
+mimalloc = ["rocko"]
+nix = ["rocko-supervisor", "rocko-testing"] # interface enumeration for the host candidates; the DSCP of received datagrams (`rocko_testing::dscp`)

@@ -1,0 +1,360 @@
+//! Fragmented MP4 for event recordings and live outputs: the [`RecordingMuxer`] that writes one recording's
+//! frames, H.264 or H.265 video and optionally AAC-LC or Opus audio, as
+//! one fragmented MP4 file, and the [`Factory`] the binary registers; and
+//! the [`LiveWriter`] that writes a live output's frames of the same codecs
+//! as an init segment and one fragment per video frame (see the `live`
+//! module), with the [`LiveFactory`] the binary registers for it.
+//!
+//! Runs in a worker, inside a recording or live task, on frames the worker's tracks
+//! already accepted. Sans-IO and pure: every call returns the bytes it
+//! completed and the caller writes them; no I/O, no clock (the frames'
+//! capture times are the only time), no logging (the recording task logs the
+//! recording). Depends on `rocko-core` (the recording contract, frames, codecs),
+//! `rocko-codec` (parameter sets, NAL units, Opus packet lengths) and
+//! mp4-atom, which encodes the boxes; never on a source or output crate
+//! or a process crate.
+//!
+//! The file: an init segment (`ftyp`, `moov` with one track per recording
+//! track and `mvex`), then one movie fragment (`moof` and `mdat`) at a
+//! time. A fragment ends before every video keyframe, before a frame that
+//! begins a new epoch of its track, once a track's decode time has
+//! advanced by the recording policy's fragment span in it, and once what its
+//! samples hold, their frames' bytes and what describes them, reaches the
+//! recording's memory budget, its queue's bound (`RecordingPolicy::queue_bytes`, at
+//! most [`MAX_FRAGMENT_BYTES`]); [`RecordingMuxer::finish`] writes the last.
+//! So a camera whose timestamps barely advance, or that sends no
+//! keyframe, cannot make one fragment hold more than the recording's queue
+//! would: the frames a fragment holds have left the queue's bound, and a
+//! pre-record's the stream's. A fragment may begin at any sample, since each
+//! sample carries its own sync flag (ISO/IEC 14496-12 §8.8.3.1,
+//! `sample_is_non_sync_sample`, in the `trun`'s `sample_flags`, §8.8.8),
+//! as a fragment the span ends does too; a frame that alone reaches the
+//! bound ends the fragment it is in at once.
+//! The file is playable up to its last complete fragment whenever it
+//! ends. Sample payloads go out as slices of the frames' own bytes, never
+//! copied.
+//!
+//! Standards: ISO/IEC 14496-12 (ISO base media file format: the boxes,
+//! movie fragments, sample flags, composition offsets), ISO/IEC 14496-14
+//! (MP4: the `mp4a` sample entry and its `esds`), ISO/IEC 14496-15 (NAL
+//! unit structured video: `avc1`/`avcC`, `hvc1`/`hvcC`, length-prefixed
+//! samples), ISO/IEC 14496-1 §7.2.6.6 (the decoder configuration
+//! descriptor) and ISO/IEC 14496-3 §1.6.2.1 (`AudioSpecificConfig`), and
+//! "Encapsulation of Opus in ISO Base Media File Format" v0.8.1 (`Opus`
+//! and `dOps`). Each module names its clauses.
+
+mod fragment;
+mod init;
+mod live;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use rocko_core::recording::{
+    RecordingError, RecordingMuxer, RecordingMuxerFactory, RecordingPolicy, RecordingTrack,
+};
+use rocko_core::{Codec, Kind, MediaFrame};
+
+use crate::fragment::TrackWriter;
+use crate::init::{AUDIO_TRACK_ID, VIDEO_TRACK_ID};
+pub use crate::live::{AUDIO_FRAGMENT_BYTES, AUDIO_FRAGMENT_SPAN, LiveFactory, LiveWriter};
+
+/// The largest frame a sample takes: far above any camera's frame
+/// (`limits.max_frame_bytes` defaults to 4 MiB), and small enough that a
+/// sample's size, a length added per NAL unit, fits its 32-bit field
+/// (ISO/IEC 14496-12 §8.8.8, `sample_size`).
+pub const MAX_SAMPLE_BYTES: usize = 256 * 1024 * 1024;
+
+/// The most a fragment's samples hold before it ends early, however large
+/// the recording's queue bound ([`Muxer::new`]): their frames' bytes, their
+/// NAL units' lengths and the descriptors of their pieces, so a frame of
+/// many tiny NAL units counts the memory it takes, not only its media
+/// data. The media data are less, and one more sample
+/// of each track may follow, so the run's data offset, a signed 32-bit
+/// count from the `moof` (ISO/IEC 14496-12 §8.8.8, `data_offset`), always
+/// fits.
+pub const MAX_FRAGMENT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// An mp4-atom encoding failure: a field the sample entry cannot carry.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the shape `map_err` calls it with"
+)]
+pub(crate) fn encode_failed(err: mp4_atom::Error) -> RecordingError {
+    RecordingError::Failed(format!("mp4 encoding: {err}"))
+}
+
+/// The fragmented MP4 container: registered by the binary as the recording
+/// output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Factory;
+
+impl RecordingMuxerFactory for Factory {
+    /// H.264 and H.265 with their parameter sets, AAC-LC with its
+    /// configuration, mono or stereo Opus.
+    fn accepts(&self, codec: &Codec) -> bool {
+        init::carries(codec)
+    }
+
+    fn muxer(&self, policy: &RecordingPolicy) -> Box<dyn RecordingMuxer> {
+        Box::new(Muxer::new(policy))
+    }
+}
+
+/// The bounds a muxer keeps; outside the tests [`MAX_SAMPLE_BYTES`] and
+/// the recording's queue bound, at most [`MAX_FRAGMENT_BYTES`]
+/// ([`Muxer::new`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Limits {
+    /// The largest frame a sample takes.
+    sample_bytes: usize,
+    /// What a fragment's samples hold after which it ends.
+    fragment_bytes: u64,
+}
+
+/// Where a muxer is in its recording.
+#[derive(Debug)]
+enum State {
+    /// Before [`RecordingMuxer::start`].
+    Idle,
+    /// Between the start and the finish.
+    Running(Box<Recording>),
+    /// After [`RecordingMuxer::finish`], or a finish without a start.
+    Finished,
+}
+
+/// The recording a running muxer writes.
+#[derive(Debug)]
+struct Recording {
+    /// The video track.
+    video: TrackWriter,
+    /// The audio track, when the recording has one.
+    audio: Option<TrackWriter>,
+    /// Decode time 0: the capture time [`RecordingMuxer::set_origin`] gave, else
+    /// the recording's first frame's.
+    origin: Option<Instant>,
+    /// Where the current fragment's span counts from on the video track:
+    /// see [`Recording::began`].
+    video_began: Option<Duration>,
+    /// Where it counts from on the audio track.
+    audio_began: Option<Duration>,
+    /// The sequence number of the latest fragment (ISO/IEC 14496-12
+    /// §8.8.5): 0 before the first.
+    sequence: u32,
+}
+
+impl Recording {
+    /// A recording of `video` and `audio` before its first frame.
+    fn new(video: &RecordingTrack, audio: Option<&RecordingTrack>) -> Self {
+        Self {
+            video: TrackWriter::new(VIDEO_TRACK_ID, Kind::Video, video),
+            audio: audio.map(|audio| TrackWriter::new(AUDIO_TRACK_ID, Kind::Audio, audio)),
+            origin: None,
+            video_began: None,
+            audio_began: None,
+            sequence: 0,
+        }
+    }
+
+    /// Where the current fragment's span counts from on the `kind` track:
+    /// the decode time of the track's first frame taken since the fragment
+    /// began, the frame that began it on its own track; `None` before it.
+    /// Each track's span counts on its own decode times, not on capture
+    /// times: a track's never go back (see the [`fragment`] module), and
+    /// inside an epoch they follow the timestamps, so a capture time a
+    /// Sender Report put ahead and a later one corrected back, which the
+    /// recording's interleaver takes, cannot hold the next cut until the capture
+    /// times catch up. Nor on the other track's: the two timelines are
+    /// anchored apart, at their epochs' capture times, and a track whose
+    /// epoch a Sender Report put an hour ahead would otherwise hold the
+    /// other track's cuts for that hour, or end a fragment at each of its
+    /// own frames. The other track's frame held at a cut, captured before
+    /// the frame that cut, is not counted: its span would end before the
+    /// cutting track's, a frame short of a keyframe, so the track whose
+    /// frame cut keeps pacing the fragments, and the other's run in one
+    /// spans at most a frame more.
+    const fn began(&mut self, kind: Kind) -> &mut Option<Duration> {
+        match kind {
+            Kind::Video => &mut self.video_began,
+            Kind::Audio => &mut self.audio_began,
+        }
+    }
+
+    /// Takes `frame` of the `kind` track; the fragment it completed, if
+    /// any.
+    fn push(
+        &mut self,
+        kind: Kind,
+        frame: Arc<MediaFrame>,
+        span: Duration,
+        fragment_bytes: u64,
+    ) -> Result<Vec<Bytes>, RecordingError> {
+        let origin = *self.origin.get_or_insert(frame.wallclock);
+        let keyframe = frame.keyframe;
+        let track = match kind {
+            Kind::Video => &mut self.video,
+            Kind::Audio => self.audio.as_mut().ok_or_else(|| {
+                RecordingError::Failed("an audio frame for a recording without audio".into())
+            })?,
+        };
+        let anchored = track.push(frame, origin)?;
+        let at = track.decode_time();
+        let began = *self.began(kind).get_or_insert(at);
+        let ready = self
+            .video
+            .ready_bytes()
+            .saturating_add(self.audio.as_ref().map_or(0, TrackWriter::ready_bytes));
+        let cut = anchored
+            || (kind == Kind::Video && keyframe)
+            || at.saturating_sub(began) >= span
+            || ready >= fragment_bytes;
+        if !cut {
+            return Ok(Vec::new());
+        }
+        let out = self.fragment()?;
+        if !out.is_empty() {
+            self.video_began = None;
+            self.audio_began = None;
+            *self.began(kind) = Some(at);
+        }
+        Ok(out)
+    }
+
+    /// The fragment of the samples ready, if any.
+    fn fragment(&mut self) -> Result<Vec<Bytes>, RecordingError> {
+        let mut runs = vec![self.video.take_ready()];
+        runs.extend(self.audio.as_mut().map(TrackWriter::take_ready));
+        let sequence = self.sequence.wrapping_add(1);
+        let out = fragment::fragment(sequence, &runs)?;
+        if !out.is_empty() {
+            self.sequence = sequence;
+        }
+        Ok(out)
+    }
+
+    /// Finishes every track's last sample and writes the last fragment.
+    fn finish(&mut self) -> Result<Vec<Bytes>, RecordingError> {
+        self.video.close();
+        if let Some(audio) = &mut self.audio {
+            audio.close();
+        }
+        self.fragment()
+    }
+}
+
+/// One recording's fragmented MP4 writer.
+#[derive(Debug)]
+pub struct Muxer {
+    /// The longest a fragment spans.
+    span: Duration,
+    /// The bounds it keeps.
+    limits: Limits,
+    /// Where it is.
+    state: State,
+}
+
+impl Muxer {
+    /// A muxer whose fragments span at most `policy.fragment` and end
+    /// once their samples hold `policy.queue_bytes`, the recording's queue's
+    /// bound, or [`MAX_FRAGMENT_BYTES`] if that is less: the recording's
+    /// memory budget, so the fragment it writes holds no more than its
+    /// queue does.
+    pub fn new(policy: &RecordingPolicy) -> Self {
+        Self {
+            span: policy.fragment,
+            limits: Limits {
+                sample_bytes: MAX_SAMPLE_BYTES,
+                fragment_bytes: u64::try_from(policy.queue_bytes)
+                    .unwrap_or(MAX_FRAGMENT_BYTES)
+                    .min(MAX_FRAGMENT_BYTES),
+            },
+            state: State::Idle,
+        }
+    }
+}
+
+/// The error of a call out of order.
+pub(crate) fn out_of_order(call: &str) -> RecordingError {
+    RecordingError::Failed(format!("{call} out of order"))
+}
+
+impl RecordingMuxer for Muxer {
+    fn start(
+        &mut self,
+        video: &RecordingTrack,
+        audio: Option<&RecordingTrack>,
+    ) -> Result<Vec<Bytes>, RecordingError> {
+        if !matches!(self.state, State::Idle) {
+            return Err(out_of_order("start"));
+        }
+        let init = init::init_segment(video, audio)?;
+        self.state = State::Running(Box::new(Recording::new(video, audio)));
+        Ok(vec![init])
+    }
+
+    fn set_origin(&mut self, origin: Instant) {
+        if let State::Running(recording) = &mut self.state
+            && recording.origin.is_none()
+        {
+            recording.origin = Some(origin);
+        }
+    }
+
+    fn push(&mut self, track: Kind, frame: Arc<MediaFrame>) -> Result<Vec<Bytes>, RecordingError> {
+        let State::Running(recording) = &mut self.state else {
+            return Err(out_of_order("push"));
+        };
+        let bytes = frame.payload.len();
+        if bytes > self.limits.sample_bytes {
+            return Err(RecordingError::Failed(format!(
+                "a frame of {bytes} bytes is larger than a sample may be ({})",
+                self.limits.sample_bytes
+            )));
+        }
+        recording.push(track, frame, self.span, self.limits.fragment_bytes)
+    }
+
+    fn media_time(&self, track: Kind) -> Duration {
+        let State::Running(recording) = &self.state else {
+            return Duration::ZERO;
+        };
+        match track {
+            Kind::Video => recording.video.media_time(),
+            Kind::Audio => recording
+                .audio
+                .as_ref()
+                .map_or(Duration::ZERO, TrackWriter::media_time),
+        }
+    }
+
+    fn end_video(&mut self, end: &MediaFrame) -> Instant {
+        // Outside a running recording there is no video to end.
+        let State::Running(recording) = &mut self.state else {
+            return end.wallclock;
+        };
+        recording.video.close_at(end)
+    }
+
+    fn media_end(&self) -> Duration {
+        let State::Running(recording) = &self.state else {
+            return Duration::ZERO;
+        };
+        recording
+            .audio
+            .as_ref()
+            .map_or(Duration::ZERO, TrackWriter::reach)
+            .max(recording.video.reach())
+    }
+
+    fn finish(&mut self) -> Result<Vec<Bytes>, RecordingError> {
+        let State::Running(mut recording) = std::mem::replace(&mut self.state, State::Finished)
+        else {
+            return Err(out_of_order("finish"));
+        };
+        recording.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests;

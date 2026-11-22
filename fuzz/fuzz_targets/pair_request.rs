@@ -6,7 +6,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_api::pairing::parse_request;
+use rocko_api::pairing::parse_request;
 
 fuzz_target!(|data: &[u8]| {
     if let Some(secret) = parse_request(data) {

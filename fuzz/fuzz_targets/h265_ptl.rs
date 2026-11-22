@@ -8,7 +8,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::h265::{has_recovery_point, parse_sps};
+use rocko_codec::h265::{has_recovery_point, parse_sps};
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(info) = parse_sps(data) {

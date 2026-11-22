@@ -5,29 +5,29 @@
 # Builds the image from Dockerfile and a static release binary with `podman build`, then:
 #
 # 1. starts it as it is, as 65532: read-only, without a capability, no_new_privs, the ports
-#    published, a tmpfs of its own on /run/lotse, a volume on /data, the control TLS listener on and the
-#    sandbox required. It must go ready; `lotse ctl info` through `podman exec` must report every
-#    sandbox layer enforced as 65532; every lotse process must run as 65532 with no capability
-#    and a seccomp filter; a worker must start and reach its source's error; `lotse identity`
+#    published, a tmpfs of its own on /run/rocko, a volume on /data, the control TLS listener on and the
+#    sandbox required. It must go ready; `rocko ctl info` through `podman exec` must report every
+#    sandbox layer enforced as 65532; every rocko process must run as 65532 with no capability
+#    and a seccomp filter; a worker must start and reach its source's error; `rocko identity`
 #    must read the identity the start made in the volume.
 # 2. starts it as root (`--user 0`) with CAP_SETUID and CAP_SETGID alone and a root-owned socket
-#    directory: it must drop to 65532 (LOTSE_USER and LOTSE_GROUP) and report the same.
+#    directory: it must drop to 65532 (ROCKO_USER and ROCKO_GROUP) and report the same.
 # 3. starts it as root again, with CAP_DAC_OVERRIDE besides, on the directories of 65532 (the
-#    first start's /data volume, and a volume on /run/lotse, which takes the image's directory's
+#    first start's /data volume, and a volume on /run/rocko, which takes the image's directory's
 #    owner and mode): the owner checks take the uid a start as root drops to, so it must come up
 #    on them, serve the identity the first start made, and drop to 65532.
 #
-# Usage: scripts/rootless-podman.sh <static lotse binary> [x86_64|aarch64]
+# Usage: scripts/rootless-podman.sh <static rocko binary> [x86_64|aarch64]
 set -eu
 
-BIN="${1:?usage: $0 <static lotse binary> [x86_64|aarch64]}"
+BIN="${1:?usage: $0 <static rocko binary> [x86_64|aarch64]}"
 ARCH="${2:-$(uname -m)}"
-IMAGE=localhost/lotse:rootless-check
-NAME=lotse-rootless-check
-VOLUME=lotse-rootless-check-data
-RUN_VOLUME=lotse-rootless-check-run
-ID=65532 # the image's user and group, LOTSE_USER and LOTSE_GROUP
-SOCKET=/run/lotse/lotse.sock
+IMAGE=localhost/rocko:rootless-check
+NAME=rocko-rootless-check
+VOLUME=rocko-rootless-check-data
+RUN_VOLUME=rocko-rootless-check-run
+ID=65532 # the image's user and group, ROCKO_USER and ROCKO_GROUP
+SOCKET=/run/rocko/rocko.sock
 
 fail() {
   echo "FAIL: $*" >&2
@@ -50,9 +50,9 @@ esac
 podman version --format 'podman {{.Client.Version}}'
 podman info --format 'network: {{.Host.NetworkBackend}}, cgroups {{.Host.CgroupsVersion}} ({{.Host.CgroupManager}}: {{.Host.CgroupControllers}}), storage {{.Store.GraphDriverName}}'
 
-# The context Dockerfile takes: the binary at target/image/<arch>/lotse.
+# The context Dockerfile takes: the binary at target/image/<arch>/rocko.
 context="$(mktemp -d)"
-install -D -m 0755 "$BIN" "$context/target/image/$platform/lotse"
+install -D -m 0755 "$BIN" "$context/target/image/$platform/rocko"
 podman build --quiet --file Dockerfile --platform "linux/$platform" --tag "$IMAGE" "$context" >/dev/null
 echo "built $IMAGE from $BIN"
 
@@ -70,7 +70,7 @@ start() {
   # shellcheck disable=SC2086 # $limits is a list of options
   podman run --detach --name "$NAME" --read-only --security-opt=no-new-privileges \
     --publish 30415:30415/udp --publish 30415:30415/tcp --publish 18557:18557/tcp \
-    --env LOTSE_SANDBOX=require --env LOTSE_WEBRTC_ADVERTISE=192.0.2.10 \
+    --env ROCKO_SANDBOX=require --env ROCKO_WEBRTC_ADVERTISE=192.0.2.10 \
     $limits "$@" "$IMAGE" >/dev/null
   i=0
   until podman logs "$NAME" 2>&1 | grep -q '"event":"ready"'; do
@@ -83,9 +83,9 @@ start() {
   done
 }
 
-# `ctl <args>`: `lotse ctl` inside the container, as its user, over the socket.
+# `ctl <args>`: `rocko ctl` inside the container, as its user, over the socket.
 ctl() {
-  podman exec "$NAME" /lotse ctl --socket "$SOCKET" --compact "$@"
+  podman exec "$NAME" /rocko ctl --socket "$SOCKET" --compact "$@"
 }
 
 # `stop`: the daemon stopped by SIGTERM; it must exit 0.
@@ -154,7 +154,7 @@ unprivileged() {
       END { print name, "uids", uids, "gids", gids, "eff", eff, "prm", prm, "bnd", bnd, "nnp", nnp, "seccomp", seccomp }
     ' "$status" 2>/dev/null)" || continue # a process that has exited since
     echo "pid $pid: $line"
-    want="lotse uids $ID $ID $ID $ID gids $ID $ID $ID $ID eff 0000000000000000 prm 0000000000000000"
+    want="rocko uids $ID $ID $ID $ID gids $ID $ID $ID $ID eff 0000000000000000 prm 0000000000000000"
     case "$line" in
       "$want bnd $2 nnp 1 seccomp 2") ;;
       *) fail "pid $pid is not unprivileged: $line" ;;
@@ -166,8 +166,8 @@ unprivileged() {
 
 # 1. As the image's user.
 cleanup
-start --cap-drop=all --tmpfs /run/lotse:rw,mode=0700,U --volume "$VOLUME:/data" \
-  --env 'LOTSE_CONTROL_LISTEN=[::]:18557'
+start --cap-drop=all --tmpfs /run/rocko:rw,mode=0700,U --volume "$VOLUME:/data" \
+  --env 'ROCKO_CONTROL_LISTEN=[::]:18557'
 echo "OK: ready as $ID, rootless, read-only, without capabilities"
 sandboxed
 # A worker: started, sandboxed, and failing to reach a port nothing listens on, which it
@@ -181,14 +181,14 @@ until [ "$(ctl stream get front | jq -r '.last_error.code // empty')" = source_u
 done
 echo "front: $(ctl stream get front)"
 unprivileged 1 0000000000000000 # nothing
-pin="$(podman exec "$NAME" /lotse identity)"
-podman logs "$NAME" 2>&1 | grep -q "\"server_pin\":\"$pin\"" || fail "lotse identity read $pin, not the served pin"
-echo "OK: lotse identity reads the volume's identity, $pin"
+pin="$(podman exec "$NAME" /rocko identity)"
+podman logs "$NAME" 2>&1 | grep -q "\"server_pin\":\"$pin\"" || fail "rocko identity read $pin, not the served pin"
+echo "OK: rocko identity reads the volume's identity, $pin"
 ctl stream delete front >/dev/null
 stop
 
 # 2. As root, with CAP_SETUID and CAP_SETGID alone: it binds in its own directory and drops.
-start --user 0 --cap-drop=all --cap-add=SETUID,SETGID --tmpfs /run/lotse:rw,mode=0700
+start --user 0 --cap-drop=all --cap-add=SETUID,SETGID --tmpfs /run/rocko:rw,mode=0700
 echo "OK: ready as root with CAP_SETUID and CAP_SETGID"
 sandboxed
 unprivileged 1 00000000000000c0 # CAP_SETUID (7) and CAP_SETGID (6)
@@ -196,8 +196,8 @@ stop
 
 # 3. As root on the directories of the uid it drops to.
 start --user 0 --cap-drop=all --cap-add=SETUID,SETGID,DAC_OVERRIDE \
-  --volume "$RUN_VOLUME:/run/lotse" --volume "$VOLUME:/data" \
-  --env 'LOTSE_CONTROL_LISTEN=[::]:18557'
+  --volume "$RUN_VOLUME:/run/rocko" --volume "$VOLUME:/data" \
+  --env 'ROCKO_CONTROL_LISTEN=[::]:18557'
 echo "OK: ready as root on the directories of $ID"
 sandboxed
 podman logs "$NAME" 2>&1 | grep -q "\"server_pin\":\"$pin\"" || fail "the start as root did not serve the identity $pin"

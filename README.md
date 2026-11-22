@@ -1,4 +1,4 @@
-# lotse
+# rocko
 
 A small, fast, memory-safe media daemon built for Home Assistant. It takes
 camera streams (RTSP, HLS or MPEG-TS over HTTP, and WebRTC cameras such as
@@ -10,7 +10,7 @@ seconds it keeps in memory, for its client to store. It does nothing
 else.
 
 > [!WARNING]
-> **Design phase, not for production use.** lotse is at an early stage. It
+> **Design phase, not for production use.** rocko is at an early stage. It
 > has not had an independent security review and has not been tested
 > widely. The control API, configuration and command line may change
 > between versions without migration. Don't rely on it for your cameras,
@@ -23,7 +23,7 @@ signaling path (offer/answer/candidate), a stream registry, a JPEG
 snapshot, a way to keep a stream connected without viewers, and a recording of
 an event with the seconds before it.
 
-lotse is scoped to exactly that, written in Rust with a sans-IO WebRTC
+rocko is scoped to exactly that, written in Rust with a sans-IO WebRTC
 engine, a battle-tested RTSP client, in-process audio transcoding, a
 process per camera, and a typed control API over a private Unix socket
 that any program can drive; Home Assistant's integration is the client it
@@ -75,9 +75,9 @@ over the control API. In M1 an H.264 camera plays video (no audio yet)
 over RTSP/TCP, on the LAN or through a STUN-only NAT.
 
 ```sh
-mkdir -m 700 /tmp/lotse     # the control socket's directory must be private
-cargo run -p lotse -- serve --socket /tmp/lotse/lotse.sock --log-format text --sandbox on
-cargo run -p lotse-testing --bin lotse-dev-viewer -- --socket /tmp/lotse/lotse.sock
+mkdir -m 700 /tmp/rocko     # the control socket's directory must be private
+cargo run -p rocko -- serve --socket /tmp/rocko/rocko.sock --log-format text --sandbox on
+cargo run -p rocko-testing --bin rocko-dev-viewer -- --socket /tmp/rocko/rocko.sock
 ```
 
 `--sandbox on`: a development host (macOS, or a kernel without every
@@ -108,7 +108,7 @@ stopping releases the backchannel for other viewers. The browser offers
 the microphone only to a page opened at `localhost` or a loopback
 address. The page shows
 the session's progress, the time to the first frame and the browser's
-receive statistics. `lotse-dev-viewer` relays the page to the daemon's
+receive statistics. `rocko-dev-viewer` relays the page to the daemon's
 socket and nothing else.
 `--listen ADDR` serves it elsewhere than `127.0.0.1:8080`, on a loopback
 address only: anything that reaches the relay drives the daemon, so an
@@ -119,7 +119,7 @@ socket (`--webrtc-udp-listen`) and ICE-TCP listener
 (`--webrtc-tcp-listen`). Behind a container's bridge network, with those
 ports published instead of host networking, those addresses are the
 container's own, which no browser reaches: `--webrtc-advertise`
-(`LOTSE_WEBRTC_ADVERTISE`, `webrtc.advertise` in the config file) names up
+(`ROCKO_WEBRTC_ADVERTISE`, `webrtc.advertise` in the config file) names up
 to eight addresses, `IP` or `IP:PORT`, that browsers are told instead, and
 with one set they are told none of the container's own.
 
@@ -138,17 +138,17 @@ registered:
 
 A URL protocol's name is its URL's scheme; credentials go in the URL's
 userinfo. `tls` is `"roots"` (the default), `"insecure"` (warned about on
-every connection) or `{"pin": "<SHA-256 fingerprint>"}`. `lotse ctl
+every connection) or `{"pin": "<SHA-256 fingerprint>"}`. `rocko ctl
 stream put` names a source by its `--url`'s scheme, or by `--protocol`
 for one without a URL, and merges `--options` into it.
 
 A WebRTC camera (Home Assistant's native WebRTC cameras: Nest, Ring,
-Matter) has no address lotse could connect to, so a stream names it by
+Matter) has no address rocko could connect to, so a stream names it by
 its protocol alone, `{"protocol": "webrtc"}`, and the stream is its
 identity; its one field is `data_channel` (the data channel label the
 camera's integration asks for, `dataSendChannel` for Nest). The offer
 always asks for the camera's audio; a camera without audio rejects that
-m-line (RFC 3264 §6) and the stream has video alone. lotse makes the offer, but the camera's signaling is its
+m-line (RFC 3264 §6) and the stream has video alone. rocko makes the offer, but the camera's signaling is its
 cloud's, so the control-API client relays it: it subscribes with
 `signaling/subscribe`, takes each `offer` event (it names the stream) and
 each `candidate` event to the camera, and brings back the camera's answer, its
@@ -304,41 +304,41 @@ the player; the daemon refuses a request that carries `Origin`.
 
 ## Running in a container
 
-The release image (`ghcr.io/<owner>/lotse`, built from `Dockerfile`)
+The release image (`ghcr.io/<owner>/rocko`, built from `Dockerfile`)
 holds the static binary alone and runs as uid and gid 65532 from the start.
 A rootless engine maps that uid from its default subordinate ids (any uid
 below 65536 is in them), so the daemon runs as nobody's root and with no
-capability at all, under its own sandbox: `LOTSE_SANDBOX=require` refuses
+capability at all, under its own sandbox: `ROCKO_SANDBOX=require` refuses
 to start without every layer. Podman is the engine this is written and
 tested for (CI's Rootless Podman job runs the image this way).
 
 As a rootless Podman Quadlet unit,
-`~/.config/containers/systemd/lotse.container`:
+`~/.config/containers/systemd/rocko.container`:
 
 ```ini
 [Unit]
-Description=lotse media daemon
+Description=rocko media daemon
 Wants=network-online.target
 After=network-online.target
 
 [Container]
-ContainerName=lotse
-Image=ghcr.io/<owner>/lotse:<version>@sha256:<digest>
+ContainerName=rocko
+Image=ghcr.io/<owner>/rocko:<version>@sha256:<digest>
 ReadOnly=true
 DropCapability=ALL
 NoNewPrivileges=true
 # The socket's directory, the container user's, mode 0700 as `serve` checks it.
-Tmpfs=/run/lotse:rw,mode=0700,U
-Volume=lotse-data:/data
+Tmpfs=/run/rocko:rw,mode=0700,U
+Volume=rocko-data:/data
 PublishPort=30415:30415/udp
 PublishPort=30415:30415/tcp
 # The control API over mutual TLS, for a client outside the container.
 PublishPort=18557:18557/tcp
-Environment=LOTSE_CONTROL_LISTEN=[::]:18557
+Environment=ROCKO_CONTROL_LISTEN=[::]:18557
 # The host's LAN address, which browsers are told.
-Environment=LOTSE_WEBRTC_ADVERTISE=192.168.1.10
-Environment=LOTSE_SANDBOX=require
-HealthCmd=["/lotse", "ctl", "--socket", "/run/lotse/lotse.sock", "info"]
+Environment=ROCKO_WEBRTC_ADVERTISE=192.168.1.10
+Environment=ROCKO_SANDBOX=require
+HealthCmd=["/rocko", "ctl", "--socket", "/run/rocko/rocko.sock", "info"]
 HealthInterval=30s
 PidsLimit=512
 Memory=1G
@@ -350,14 +350,14 @@ Restart=always
 WantedBy=default.target
 ```
 
-`systemctl --user daemon-reload && systemctl --user start lotse` starts
+`systemctl --user daemon-reload && systemctl --user start rocko` starts
 it, and `loginctl enable-linger` starts it at boot without a login.
-`podman logs lotse` shows the first client's pairing code and
-`podman exec lotse /lotse pair` makes another. Without the TLS listener a
+`podman logs rocko` shows the first client's pairing code and
+`podman exec rocko /rocko pair` makes another. Without the TLS listener a
 client reaches the socket only from inside the container, or from a
-container that shares `/run/lotse` as a volume and runs as 65532: the
+container that shares `/run/rocko` as a volume and runs as 65532: the
 directory is 0700 and the socket 0600, both 65532's, so another uid
-cannot open it, whatever `LOTSE_ALLOW_UID` admits.
+cannot open it, whatever `ROCKO_ALLOW_UID` admits.
 
 - `HealthCmd` is a JSON array: the image has no shell, and Podman runs a
   plain string through `/bin/sh -c`, which fails.
@@ -373,12 +373,12 @@ cannot open it, whatever `LOTSE_ALLOW_UID` admits.
 The same as one `podman run`:
 
 ```sh
-podman run -d --name lotse --read-only --cap-drop=all --security-opt=no-new-privileges \
-  --tmpfs /run/lotse:rw,mode=0700,U -v lotse-data:/data \
+podman run -d --name rocko --read-only --cap-drop=all --security-opt=no-new-privileges \
+  --tmpfs /run/rocko:rw,mode=0700,U -v rocko-data:/data \
   -p 30415:30415/udp -p 30415:30415/tcp -p 18557:18557/tcp \
-  -e 'LOTSE_CONTROL_LISTEN=[::]:18557' -e LOTSE_WEBRTC_ADVERTISE=192.168.1.10 \
-  -e LOTSE_SANDBOX=require --pids-limit=512 --memory=1g \
-  ghcr.io/<owner>/lotse:<version>@sha256:<digest>
+  -e 'ROCKO_CONTROL_LISTEN=[::]:18557' -e ROCKO_WEBRTC_ADVERTISE=192.168.1.10 \
+  -e ROCKO_SANDBOX=require --pids-limit=512 --memory=1g \
+  ghcr.io/<owner>/rocko:<version>@sha256:<digest>
 ```
 
 A compose file works the same way under podman-compose or docker compose,
@@ -388,7 +388,7 @@ ports, the environment, `pids_limit`, `mem_limit`); Docker's tmpfs takes
 `uid=65532,gid=65532` in place of `U`.
 
 Started as root instead (`--user 0`), the daemon binds and drops to
-`LOTSE_USER` and `LOTSE_GROUP`, which the image sets to 65532 too. It then
+`ROCKO_USER` and `ROCKO_GROUP`, which the image sets to 65532 too. It then
 needs CAP_SETUID and CAP_SETGID, and its socket and data directories may
 belong to root or to 65532: reaching 65532's as root takes
 CAP_DAC_OVERRIDE, and making the enrolled clients' directory for 65532
@@ -399,14 +399,14 @@ A data volume of the 0.0.1 image, which started as root and dropped to
 once, before the first start of the new image:
 
 ```sh
-podman run --rm -v lotse-data:/data mirror.gcr.io/library/busybox:1.37.0 \
+podman run --rm -v rocko-data:/data mirror.gcr.io/library/busybox:1.37.0 \
   chown -R 65532:65532 /data
 ```
 
 No host network is needed. Every browser session shares one UDP port and
 one ICE-TCP port, 30415, published as it is (keep the host's port the
 container's, or advertise `IP:PORT`). The daemon's own addresses are the
-container's, so `LOTSE_WEBRTC_ADVERTISE` names the host's LAN address that
+container's, so `ROCKO_WEBRTC_ADVERTISE` names the host's LAN address that
 browsers are told instead, and with it set they are told none of the
 container's. What the rootless network does to this, observed on
 2026-11-09 with Podman 5.8.9 (pasta 2026-10-02) and Podman 4.9.3
@@ -417,15 +417,15 @@ container's. What the rootless network does to this, observed on
   as its host candidate. A datagram or a connection to the published port from
   another machine arrived with that machine's address and port, and the
   answer left from the published port. So under pasta the host candidate
-  alone is reachable, without `LOTSE_WEBRTC_ADVERTISE`. Not verified: a
+  alone is reachable, without `ROCKO_WEBRTC_ADVERTISE`. Not verified: a
   browser's ICE session end to end, a host with several addresses or
   interfaces (pasta copies those of the default route's interface), and
   the host's address changing while the container runs. Setting
-  `LOTSE_WEBRTC_ADVERTISE` keeps the candidate right whichever network the
+  `ROCKO_WEBRTC_ADVERTISE` keeps the candidate right whichever network the
   engine uses.
 - slirp4netns, the default before Podman 5, gives the container 10.0.2.100
   (and an `fd00::` address), which no browser reaches:
-  `LOTSE_WEBRTC_ADVERTISE` is required. Its default port forwarder replaces
+  `ROCKO_WEBRTC_ADVERTISE` is required. Its default port forwarder replaces
   the source of an inbound datagram or connection with 10.0.2.100 and a
   port of its own; `--network slirp4netns:port_handler=slirp4netns` keeps
   the browser's. Not verified: an ICE session through the default
@@ -434,7 +434,7 @@ container's. What the rootless network does to this, observed on
 ## Metrics with Prometheus
 
 The daemon serves its metrics at `GET /v0/metrics`, on the control socket
-and on the mutual-TLS control listener (`LOTSE_CONTROL_LISTEN`), never
+and on the mutual-TLS control listener (`ROCKO_CONTROL_LISTEN`), never
 anywhere without authentication. The scraper's `Accept` header picks the
 format, as Prometheus negotiates it: OpenMetrics 1.0, which Prometheus asks
 for by default, or the Prometheus text format 0.0.4, the fallback for
@@ -452,8 +452,8 @@ container above; `--socket` and `--data-dir` name the paths elsewhere.
 
    ```sh
    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-     -keyout lotse-client.key -out lotse-client.pem -days 36500 -subj "/CN=prometheus"
-   openssl x509 -in lotse-client.pem -noout -fingerprint -sha256
+     -keyout rocko-client.key -out rocko-client.pem -days 36500 -subj "/CN=prometheus"
+   openssl x509 -in rocko-client.pem -noout -fingerprint -sha256
    ```
 
    The fingerprint after `=` is the pin, taken as printed, in either case,
@@ -464,13 +464,13 @@ container above; `--socket` and `--data-dir` name the paths elsewhere.
    handshake.
 
 2. Enroll the pin as a `metrics` client, either fixed in the configuration
-   (`LOTSE_METRICS_CLIENTS`, `--metrics-clients` or `[metrics] clients`,
-   comma-separated like `LOTSE_CONTROL_CLIENTS`; a restart takes it), or at
+   (`ROCKO_METRICS_CLIENTS`, `--metrics-clients` or `[metrics] clients`,
+   comma-separated like `ROCKO_CONTROL_CLIENTS`; a restart takes it), or at
    once, with no restart, over the control socket, which keeps it in the
    data directory:
 
    ```sh
-   podman exec lotse /lotse ctl clients add <pin> metrics
+   podman exec rocko /rocko ctl clients add <pin> metrics
    ```
 
    A pin is either a `control` or a `metrics` client: one given both roles
@@ -478,15 +478,15 @@ container above; `--socket` and `--data-dir` name the paths elsewhere.
    role until it is removed. `clients list` shows each pin's role.
 
 3. Copy the daemon's certificate to Prometheus, which trusts it as its CA
-   file and checks the DNS name `lotse` in it:
+   file and checks the DNS name `rocko` in it:
 
    ```sh
-   podman exec lotse /lotse identity --certificate > lotse-server.pem
+   podman exec rocko /rocko identity --certificate > rocko-server.pem
    ```
 
    It prints the certificate alone, never the key. An identity made before
    the daemon put that name in its certificate has none, and the command
-   says so: `podman exec lotse /lotse identity --reissue` makes a new
+   says so: `podman exec rocko /rocko identity --reissue` makes a new
    certificate from the same key, which changes the pin, so every client
    pairs again (and a client that pinned the old one by hand takes the new
    one), and the daemon serves it once restarted.
@@ -495,22 +495,22 @@ container above; `--socket` and `--data-dir` name the paths elsewhere.
 
    ```yaml
    scrape_configs:
-     - job_name: lotse
+     - job_name: rocko
        scheme: https
        metrics_path: /v0/metrics
        static_configs: [{ targets: ["<host>:18557"] }]
        tls_config:
-         ca_file: /etc/prometheus/lotse-server.pem
-         server_name: lotse
-         cert_file: /etc/prometheus/lotse-client.pem
-         key_file: /etc/prometheus/lotse-client.key
+         ca_file: /etc/prometheus/rocko-server.pem
+         server_name: rocko
+         cert_file: /etc/prometheus/rocko-client.pem
+         key_file: /etc/prometheus/rocko-client.key
    ```
 
-5. Revoke it with `podman exec lotse /lotse ctl clients remove <pin>`,
+5. Revoke it with `podman exec rocko /rocko ctl clients remove <pin>`,
    which closes its connections at once; a fixed pin goes from the
    configuration instead.
 
-The metrics' names start with `lotse_`, a counter's end in `_total`, and
+The metrics' names start with `rocko_`, a counter's end in `_total`, and
 units are in the name (`_bytes`, `_seconds`). Over TLS, a `metrics`
 client is answered 403 on every other route and 404 on a path that does
 not exist. `mise run interop` runs this setup against a real Prometheus.
@@ -529,7 +529,7 @@ at your option.
 This is the Rust default (rustc, std, serde), so contributors and tooling
 expect it. The Apache-2.0 option carries the contributor patent grant; the
 MIT option keeps GPLv2 compatibility for distro packaging. Both are
-compatible with Home Assistant core (Apache-2.0), and lotse ships as a
+compatible with Home Assistant core (Apache-2.0), and rocko ships as a
 separate binary.
 Narrowing to Apache-2.0 alone later needs no contributor consent, because
 every contribution is already offered under it; broadening from

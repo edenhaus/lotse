@@ -77,15 +77,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::clock::{Clock, SystemClock};
-use lotse_core::clock_map::ClockMapper;
-use lotse_core::media::{MediaPacket, RtpHeaderFields};
-use lotse_core::source::{
+use rocko_core::clock::{Clock, SystemClock};
+use rocko_core::clock_map::ClockMapper;
+use rocko_core::media::{MediaPacket, RtpHeaderFields};
+use rocko_core::source::{
     BackchannelSlot, ClockInput, ResolvedPeer, SourceCtx, SourceFactory as _, TrackSet,
 };
-use lotse_core::source_url::SourceUrl;
-use lotse_core::track::TrackLimits;
-use lotse_rtsp::RtspFactory;
+use rocko_core::source_url::SourceUrl;
+use rocko_core::track::TrackLimits;
+use rocko_rtsp::RtspFactory;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -106,7 +106,7 @@ const PASSWORD: &str = "Pw-4E2d81";
 
 /// The challenge of flag bit 5 when bit 6 leaves it to the camera: a
 /// Digest one (RFC 7616 §3.3) with the fields retina answers.
-const DIGEST: &[u8] = br#"Digest realm="lotse", nonce="4f1c2b", qop="auth", algorithm=MD5"#;
+const DIGEST: &[u8] = br#"Digest realm="rocko", nonce="4f1c2b", qop="auth", algorithm=MD5"#;
 
 /// The camera's script, cut from the input.
 struct Script<'a> {

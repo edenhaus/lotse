@@ -38,7 +38,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       ARCH: ${{ matrix.arch }}
-      BIN: target/${{ matrix.arch }}-unknown-linux-musl/release/lotse
+      BIN: target/${{ matrix.arch }}-unknown-linux-musl/release/rocko
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,10 +64,10 @@ jobs:
       - name: Size check (< 15 MB)
         run: |
           size=$(stat -c %s "$BIN")
-          echo "lotse: $size bytes"
+          echo "rocko: $size bytes"
           test "$size" -lt 15728640
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: lotse-${{ matrix.arch }}
+          name: rocko-${{ matrix.arch }}
           path: ${{ env.BIN }}
           if-no-files-found: error

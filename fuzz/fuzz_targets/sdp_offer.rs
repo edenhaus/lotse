@@ -13,15 +13,15 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::Orientation;
-use lotse_core::codec::Codec;
-use lotse_core::session::{
+use rocko_core::Orientation;
+use rocko_core::codec::Codec;
+use rocko_core::session::{
     IceCredentials, SessionEngine, SessionLimits, SessionOpenError, SessionRequest, TalkbackClaim,
     TalkbackTarget,
 };
-use lotse_core::uplink::UplinkCodec;
-use lotse_webrtc::Session;
-use lotse_webrtc::sdp::check_payload_types;
+use rocko_core::uplink::UplinkCodec;
+use rocko_webrtc::Session;
+use rocko_webrtc::sdp::check_payload_types;
 
 /// An offer of a web player's shape, audio and video in one BUNDLE group, that the
 /// session answers: the base the fuzzer inserts lines into, so it reaches
@@ -133,8 +133,8 @@ fuzz_target!(|data: &[u8]| {
     let request = SessionRequest {
         offer,
         ice: IceCredentials {
-            ufrag: "lotseufrag".into(),
-            pass: "lotsepassword0123456789ab".into(),
+            ufrag: "rockoufrag".into(),
+            pass: "rockopassword0123456789ab".into(),
         },
         candidates: vec!["192.0.2.10:18556".parse().expect("an address")],
         tcp_candidates: vec![],
@@ -148,13 +148,13 @@ fuzz_target!(|data: &[u8]| {
             Codec::H265 {
                 vps: None,
                 sps: (pick & 16 != 0)
-                    .then(|| lotse_codec::h265::test_data::sps_of_tier(1, true, 640, 480).into()),
+                    .then(|| rocko_codec::h265::test_data::sps_of_tier(1, true, 640, 480).into()),
                 pps: None,
             }
         })),
         audio,
         backchannel: None,
-        claim: lotse_core::session::TalkbackClaim::Granted,
+        claim: rocko_core::session::TalkbackClaim::Granted,
         orientation: Orientation::ALL[usize::from(pick >> 5)],
         limits: SessionLimits::default(),
         wall: SystemTime::UNIX_EPOCH,

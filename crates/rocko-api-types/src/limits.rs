@@ -1,0 +1,58 @@
+//! The shape and length caps of command inputs, checked by
+//! [`parse_command`](crate::parse_command) and published in the schema
+//! bundle as `pattern`, `maxLength` and `maxItems`.
+//!
+//! Lengths count characters (Unicode scalar values), as JSON Schema's
+//! `maxLength` does (JSON Schema Validation 2020-12 §6.3.1). The caps are
+//! design limits, not a standard's: each is far above what browsers and
+//! the clients relaying them send (observed 2026-10) and far below the 64 KiB frame,
+//! except the SDP's, which is the frame's own size. Identifier shapes are
+//! checked where they are used; their length is capped here, every
+//! `stream_id` and session id, so no refusal or log carries a longer one.
+//! An over-long `stream_id` is `invalid_stream_id`, as a malformed one is.
+
+/// The shape of a stream or session id, as `rocko_core::id` checks it.
+pub const ID_PATTERN: &str = "^[A-Za-z0-9._-]{1,128}$";
+
+/// The shape of a recording id, as `rocko_core::id::RecordingId` checks it:
+/// [`ID_PATTERN`] but `.` and `..`, the dot segments (RFC 3986 §3.3) that
+/// URL resolution would remove from the recording's route (§5.2.4). Three
+/// characters or more, two not starting with a dot, one not a dot, or a
+/// dot and one that is not: no lookahead, which not every client's regex
+/// engine has.
+pub const RECORDING_ID_PATTERN: &str =
+    "^(?:[A-Za-z0-9._-]{3,128}|[A-Za-z0-9_-][A-Za-z0-9._-]?|\\.[A-Za-z0-9_-])$";
+
+/// The longest stream or session id, `rocko_core::id::MAX_LEN`.
+pub const MAX_ID_CHARS: usize = 128;
+
+/// The most `sources` of one `stream/put`; v1 uses one, failover a few.
+pub const MAX_SOURCES: usize = 8;
+
+/// The longest source URL, credentials and query included.
+pub const MAX_URL_CHARS: usize = 4096;
+
+/// The longest SDP offer: the whole 64 KiB frame.
+pub const MAX_SDP_CHARS: usize = 64 * 1024;
+
+/// The most `ice_servers` of one `webrtc/offer`.
+pub const MAX_ICE_SERVERS: usize = 16;
+
+/// The most `urls` of one ICE server.
+pub const MAX_ICE_URLS: usize = 16;
+
+/// The longest certificate pin, of `clients/remove` and of a source's
+/// `tls`: 32 hex pairs and the 31 colons between them.
+pub const MAX_PIN_CHARS: usize = 95;
+
+/// The longest ICE server URL, TURN username or credential, trickled
+/// candidate or `sdp_mid`.
+pub const MAX_TEXT_CHARS: usize = 1024;
+
+/// The shape of a `signaling/error`'s `code`: a lowercase word of letters,
+/// digits and underscores, as the API's own codes are.
+pub const SIGNAL_ERROR_CODE_PATTERN: &str = "^[a-z0-9_]{1,64}$";
+
+/// The longest `signaling/error` `code`, as
+/// [`SIGNAL_ERROR_CODE_PATTERN`] has it.
+pub const MAX_SIGNAL_ERROR_CODE_CHARS: usize = 64;

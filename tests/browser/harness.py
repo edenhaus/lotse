@@ -25,7 +25,7 @@ class Case:
 
     name: str
     audio: str
-    """The synthetic camera's audio (`lotse-browser --audio`): `pcmu`, `aac` or `opus`."""
+    """The synthetic camera's audio (`rocko-browser --audio`): `pcmu`, `aac` or `opus`."""
     disrupt: str | None
     """What the page does after a first window, before the window the checks take: `pli` (a
     keyframe request of its own), `reconnect` (the harness restarts the camera's publisher) or
@@ -96,8 +96,8 @@ class Settings:
 
     engine: str
     play_s: float
-    lotse: Path
-    lotse_browser: Path
+    rocko: Path
+    rocko_browser: Path
     camera: str | None
     out: Path
     headless: bool
@@ -112,13 +112,13 @@ class Settings:
 
 @dataclass(frozen=True, kw_only=True)
 class Served:
-    """What `lotse-browser` serves: the page, the camera, and the stream the camera sends."""
+    """What `rocko-browser` serves: the page, the camera, and the stream the camera sends."""
 
     page: str
     camera: str
     stream: Stream
     command: Callable[[str], dict[str, Any]] | None = None
-    """Sends `lotse-browser` a command line and returns its answer (`restart-camera`)."""
+    """Sends `rocko-browser` a command line and returns its answer (`restart-camera`)."""
     daemon_pid: int | None = None
     """The daemon's process, whose child is the worker a crash kills."""
 

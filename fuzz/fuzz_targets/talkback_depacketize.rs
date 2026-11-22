@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::opus;
-use lotse_core::codec::CodecFamily;
-use lotse_core::media::RtpHeaderFields;
-use lotse_core::uplink::UplinkCodec;
-use lotse_webrtc::talkback::Depacketizer;
+use rocko_codec::opus;
+use rocko_core::codec::CodecFamily;
+use rocko_core::media::RtpHeaderFields;
+use rocko_core::uplink::UplinkCodec;
+use rocko_webrtc::talkback::Depacketizer;
 
 fuzz_target!(|data: &[u8]| {
     // [pt][marker][payload...]: a browser's payload types, with G.722 and

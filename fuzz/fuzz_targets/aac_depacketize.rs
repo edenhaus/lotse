@@ -6,7 +6,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::aac::AacDepacketizer;
+use rocko_codec::aac::AacDepacketizer;
 
 fuzz_target!(|data: &[u8]| {
     // The input is a sequence of packets: [len:u8][ts_delta:u8][flags:u8][payload...].

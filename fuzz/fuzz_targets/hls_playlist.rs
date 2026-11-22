@@ -14,7 +14,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_http::hls::{
+use rocko_http::hls::{
     Event, MAX_RENDITIONS, MAX_SEGMENTS, MAX_URL_BYTES, MAX_VARIANTS, MediaPlaylist, Playlist,
     Tracker, choose_variant, parse, start_index,
 };

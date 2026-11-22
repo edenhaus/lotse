@@ -1,11 +1,11 @@
-"""The comparison: lotse's runs side by side with each other server's, reported, never judged.
+"""The comparison: rocko's runs side by side with each other server's, reported, never judged.
 
 The other servers are go2rtc's two paths (`go2rtc`, its own RTSP client, and `go2rtc-ffmpeg`, a
 camera it pulls through ffmpeg). Everything here is a pure function of the runs' results, which
 `test_comparison.py` collects: for each server, what `checks.check` measured in each run, its
 diagnostics and the processes' usage, or why the run did not play. Every metric is summarised per
-server (median, 95th percentile, range), and lotse's median and 95th percentile are set against
-each other server's as a difference. Nothing here passes or fails: lotse's runs are held to the
+server (median, 95th percentile, range), and rocko's median and 95th percentile are set against
+each other server's as a difference. Nothing here passes or fails: rocko's runs are held to the
 browser test's own checks (`checks.check`), which `test_comparison.py` applies, and the other
 servers' figures and failed checks are recorded only.
 """
@@ -48,7 +48,7 @@ METRICS: dict[str, tuple[str, ...]] = {
 `checks.check`'s; `diagnostics` are the getStats() fields only some browsers report (absent when
 "not reported"); `usage` is `usage.usage` of the server's processes over the play time."""
 
-LOTSE = "lotse"
+ROCKO = "rocko"
 """The server every other one is set against."""
 
 
@@ -102,7 +102,7 @@ def summarise(runs: list[Json], path: tuple[str, ...]) -> Summary:
 
 
 def delta(mine: float | None, theirs: float | None) -> float | None:
-    """The difference of lotse's figure from another server's; `None` when either has none."""
+    """The difference of rocko's figure from another server's; `None` when either has none."""
     if mine is None or theirs is None:
         return None
     return mine - theirs
@@ -112,7 +112,7 @@ def outcomes(runs: list[Json]) -> dict[str, Json]:
     """How a server's runs went: how many played, and each run's failed checks or error.
 
     A run that did not play carries `error` (`test_comparison._run`); one that played carries the
-    failures of `checks.check`, which only lotse is held to.
+    failures of `checks.check`, which only rocko is held to.
     """
     played = [run for run in runs if "error" not in run]
     failures: list[str] = []
@@ -140,14 +140,14 @@ def negotiated(runs: list[Json]) -> dict[str, list[str]]:
     return {kind: sorted(found) for kind, found in codecs.items()}
 
 
-def compare(lotse: list[Json], others: dict[str, list[Json]]) -> dict[str, Json]:
-    """The report: each metric per server, lotse's differences, the codecs and how the runs went.
+def compare(rocko: list[Json], others: dict[str, list[Json]]) -> dict[str, Json]:
+    """The report: each metric per server, rocko's differences, the codecs and how the runs went.
 
     `others` has each other server's runs by its name, in the order the report lists them;
-    `deltas` has, per metric and other server, lotse's median and 95th percentile minus that
-    server's (negative where lotse's figure is lower).
+    `deltas` has, per metric and other server, rocko's median and 95th percentile minus that
+    server's (negative where rocko's figure is lower).
     """
-    runs = {LOTSE: lotse, **others}
+    runs = {ROCKO: rocko, **others}
     metrics = {
         name: {server: summarise(each, path) for server, each in runs.items()}
         for name, path in METRICS.items()
@@ -160,8 +160,8 @@ def compare(lotse: list[Json], others: dict[str, list[Json]]) -> dict[str, Json]
         "deltas": {
             name: {
                 server: {
-                    "p50": delta(each[LOTSE].p50, each[server].p50),
-                    "p95": delta(each[LOTSE].p95, each[server].p95),
+                    "p50": delta(each[ROCKO].p50, each[server].p50),
+                    "p95": delta(each[ROCKO].p95, each[server].p95),
                 }
                 for server in others
             }
@@ -175,7 +175,7 @@ def compare(lotse: list[Json], others: dict[str, list[Json]]) -> dict[str, Json]
 def table(comparison: dict[str, Json]) -> str:
     """The comparison as a Markdown table.
 
-    Each metric's median and 95th percentile per server, then lotse's median minus each other
+    Each metric's median and 95th percentile per server, then rocko's median minus each other
     server's.
     """
 

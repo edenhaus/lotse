@@ -1,5 +1,5 @@
 [package]
-name = "lotse-fuzz"
+name = "rocko-fuzz"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,20 +17,20 @@ cargo-fuzz = true
 [dependencies]
 bytes.workspace = true
 libfuzzer-sys.workspace = true
-lotse-api.workspace = true
-lotse-api-types.workspace = true
-lotse-codec = { workspace = true, features = ["test-util"] }
-lotse-core = { workspace = true, features = ["test-util"] }
-lotse-hls.workspace = true
-lotse-http.workspace = true
-lotse-ipc.workspace = true
-lotse-mux.workspace = true
-lotse-rtsp.workspace = true
-lotse-supervisor.workspace = true
-lotse-testing.workspace = true
-lotse-webrtc.workspace = true
-lotse-worker.workspace = true
 mp4-atom.workspace = true
+rocko-api.workspace = true
+rocko-api-types.workspace = true
+rocko-codec = { workspace = true, features = ["test-util"] }
+rocko-core = { workspace = true, features = ["test-util"] }
+rocko-hls.workspace = true
+rocko-http.workspace = true
+rocko-ipc.workspace = true
+rocko-mux.workspace = true
+rocko-rtsp.workspace = true
+rocko-supervisor.workspace = true
+rocko-testing.workspace = true
+rocko-webrtc.workspace = true
+rocko-worker.workspace = true
 serde_json.workspace = true
 str0m.workspace = true
 tokio = { workspace = true, features = ["net", "time", "io-util", "macros"] }

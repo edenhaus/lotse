@@ -19,13 +19,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::aac::test_data::{CONFIG_16K_MONO, SINE_16K_MONO, frames};
-use lotse_codec::transcode::AacToOpus;
-use lotse_core::clock::{Clock, SystemClock};
-use lotse_core::codec::{Codec, Kind};
-use lotse_core::media::{MediaFrame, MediaTime};
-use lotse_core::track::{SubscriptionError, Track, TrackId, TrackLimits};
-use lotse_core::transcode::Transcoder as _;
+use rocko_codec::aac::test_data::{CONFIG_16K_MONO, SINE_16K_MONO, frames};
+use rocko_codec::transcode::AacToOpus;
+use rocko_core::clock::{Clock, SystemClock};
+use rocko_core::codec::{Codec, Kind};
+use rocko_core::media::{MediaFrame, MediaTime};
+use rocko_core::track::{SubscriptionError, Track, TrackId, TrackLimits};
+use rocko_core::transcode::Transcoder as _;
 
 /// Takes `N` bytes off the front of `rest`.
 fn take<const N: usize>(rest: &mut &[u8]) -> Option<[u8; N]> {
@@ -64,7 +64,7 @@ fuzz_target!(|data: &[u8]| {
             ((index & 1) << 7) | (channels << 3),
         ]
     };
-    let Ok(parsed) = lotse_codec::aac::parse_config(&config) else {
+    let Ok(parsed) = rocko_codec::aac::parse_config(&config) else {
         return;
     };
     let sine = frames(SINE_16K_MONO);
@@ -106,7 +106,7 @@ fuzz_target!(|data: &[u8]| {
         };
         let mut ts = 0_i64;
         let mut seen: Vec<(u32, i64)> = Vec::new();
-        let mut collect = |out: &mut lotse_core::track::FrameSubscription| loop {
+        let mut collect = |out: &mut rocko_core::track::FrameSubscription| loop {
             match out.try_recv() {
                 Ok(Some(frame)) => {
                     assert!(!frame.payload.is_empty(), "an Opus packet has a payload");

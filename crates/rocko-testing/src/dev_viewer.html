@@ -1,0 +1,1032 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rocko dev viewer</title>
+<style>
+  :root { --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #5d6677; --line: #d9dde5; --accent: #2f6fde; --bad: #c0392b; --good: #1f8a4c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --panel: #1c2027; --text: #e6e9ef; --muted: #99a2b3; --line: #2d333d; --accent: #6b9bff; --bad: #ff7b6b; --good: #5fd08f; }
+  }
+  /* Native controls and scrollbars in the page's scheme (CSS Color
+     Adjustment Level 1 §2.1), the scrollbars thin and muted (CSS Scrollbars
+     Styling Level 1 §2, §3): without a color-scheme Chrome draws its light
+     ones in the dark scheme too (Chrome on macOS, 2026-10-13). */
+  :root { color-scheme: light dark; scrollbar-color: color-mix(in srgb, var(--muted) 50%, transparent) transparent; }
+  * { box-sizing: border-box; }
+  aside, .col, #log { scrollbar-width: thin; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; overflow-x: hidden; }
+  /* The video takes everything the side panel leaves; below 760 px the
+     panel goes under it and the page scrolls vertically only. */
+  .app { display: grid; grid-template-columns: minmax(0, 1fr) 360px; height: 100vh; height: 100dvh; }
+  .stage { background: #000; min-width: 0; min-height: 0; }
+  video { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  aside { background: var(--panel); border-left: 1px solid var(--line); padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+  h1 { font-size: 16px; margin: 0; }
+  h1 small { display: block; color: var(--muted); font-weight: normal; font-size: 12px; }
+  h2 { font-size: 12px; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  form, section { display: grid; gap: 8px; min-width: 0; }
+  label { display: grid; gap: 3px; color: var(--muted); font-size: 12px; min-width: 0; }
+  label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+  input, select { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); min-width: 0; width: 100%; }
+  label.check input { width: auto; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+  .buttons input { flex: 1 1 120px; width: auto; }
+  button { font: inherit; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .dock { display: flex; gap: 2px; }
+  .dock button { padding: 3px; line-height: 0; background: transparent; border-color: transparent; color: var(--muted); }
+  .dock button[aria-pressed="true"] { color: var(--accent); border-color: var(--line); }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  #log { margin: 0; min-height: 120px; flex: 1 0 120px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .bad { color: var(--bad); } .good { color: var(--good); }
+  /* The panel below the video, for a landscape stream: the video keeps the
+     full width, and the panel is a strip of three columns that scroll on
+     their own: the stream's fields, the session, and the log, widest so
+     its lines stay readable. */
+  @media (min-width: 761px) {
+    .app.below { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+    .app.below aside { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1.8fr); grid-template-rows: minmax(0, 1fr); gap: 24px; border-left: 0; border-top: 1px solid var(--line); height: 40vh; height: 40dvh; overflow: hidden; }
+    /* Vertical scrolling only: `overflow-y` alone makes `overflow-x` auto too
+       (CSS Overflow 3 §3.1), and a column rounded a pixel narrower than its
+       content then scrolls sideways (Chrome on macOS, 2026-10-13). */
+    .app.below .col, .app.below #log { min-height: 0; overflow: hidden auto; }
+  }
+  @media (max-width: 760px) {
+    .app { grid-template-columns: minmax(0, 1fr); height: auto; }
+    .stage { height: min(75vh, 100vw); height: min(75dvh, 100vw); }
+    aside { border-left: 0; overflow: visible; }
+    #log { max-height: 50vh; }
+    .dock { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="app below" id="app">
+  <div class="stage"><video id="video" autoplay muted playsinline controls></video></div>
+  <aside>
+    <div class="col">
+      <header>
+        <h1>rocko dev viewer <small id="hello">connecting to the daemon…</small></h1>
+        <div class="dock" role="group" aria-label="Panel position">
+          <button id="dock-right" type="button" title="Panel right of the video" aria-label="Panel right of the video" aria-pressed="false">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor"/><rect x="9.5" y="2.5" width="5" height="11" fill="currentColor" fill-opacity=".45"/></svg>
+          </button>
+          <button id="dock-below" type="button" title="Panel below the video" aria-label="Panel below the video" aria-pressed="true">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor"/><rect x="1.5" y="9.5" width="13" height="4" fill="currentColor" fill-opacity=".45"/></svg>
+          </button>
+        </div>
+      </header>
+      <form id="form">
+        <label>Saved streams <select id="saved"><option value="">(not saved)</option></select></label>
+        <div class="buttons">
+          <input id="label" placeholder="Name (optional)" aria-label="Name for the saved stream" autocomplete="off">
+          <button id="save-entry" type="button" class="secondary">Save</button>
+          <button id="delete-entry" type="button" class="secondary" disabled>Delete</button>
+        </div>
+        <div class="buttons">
+          <button id="play" type="submit" disabled>Play</button>
+          <button id="stop" type="button" class="secondary" disabled>Stop</button>
+          <button id="talk" type="button" class="secondary" disabled title="Sends the microphone to the camera's speaker; the browser asks for it on the first press">Talk</button>
+        </div>
+        <label>Camera URL <input id="url" placeholder="rtsp://user:pass@192.168.1.10:554/stream1" autocomplete="off" spellcheck="false" required></label>
+        <label>STUN server (optional) <input id="stun" placeholder="stun:stun.l.google.com:19302"></label>
+        <label title="stream/put's orientation; changing it while playing puts the stream again, and the open session turns from its next frame">Orientation (CVO)
+          <select id="orientation">
+            <option value="no_transform">no_transform</option>
+            <option value="mirror">mirror</option>
+            <option value="rotate_180">rotate_180</option>
+            <option value="flip">flip</option>
+            <option value="rotate_left_and_flip">rotate_left_and_flip</option>
+            <option value="rotate_left">rotate_left</option>
+            <option value="rotate_right_and_flip">rotate_right_and_flip</option>
+            <option value="rotate_right">rotate_right</option>
+          </select>
+        </label>
+        <label class="check" title="stream/put's RTSP option backchannel: the daemon asks the camera for its ONVIF backchannel, and the offer carries a send-only audio m-line for the microphone; changing it while playing plays again"><input id="talkback" type="checkbox"> Two-way audio (camera backchannel)</label>
+        <label title="The name as a slug until edited here; clearing it hands it back to the name">Stream id <input id="stream" value="cam" pattern="[A-Za-z0-9._\-]{1,128}" required></label>
+      </form>
+    </div>
+    <div class="col">
+      <section>
+        <h2>Session</h2>
+        <dl id="stats">
+          <dt>Session</dt><dd id="s-state">–</dd>
+          <dt>First frame</dt><dd id="s-ttff">–</dd>
+          <dt>Video</dt><dd id="s-video">–</dd>
+          <dt title="Whether the answer's video m-line carries urn:3gpp:video-orientation">CVO</dt><dd id="s-cvo">–</dd>
+          <dt>Frame rate</dt><dd id="s-fps">–</dd>
+          <dt>Decoded</dt><dd id="s-decoded">–</dd>
+          <dt>Lost</dt><dd id="s-lost">–</dd>
+          <dt>Video buffer</dt><dd id="s-vbuf">–</dd>
+          <dt>Audio</dt><dd id="s-audio">–</dd>
+          <dt>Audio buffer</dt><dd id="s-abuf">–</dd>
+          <dt title="The browser's estimate from the daemon's Sender Reports: shows what it aligns to, not whether the camera's timestamps are right">A/V playout</dt><dd id="s-av">–</dd>
+          <dt title="The backchannel of session/get: what the daemon received and handed to the camera">Talk-back</dt><dd id="s-talk">–</dd>
+          <dt title="The browser's outbound talk-back RTP">Uplink</dt><dd id="s-uplink">–</dd>
+          <dt>Path</dt><dd id="s-path">–</dd>
+        </dl>
+      </section>
+      <section>
+        <h2>Offer</h2>
+        <label class="check"><input id="audio" type="checkbox" checked> Offer audio (receive-only)</label>
+        <label class="check"><input id="constrained-high" type="checkbox" checked> Offer Constrained High (640c1f)</label>
+        <label class="check"><input id="playout-delay" type="checkbox" checked> Offer playout-delay (daemon sends min 0 / max 0)</label>
+        <div class="buttons"><button id="copy-offer" type="button" class="secondary" disabled>Copy offer SDP</button></div>
+      </section>
+    </div>
+    <pre id="log"></pre>
+  </aside>
+</div>
+<script>
+"use strict";
+// Speaks rocko's control API through the dev
+// viewer's relay: stream/put, then webrtc/offer as a subscription whose
+// events carry the answer and the daemon's candidates.
+const $ = (id) => document.getElementById(id);
+// The camera URL's password is masked while the field is not being
+// edited, so a screenshot never shows it. The real URL is kept in `cameraUrl`:
+// focusing the field shows it for editing and copying, and Play sends it.
+// The saved-streams list shows it masked too.
+// localStorage keeps the URLs with their credentials, so a new tab and a
+// restarted browser get them back: this is a test tool on the developer's
+// machine, and retyping every camera's password costs more than what any
+// page later served on this origin (localhost:8080, say) could read.
+let cameraUrl = "";
+const MASK = "•".repeat(8);
+// The video orientation RTP header extension (3GPP TS 26.114 §6.2.3.3).
+const CVO = "urn:3gpp:video-orientation";
+// The key in localStorage (the settings) and in sessionStorage (the
+// credentials pages before 2026-10-13 kept in the tab only).
+const STORE = "rocko-dev-viewer";
+// A URL's scheme and `//`, after which its authority starts (RFC 3986 §3).
+const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+// `url` with its password replaced by a fixed-length mask; the userinfo
+// ends at the authority's last `@` (RFC 3986 §3.2.1).
+function masked(url) {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/[^\/?#@:]*:)[^\/?#]*@/i, `$1${MASK}@`);
+}
+
+// `url` split into `bare`, the URL without its userinfo, and `userinfo`,
+// user and password up to and including the authority's last `@` (RFC
+// 3986 §3.2.1), or "" if it has none.
+function splitUserinfo(url) {
+  const found = /^([a-z][a-z0-9+.-]*:\/\/)([^\/?#]*@)/i.exec(url);
+  return found ? { bare: found[1] + url.slice(found[0].length), userinfo: found[2] } : { bare: url, userinfo: "" };
+}
+
+// `url` with `userinfo` put back, unless it has userinfo of its own; a
+// `userinfo` that is not one (storage holds what any page on this origin
+// wrote) is ignored.
+function withUserinfo(url, userinfo) {
+  if (typeof userinfo !== "string" || !/^[^\/?#]*@$/.test(userinfo) || splitUserinfo(url).userinfo) return url;
+  return url.replace(SCHEME, (scheme) => scheme + userinfo);
+}
+
+// `name` as a stream id: lowercase ASCII letters and digits, accents
+// dropped, every other run of characters one `_`, at most the 128
+// characters the stream id's pattern allows.
+function slugify(name) {
+  return name.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_").slice(0, 128).replace(/^_+|_+$/g, "");
+}
+
+function showUrl() {
+  const field = $("url");
+  field.value = document.activeElement === field ? cameraUrl : masked(cameraUrl);
+}
+
+function log(text, cls) {
+  const line = document.createElement("div");
+  line.textContent = `${new Date().toISOString().slice(11, 23)}  ${text}`;
+  if (cls) line.className = cls;
+  $("log").prepend(line);
+}
+
+// `text` parsed as an object, or nothing: storage can hold something this
+// page did not write.
+function parsed(text) {
+  const value = JSON.parse(text ?? "{}");
+  return value && typeof value === "object" ? value : {};
+}
+
+// The settings localStorage held and the credentials an earlier page left
+// in sessionStorage, or nothing: storage can be disabled, full, or hold
+// anything.
+function load() {
+  let settings = {}, credentials = {};
+  try {
+    settings = parsed(localStorage.getItem(STORE));
+  } catch {}
+  try {
+    credentials = parsed(sessionStorage.getItem(STORE));
+  } catch {}
+  return { saved: settings, credentials };
+}
+
+const isOrientation = (value) => [...$("orientation").options].some((o) => o.value === value);
+const { saved, credentials } = load();
+// Where the panel sits: "below" the video, the default, or "right" of it
+// for a portrait stream.
+let panel = saved.panel === "right" ? "right" : "below";
+// Puts the panel where `panel` says and marks its dock button pressed.
+function placePanel() {
+  $("app").classList.toggle("below", panel === "below");
+  for (const side of ["right", "below"]) $(`dock-${side}`).setAttribute("aria-pressed", String(panel === side));
+}
+const savedCredentials = new Map(Array.isArray(credentials.saved) ? credentials.saved.filter(Array.isArray) : []);
+// The saved streams, each { id, label, stream, url, orientation, talkback }
+// with the URL as typed, the credentials an earlier page left in this tab
+// put back; and which one the fields show, if any.
+let entries = (Array.isArray(saved.saved) ? saved.saved : [])
+  .filter((e) => e && typeof e.id === "string" && typeof e.url === "string" && typeof e.stream === "string")
+  .map((e) => ({ id: e.id, label: typeof e.label === "string" ? e.label : "", stream: e.stream,
+                 url: withUserinfo(e.url, savedCredentials.get(e.id)),
+                 orientation: isOrientation(e.orientation) ? e.orientation : "no_transform",
+                 talkback: e.talkback === true }));
+let selectedId = typeof saved.selected === "string" ? saved.selected : undefined;
+let storageWarned = false;
+
+function storageFailed(err) {
+  if (!storageWarned) log(`settings are not kept: storage unavailable (${err.name})`, "bad");
+  storageWarned = true;
+}
+
+// Keeps the fields and the saved streams in localStorage, every URL with
+// its userinfo; whether localStorage took them.
+function save() {
+  try {
+    localStorage.setItem(STORE, JSON.stringify({
+      stream: $("stream").value.trim(),
+      url: cameraUrl,
+      stun: $("stun").value.trim(),
+      orientation: $("orientation").value,
+      talkback: $("talkback").checked,
+      panel,
+      saved: entries,
+      selected: selectedId ?? null,
+    }));
+    return true;
+  } catch (err) {
+    storageFailed(err);
+    return false;
+  }
+}
+
+const selected = () => entries.find((e) => e.id === selectedId);
+// The saved stream the fields show: the selected one while they still
+// match it, else the first that matches, else none. URLs match without
+// their userinfo, so typing the password into a stream saved without it
+// keeps it selected, and Save updates it.
+function matching() {
+  const stream = $("stream").value.trim();
+  const bare = splitUserinfo(cameraUrl).bare;
+  const same = (e) => splitUserinfo(e.url).bare === bare && e.stream === stream;
+  const current = selected();
+  return current && same(current) ? current : entries.find(same);
+}
+
+function renderSaved() {
+  const list = $("saved");
+  list.replaceChildren(new Option("(not saved)", ""));
+  for (const entry of entries) {
+    const shown = masked(entry.url);
+    const option = new Option(entry.label ? `${entry.label}: ${shown}` : shown, entry.id);
+    option.title = `${entry.stream}, ${entry.orientation}${entry.talkback ? ", two-way audio" : ""}, ${shown}`;
+    list.add(option);
+  }
+  list.value = selected() ? selectedId : "";
+  $("delete-entry").disabled = !selected();
+}
+
+function syncSelection() {
+  selectedId = matching()?.id;
+  renderSaved();
+}
+
+for (const id of ["stream", "stun"]) if (typeof saved[id] === "string" && saved[id]) $(id).value = saved[id];
+if (isOrientation(saved.orientation)) $("orientation").value = saved.orientation;
+$("talkback").checked = saved.talkback === true;
+placePanel();
+cameraUrl = typeof saved.url === "string" ? withUserinfo(saved.url, credentials.url) : "";
+showUrl();
+syncSelection();
+if (selected()) $("label").value = selected().label;
+// Pages before 2026-10-13 kept the credentials in this tab's
+// sessionStorage only: they move to localStorage, which every tab reads.
+// sessionStorage keeps them until localStorage has taken them, so a failed
+// write loses nothing and the next load tries again.
+if (Object.keys(credentials).length && save()) {
+  try {
+    sessionStorage.removeItem(STORE);
+  } catch {}
+  log("this tab's camera credentials are kept in local storage now");
+}
+$("url").addEventListener("focus", showUrl);
+$("url").addEventListener("input", () => { cameraUrl = $("url").value.trim(); syncSelection(); });
+$("url").addEventListener("blur", () => { save(); showUrl(); });
+// Whether a stream id nobody just typed is one the name did not give:
+// neither empty, the page's default, nor the name's slug. On load and on
+// choosing a saved stream, this is the best guess.
+const typedStream = () => !["", $("stream").defaultValue, slugify($("label").value)].includes($("stream").value.trim());
+// Whether the stream id was typed by hand, so the name leaves it alone.
+let streamTyped = typedStream();
+// Any id typed here is the user's, even the default or the name's slug;
+// emptying the field hands it back to the name.
+$("stream").addEventListener("input", () => {
+  streamTyped = $("stream").value.trim() !== "";
+  syncSelection();
+});
+// An emptied stream id is handed back to the name once the field is left,
+// not while it is empty, which is also on the way to typing a new one.
+$("stream").addEventListener("blur", () => {
+  const slug = slugify($("label").value);
+  if ($("stream").value.trim() || !slug) return;
+  $("stream").value = slug;
+  streamTyped = false;
+  syncSelection();
+  save();
+});
+// A new stream's id follows its name until it is typed; a saved stream
+// keeps its id when renamed, so Save updates it.
+$("label").addEventListener("input", () => {
+  const slug = slugify($("label").value);
+  if (streamTyped || selected() || !slug) return;
+  $("stream").value = slug;
+  syncSelection();
+});
+for (const side of ["right", "below"]) {
+  $(`dock-${side}`).addEventListener("click", () => { panel = side; placePanel(); save(); });
+}
+
+let ws, nextId = 1, pc, offerId, sessionId, offerAccepted = false, pendingCandidates = [];
+let statsTimer, playClicked, lastOffer, offeredCvo, attempt = 0;
+// The playing session's stream, camera URL and talk-back opt-in, and its
+// answer.
+let playing, lastAnswer;
+// What the daemon's hello announced (`two_way_audio` among them).
+let features = [];
+// Talk-back: the send-only audio transceiver the offer carried, and the
+// microphone while Talk is on, the one track on its sender.
+let talkTransceiver, mic;
+// Why the current negotiation's talk-back was declined, as its
+// backchannel_declined warning said, or undefined. Play's offer and every
+// re-offer start without one, so an earlier negotiation's reason never
+// shows for a later one.
+let declinedWhy;
+// The talk-back status after an answer that declined it: the warning's
+// reason once it came, which can be before the answer is applied, as
+// events are not awaited one after the other; else a pointer to it.
+const declinedStatus = () => `${declinedWhy ?? "declined (the warning says why)"}; Talk asks again`;
+// Whether Play's offer went without playout-delay, which the re-offers
+// leave out too: only the audio m-lines may change in them.
+let withoutPlayoutDelay = false;
+// The last second's cumulative jitter-buffer counters per inbound stream,
+// so the page shows the current buffer rather than the session average.
+let previous = new Map();
+const results = new Map();
+
+function send(command, onResult) {
+  const id = nextId++;
+  if (onResult) results.set(id, onResult);
+  ws.send(JSON.stringify({ id, ...command }));
+  return id;
+}
+
+// `command`'s result frame.
+const call = (command) => new Promise((resolve) => send(command, resolve));
+
+// The source `stream/put` gets: the RTSP option `backchannel` only when
+// talk-back is on, so a camera without one never sees the request.
+const source = (url, talkback) => ({ protocol: url.slice(0, url.indexOf("://")).toLowerCase(), url, ...(talkback ? { backchannel: true } : {}) });
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => log("relay connected");
+  ws.onclose = () => {
+    $("hello").textContent = "daemon connection closed — reload to retry";
+    $("hello").className = "bad";
+    $("play").disabled = true;
+  };
+  ws.onmessage = (message) => {
+    const frame = JSON.parse(message.data);
+    if (frame.type === "hello") {
+      $("hello").textContent = `rocko ${frame.version}, api ${frame.api}`;
+      $("play").disabled = false;
+      features = Array.isArray(frame.features) ? frame.features : [];
+      log(`hello: outputs ${frame.outputs.join(", ")}; features ${features.join(", ") || "none"}`);
+    } else if (frame.type === "result") {
+      const callback = results.get(frame.id);
+      results.delete(frame.id);
+      if (!frame.success) log(`#${frame.id} failed: ${frame.error.code}: ${frame.error.message}`, "bad");
+      if (callback) callback(frame);
+    } else if (frame.type === "event" && frame.id === offerId) {
+      onSessionEvent(frame.event);
+    } else if (frame.type === "shutdown") {
+      log("the daemon is shutting down", "bad");
+    }
+  };
+}
+
+// The id under which `sdp`'s first `kind` m-section (or its session
+// level) maps the header extension `uri` (RFC 8285 §5), or undefined.
+function extmapId(sdp, kind, uri) {
+  const sections = sdp.split(/\r?\n(?=m=)/);
+  const media = sections.find((s) => s.startsWith(`m=${kind} `));
+  if (media === undefined) return undefined;
+  const session = sections[0].startsWith("m=") ? "" : sections[0];
+  for (const line of `${session}\n${media}`.split(/\r?\n/)) {
+    const map = /^a=extmap:(\d+)(?:\/\w+)? (\S+)/.exec(line);
+    if (map && map[2] === uri) return Number(map[1]);
+  }
+  return undefined;
+}
+
+// What the answer says about CVO: negotiated, or why not.
+function showCvo(answer) {
+  const id = extmapId(answer, "video", CVO);
+  const orientation = $("orientation").value;
+  let text, cls;
+  if (id !== undefined) {
+    const turnedOnly = /flip|mirror/.test(orientation) ? "; turned, not mirrored (the flip bit is not sent)" : "";
+    text = `negotiated, extmap id ${id}, ${orientation}${turnedOnly}`;
+    cls = "good";
+  } else if (offeredCvo !== undefined) {
+    text = `offered (id ${offeredCvo}) but not in the answer`;
+    cls = "bad";
+  } else {
+    text = "not offered by this browser: the picture plays unturned";
+    cls = orientation === "no_transform" ? undefined : "bad";
+  }
+  $("s-cvo").textContent = text;
+  $("s-cvo").className = cls ?? "";
+  log(`CVO: ${text}`, cls);
+}
+
+async function onSessionEvent(event) {
+  switch (event.type) {
+    case "session":
+      log(`session ${event.session_id}`);
+      break;
+    case "answer":
+      lastAnswer = event.sdp;
+      showCvo(event.sdp);
+      await pc.setRemoteDescription({ type: "answer", sdp: event.sdp });
+      log("answer applied");
+      if (talkTransceiver) answeredTalkback();
+      break;
+    case "candidate":
+      try {
+        if (event.candidate === "") {
+          await pc.addIceCandidate();
+          log("daemon: end of candidates");
+        } else {
+          await pc.addIceCandidate({
+            candidate: event.candidate,
+            sdpMid: event.sdp_mid ?? null,
+            sdpMLineIndex: event.sdp_mline_index ?? (event.sdp_mid == null ? 0 : null),
+          });
+          log(`daemon candidate: ${event.candidate}`);
+        }
+      } catch (err) {
+        log(`candidate refused: ${err}`, "bad");
+      }
+      break;
+    case "state":
+      $("s-state").textContent = `ice ${event.ice}, dtls ${event.dtls}`;
+      log(`state: ice ${event.ice}, dtls ${event.dtls}`, event.ice === "connected" ? "good" : undefined);
+      break;
+    case "warning":
+      // backchannel_declined says why an offer's talk-back was declined,
+      // and the camera's status when it refused.
+      log(`warning ${event.code}${event.reason ? ` (${event.reason}${event.status ? ` ${event.status}` : ""})` : ""}: ${event.message}`, "bad");
+      if (event.code === "backchannel_declined") {
+        // The answer declined talk-back and the session plays on; the
+        // next press of Talk is another try. The reason is kept for the
+        // status set once the answer is applied.
+        declinedWhy = `declined (${event.reason}): ${event.message}`;
+        $("s-talk").textContent = declinedStatus();
+        $("s-talk").className = "bad";
+      }
+      break;
+    case "closed":
+      log(`closed: ${event.code}: ${event.message}`, event.code === "session_closed" ? undefined : "bad");
+      $("s-state").textContent = `closed (${event.code})`;
+      offerId = undefined; // the subscription ended with this event
+      teardown(true);
+      break;
+  }
+}
+
+function sendCandidate(candidate) {
+  send({
+    type: "webrtc/candidate",
+    session_id: sessionId,
+    candidate: candidate ? candidate.candidate : "",
+    sdp_mid: candidate?.sdpMid ?? undefined,
+    sdp_mline_index: candidate?.sdpMLineIndex ?? undefined,
+  });
+}
+
+async function play() {
+  teardown(true);
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // A newer Play (an orientation change, another saved stream) ends this
+  // one at its next await.
+  const mine = ++attempt;
+  const streamId = $("stream").value.trim();
+  const url = cameraUrl;
+  const stun = $("stun").value.trim();
+  const orientation = $("orientation").value;
+  const talkback = $("talkback").checked;
+  playing = { streamId, url, talkback };
+  lastAnswer = undefined;
+  declinedWhy = undefined;
+  save();
+  $("play").disabled = true;
+  $("stop").disabled = false;
+  for (const id of ["s-ttff", "s-video", "s-cvo", "s-fps", "s-decoded", "s-lost", "s-vbuf", "s-audio", "s-abuf", "s-av", "s-talk", "s-uplink", "s-path"]) $(id).textContent = "–";
+  $("s-cvo").className = "";
+  previous = new Map();
+  // Play is a user gesture, so the browser lets the element start with
+  // sound; without audio it stays muted as before.
+  const withAudio = $("audio").checked;
+  $("video").muted = !withAudio;
+  playClicked = performance.now();
+  offerAccepted = false;
+  pendingCandidates = [];
+  sessionId = `viewer-${Date.now()}`;
+
+  // The offer needs the stream, so it waits for the put's result.
+  const put = call({ type: "stream/put", stream_id: streamId, sources: [source(url, talkback)], orientation });
+
+  const peer = new RTCPeerConnection({ iceServers: stun ? [{ urls: stun }] : [] });
+  pc = peer;
+  const transceiver = peer.addTransceiver("video", { direction: "recvonly" });
+  if (!$("constrained-high").checked && transceiver.setCodecPreferences && RTCRtpReceiver.getCapabilities) {
+    // A diagnostic: without Constrained High the daemon answers under the
+    // next payload type, as before 2026-09-30.
+    const codecs = RTCRtpReceiver.getCapabilities("video").codecs
+      .filter((c) => !/profile-level-id=640c/i.test(c.sdpFmtpLine ?? ""));
+    transceiver.setCodecPreferences(codecs);
+    log("offer without Constrained High");
+  }
+  if (withAudio) {
+    // The daemon answers it with the camera's audio: G.711, G.722 or Opus
+    // cut through, AAC transcoded to Opus; or inactive without usable audio.
+    peer.addTransceiver("audio", { direction: "recvonly" });
+  }
+  if (talkback) {
+    // Talk-back goes up on a dedicated send-only m-line, which the daemon
+    // answers recvonly in the backchannel's codec, else for a G.711 camera
+    // the other G.711 law (converted), else Opus (RFC 3264 §6.1)
+    // from the backchannel the connection's probe found; without one the
+    // answer declines it (backchannel_declined) and the session plays on.
+    // An offer right after a put that opted in waits in the daemon for that
+    // probe. The offer claims the backchannel for this session if nobody
+    // holds it; Stop talking re-offers the m-line inactive to let it go,
+    // and every Talk re-offers it sendonly to claim it again. It carries no
+    // track until Talk, so nothing is sent before.
+    if (!features.includes("two_way_audio")) log("the daemon announces no two_way_audio: talk-back will not be negotiated", "bad");
+    if (navigator.mediaDevices?.getUserMedia) {
+      talkTransceiver = peer.addTransceiver("audio", { direction: "sendonly" });
+    } else {
+      // Browsers hide the microphone outside a secure context, which plain
+      // http is only on loopback (W3C Secure Contexts §3.1).
+      log("no microphone here: open the page at http://localhost or http://127.0.0.1 (a secure context); offering without talk-back", "bad");
+    }
+  }
+  // The daemon puts audio and video in one stream (one msid), so the
+  // browser keeps them in sync; both tracks go to the one element.
+  peer.ontrack = (track) => {
+    const video = $("video");
+    if (track.streams[0]) {
+      if (video.srcObject !== track.streams[0]) video.srcObject = track.streams[0];
+    } else {
+      if (!(video.srcObject instanceof MediaStream)) video.srcObject = new MediaStream();
+      video.srcObject.addTrack(track.track);
+    }
+    log(`track: ${track.track.kind}`);
+    if (track.track.kind === "video") watchFirstFrame(mine);
+    video.play().catch(() => {
+      video.muted = true;
+      video.play().catch(() => {});
+      log("autoplay with sound was blocked; unmute with the player controls", "bad");
+    });
+  };
+  // The session exists once the offer's result arrived; candidates wait.
+  peer.onicecandidate = ({ candidate }) => {
+    if (mine !== attempt) return;
+    if (offerAccepted) sendCandidate(candidate);
+    else pendingCandidates.push(candidate);
+  };
+  peer.onconnectionstatechange = () => log(`browser: ${peer.connectionState}`);
+  const offer = await peer.createOffer();
+  if (mine !== attempt) return;
+  await peer.setLocalDescription(offer);
+  if (mine !== attempt) return;
+  // What this browser offers for H.264, for negotiation fixtures.
+  lastOffer = offer.sdp;
+  $("copy-offer").disabled = false;
+  const h264 = offer.sdp.split("\r\n")
+    .filter((line) => /^a=fmtp:\d+ .*profile-level-id=/.test(line))
+    .map((line) => `${line.match(/^a=fmtp:(\d+)/)[1]}: ${line.match(/profile-level-id=([0-9a-fA-F]{6})/)[1]}${/packetization-mode=1/.test(line) ? "" : " (mode 0)"}`);
+  log(`offer H.264 payload types ${h264.join(", ")}`);
+  // The browser's own offer carries CVO where it supports it (Chrome and
+  // Safari do, Firefox does not); nothing below removes it.
+  offeredCvo = extmapId(offer.sdp, "video", CVO);
+  log(offeredCvo === undefined ? "offer without CVO" : `offer CVO extmap id ${offeredCvo}`);
+  // A diagnostic: without the extension in the offer the daemon cannot
+  // negotiate it, so the browser applies its own playout timing, lip-sync
+  // hold included. Only what is sent changes; the local description keeps it.
+  withoutPlayoutDelay = !$("playout-delay").checked;
+  const sdp = sent(offer.sdp);
+  if (withoutPlayoutDelay) log("offer without playout-delay");
+  const putResult = await put;
+  if (mine !== attempt) return;
+  if (!putResult.success) { teardown(true); return; }
+  log(`stream ${streamId} ${putResult.result.created ? "created" : "updated or unchanged"}, ${orientation}`);
+  offerId = send({
+    type: "webrtc/offer",
+    stream_id: streamId,
+    session_id: sessionId,
+    sdp,
+    ice_servers: stun ? [{ urls: [stun] }] : [],
+  }, (result) => {
+    if (mine !== attempt) return;
+    if (!result.success) { offerId = undefined; teardown(true); return; }
+    offerAccepted = true;
+    for (const candidate of pendingCandidates) sendCandidate(candidate);
+    pendingCandidates = [];
+  });
+  statsTimer = setInterval(stats, 1000);
+}
+
+// The SDP the page sends for the browser's `sdp`: without the
+// playout-delay extension when Play's offer went without it.
+function sent(sdp) {
+  if (!withoutPlayoutDelay) return sdp;
+  return sdp.split("\r\n")
+    .filter((line) => !/^a=extmap:\d+(\/\w+)? http:\/\/www\.webrtc\.org\/experiments\/rtp-hdrext\/playout-delay/.test(line))
+    .join("\r\n");
+}
+
+// What the answer did with the talk-back m-line: recvonly makes the
+// browser's side sendonly, and the session holds the camera's
+// backchannel; inactive declined it, and a backchannel_declined warning
+// says why. Talk is usable either way: it re-offers to claim it again.
+function answeredTalkback() {
+  const negotiated = talkTransceiver.currentDirection === "sendonly";
+  $("talk").disabled = false;
+  $("s-talk").textContent = negotiated ? "negotiated; press Talk" : declinedStatus();
+  $("s-talk").className = negotiated ? "" : "bad";
+  log(negotiated ? "talk-back negotiated" : "talk-back declined: the answer's m-line is inactive", negotiated ? "good" : "bad");
+}
+
+// Re-offers with the talk-back transceiver's direction set to `direction`
+// (webrtc/reoffer, RFC 8829 §5.2.2) and applies the answer: true when
+// the browser's side is sendonly then, the session holding the camera's
+// backchannel; false when the answer declined it (inactive). Each starts
+// without the last negotiation's decline reason. A re-offer
+// the daemon refused is rolled back, the session going on as it was, and
+// gives undefined, as does one a newer Play overtook.
+async function reoffer(direction, mine) {
+  const peer = pc;
+  const transceiver = talkTransceiver;
+  const session = sessionId;
+  const before = transceiver.direction;
+  declinedWhy = undefined;
+  transceiver.direction = direction;
+  const offer = await peer.createOffer();
+  if (mine !== attempt) return undefined;
+  await peer.setLocalDescription(offer);
+  if (mine !== attempt) return undefined;
+  const answered = await call({ type: "webrtc/reoffer", session_id: session, sdp: sent(offer.sdp) });
+  if (mine !== attempt) return undefined;
+  if (!answered.success) {
+    await peer.setLocalDescription({ type: "rollback" });
+    transceiver.direction = before;
+    return undefined;
+  }
+  await peer.setRemoteDescription({ type: "answer", sdp: answered.result.sdp });
+  return transceiver.currentDirection === "sendonly";
+}
+
+// Puts the microphone on the talk-back m-line. Every press re-offers the
+// m-line sendonly first, even one answered recvonly before: the answer
+// says the session held the camera's backchannel then, not now, as
+// another control client's release frees it without a re-offer, and the
+// worker drops the packets of a session that no longer holds it.
+// The daemon decides the claim: the session keeps one it holds, takes the
+// backchannel while it is free, and is answered inactive with a
+// backchannel_declined warning while another session holds it or the
+// camera refuses; then the microphone stops and Talk asks again on the
+// next press. The browser asks for the microphone on this click, not on
+// Play's.
+async function startTalking() {
+  const mine = attempt;
+  const transceiver = talkTransceiver;
+  $("talk").disabled = true;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    // A later Play owns the controls now: nothing of this one's to undo.
+    if (mine !== attempt) return;
+    log(`no microphone: ${err.name}: ${err.message}`, "bad");
+    $("talk").disabled = false;
+    return;
+  }
+  if (mine !== attempt) {
+    for (const track of stream.getTracks()) track.stop();
+    return;
+  }
+  // The claim comes before the microphone is this session's: nothing
+  // stops talking while the re-offer is on its way.
+  log("claiming the backchannel: re-offering talk-back");
+  let claimed, failed;
+  try {
+    claimed = await reoffer("sendonly", mine);
+  } catch (err) {
+    failed = err;
+  }
+  if (mine !== attempt || claimed !== true) {
+    for (const track of stream.getTracks()) track.stop();
+    if (mine !== attempt) return;
+    // Declined, its warning says why; or the re-offer failed, the
+    // daemon's refusal logged with its result.
+    if (failed) log(`re-offer failed: ${failed.name}: ${failed.message}`, "bad");
+    log(claimed === false ? "talk-back declined; press Talk to ask again" : "talk-back not claimed; press Talk to ask again", "bad");
+    $("s-talk").textContent = claimed === false ? declinedStatus() : "not claimed (the log says why); Talk asks again";
+    $("s-talk").className = "bad";
+    $("talk").disabled = false;
+    return;
+  }
+  log("talk-back negotiated: the backchannel is this session's", "good");
+  mic = stream;
+  const track = stream.getAudioTracks()[0];
+  // Unplugged, or the permission taken back.
+  track.addEventListener("ended", () => { if (mic === stream) stopTalking(); });
+  try {
+    await transceiver.sender.replaceTrack(track);
+  } catch (err) {
+    // A track the m-line cannot take "without renegotiation" (W3C WebRTC
+    // 1.0, replaceTrack), say: the
+    // microphone goes, and Talk comes back for this attempt only; a later
+    // Play's controls stay as they are.
+    for (const t of stream.getTracks()) t.stop();
+    if (mine !== attempt) return;
+    log(`microphone not sent: ${err.name}: ${err.message}`, "bad");
+    if (mic === stream) releaseMic();
+    $("talk").disabled = false;
+    return;
+  }
+  if (mine !== attempt) return;
+  $("talk").textContent = "Stop talking";
+  $("talk").disabled = false;
+  log(`talking: ${track.label || "microphone"}`, "good");
+}
+
+// Stops the microphone.
+function releaseMic() {
+  if (mic) for (const track of mic.getTracks()) track.stop();
+  mic = undefined;
+  $("talk").textContent = "Talk";
+}
+
+// Takes the microphone off the m-line, which ends the uplink, and re-offers
+// the m-line inactive, which frees the camera's backchannel if this
+// session holds it: the talker keeps it until its session closes or its
+// re-offer drops talk-back, so without it no other viewer could talk while
+// this one plays. The worker lets go before it answers, so a Talk after
+// the answer claims afresh, and only this session's claim goes.
+//
+// Talk stays disabled until the answer is applied: the browser takes one
+// offer at a time.
+async function stopTalking() {
+  const mine = attempt;
+  const transceiver = talkTransceiver;
+  releaseMic();
+  $("talk").disabled = true;
+  if (!transceiver || !playing) return;
+  await transceiver.sender.replaceTrack(null);
+  if (mine !== attempt) return;
+  log("talking stopped");
+  if (transceiver.currentDirection === "sendonly") {
+    let held, failed;
+    try {
+      held = await reoffer("inactive", mine);
+    } catch (err) {
+      failed = err;
+    }
+    if (mine !== attempt) return;
+    if (failed) log(`re-offer failed: ${failed.name}: ${failed.message}`, "bad");
+    if (held === false) {
+      log("talk-back dropped: the backchannel is free");
+      $("s-talk").textContent = "dropped; press Talk to claim the backchannel again";
+      $("s-talk").className = "";
+    } else {
+      log("talk-back not dropped: this session keeps the backchannel", "bad");
+    }
+  }
+  $("talk").disabled = false;
+}
+
+// The talk-back counters of session/get, which the worker pushes once per
+// second.
+function showTalkback(got) {
+  if (!got.success) return;
+  const b = got.result.backchannel;
+  if (!b.negotiated) return;
+  const holds = b.talker ? "holds the backchannel" : "does not hold the backchannel";
+  $("s-talk").textContent = `${b.codec}, ${holds}, ${b.packets_received} packets received, ${b.packets_dropped_busy} dropped busy, ${b.bytes_sent} bytes to the camera`;
+  $("s-talk").className = b.talker ? "good" : "";
+}
+
+// One inbound stream's jitter buffer over the last second: what it holds
+// now and what the browser aims for (its target includes the delay it adds
+// to keep audio and video in sync), with the session average for contrast.
+function buffer(s) {
+  if (!s.jitterBufferEmittedCount) return "–";
+  const last = previous.get(s.id) ?? { delay: 0, target: 0, count: 0 };
+  previous.set(s.id, { delay: s.jitterBufferDelay, target: s.jitterBufferTargetDelay ?? 0, count: s.jitterBufferEmittedCount });
+  const average = Math.round((s.jitterBufferDelay / s.jitterBufferEmittedCount) * 1000);
+  const emitted = s.jitterBufferEmittedCount - last.count;
+  if (emitted <= 0) return `nothing played this second (session ${average} ms)`;
+  const now = Math.round(((s.jitterBufferDelay - last.delay) / emitted) * 1000);
+  const target = s.jitterBufferTargetDelay === undefined
+    ? ""
+    : `, target ${Math.round(((s.jitterBufferTargetDelay - last.target) / emitted) * 1000)} ms`;
+  return `${now} ms now${target} (session ${average} ms)`;
+}
+
+// `mine` is the Play it belongs to; a later one's frame is not its.
+function watchFirstFrame(mine) {
+  const video = $("video");
+  const done = () => {
+    if (mine !== attempt) return;
+    const ms = Math.round(performance.now() - playClicked);
+    $("s-ttff").textContent = `${ms} ms after Play`;
+    log(`first frame after ${ms} ms`, "good");
+  };
+  if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(done);
+  else video.addEventListener("playing", done, { once: true });
+}
+
+async function stats() {
+  if (!pc) return;
+  if (offerAccepted && talkTransceiver?.currentDirection === "sendonly") {
+    send({ type: "session/get", session_id: sessionId }, showTalkback);
+  }
+  const report = await pc.getStats();
+  let pair;
+  const playout = {};
+  report.forEach((s) => {
+    if (s.type === "inbound-rtp" && s.kind === "video") {
+      // The decoded size; the element's is the turned one under CVO.
+      const video = $("video");
+      const shown = video.videoWidth && (video.videoWidth !== s.frameWidth || video.videoHeight !== s.frameHeight)
+        ? `, shown ${video.videoWidth}×${video.videoHeight}`
+        : "";
+      if (s.frameWidth) $("s-video").textContent = `${s.frameWidth}×${s.frameHeight}${shown}`;
+      if (s.framesPerSecond !== undefined) $("s-fps").textContent = `${s.framesPerSecond} fps`;
+      $("s-decoded").textContent = `${s.framesDecoded ?? 0} frames, ${s.keyFramesDecoded ?? "?"} keyframes`;
+      $("s-lost").textContent = `${s.packetsLost ?? 0} packets, ${s.nackCount ?? 0} NACKs, ${s.pliCount ?? 0} PLIs`;
+      $("s-vbuf").textContent = buffer(s);
+      playout.video = s.estimatedPlayoutTimestamp;
+    }
+    if (s.type === "inbound-rtp" && s.kind === "audio") {
+      const codec = s.codecId ? report.get(s.codecId) : undefined;
+      const name = codec ? `${codec.mimeType.replace("audio/", "")} ${codec.clockRate / 1000} kHz` : "?";
+      $("s-audio").textContent = `${name}, ${s.packetsReceived ?? 0} packets, ${s.packetsLost ?? 0} lost`;
+      $("s-abuf").textContent = buffer(s);
+      playout.audio = s.estimatedPlayoutTimestamp;
+    }
+    if (s.type === "outbound-rtp" && s.kind === "audio") {
+      const codec = s.codecId ? report.get(s.codecId) : undefined;
+      const name = codec ? `${codec.mimeType.replace("audio/", "")} ${codec.clockRate / 1000} kHz` : "?";
+      $("s-uplink").textContent = `${name}, ${s.packetsSent ?? 0} packets sent${mic ? "" : " (not talking)"}`;
+    }
+    if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") pair = s;
+  });
+  if (playout.audio !== undefined && playout.video !== undefined) {
+    // Both are the sender-clock time of what plays now; equal is in sync.
+    const ms = Math.round(playout.audio - playout.video);
+    $("s-av").textContent = ms === 0 ? "in sync" : `audio ${Math.abs(ms)} ms ${ms > 0 ? "ahead of" : "behind"} video`;
+  }
+  if (pair) {
+    const local = report.get(pair.localCandidateId);
+    const remote = report.get(pair.remoteCandidateId);
+    if (local && remote) {
+      $("s-path").textContent = `${remote.address ?? remote.ip ?? "?"}:${remote.port} ${remote.protocol} (${remote.candidateType}), rtt ${Math.round((pair.currentRoundTripTime ?? 0) * 1000)} ms`;
+    }
+  }
+}
+
+function teardown(quiet) {
+  clearInterval(statsTimer);
+  attempt++;
+  if (offerId !== undefined && ws.readyState === WebSocket.OPEN) {
+    send({ type: "unsubscribe", subscription: offerId });
+    if (!quiet) log("session ended");
+  }
+  offerId = undefined;
+  if (pc) pc.close();
+  pc = undefined;
+  playing = undefined;
+  releaseMic();
+  talkTransceiver = undefined;
+  $("talk").disabled = true;
+  $("play").disabled = !ws || ws.readyState !== WebSocket.OPEN;
+  $("stop").disabled = true;
+}
+
+$("form").addEventListener("submit", (event) => { event.preventDefault(); play(); });
+$("stop").addEventListener("click", () => teardown(false));
+$("talk").addEventListener("click", () => (mic ? stopTalking() : startTalking()));
+// The orientation reaches the open session too, from its next frame, so
+// a change while playing only puts the stream again: no new session.
+$("orientation").addEventListener("change", () => {
+  const entry = matching();
+  const orientation = $("orientation").value;
+  if (entry) entry.orientation = orientation;
+  save();
+  renderSaved();
+  if (!playing) return;
+  const { streamId, url, talkback } = playing;
+  send({ type: "stream/put", stream_id: streamId, sources: [source(url, talkback)], orientation }, (result) => {
+    if (!result.success) return;
+    log(`orientation ${orientation}: stream ${streamId} put again; the session turns from its next frame`);
+    if (lastAnswer !== undefined) showCvo(lastAnswer);
+  });
+});
+// The opt-in changes the source and the offer, so a change while playing
+// plays again.
+$("talkback").addEventListener("change", () => {
+  const entry = matching();
+  if (entry) entry.talkback = $("talkback").checked;
+  save();
+  renderSaved();
+  if (playing && $("form").reportValidity()) play();
+});
+// Picking a saved stream fills the fields and plays it.
+$("saved").addEventListener("change", () => {
+  selectedId = $("saved").value || undefined;
+  const entry = selected();
+  $("delete-entry").disabled = !entry;
+  if (entry) {
+    $("stream").value = entry.stream;
+    cameraUrl = entry.url;
+    showUrl();
+    $("orientation").value = entry.orientation;
+    $("talkback").checked = entry.talkback;
+    $("label").value = entry.label;
+  }
+  streamTyped = typedStream();
+  save();
+  if (entry && $("form").reportValidity()) play();
+});
+// Saves the fields: the entry with this URL and stream id gets the name
+// and orientation, or a new entry is added.
+$("save-entry").addEventListener("click", () => {
+  const stream = $("stream").value.trim();
+  if (!cameraUrl || !$("form").reportValidity()) return;
+  const fields = { label: $("label").value.trim(), stream, url: cameraUrl, orientation: $("orientation").value, talkback: $("talkback").checked };
+  const entry = matching();
+  if (entry) Object.assign(entry, fields);
+  else entries.push({ id: `${Date.now().toString(36)}-${entries.length}`, ...fields });
+  selectedId = (entry ?? entries[entries.length - 1]).id;
+  save();
+  renderSaved();
+  log(`saved ${fields.label || masked(cameraUrl)}`);
+});
+$("delete-entry").addEventListener("click", () => {
+  const entry = selected();
+  if (!entry) return;
+  entries = entries.filter((e) => e !== entry);
+  selectedId = undefined;
+  $("label").value = "";
+  save();
+  renderSaved();
+  log(`deleted ${entry.label || masked(entry.url)}`);
+});
+$("copy-offer").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(lastOffer);
+    log("offer SDP copied");
+  } catch (err) {
+    log(`copy failed: ${err}`, "bad");
+  }
+});
+connect();
+</script>
+</body>
+</html>

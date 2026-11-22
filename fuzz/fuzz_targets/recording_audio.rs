@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::opus::packet_samples;
-use lotse_codec::transcode::recording::ToOpus;
-use lotse_core::clock::{Clock, SystemClock};
-use lotse_core::codec::Codec;
-use lotse_core::media::{MediaFrame, MediaTime};
+use rocko_codec::opus::packet_samples;
+use rocko_codec::transcode::recording::ToOpus;
+use rocko_core::clock::{Clock, SystemClock};
+use rocko_core::codec::Codec;
+use rocko_core::media::{MediaFrame, MediaTime};
 
 /// Takes `N` bytes off the front of `rest`.
 fn take<const N: usize>(rest: &mut &[u8]) -> Option<[u8; N]> {

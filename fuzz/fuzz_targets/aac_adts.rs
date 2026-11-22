@@ -8,7 +8,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::aac::{AdtsSplitter, MAX_ADTS_FRAME, parse_config};
+use rocko_codec::aac::{AdtsSplitter, MAX_ADTS_FRAME, parse_config};
 
 /// The frame limit: short frames fit, longer ones are dropped.
 const MAX_FRAME: usize = 64;

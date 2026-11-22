@@ -26,14 +26,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::clock::SystemClock;
-use lotse_ipc::datagram;
-use lotse_supervisor::net::demux::{
+use rocko_core::clock::SystemClock;
+use rocko_ipc::datagram;
+use rocko_supervisor::net::demux::{
     DatagramSink, DemuxStats, MAX_ADDRS_PER_SESSION, Registrations, Relay, Relays, Router,
     StunResponses,
 };
-use lotse_supervisor::net::stun::{self, Builder, Class, METHOD_BINDING};
-use lotse_supervisor::net::turn::{self, Channel};
+use rocko_supervisor::net::stun::{self, Builder, Class, METHOD_BINDING};
+use rocko_supervisor::net::turn::{self, Channel};
 
 /// A worker's channel: the frames it got, or full.
 #[derive(Debug, Default)]
