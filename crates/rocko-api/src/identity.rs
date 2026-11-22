@@ -6,17 +6,18 @@
 //!
 //! A generated certificate names [`SERVER_NAME`] as a DNS name in its
 //! subject alternative names, so a client whose TLS stack verifies by name
-//! can trust it as its own root and verify it by that name: Go's x509
-//! never matches a name against the Common Name (from Go 1.15), so an
-//! identity without the name is refused (observed with Prometheus 3.16.0,
-//! `server_name: rocko`, on 2026-11-15: "x509: certificate is not valid
-//! for any names, but wanted to match rocko"), and Go accepts a leaf that
-//! is itself in the root pool as a chain of one, which amounts to pinning
-//! it (the same Prometheus scraped the reissued identity). An
-//! identity made before the name keeps working as it is: the pin is the
-//! SHA-256 of the whole certificate, so a new certificate is a new pin
-//! and every client pairs again. Only [`ServerIdentity::reissue`] makes
-//! one, from the same key, when the operator asks.
+//! can trust it as its own root and verify it by that name: Go's x509 never
+//! matches a name against the Common Name (from Go 1.15), so an identity
+//! without the name is refused (observed with Prometheus 3.16.0,
+//! `server_name: lotse`, on 2026-11-15: "x509: certificate is not valid for
+//! any names, but wanted to match lotse"; the name was `lotse` until the
+//! project was renamed), and Go accepts a leaf that is itself in the root
+//! pool as a chain of one, which amounts to pinning it (the same Prometheus
+//! scraped the reissued identity). An identity made before the name keeps
+//! working as it is: the pin is the SHA-256 of the whole certificate, so a
+//! new certificate is a new pin and every client pairs again. Only
+//! [`ServerIdentity::reissue`] makes one, from the same key, when the
+//! operator asks.
 //!
 //! The key and the certificate share one PEM file, so a generation is one
 //! atomic rename and a crash leaves either no identity or a whole one. The
