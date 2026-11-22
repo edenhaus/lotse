@@ -20,9 +20,10 @@
 # ROCKO_USER and ROCKO_GROUP, the same 65532.
 #
 # A /data volume of the 0.0.1 image (root's, its clients directory 65534's) suits neither start:
-# give it to 65532 once (README.md, "Running in a container"):
+# give it, `lotse-data` in that image's documentation, to 65532 once (README.md, "Running in a
+# container"):
 #
-#   podman run --rm -v rocko-data:/data mirror.gcr.io/library/busybox:1.37.0 chown -R 65532:65532 /data
+#   podman run --rm -v lotse-data:/data mirror.gcr.io/library/busybox:1.37.0 chown -R 65532:65532 /data
 #
 # The two directories of the daemon's account, with the mode `serve` checks: scratch has no mkdir,
 # and COPY sets the mode of a directory it makes differently in BuildKit and Buildah, so a stage
