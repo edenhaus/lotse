@@ -395,13 +395,11 @@ CAP_DAC_OVERRIDE, and making the enrolled clients' directory for 65532
 takes CAP_CHOWN. The start as 65532 needs none of them.
 
 A data volume of the 0.0.1 image, which started as root and dropped to
-65534, belongs to root and 65534 and is no use to 65532. That image's
-documentation named the volume `lotse-data`: give it to 65532 once, before
-the first start of the new image, and mount it at `/data` where the
-examples above name `rocko-data`:
+65534, belongs to root and 65534 and is no use to 65532. Give it to 65532
+once, before the first start of the new image:
 
 ```sh
-podman run --rm -v lotse-data:/data mirror.gcr.io/library/busybox:1.37.0 \
+podman run --rm -v rocko-data:/data mirror.gcr.io/library/busybox:1.37.0 \
   chown -R 65532:65532 /data
 ```
 

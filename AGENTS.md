@@ -42,7 +42,7 @@ fuzz targets once for the Fuzz jobs, which run up to 4 targets each in
 parallel: on a PR only the targets built from a file it changed
 (`scripts/fuzz-select.sh`), else all, 5 min each nightly, each target from
 its corpus in `edenhaus/rocko-fuzz-corpus`, which only `main`'s Fuzz corpus
-job writes (a token of the lotse-bot app, whose key is in the `lotse-bot` environment); every compiling job keeps a Rust
+job writes (a token of the rocko-bot app, whose key is in the `rocko-bot` environment); every compiling job keeps a Rust
 cache, saved by every run and restored from the PR's own (GitHub scopes
 them to it) or else from `main`'s; only the Mutants jobs (a PR's changed
 lines, and nightly the whole workspace, each sharded by its Mutants plan job)
