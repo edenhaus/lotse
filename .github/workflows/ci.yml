@@ -1032,7 +1032,7 @@ jobs:
       contents: write # the draft release
       pull-requests: read # the merged PRs' titles
     steps:
-      - uses: release-drafter/release-drafter@978bb0b30c5ee8cdd332ced253758157150d43f0 # v7.10.0
+      - uses: release-drafter/release-drafter@d1a19e60e81a7e650d00a7de9277f87e439117ea # v7.11.0
 
   # A change to the API schema on main asks rocko-clients to sync it: its sync-schema.yml opens or
   # updates a PR with the schema and the regenerated models, whose CI runs the contract tests
