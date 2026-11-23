@@ -9,6 +9,9 @@ as event recordings: fragmented MP4 that starts before the event, from the
 seconds it keeps in memory, for its client to store. It does nothing
 else.
 
+It is named after [Rocko](#the-name), who watched over a house long before
+this daemon did.
+
 > [!WARNING]
 > **Design phase, not for production use.** rocko is at an early stage. It
 > has not had an independent security review and has not been tested
@@ -514,6 +517,15 @@ The metrics' names start with `rocko_`, a counter's end in `_total`, and
 units are in the name (`_bytes`, `_seconds`). Over TLS, a `metrics`
 client is answered 403 on every other route and 404 on a path that does
 not exist. `mise run interop` runs this setup against a real Prometheus.
+
+## The name
+
+Rocko was my dog. He was born on 30 April 2015 and died at the beginning
+of 2026. He always watched over us and our house. This daemon does that
+with the cameras now, so it carries his name, in his memory.
+
+Two things follow from him. The default port, 30415, is his birthday
+(30.4.15), and the project's home is <https://rocko.watch>.
 
 ## License
 
