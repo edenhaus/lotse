@@ -1,0 +1,111 @@
+//! Runs any [`Source`] the way core's runner does, for the conformance
+//! tests of a protocol crate: a track set, a source context with the
+//! connection's clock mapper, cancellation, and the exit.
+
+use std::sync::Arc;
+
+use rocko_core::clock::Clock;
+use rocko_core::clock_map::ClockMapper;
+use rocko_core::source::{
+    BackchannelSlot, ClockInput, ClockReport, ResolvedPeer, Source, SourceCtx, SourceError,
+    TrackSet,
+};
+use rocko_core::task::spawn_named;
+use rocko_core::track::TrackLimits;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+/// One connection attempt of a source, running in a task.
+#[derive(Debug)]
+pub struct Harness {
+    /// The tracks the source declares.
+    pub tracks: Arc<TrackSet>,
+    /// The sync hints the source reported.
+    pub reports: mpsc::Receiver<ClockReport>,
+    /// The mapper the hints belong to.
+    pub mapper: Arc<ClockMapper>,
+    /// Where the source offers its backchannel, if it has one.
+    pub backchannel: BackchannelSlot,
+    /// Ends the attempt.
+    cancel: CancellationToken,
+    /// The attempt.
+    run: JoinHandle<SourceError>,
+}
+
+impl Harness {
+    /// Starts `source` against `peer`.
+    pub fn start(source: &dyn Source, peer: ResolvedPeer, clock: Arc<dyn Clock>) -> Self {
+        Self::start_with(source, peer, clock, BackchannelSlot::default())
+    }
+
+    /// Starts `source` against `peer`, offering its backchannel on
+    /// `backchannel`: one shared with an earlier attempt, as a reconnect
+    /// shares its connection's, or one whose probes wait at a gate.
+    pub fn start_with(
+        source: &dyn Source,
+        peer: ResolvedPeer,
+        clock: Arc<dyn Clock>,
+        backchannel: BackchannelSlot,
+    ) -> Self {
+        let tracks = TrackSet::new(TrackLimits::default(), clock.now());
+        let mapper = Arc::new(ClockMapper::new());
+        let (clock_input, reports) = ClockInput::channel(Arc::clone(&mapper));
+        let cancel = CancellationToken::new();
+        let ctx = SourceCtx {
+            peer,
+            tracks: tracks.publisher(),
+            clock: clock_input,
+            time: clock,
+            backchannel: backchannel.clone(),
+            signaling: None,
+            cancel: cancel.clone(),
+        };
+        let run = spawn_named("harness.source", source.run(ctx));
+        Self {
+            tracks,
+            reports,
+            mapper,
+            backchannel,
+            cancel,
+            run,
+        }
+    }
+
+    /// Waits until the source reports ready; `false` if it exited first.
+    pub async fn wait_ready(&mut self) -> bool {
+        let mut ready = self.tracks.ready();
+        loop {
+            if *ready.borrow_and_update() {
+                return true;
+            }
+            tokio::select! {
+                changed = ready.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+                () = std::future::poll_fn(|cx| {
+                    if self.run.is_finished() {
+                        std::task::Poll::Ready(())
+                    } else {
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                }) => return false,
+            }
+        }
+    }
+
+    /// Cancels the attempt.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Waits for the source to exit and returns how.
+    pub async fn finish(self) -> SourceError {
+        self.run
+            .await
+            .unwrap_or_else(|err| SourceError::Protocol(format!("the source task failed: {err}")))
+    }
+}

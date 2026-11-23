@@ -1,5 +1,5 @@
 //! `live_records`: the supervisor's reader of a framed live output's pipe
-//! (`lotse_ipc::fragments::Decoder`), whose bytes a worker writes and so are
+//! (`rocko_ipc::fragments::Decoder`), whose bytes a worker writes and so are
 //! untrusted, never panics whatever the bytes and however the reads split
 //! them; the records it takes are the same for every split, each within
 //! its bounds, and it never asks for more than one record ahead.
@@ -9,7 +9,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_ipc::fragments::{Decoder, MAX_RECORD_BYTES, Record, RecordError};
+use rocko_ipc::fragments::{Decoder, MAX_RECORD_BYTES, Record, RecordError};
 
 /// The records of `stream` read `step` bytes at a time, and the error that
 /// ended it, if any.

@@ -1,6 +1,6 @@
 """What decides the browser test: the checks on what the test page measured.
 
-The page (`crates/lotse-testing/src/browser/page.html`) measures what a viewer would see and hear
+The page (`crates/rocko-testing/src/browser/page.html`) measures what a viewer would see and hear
 and takes two `getStats()` snapshots, at the first frame plus nothing and after the play time;
 everything here is a pure function of that result and of the stream the camera sends, so the
 rules are written once for every browser.
@@ -166,7 +166,7 @@ LATENCY_PERCENTILE = 0.9
 
 @dataclass(frozen=True, kw_only=True)
 class Stream:
-    """What the synthetic camera sends (`lotse_testing::browser::STREAM`, from its `Ready` line)."""
+    """What the synthetic camera sends (`rocko_testing::browser::STREAM`, from its `Ready` line)."""
 
     width: int
     height: int
@@ -180,7 +180,7 @@ class Stream:
 
     @classmethod
     def from_json(cls, value: Json) -> Stream:
-        """The stream of `lotse-browser`'s `Ready` line."""
+        """The stream of `rocko-browser`'s `Ready` line."""
         return cls(**{name: value[name] for name in cls.__dataclass_fields__})
 
     def beep_energy_per_second(self) -> float:

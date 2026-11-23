@@ -19,11 +19,11 @@
 use std::time::{Duration, Instant};
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::clock_map::{ClockMapper, MAX_RESIDUAL, MAX_SLEW, SyncMode};
-use lotse_core::codec::Kind;
-use lotse_core::discontinuity::{MAX_TIMESTAMP_JUMP, TimestampGuard};
-use lotse_core::source::{ClockReport, SyncHint};
-use lotse_core::track::TrackId;
+use rocko_core::clock_map::{ClockMapper, MAX_RESIDUAL, MAX_SLEW, SyncMode};
+use rocko_core::codec::Kind;
+use rocko_core::discontinuity::{MAX_TIMESTAMP_JUMP, TimestampGuard};
+use rocko_core::source::{ClockReport, SyncHint};
+use rocko_core::track::TrackId;
 
 /// Takes `N` bytes off the front of `rest`.
 fn take<const N: usize>(rest: &mut &[u8]) -> Option<[u8; N]> {

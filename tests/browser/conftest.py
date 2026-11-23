@@ -3,8 +3,8 @@
 `--browser chrome|firefox|safari` picks the browser; without it the browser test and the comparison
 are skipped and only the unit tests run. `--case` picks the browser test's cases (`harness.CASES`,
 all by default); each writes its report and logs to its own directory in `--out`.
-`scripts/browser.sh` (`mise run browser`) builds the release daemon and the `lotse-browser` example
-and passes them as `--lotse` and `--lotse-browser`; `scripts/compare.sh` (`mise run compare`)
+`scripts/browser.sh` (`mise run browser`) builds the release daemon and the `rocko-browser` example
+and passes them as `--rocko` and `--rocko-browser`; `scripts/compare.sh` (`mise run compare`)
 passes `--go2rtc` and `--runs` as well.
 
 The browser is the installed one (the runner image's current stable on CI) unless
@@ -35,11 +35,11 @@ ENGINES = ("chrome", "firefox", "safari")
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     """The browser test's command line."""
-    group = parser.getgroup("lotse browser test")
+    group = parser.getgroup("rocko browser test")
     group.addoption("--browser", choices=ENGINES, help="the browser; without it, unit tests only")
     group.addoption("--play", default="20s", help="how long the page plays after the first frame")
-    group.addoption("--lotse", help="the daemon's binary (`lotse`)")
-    group.addoption("--lotse-browser", help="the `lotse-browser` example's binary")
+    group.addoption("--rocko", help="the daemon's binary (`rocko`)")
+    group.addoption("--rocko-browser", help="the `rocko-browser` example's binary")
     group.addoption("--go2rtc", help="go2rtc's binary, for the comparison")
     group.addoption(
         "--runs", type=int, default=5, help="the comparison's plays through each server"
@@ -76,7 +76,7 @@ def settings(request: pytest.FixtureRequest) -> Settings:
     engine = config.getoption("--browser")
     if engine is None:
         pytest.skip("no --browser: the browser test runs through `mise run browser <engine>`")
-    missing = [flag for flag in ("--lotse", "--lotse-browser") if not config.getoption(flag)]
+    missing = [flag for flag in ("--rocko", "--rocko-browser") if not config.getoption(flag)]
     if missing:
         pytest.fail(f"{', '.join(missing)} required with --browser (scripts/browser.sh sets them)")
     out = Path(config.getoption("--out") or f"browser-{engine}").resolve()
@@ -85,8 +85,8 @@ def settings(request: pytest.FixtureRequest) -> Settings:
     return Settings(
         engine=engine,
         play_s=parse_duration(config.getoption("--play")),
-        lotse=Path(config.getoption("--lotse")).resolve(),
-        lotse_browser=Path(config.getoption("--lotse-browser")).resolve(),
+        rocko=Path(config.getoption("--rocko")).resolve(),
+        rocko_browser=Path(config.getoption("--rocko-browser")).resolve(),
         camera=config.getoption("--camera"),
         out=out,
         headless=engine != "safari" and not config.getoption("--headful"),
@@ -108,8 +108,8 @@ def out(settings: Settings, case: Case) -> Path:
 
 @pytest.fixture
 def served(settings: Settings, case: Case, out: Path) -> Iterator[Served]:
-    """The daemon, the camera with the case's audio and the page (`servers.lotse`)."""
-    with servers.lotse(settings, out, audio=case.audio) as running:
+    """The daemon, the camera with the case's audio and the page (`servers.rocko`)."""
+    with servers.rocko(settings, out, audio=case.audio) as running:
         yield running.served
 
 

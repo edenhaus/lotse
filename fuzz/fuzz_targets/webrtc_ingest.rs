@@ -23,9 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::codec::Kind;
-use lotse_core::signaling::SignalCandidate;
-use lotse_webrtc::ingest::{IngestEngine, IngestOutput, WebRtcOptions};
+use rocko_core::codec::Kind;
+use rocko_core::signaling::SignalCandidate;
+use rocko_webrtc::ingest::{IngestEngine, IngestOutput, WebRtcOptions};
 use str0m::change::SdpOffer;
 use str0m::media::{Mid, Pt};
 use str0m::net::{DatagramRecv, Protocol, Receive};
@@ -260,7 +260,7 @@ fn camera_answer(offer: &str, now: Instant, audio: bool) -> Option<(Rtc, String)
 }
 
 fuzz_target!(|data: &[u8]| {
-    lotse_webrtc::install_crypto_provider();
+    rocko_webrtc::install_crypto_provider();
     let mut rest = data;
     let Some([setup]) = take::<1>(&mut rest) else {
         return;

@@ -10,7 +10,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::{h264, h265};
+use rocko_codec::{h264, h265};
 
 /// The packet target: small, so short inputs reach fragmentation.
 const MAX_PAYLOAD: usize = 64;

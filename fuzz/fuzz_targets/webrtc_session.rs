@@ -1,6 +1,6 @@
 //! `webrtc_session`: a connected session never panics on whatever a viewer
 //! or a stranger sends it, and what it writes keeps the rewrite contract.
-//! The headless viewer of `lotse-testing` connects to a real `Session` in
+//! The headless viewer of `rocko-testing` connects to a real `Session` in
 //! memory (ICE, DTLS, SRTP), then the input drives both sides: datagrams of
 //! arbitrary bytes from the viewer's address and from an unknown one (STUN,
 //! DTLS records into `dimpl`, SRTP and SRTCP into str0m: the DTLS record
@@ -21,15 +21,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::Orientation;
-use lotse_core::codec::Codec;
-use lotse_core::media::{MediaPacket, RtpHeaderFields};
-use lotse_core::session::{
+use rocko_core::Orientation;
+use rocko_core::codec::Codec;
+use rocko_core::media::{MediaPacket, RtpHeaderFields};
+use rocko_core::session::{
     IceCredentials, SessionEngine as _, SessionEvent, SessionLimits, SessionOutput, SessionRequest,
     Transport,
 };
-use lotse_testing::viewer::{Outgoing, Viewer};
-use lotse_webrtc::Session;
+use rocko_testing::viewer::{Outgoing, Viewer};
+use rocko_webrtc::Session;
 
 /// The viewer's address.
 const BROWSER: SocketAddr = SocketAddr::new(
@@ -175,7 +175,7 @@ fn check_rewrite(kind: &str, written: &[Written], received: &[(u16, u32, Vec<u8>
 }
 
 fuzz_target!(|data: &[u8]| {
-    lotse_webrtc::install_crypto_provider();
+    rocko_webrtc::install_crypto_provider();
     let mut rest = data;
     let Some([setup]) = take::<1>(&mut rest) else {
         return;
@@ -205,7 +205,7 @@ fuzz_target!(|data: &[u8]| {
         })),
         audio: audio.then(|| Arc::new(Codec::Pcmu)),
         backchannel: None,
-        claim: lotse_core::session::TalkbackClaim::Granted,
+        claim: rocko_core::session::TalkbackClaim::Granted,
         orientation: Orientation::ALL[usize::from((setup >> 1) & 7)],
         limits: SessionLimits::default(),
         wall: SystemTime::UNIX_EPOCH,

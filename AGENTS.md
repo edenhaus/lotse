@@ -6,7 +6,7 @@ rule for humans: whoever submits a change can explain every line of it.
 
 ## What this is
 
-lotse is a media daemon built for Home Assistant: RTSP and HLS/MPEG-TS
+rocko is a media daemon built for Home Assistant: RTSP and HLS/MPEG-TS
 cameras by URL and WebRTC cameras whose signaling its client relays in, WebRTC to browsers and event recordings (fragmented MP4 with a pre-record) out, driven by its
 client over a Unix-socket control API. It is in the design phase.
 
@@ -41,8 +41,8 @@ arch, OIDC, no secret; an upload that fails fails the job). Its Fuzz build job c
 fuzz targets once for the Fuzz jobs, which run up to 4 targets each in
 parallel: on a PR only the targets built from a file it changed
 (`scripts/fuzz-select.sh`), else all, 5 min each nightly, each target from
-its corpus in `edenhaus/lotse-fuzz-corpus`, which only `main`'s Fuzz corpus
-job writes (a token of the lotse-bot app, whose key is in the `lotse-bot` environment); every compiling job keeps a Rust
+its corpus in `edenhaus/rocko-fuzz-corpus`, which only `main`'s Fuzz corpus
+job writes (a token of the rocko-bot app, whose key is in the `rocko-bot` environment); every compiling job keeps a Rust
 cache, saved by every run and restored from the PR's own (GitHub scopes
 them to it) or else from `main`'s; only the Mutants jobs (a PR's changed
 lines, and nightly the whole workspace, each sharded by its Mutants plan job)
@@ -64,13 +64,13 @@ workflow and job names start with a capital letter.
 | `mise run coverage-musl` | the 100 % line-coverage gate on the musl target, from `coverage-archive`'s archive; writes `target/cov/lcov.info` (CI's Tests jobs) |
 | `mise run mutants [base] [--all]` | `cargo mutants --in-diff` against a base ref (default `origin/main`), or with `--all` the whole workspace (CI's nightly run); CI splits it over up to 8 jobs, nightly up to 40 (`scripts/mutants-shards.sh`, `--shard k/n --in-place --skip-baseline`) |
 | `mise run mutants-cache` | each package's tests built alone, as cargo-mutants builds a mutant (CI's Mutants cache job on `main`) |
-| `mise run bench [divan args]` | the divan microbenchmarks of the media path (`benches/` of lotse-codec, lotse-http, lotse-supervisor) in the release profile, e.g. `mise run bench h264 --sample-count 10`; a report, not a gate, and no CI job yet |
+| `mise run bench [divan args]` | the divan microbenchmarks of the media path (`benches/` of rocko-codec, rocko-http, rocko-supervisor) in the release profile, e.g. `mise run bench h264 --sample-count 10`; a report, not a gate, and no CI job yet |
 | `mise run turn-e2e` | the TURN client against a real coturn in Docker (ignored `coturn_` tests) |
 | `mise run load [cameras] [viewers] [duration]` | the load generator against a release daemon (`target/load-report.json`) |
 | `mise run soak [duration] [cycle]` | the soak: viewer and camera churn, checked for memory, task and descriptor growth (`target/soak-report.json`) |
 | `mise run interop` | the daemon against MediaMTX fed by ffmpeg (pinned in `mise.toml`): RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS; and ffmpeg's raw MPEG-TS over HTTP (ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (ignored `mediamtx_iso14496_12_recording_` tests); an LL-HLS session read by ffmpeg as plain HLS, H.264 with AAC and with Opus, and decoded by ffprobe (ignored `mediamtx_hls_ll_` tests); and ffprobe reading the recording muxer's fixtures (ignored `ffprobe_` tests); a real Prometheus (pinned in `mise.toml`) scraping `GET /v0/metrics` over mutual TLS with an openssl-made client certificate, in OpenMetrics and in the Prometheus text format (ignored `prometheus_` test) |
 | `mise run browser [chrome\|firefox\|safari] [play] [case]` | the browser test: one pytest test (`tests/browser/`) has Selenium drive a real browser playing ffmpeg's stream from MediaMTX through a release daemon, per case (`join`, `aac`, `pli`, `reconnect`, `crash`; `mse`, `mse-pcmu`, `mse-opus`, live fMP4 through the browser's MSE beside WebRTC; `llhls`, `llhls-opus`, LL-HLS through a pinned hls.js beside WebRTC; their latencies reported; or `all`, the default) (`target/browser-<engine>/<case>/`); needs the browser, Selenium Manager finds or fetches its driver |
-| `mise run compare [engine] [runs] [play]` | the browser test through lotse and through go2rtc, side by side; a report, not a gate (`target/compare-<engine>/compare.json`) |
+| `mise run compare [engine] [runs] [play]` | the browser test through rocko and through go2rtc, side by side; a report, not a gate (`target/compare-<engine>/compare.json`) |
 | `mise run test-musl` | the tests on the static musl target (Linux only); CI runs them from `coverage-archive`'s archive instead (`coverage-musl`) |
 | `mise run test-archive` | the musl tests built and archived for other machines, then the doctests (CI's Build job) |
 | `mise run audit` | RustSec advisories of the workspace, the fuzz crate included (network) |
@@ -78,25 +78,25 @@ workflow and job names start with a capital letter.
 | `mise run set-version <version>` | the workspace version and its lockfile entries; only a release build sets it, from the tag (the repository keeps `0.0.0-dev`) |
 | `mise run release-build [x86_64\|aarch64]` | static musl binary, its dependency list embedded by cargo-auditable for scanners (Linux only); zig links every musl build (`.cargo/config.toml`) |
 | `mise run sbom` / `mise run licenses` | a release's CycloneDX SBOMs and `THIRD_PARTY_LICENSES.md`, in `target/dist/` |
-| `mise run image` | `release-build` for the host's arch, then the release image from it, reproducibly (`Dockerfile`, which takes `target/image/<docker arch>/lotse`), into the local Podman, or Docker without it, as `lotse:dev` (Linux only) |
+| `mise run image` | `release-build` for the host's arch, then the release image from it, reproducibly (`Dockerfile`, which takes `target/image/<docker arch>/rocko`), into the local Podman, or Docker without it, as `rocko:dev` (Linux only) |
 | `mise run rootless-podman [binary] [arch]` | the release image under rootless Podman, read-only and without capabilities, as a start as its user and as root (`scripts/rootless-podman.sh`, CI's Rootless Podman job; Linux only, as an unprivileged user) |
 
 ## Layout
 
-Cargo workspace, one binary (`crates/lotse`), library crates under
+Cargo workspace, one binary (`crates/rocko`), library crates under
 `crates/`. Dependencies only
-point downward and `lotse-core` knows nothing about RTSP, WebRTC, HTTP or
+point downward and `rocko-core` knows nothing about RTSP, WebRTC, HTTP or
 processes. The allowed edges are listed in `.cargo/layering.toml` and
 checked by a hook: adding a dependency edge means editing that file in
 the same PR. `cargo shear` fails on declared
 dependencies nothing uses, so never add a dependency ahead of the code that
 uses it. The binary only parses the CLI and dispatches to
-`lotse-supervisor` or `lotse-worker`; both are libraries with tests.
-The fuzz targets are a member too (`fuzz/`, `lotse-fuzz`, outside
+`rocko-supervisor` or `rocko-worker`; both are libraries with tests.
+The fuzz targets are a member too (`fuzz/`, `rocko-fuzz`, outside
 `default-members`), sharing the one `Cargo.lock`; `cargo fuzz build` builds
 them on the pinned nightly, whose AddressSanitizer is the only reason for it.
-The clients, the Python `lotse-client` among them, live in their own repository,
-[lotse-clients](https://github.com/edenhaus/lotse-clients): their models are generated from a copy of the API's JSON Schema bundle.
+The clients, the Python `rocko-client` among them, live in their own repository,
+[rocko-clients](https://github.com/edenhaus/rocko-clients): their models are generated from a copy of the API's JSON Schema bundle.
 
 ## Conventions
 
@@ -115,7 +115,7 @@ The clients, the Python `lotse-client` among them, live in their own repository,
   arithmetic is explicitly `checked_`/`wrapping_`/`saturating_`. `assert!`
   in production code is a panic: use `debug_assert!` or return an error.
 - `clippy.toml` `disallowed-methods` enforce design rules: tasks are spawned
-  through `lotse_core::task::spawn_named` (never `tokio::spawn`), time comes
+  through `rocko_core::task::spawn_named` (never `tokio::spawn`), time comes
   from the injected clock (never `Instant::now`), configuration is read
   once in the binary (never `std::env::var`), and only the supervisor
   spawns processes. The one implementation of each carries a scoped
@@ -143,8 +143,8 @@ The clients, the Python `lotse-client` among them, live in their own repository,
   `cargo mutants --in-diff` (`mise run mutants`); an equivalent mutant is
   excluded in `.cargo/mutants.toml` with its reason. Code a test cannot
   reach is dead or needs a seam (fake, injected clock/fault). Fakes for a
-  crate's own types live behind its `test-util` feature; `lotse-testing`
-  is a dev-dependency of everything except `lotse-core`.
+  crate's own types live behind its `test-util` feature; `rocko-testing`
+  is a dev-dependency of everything except `rocko-core`.
 - Every dependency goes in `[workspace.dependencies]` with
   `default-features = false` and a comment saying why it exists. It must
   pass `cargo deny`, and a protocol
@@ -152,9 +152,9 @@ The clients, the Python `lotse-client` among them, live in their own repository,
 - Conventional Commits PR titles, enforced by `pr-title.yml`: PRs are
   squash-merged with their title, so commit messages are not checked.
 - An API change flows Rust DTOs, then the bundle (`cargo run -p
-  lotse-api-types --features schema --example schema > crates/lotse-api-types/schema/api.json`),
+  rocko-api-types --features schema --example schema > crates/rocko-api-types/schema/api.json`),
   in one commit; the `api-schema` hook fails on a stale bundle. Once it
-  reaches `main`, CI's clients job has lotse-clients open a PR with the bundle
+  reaches `main`, CI's clients job has rocko-clients open a PR with the bundle
   and the regenerated models, whose CI runs the contract tests against
   that commit.
 

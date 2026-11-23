@@ -1,0 +1,36 @@
+[package]
+name = "rocko-worker"
+description = "Worker process: IPC client, source connection runner, session manager and stats push for one camera connection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bytes = { workspace = true } # the recording container's output, written into the pipe as the frames' own slices
+libc = { workspace = true } # the layout and names of the DSCP and source-address control messages (`cmsghdr`, `IP_TOS`, `IPV6_TCLASS`, `in_pktinfo`, `in6_pktinfo`)
+rustix = { workspace = true } # moves the shared UDP socket to the descriptor number the seccomp filter names (`F_DUPFD_CLOEXEC`)
+socket2 = { workspace = true } # `sendmsg` with the audio track's DSCP and the candidate's source address as control messages
+serde_json = { workspace = true } # the per-scheme options arrive as JSON text
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "net", "io-util"] } # the worker's runtime, channels, the datagram channel and ICE-TCP framing
+tokio-util = { workspace = true, features = ["rt"] } # `rt`: the tracker of the signaling relays the shutdown waits for
+tracing = { workspace = true }
+rocko-codec = { workspace = true } # a video track's picture size, read from its SPS for `stream/get`; the recordings' G.711 and G.722 transcode to Opus
+rocko-core = { workspace = true }
+rocko-ipc = { workspace = true }
+
+[dev-dependencies]
+allocation-counter = { workspace = true } # the relay framer's allocation count (tests/allocations.rs)
+rocko-codec = { workspace = true, features = ["test-util"] } # hand-built parameter sets
+rocko-core = { workspace = true, features = ["test-util"] } # the fake source
+rocko-testing = { workspace = true } # the DSCP datagrams arrive with (Linux)
+rustix = { workspace = true, features = ["fs", "process", "stdio"] } # reads the shared socket's O_NONBLOCK, fills the descriptor table and puts the control channel on stdin in tests
+
+[lints]
+workspace = true

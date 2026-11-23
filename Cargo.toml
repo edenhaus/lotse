@@ -11,7 +11,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0" # see README, License
 publish = false
 rust-version = "1.99"
-repository = "https://github.com/edenhaus/lotse"
+repository = "https://github.com/edenhaus/rocko"
 readme = "README.md"
 keywords = ["media-server", "webrtc", "rtsp", "camera", "streaming"]
 categories = ["multimedia::video", "network-programming"]
@@ -23,7 +23,7 @@ categories = ["multimedia::video", "network-programming"]
 # in .cargo/deny.toml.
 # `cargo shear` fails on entries nothing uses, so this table only ever lists real edges.
 
-# Runtime: tasks are spawned only through `lotse_core::task`.
+# Runtime: tasks are spawned only through `rocko_core::task`.
 tokio = { version = "1", default-features = false, features = ["rt"] }
 # Typed errors in every library crate; `anyhow` stays in `main` (AGENTS.md).
 thiserror = { version = "2", default-features = false, features = ["std"] }
@@ -58,19 +58,19 @@ landlock = { version = "0.4", default-features = false }
 # seccomp-bpf allowlists per process kind, Linux only.
 seccompiler = { version = "0.5", default-features = false }
 # The supervisor's interface enumeration (`getifaddrs(3)`) for the host candidates, and the DSCP a
-# datagram arrived with in lotse-testing on Linux only: `recvmsg` with the `IP_TOS` and
+# datagram arrived with in rocko-testing on Linux only: `recvmsg` with the `IP_TOS` and
 # `IPV6_TCLASS` control messages. Neither rustix nor socket2 has either without `unsafe`.
 nix = { version = "0.31", default-features = false }
 # Syscall numbers for the seccomp allowlists, and the worker's DSCP control message (`cmsghdr`,
 # `IP_TOS`, `IPV6_TCLASS`), which rustix cannot send; everything else goes through rustix.
 libc = { version = "0.2", default-features = false }
-# The command line of the one binary: subcommands, flags and `LOTSE_*` environment variables.
+# The command line of the one binary: subcommands, flags and `ROCKO_*` environment variables.
 clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 # The standalone TOML configuration file, below flags and environment in precedence.
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 # JSON (or text) log lines on stderr with `RUST_LOG` filtering.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
-# The `log` facade that crates below lotse still log through (dimpl, sctp-proto, mpeg2ts-reader,
+# The `log` facade that crates below rocko still log through (dimpl, sctp-proto, mpeg2ts-reader,
 # symphonia, tungstenite): the binary installs the logger that bridges it.
 log = { version = "0.4", default-features = false, features = ["std"] }
 # Forwards those `log` records to the `tracing` subscriber with their target, module, file and line,
@@ -79,10 +79,10 @@ tracing-log = { version = "0.2", default-features = false, features = ["log-trac
 # Ergonomic error context at the top level only: `anyhow` never leaves `main` (AGENTS.md).
 anyhow = { version = "1", default-features = false, features = ["std"] }
 # JSON Schema 2020-12 for every control API message, generated from the DTOs and committed; behind
-# lotse-api-types' `schema` feature, so the daemon, which serves the committed bundle, links none of it.
+# rocko-api-types' `schema` feature, so the daemon, which serves the committed bundle, links none of it.
 schemars = { version = "1", default-features = false, features = ["std", "derive"] }
 # The control API server: HTTP/1.1 with the WebSocket upgrade on the Unix socket; also the dev
-# viewer's pages and relay in `lotse-testing`.
+# viewer's pages and relay in `rocko-testing`.
 axum = { version = "0.8", default-features = false, features = ["ws", "http1", "tokio"] }
 # The control API's HTTP/1.1 connection, configured directly because `axum::serve` exposes no
 # limits: upgrade headers <= 16 KiB and a header count. Already axum's engine; no new code. The
@@ -105,7 +105,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # `SETUP` answer without `server_port`; a UDP port learned only from a datagram that validates; a
 # single `server_port` and whitespace around `Transport` parameters accepted, RFC 2326 §12.39, §4),
 # until a crates.io release carries the ONVIF backchannel and the receiver reports. Without its
-# `tokio` feature: lotse drives the sans-I/O core itself. `unstable-sans-io`: `client::SessionCore`
+# `tokio` feature: rocko drives the sans-I/O core itself. `unstable-sans-io`: `client::SessionCore`
 # and `client::TeardownCore`, which the source drives on its own connections to the camera and
 # its UDP pairs; `unstable-send`: the backchannel's `rtp::Sender` and `SessionCore::queue_rtp`; `h264`, `h265`: `Stream::parameters`, the parameter sets
 # of an H.264 (RFC 6184 §8.1 `sprop-parameter-sets`) or H.265 (RFC 7798 §7.1 `sprop-vps`,
@@ -122,7 +122,7 @@ mpeg2ts-reader = { version = "0.18", default-features = false }
 # The ISO base media file format boxes of the HTTP source's fragmented MP4 (ISO/IEC 14496-12): the
 # init segment's moov (stsd with avcC, hvcC and esds) and each media segment's moof (tfhd, tfdt,
 # trun); bounded `Vec`s for untrusted counts, no `unsafe` in the decoding. Also the encoder of the
-# event recordings' fragmented MP4 (lotse-mux): the same boxes, with `mp4a`/`Opus` sample entries. Its
+# event recordings' fragmented MP4 (rocko-mux): the same boxes, with `mp4a`/`Opus` sample entries. Its
 # optional features (bytes, serde, tokio) are off; num, derive_more, pastey and thiserror 1 come
 # with it. Pinned: the fmp4 reader's box walk mirrors how 0.17.1 reads boxes, labels and
 # descriptors (which it reads by their type, from where, what it reads on the stack), so every
@@ -130,7 +130,7 @@ mpeg2ts-reader = { version = "0.18", default-features = false }
 mp4-atom = { version = "=0.17.1", default-features = false }
 # RTSP message parsing and serialization for the fake camera of the tests.
 rtsp-types = { version = "0.1", default-features = false }
-# SDP media descriptions in `lotse-rtsp`: the payload type and `a=ptime` of a camera's backchannel
+# SDP media descriptions in `rocko-rtsp`: the payload type and `a=ptime` of a camera's backchannel
 # media; the version retina parses with, already in the tree.
 sdp-types = { version = "0.2", default-features = false }
 # H.264 bitstream syntax (SPS profile, level and dimensions, SEI) on the side branch; the packet
@@ -157,7 +157,7 @@ socket2 = { version = "0.6", default-features = false, features = ["all"] }
 # The supervisor's receive thread: batched `recvmmsg` with GRO, and each datagram's destination
 # address (`IP_PKTINFO`, `IPV6_PKTINFO`) without `unsafe` of ours.
 quinn-udp = { version = "0.6", default-features = false }
-# The WebRTC engine, sans-IO, without a crypto feature: lotse-webrtc's own provider supplies it,
+# The WebRTC engine, sans-IO, without a crypto feature: rocko-webrtc's own provider supplies it,
 # because str0m's `rust-crypto` feature turns on dimpl's `rcgen` feature and with it aws-lc-rs.
 str0m = { version = "0.25", default-features = false }
 # DTLS 1.2/1.3 of the crypto provider on its RustCrypto backend only, so neither aws-lc nor OpenSSL
@@ -168,11 +168,11 @@ dimpl = { version = "0.9", default-features = false, features = ["rust-crypto"] 
 aes = { version = "0.9", default-features = false }
 ctr = { version = "0.10", default-features = false }
 aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
-# TLS of the sources (lotse-tls), `rtsps://` cameras first, and the control API's TLS listener,
+# TLS of the sources (rocko-tls), `rtsps://` cameras first, and the control API's TLS listener,
 # with the `ring` provider so the static musl build carries no OpenSSL or aws-lc of its own; TLS 1.2
 # stays on because cameras often speak nothing newer (the control listener offers TLS 1.3 only).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-# rustls over tokio streams: the client half of lotse-tls, the server half for the control API's
+# rustls over tokio streams: the client half of rocko-tls, the server half for the control API's
 # TLS listener and the fake camera.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Mozilla's root certificates, embedded: the worker has no filesystem to read a CA bundle from.
@@ -194,9 +194,9 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 # made per scrape. No protobuf.
 prometheus-client = { version = "0.26", default-features = false }
 # The media ranges of the metrics' `Accept` header (RFC 9110 §12.5.1 grammar, quoted strings
-# included), which picks the exposition format; the selection over them is lotse's (exporter.rs).
+# included), which picks the exposition format; the selection over them is rocko's (exporter.rs).
 mediatype = { version = "0.23", default-features = false }
-# PEM (RFC 7468) of the control identity's certificate alone, which `lotse identity --certificate`
+# PEM (RFC 7468) of the control identity's certificate alone, which `rocko identity --certificate`
 # prints for a client that trusts it as its CA file; already in the tree via rcgen's `pem`.
 pem = { version = "4", default-features = false }
 # X.509 parsing of the control identity's certificate: whether it names the DNS name a client
@@ -205,11 +205,11 @@ rustls-webpki = { version = "0.103", default-features = false }
 # The allocation-counting tests of the hot paths: a global allocator counting the calling thread's
 # allocations, linked only into the test binaries that use it.
 allocation-counter = { version = "0.8", default-features = false }
-# The microbenchmarks of the media path (`benches/` of lotse-codec, lotse-http and lotse-supervisor,
+# The microbenchmarks of the media path (`benches/` of rocko-codec, rocko-http and rocko-supervisor,
 # `mise run bench`): wall-clock timing with throughput counters; dev-only, never linked into the
 # binary. Its `wrap_help` default only formats `--help`.
 divan = { version = "0.1", default-features = false }
-# The WebSocket client of `lotse ctl` over the Unix socket; the same engine axum uses.
+# The WebSocket client of `rocko ctl` over the Unix socket; the same engine axum uses.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
 # The Opus encoder of the AAC-LC → Opus transcoder, later the talk-back decoder: safe bindings to
@@ -236,21 +236,21 @@ nanoaudio-g722 = { version = "0.1.1", default-features = false }
 libfuzzer-sys = { version = "0.4", default-features = false, features = ["link_libfuzzer"] }
 
 # Workspace crates; the allowed edges are in .cargo/layering.toml.
-lotse-api = { path = "crates/lotse-api" }
-lotse-api-types = { path = "crates/lotse-api-types" }
-lotse-codec = { path = "crates/lotse-codec" }
-lotse-core = { path = "crates/lotse-core" }
-lotse-hls = { path = "crates/lotse-hls" }
-lotse-http = { path = "crates/lotse-http" }
-lotse-ipc = { path = "crates/lotse-ipc" }
-lotse-mux = { path = "crates/lotse-mux" }
-lotse-rtsp = { path = "crates/lotse-rtsp" }
-lotse-sandbox = { path = "crates/lotse-sandbox" }
-lotse-supervisor = { path = "crates/lotse-supervisor" }
-lotse-testing = { path = "crates/lotse-testing" }
-lotse-tls = { path = "crates/lotse-tls" }
-lotse-webrtc = { path = "crates/lotse-webrtc" }
-lotse-worker = { path = "crates/lotse-worker" }
+rocko-api = { path = "crates/rocko-api" }
+rocko-api-types = { path = "crates/rocko-api-types" }
+rocko-codec = { path = "crates/rocko-codec" }
+rocko-core = { path = "crates/rocko-core" }
+rocko-hls = { path = "crates/rocko-hls" }
+rocko-http = { path = "crates/rocko-http" }
+rocko-ipc = { path = "crates/rocko-ipc" }
+rocko-mux = { path = "crates/rocko-mux" }
+rocko-rtsp = { path = "crates/rocko-rtsp" }
+rocko-sandbox = { path = "crates/rocko-sandbox" }
+rocko-supervisor = { path = "crates/rocko-supervisor" }
+rocko-testing = { path = "crates/rocko-testing" }
+rocko-tls = { path = "crates/rocko-tls" }
+rocko-webrtc = { path = "crates/rocko-webrtc" }
+rocko-worker = { path = "crates/rocko-worker" }
 
 # Lint policy. Clippy runs with `-D warnings`, so every `warn` below fails the build. Suppress a
 # lint only with `#[expect(lint, reason = "...")]`; blanket relaxations for test modules are an
@@ -322,7 +322,7 @@ arithmetic_side_effects = "deny"     # wrapping_/checked_/saturating_ explicit o
 unimplemented = "deny"
 todo = "deny"
 dbg_macro = "deny"
-print_stdout = "deny"                # logs go to stderr; the one exception is `lotse ctl` output, in one module with a scoped expect
+print_stdout = "deny"                # logs go to stderr; the one exception is `rocko ctl` output, in one module with a scoped expect
 print_stderr = "deny"                # use tracing
 exit = "deny"                        # `process::exit` skips destructors; `main` returns `ExitCode`
 mem_forget = "deny"                  # leaks fds and buffers

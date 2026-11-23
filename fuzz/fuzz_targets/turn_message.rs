@@ -15,13 +15,13 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::secret::Secret;
-use lotse_supervisor::net::allocation::{Allocation, AllocationConfig, Event, Transport};
-use lotse_supervisor::net::credential::{
+use rocko_core::secret::Secret;
+use rocko_supervisor::net::allocation::{Allocation, AllocationConfig, Event, Transport};
+use rocko_supervisor::net::credential::{
     Authenticator, Challenge, Credentials, password_algorithms, security_features,
 };
-use lotse_supervisor::net::stun::{Builder, Class, parse};
-use lotse_supervisor::net::turn::{
+use rocko_supervisor::net::stun::{Builder, Class, parse};
+use rocko_supervisor::net::turn::{
     CHANNEL_DATA_HEADER_LEN, Kind, METHOD_REFRESH, channel_number, data_indication,
     frame_channel_data, kind, lifetime, parse_channel_data, relayed_address, stream_frame_len,
 };

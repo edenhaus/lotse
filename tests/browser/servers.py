@@ -1,7 +1,7 @@
 """The servers the browser plays the camera through, and one play of the test page.
 
-`lotse` starts a release daemon and `lotse-browser` (the camera and the dev viewer that serves the
-page and relays its signaling to the daemon); `go2rtc` starts `lotse-browser` for the camera and the
+`rocko` starts a release daemon and `rocko-browser` (the camera and the dev viewer that serves the
+page and relays its signaling to the daemon); `go2rtc` starts `rocko-browser` for the camera and the
 page, and go2rtc configured and driven as its common deployment does it: that deployment's config
 file (`go2rtc.yaml`, its differences listed there) and go2rtc's client library, go2rtc-client,
 over the Unix socket, for the stream and its preload, the camera's URL as the source or, with
@@ -62,7 +62,7 @@ STOP_TIMEOUT_S = 15.0
 
 LIVE_TIMEOUT_S = 10.0
 """How long go2rtc may take to receive the camera's video and audio once the stream is preloaded;
-the page gives lotse's stream the same 10 s to go live."""
+the page gives rocko's stream the same 10 s to go live."""
 
 WARM_MS = 1_500
 """How long the stream stays live before the offer, so a GOP cache holds a whole group of pictures
@@ -96,13 +96,13 @@ class Running:
     """A server playing the camera: what the page needs and the processes to measure."""
 
     name: str
-    """`lotse`, `go2rtc` or `go2rtc-ffmpeg`."""
+    """`rocko`, `go2rtc` or `go2rtc-ffmpeg`."""
     version: str | None
     """The server's version, where the harness learns it before the page runs."""
     served: Served
     """The page and the camera."""
     pid: int
-    """The server's process; its descendants (lotse's worker, go2rtc's ffmpeg) count as its own."""
+    """The server's process; its descendants (rocko's worker, go2rtc's ffmpeg) count as its own."""
     root_label: str
     """What the report calls the server's process."""
     child_label: str
@@ -129,15 +129,15 @@ def _free_port() -> int:
 
 @contextmanager
 def _page(settings: Settings, socket: Path, out: Path, audio: str = "pcmu") -> Iterator[Served]:
-    """`lotse-browser`: the camera and the dev viewer, which relays to `socket`; stopped after.
+    """`rocko-browser`: the camera and the dev viewer, which relays to `socket`; stopped after.
 
-    The camera sends `audio` (`pcmu` or `aac`); `Served.command` sends `lotse-browser` a command.
+    The camera sends `audio` (`pcmu` or `aac`); `Served.command` sends `rocko-browser` a command.
     """
     camera = ["--camera", settings.camera] if settings.camera else []
-    log = out / "lotse-browser.log"
+    log = out / "rocko-browser.log"
     with log.open("wb") as stderr:
         page = subprocess.Popen(  # noqa: S603 -- the binary the command line names, no shell
-            [settings.lotse_browser, "--socket", socket, "--audio", audio, *camera],
+            [settings.rocko_browser, "--socket", socket, "--audio", audio, *camera],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
@@ -145,13 +145,13 @@ def _page(settings: Settings, socket: Path, out: Path, audio: str = "pcmu") -> I
     try:
         line = page.stdout.readline() if page.stdout else b""
         if not line:
-            pytest.fail(f"lotse-browser did not start:\n{tail(log)}")
+            pytest.fail(f"rocko-browser did not start:\n{tail(log)}")
         ready = json.loads(line)
 
         def command(text: str) -> dict[str, Any]:
-            """One command line to `lotse-browser`, and its one line of answer."""
+            """One command line to `rocko-browser`, and its one line of answer."""
             if page.stdin is None or page.stdout is None:
-                pytest.fail("lotse-browser has no stdin or stdout")
+                pytest.fail("rocko-browser has no stdin or stdout")
             page.stdin.write(text.encode() + b"\n")
             page.stdin.flush()
             answer: dict[str, Any] = json.loads(page.stdout.readline() or b"{}")
@@ -169,24 +169,24 @@ def _page(settings: Settings, socket: Path, out: Path, audio: str = "pcmu") -> I
             page.stdin.close()
         if page.stdout is not None:
             page.stdout.close()
-        stop(page, "lotse-browser")
+        stop(page, "rocko-browser")
 
 
 @contextmanager
-def lotse(settings: Settings, out: Path, audio: str = "pcmu") -> Iterator[Running]:
-    """A release daemon on a private socket with WebRTC on loopback, and `lotse-browser`.
+def rocko(settings: Settings, out: Path, audio: str = "pcmu") -> Iterator[Running]:
+    """A release daemon on a private socket with WebRTC on loopback, and `rocko-browser`.
 
     The camera sends `audio`. Both stopped after, the daemon's exit checked. The page puts the
     stream itself.
     """
     # A short path: a Unix socket path must fit in sun_path (104 bytes on macOS).
-    directory = Path(tempfile.mkdtemp(prefix="lotse-browser.", dir="/tmp"))
-    socket = directory / "lotse.sock"
-    daemon_log = out / "lotse.log"
+    directory = Path(tempfile.mkdtemp(prefix="rocko-browser.", dir="/tmp"))
+    socket = directory / "rocko.sock"
+    daemon_log = out / "rocko.log"
     with daemon_log.open("wb") as log:
         daemon = subprocess.Popen(  # noqa: S603 -- the binary the command line names, no shell
             [
-                settings.lotse,
+                settings.rocko,
                 "serve",
                 "--socket",
                 socket,
@@ -213,7 +213,7 @@ def lotse(settings: Settings, out: Path, audio: str = "pcmu") -> Iterator[Runnin
             time.sleep(0.1)
         with _page(settings, socket, out, audio) as served:
             yield Running(
-                name="lotse",
+                name="rocko",
                 version=None,  # the page reads it from the daemon's hello
                 served=dataclasses.replace(served, daemon_pid=daemon.pid),
                 pid=daemon.pid,
@@ -235,7 +235,7 @@ async def _register(socket: Path, username: str, password: str, source: str) -> 
     the version and the source's scheme, puts the stream with the source and an ffmpeg fallback
     that transcodes the audio to Opus for browsers that cannot play the camera's, and enables its
     preload. The source is the camera's URL, with `FFMPEG_PREFIX` in front for the ffmpeg path.
-    Then it waits until go2rtc receives video and audio, as the page waits for lotse's stream to be
+    Then it waits until go2rtc receives video and audio, as the page waits for rocko's stream to be
     live.
     """
     async with ClientSession(
@@ -279,17 +279,17 @@ async def _receiving(session: ClientSession, name: str) -> bool:
 
 @contextmanager
 def go2rtc(settings: Settings, out: Path, *, ffmpeg: bool = False) -> Iterator[Running]:
-    """go2rtc as its common deployment runs it, the camera registered as there, and `lotse-browser`.
+    """go2rtc as its common deployment runs it, the camera registered as there, and `rocko-browser`.
 
     With `ffmpeg` the camera is registered with `FFMPEG_PREFIX` in front of its URL, and go2rtc
-    pulls it through ffmpeg; without, through go2rtc's own RTSP client. `lotse-browser` serves the
+    pulls it through ffmpeg; without, through go2rtc's own RTSP client. `rocko-browser` serves the
     camera and the page; its relay is not used, so its socket has no daemon behind it.
     """
     if settings.go2rtc is None:
         pytest.fail("--go2rtc required for the comparison (scripts/compare.sh sets it)")
     if ffmpeg and shutil.which("ffmpeg") is None:
         pytest.fail("ffmpeg is not on PATH, where go2rtc looks for it (mise install)")
-    directory = Path(tempfile.mkdtemp(prefix="lotse-go2rtc.", dir="/tmp"))
+    directory = Path(tempfile.mkdtemp(prefix="rocko-go2rtc.", dir="/tmp"))
     unix = directory / "go2rtc.sock"
     # Credentials generated per start (`token_hex`), the file next to the socket, as deployed.
     username, password = secrets.token_hex(), secrets.token_hex()
@@ -383,7 +383,7 @@ def _act(served: Served, checkpoint: dict[str, Any]) -> None:
     match checkpoint.get("mode"):
         case "reconnect":
             if served.command is None:
-                pytest.fail("no lotse-browser to restart the camera")
+                pytest.fail("no rocko-browser to restart the camera")
             answer = served.command("restart-camera")
             if answer.get("restarted") is not True:
                 pytest.fail(f"the camera did not restart: {answer}")
@@ -412,7 +412,7 @@ def play(
     """
     driver.get(served.page)
     driver.execute_script(
-        "window.lotseTest.configure(arguments[0]);",
+        "window.rockoTest.configure(arguments[0]);",
         {
             "stream_id": STREAM_ID,
             "url": served.camera,
@@ -428,13 +428,13 @@ def play(
     if disrupt is not None:
         reached = driver.execute_async_script(
             "const done = arguments[arguments.length - 1];"
-            "Promise.race([window.lotseTest.checkpoint.then((c) => ({ checkpoint: c })),"
-            " window.lotseTest.finished.then(() => ({}))]).then(done);"
+            "Promise.race([window.rockoTest.checkpoint.then((c) => ({ checkpoint: c })),"
+            " window.rockoTest.finished.then(() => ({}))]).then(done);"
         )
         if "checkpoint" in reached:
             _act(served, reached["checkpoint"])
-            driver.execute_script("window.lotseTest.proceed();")
+            driver.execute_script("window.rockoTest.proceed();")
     page = driver.execute_async_script(
-        "const done = arguments[arguments.length - 1]; window.lotseTest.finished.then(done);"
+        "const done = arguments[arguments.length - 1]; window.rockoTest.finished.then(done);"
     )
     return user_agent, page

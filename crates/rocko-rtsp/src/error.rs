@@ -1,0 +1,288 @@
+//! How a retina error becomes a [`SourceError`]: the RTSP status and
+//! method stay in the message, the kind follows what went wrong. The
+//! message is scrubbed of the source URL's path and query, which retina
+//! may echo, before it is cut: a path cut partway through no longer
+//! matches the scrub.
+//!
+//! The camera's own text, which retina's messages quote (a header, an
+//! SDP line), reaches the log and the API's error only through
+//! `camera_text`: one line, no control characters, at most
+//! `CAMERA_TEXT_BYTES`, ending in `CUT_MARK` where it was cut.
+//!
+//! RFC 2326 §7.1.1: 401 and 403 are the credential failures.
+
+use rocko_core::source::SourceError;
+use rocko_core::source_url::SourceUrl;
+
+/// The most bytes of a camera's text an error message or a log line
+/// carries: a header value or a reason is a sentence, and a camera's
+/// message may be 64 KiB of anything.
+pub(crate) const CAMERA_TEXT_BYTES: usize = 200;
+
+/// A camera's `text` as an error or a log line carries it: on one line,
+/// control characters replaced, cut to [`CAMERA_TEXT_BYTES`]; cut text
+/// ends in [`CUT_MARK`](rocko_core::text::CUT_MARK) within them.
+pub(crate) fn camera_text(text: &str) -> String {
+    rocko_core::text::plain(text, CAMERA_TEXT_BYTES)
+}
+
+/// Classifies a retina client error of the session for `url`. retina
+/// keeps its variants private, so the status code (public) and the
+/// message text (stable prefixes per variant, its `ErrorInt` display
+/// formats) decide.
+///
+/// Every connection of the source, its backchannel's included, drives
+/// retina's sans-I/O core on a connection the source dialed and on the UDP
+/// pairs it bound (the crate's `driver`): the connection's own failures
+/// are the source's (a refused connect is its dial's, worded as retina's
+/// `Unable to connect`, a failed write the driver's), and retina's are
+/// `Error reading from RTSP peer` (a read that failed or ended
+/// mid-request, a keepalive unanswered), `Error writing to RTSP peer` (a
+/// keepalive retina could not flush) and `Error receiving UDP packet` (a
+/// pair's receive that failed), besides the status and protocol errors.
+/// retina's own `Unable to connect` and `Timeout` come from its tokio
+/// session and its `TEARDOWN` retries, which rocko no longer runs; they
+/// stay classified for a path that will take them.
+pub fn classify(error: &retina::client::Error, url: &SourceUrl) -> SourceError {
+    classify_text(&error.to_string(), error.status_code(), url)
+}
+
+/// [`classify`] on a retina error's `text` and RTSP `status`: its first
+/// line, scrubbed of `url` ([`RedactedUrl::scrub`]), then as
+/// [`camera_text`], is the message. The kind follows the line as retina
+/// wrote it: scrubbed, a query that happens to occur in a prefix (`t` in
+/// `Timeout`) would change it.
+///
+/// [`RedactedUrl::scrub`]: rocko_core::secret::RedactedUrl::scrub
+fn classify_text(text: &str, status: Option<u16>, url: &SourceUrl) -> SourceError {
+    let line = first_line(text);
+    let message = camera_text(&url.redacted().scrub(line));
+    if let Some(status) = status {
+        return match status {
+            401 | 403 => SourceError::AuthFailed(message),
+            _ => SourceError::Protocol(message),
+        };
+    }
+    if line.starts_with("Unable to connect") {
+        SourceError::Unreachable(message)
+    } else if line.starts_with("Timeout") {
+        SourceError::Timeout(message)
+    } else if line.starts_with("Error reading from RTSP peer")
+        || line.starts_with("Error writing to RTSP peer")
+        || line.starts_with("Error receiving UDP packet")
+    {
+        SourceError::Ended(message)
+    } else {
+        SourceError::Protocol(message)
+    }
+}
+
+/// retina appends connection and message context on further lines; the
+/// first line is the error.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::arithmetic_side_effects,
+        clippy::missing_docs_in_private_items,
+        reason = "test code"
+    )]
+
+    use rocko_core::text::CUT_MARK;
+
+    use super::*;
+
+    /// A source URL with nothing to scrub.
+    fn cam() -> SourceUrl {
+        SourceUrl::parse("rtsp://cam/").unwrap()
+    }
+
+    /// A sans-I/O core, as the driver makes one, for a camera at 554.
+    fn core() -> retina::client::SessionCore {
+        retina::client::SessionCore::new(
+            "127.0.0.1:50000".parse().unwrap(),
+            "127.0.0.1:554".parse().unwrap(),
+            retina::client::SessionOptions::default(),
+        )
+    }
+
+    /// retina names the URL it was given in an `InvalidArgument`, the
+    /// source URL's path and query included, which the attempt's scrub
+    /// removes.
+    #[test]
+    fn a_url_retina_echoes_loses_its_path_and_query() {
+        let url =
+            SourceUrl::parse("rtsp://admin:pw5b1c@cam/camkey7f3a/live?token=tok9d2e").unwrap();
+        let mut target = url.expose_url().clone();
+        target.set_scheme("rtspx").unwrap();
+        let err = core()
+            .describe(target)
+            .expect_err("retina refuses a scheme other than rtsp and rtsps");
+        assert!(
+            err.to_string().contains("camkey7f3a"),
+            "retina echoes: {err}"
+        );
+        assert_eq!(
+            classify(&err, &url),
+            SourceError::Protocol(
+                "Invalid argument: Bad URL rtspx://cam/****?**** only schemes rtsp and rtsps supported"
+                    .into()
+            )
+        );
+    }
+
+    /// retina's own text for a peer that closes the connection while its
+    /// answer to `DESCRIBE` is awaited keeps its kind.
+    #[test]
+    fn retinas_text_for_a_hang_up_keeps_its_kind() {
+        let url = cam();
+        let mut core = core();
+        core.describe(url.expose_url().clone()).unwrap();
+        let (first, _) = core.transmit_buf();
+        let sent = first.len();
+        core.advance_transmit(sent);
+        core.handle_eof();
+        let now = rocko_core::clock::Clock::now(&rocko_core::clock::SystemClock);
+        let closed = core.poll_event(now).unwrap().unwrap_err();
+        assert_eq!(
+            classify(&closed, &url),
+            SourceError::Ended(
+                "Error reading from RTSP peer: EOF while expecting response to DESCRIBE CSeq 1"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn camera_text_is_one_line_of_at_most_200_bytes() {
+        assert_eq!(camera_text("a\r\nb\u{1b}[2J"), "a  b\u{fffd}[2J");
+        let long = "é".repeat(CAMERA_TEXT_BYTES);
+        let room = CAMERA_TEXT_BYTES - CUT_MARK.len();
+        let capped = camera_text(&long);
+        assert_eq!(capped, format!("{}{CUT_MARK}", "é".repeat(room / 2)));
+        assert_eq!(capped.len(), CAMERA_TEXT_BYTES - 1, "é does not fit whole");
+        let capped = camera_text(&format!("x{long}"));
+        assert_eq!(capped, format!("x{}{CUT_MARK}", "é".repeat((room - 1) / 2)));
+        assert_eq!(capped.len(), CAMERA_TEXT_BYTES);
+    }
+
+    #[test]
+    fn a_camera_s_text_in_retina_s_error_reaches_the_message_capped_on_one_line() {
+        let quoted = format!("{:?}", format!("x\r\n{}", "y".repeat(64 * 1024)));
+        let text = format!("Unparseable Session header {quoted}\n\nconn: 127.0.0.1:1");
+        let err = classify_text(&text, None, &cam());
+        assert!(
+            matches!(&err, SourceError::Protocol(m) if m.len() == CAMERA_TEXT_BYTES
+                && m.starts_with(r#"Unparseable Session header "x\r\nyyy"#)
+                && m.ends_with(&format!("y{CUT_MARK}"))),
+            "{err:?}"
+        );
+        assert_eq!(
+            classify_text("401\u{1b}[2J\nmore", Some(401), &cam()),
+            SourceError::AuthFailed("401\u{fffd}[2J".into())
+        );
+        assert!(matches!(
+            classify_text("Unable to connect\r to x", None, &cam()),
+            SourceError::Unreachable(m) if m == "Unable to connect  to x"
+        ));
+        assert!(matches!(
+            classify_text("Timeout", None, &cam()),
+            SourceError::Timeout(_)
+        ));
+        assert!(matches!(
+            classify_text("Error receiving UDP packet", None, &cam()),
+            SourceError::Ended(_)
+        ));
+        assert!(matches!(
+            classify_text("x", Some(404), &cam()),
+            SourceError::Protocol(_)
+        ));
+    }
+
+    /// The scrub prints a URL in a camera's text as the `url` crate parsed
+    /// it: its scheme, and a special scheme's host, lowercase (WHATWG URL
+    /// Standard §4.4 scheme state, §3.5 host parsing, UTS #46 mapping
+    /// fullwidth forms to ASCII). So camera text can come back as text the
+    /// camera never sent, though from nothing but that text: no secret of
+    /// the source goes into it. The `rtsp_session` fuzz target's
+    /// `WWW-Authenticate` (2026-10-26) came back holding its then
+    /// all-lowercase password; its password is mixed case since.
+    #[test]
+    fn whatwg_url_4_4_a_url_in_camera_text_prints_its_scheme_and_special_host_lowercase() {
+        let url = SourceUrl::parse("rtsp://user:Pw-4E2d81@cam/stream").unwrap();
+        let retina = "401 response to DESCRIBE CSeq=1: Can't understand WWW-Authenticate header: \
+            invalid byte at byte 10: iiiiiiiiii(HERE-->)?iiiiiiiiii)iiii%Eiiipw-4E2d81tt://T%\"%@";
+        assert_eq!(
+            classify_text(retina, Some(401), &url),
+            SourceError::AuthFailed(
+                "401 response to DESCRIBE CSeq=1: Can't understand WWW-Authenticate header: \
+                 invalid byte at byte 10: iiiiiiiiii(HERE-->)?iiiiiiiiii)iiii%eiiipw-4e2d81tt://T%\"%@"
+                    .into()
+            )
+        );
+        for (text, printed) in [
+            (
+                "HTTP://PW-4E2D81.example/x y",
+                "http://pw-4e2d81.example/**** y",
+            ),
+            (
+                "http://\u{ff50}\u{ff57}\u{ff0d}\u{ff14}\u{ff45}\u{ff12}\u{ff44}\u{ff18}\u{ff11}.example y",
+                "http://pw-4e2d81.example/ y",
+            ),
+            // Not special: the host as the camera wrote it.
+            ("Pw-4E2d81tt://Pw-4E2d81 y", "pw-4e2d81tt://Pw-4E2d81 y"),
+        ] {
+            assert_eq!(
+                classify_text(text, Some(400), &url),
+                SourceError::Protocol(printed.into()),
+                "{text}"
+            );
+        }
+    }
+
+    /// A camera that echoes the path without a scheme, where the message
+    /// is cut: scrubbed after the cut, the path's first bytes would show.
+    /// The scrubbed path's start fills the cap up to the cut mark.
+    #[test]
+    fn a_path_echoed_where_the_message_is_cut_is_scrubbed_before_the_cut() {
+        let url = SourceUrl::parse("rtsp://cam/camkey7f3a/live?token=tok9d2e").unwrap();
+        let lead = "x".repeat(CAMERA_TEXT_BYTES - 18 - CUT_MARK.len());
+        let text = format!("Bad request {lead} /camkey7f3a/live?token=tok9d2e");
+        let cut = format!("Bad request {lead} /****{CUT_MARK}");
+        assert_eq!(cut.len(), CAMERA_TEXT_BYTES);
+        assert_eq!(
+            classify_text(&text, Some(400), &url),
+            SourceError::Protocol(cut)
+        );
+    }
+
+    /// A query that occurs in a kind's prefix is scrubbed out of the
+    /// message, not out of the classification.
+    #[test]
+    fn a_query_echoed_in_a_kinds_prefix_keeps_the_kind() {
+        let url = SourceUrl::parse("rtsp://cam/live?t").unwrap();
+        assert_eq!(
+            classify_text("Timeout", None, &url),
+            SourceError::Timeout("Timeou****".into())
+        );
+        let url = SourceUrl::parse("rtsp://cam/live?connect").unwrap();
+        assert_eq!(
+            classify_text("Unable to connect to cam", None, &url),
+            SourceError::Unreachable("Unable to **** to cam".into())
+        );
+        let url = SourceUrl::parse("rtsp://cam/live?Error").unwrap();
+        assert_eq!(
+            classify_text("Error reading from RTSP peer", None, &url),
+            SourceError::Ended("**** reading from RTSP peer".into())
+        );
+    }
+
+    #[test]
+    fn first_lines_are_kept() {
+        assert_eq!(first_line("Timeout\n\nconn: x"), "Timeout");
+        assert_eq!(first_line(""), "");
+    }
+}

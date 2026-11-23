@@ -23,10 +23,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use lotse_api::{Config, ConnectionId, Handler, Outcome, Owners, Server};
-use lotse_api_types::command::Command;
-use lotse_api_types::frame::{Hello, HelloTag};
-use lotse_core::clock::SystemClock;
+use rocko_api::{Config, ConnectionId, Handler, Outcome, Owners, Server};
+use rocko_api_types::command::Command;
+use rocko_api_types::frame::{Hello, HelloTag};
+use rocko_core::clock::SystemClock;
 use tokio_util::sync::CancellationToken;
 
 /// Answers every command with an empty result.
@@ -36,7 +36,7 @@ impl Handler for Answering {
     fn hello(&self) -> Hello {
         Hello {
             kind: HelloTag::default(),
-            api: lotse_api_types::API_VERSION.into(),
+            api: rocko_api_types::API_VERSION.into(),
             version: "0.0.0-fuzz".into(),
             outputs: vec![],
             features: vec![],
@@ -56,14 +56,14 @@ impl Handler for Answering {
 fn socket() -> &'static PathBuf {
     static SOCKET: OnceLock<PathBuf> = OnceLock::new();
     SOCKET.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("lotse-fuzz-ws-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rocko-fuzz-ws-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
             .expect("a private dir");
         let uid = std::fs::metadata(&dir).expect("its metadata").uid();
-        let socket = dir.join("lotse.sock");
+        let socket = dir.join("rocko.sock");
         let server = Server::bind(Config {
             socket: socket.clone(),
             owners: Owners::only(uid),
@@ -154,7 +154,7 @@ fuzz_target!(|data: &[u8]| {
         .expect("a read timeout");
     stream
         .write_all(
-            b"GET /v0/ws HTTP/1.1\r\nHost: lotse\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+            b"GET /v0/ws HTTP/1.1\r\nHost: rocko\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
               Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
         )
         .expect("the upgrade request goes out");

@@ -100,12 +100,12 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: lotse-*
+          pattern: rocko-*
           path: artifacts
       - name: Put the binaries where the Dockerfile takes them
         run: |
-          install -D artifacts/lotse-x86_64/lotse target/image/amd64/lotse
-          install -D artifacts/lotse-aarch64/lotse target/image/arm64/lotse
+          install -D artifacts/rocko-x86_64/rocko target/image/amd64/rocko
+          install -D artifacts/rocko-aarch64/rocko target/image/arm64/rocko
       # ghcr.io takes lowercase names only. The owner is not written down: the repository may
       # move to another organization.
       - name: Image name
@@ -203,24 +203,24 @@ jobs:
         run: |
           mkdir dist
           for arch in x86_64 aarch64; do
-            install -m 0755 "artifacts/lotse-$arch/lotse" "dist/lotse-$arch-unknown-linux-musl"
+            install -m 0755 "artifacts/rocko-$arch/rocko" "dist/rocko-$arch-unknown-linux-musl"
           done
           cp artifacts/notices/* dist/
           ls -l dist
       - name: Attest the binaries' provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: dist/lotse-*-unknown-linux-musl
+          subject-path: dist/rocko-*-unknown-linux-musl
       - name: Attest the x86_64 binary's SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: dist/lotse-x86_64-unknown-linux-musl
-          sbom-path: dist/lotse-x86_64-unknown-linux-musl.cdx.json
+          subject-path: dist/rocko-x86_64-unknown-linux-musl
+          sbom-path: dist/rocko-x86_64-unknown-linux-musl.cdx.json
       - name: Attest the aarch64 binary's SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: dist/lotse-aarch64-unknown-linux-musl
-          sbom-path: dist/lotse-aarch64-unknown-linux-musl.cdx.json
+          subject-path: dist/rocko-aarch64-unknown-linux-musl
+          sbom-path: dist/rocko-aarch64-unknown-linux-musl.cdx.json
       - name: Checksums
         working-directory: dist
         run: |
@@ -240,27 +240,27 @@ jobs:
 
           ## Container image
 
-          `$IMAGE:$VERSION@$DIGEST` (linux/amd64, linux/arm64): `/lotse` and the directories it needs.
+          `$IMAGE:$VERSION@$DIGEST` (linux/amd64, linux/arm64): `/rocko` and the directories it needs.
           Take the binary into an image of your own:
 
           ```dockerfile
-          COPY --from=$IMAGE:$VERSION@$DIGEST /lotse /bin/lotse
+          COPY --from=$IMAGE:$VERSION@$DIGEST /rocko /bin/rocko
           ```
 
           Or run it with its control API over mutual TLS, and pair a client with the code it logs:
 
           ```sh
-          docker run -d --name lotse --network host -v lotse-data:/data \
-            -e LOTSE_CONTROL_LISTEN='[::]:18557' $IMAGE:$VERSION@$DIGEST
-          docker logs lotse              # the first client's pairing code
-          docker exec lotse /lotse pair  # another one-time code
+          docker run -d --name rocko --network host -v rocko-data:/data \
+            -e ROCKO_CONTROL_LISTEN='[::]:18557' $IMAGE:$VERSION@$DIGEST
+          docker logs rocko              # the first client's pairing code
+          docker exec rocko /rocko pair  # another one-time code
           ```
 
           ## Verify
 
           ```sh
           sha256sum --check --ignore-missing SHA256SUMS
-          gh attestation verify lotse-x86_64-unknown-linux-musl --repo $GH_REPO
+          gh attestation verify rocko-x86_64-unknown-linux-musl --repo $GH_REPO
           gh attestation verify oci://$IMAGE:$VERSION --repo $GH_REPO
           ```
           EOF

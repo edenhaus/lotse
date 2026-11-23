@@ -1,4 +1,4 @@
-# Rust build output (Cargo.lock is committed: lotse ships a binary)
+# Rust build output (Cargo.lock is committed: rocko ships a binary)
 /target/
 **/*.rs.bk
 *.pdb

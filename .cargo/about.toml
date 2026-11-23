@@ -1,5 +1,5 @@
 # cargo-about: THIRD_PARTY_LICENSES.md of a release (`mise run licenses`, release.yml), rendered
-# with .cargo/about.hbs from the crates the `lotse` binary links.
+# with .cargo/about.hbs from the crates the `rocko` binary links.
 
 # The `[licenses] allow` list of .cargo/deny.toml, in the same order (the order is cargo-about's
 # preference for `OR` expressions); the `license-lists` hook keeps the two equal.
@@ -22,5 +22,5 @@ targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
-# Our own `publish = false` crates are lotse, MIT OR Apache-2.0, not third parties.
+# Our own `publish = false` crates are rocko, MIT OR Apache-2.0, not third parties.
 private = { ignore = true }

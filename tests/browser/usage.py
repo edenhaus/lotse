@@ -1,6 +1,6 @@
 """What a server's processes use while the browser plays: CPU and resident memory, from psutil.
 
-A thread samples the server's process and its descendants (lotse's worker, any ffmpeg go2rtc
+A thread samples the server's process and its descendants (rocko's worker, any ffmpeg go2rtc
 starts) every `INTERVAL_S`; `Sampler.usage` sums the CPU time each used and the resident memory
 it held over a window of the run, the play time after the first frame. psutil reads the kernel's
 own accounting (`/proc/<pid>/stat` and `status` on Linux, `proc_pidinfo` on macOS), so the numbers

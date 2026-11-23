@@ -1,24 +1,24 @@
 # cargo-mutants configuration.
 # `mise run mutants` runs the changed lines; the nightly job runs the whole workspace.
 test_tool = "nextest"
-# Test infrastructure: lotse-testing, and the codecs' test data behind lotse-codec's
+# Test infrastructure: rocko-testing, and the codecs' test data behind rocko-codec's
 # `test-util` feature, exercised by the other crates' tests.
 exclude_globs = [
-    "crates/lotse-testing/**",
+    "crates/rocko-testing/**",
     # The fuzz targets: harness code with no tests of its own, run by the Fuzz jobs.
     "fuzz/**",
     # Built only off Linux (macOS, a development host): the Mutants jobs run on Linux, where no
     # test reaches it.
-    "crates/lotse-sandbox/src/other.rs",
-    "crates/lotse-codec/src/aac/test_data.rs",
-    "crates/lotse-codec/src/g722/test_data.rs",
+    "crates/rocko-sandbox/src/other.rs",
+    "crates/rocko-codec/src/aac/test_data.rs",
+    "crates/rocko-codec/src/g722/test_data.rs",
 ]
 # Equivalent mutants: mutations that cannot change behavior, each with its reason.
 # Keep this list short and delete entries with the code they refer to.
 exclude_re = [
     # Test infrastructure, as in exclude_globs: the codecs' test data where it is a module of the
-    # file it serves (h264/sps.rs's `test_data`, behind lotse-codec's `test-util` feature).
-    "lotse-codec/src/.*: .* in test_data::",
+    # file it serves (h264/sps.rs's `test_data`, behind rocko-codec's `test-util` feature).
+    "rocko-codec/src/.*: .* in test_data::",
     # The NTP seconds are shifted above the 32-bit fraction, so `|` and `^` produce the same value.
     "ingest/engine.rs:.*replace \\| with \\^ in ntp64$",
     # The default body already returns `None`.
@@ -34,14 +34,14 @@ exclude_re = [
     # The shifted-in low byte is zero, so `|` and `^` produce the same value.
     "replace \\| with \\^ in encode_ulid",
     # The mask clears bit 6 before it is set, so `|` and `^` produce the same value.
-    "lotse-api/src/identity.rs:.*replace \\| with \\^ in serial$",
+    "rocko-api/src/identity.rs:.*replace \\| with \\^ in serial$",
     # The type preference, local preference and component occupy disjoint bits.
     "replace \\| with \\^ in srflx_candidate",
     # 248 itself maps to 'A' as 248 % 62 == 0: one value of bias, no observable behavior.
     "replace < with <= in random_chars",
     # The reconnect's keyframe and the audio before are two frames, counted apart in the order
     # pushed, so their counts are never equal and `>` and `>=` cannot differ.
-    "lotse-mux/src/live.rs:.*replace > with >= in Live::push_audio$",
+    "rocko-mux/src/live.rs:.*replace > with >= in Live::push_audio$",
     # An equal profile is taken by the arms before, so `>` and `>=` cannot differ there.
     "video/h264.rs:.*replace > with >= in choose_pt$",
     # The profile, constraint and level bytes are shifted into disjoint bits, so `|` and `^`
@@ -123,10 +123,10 @@ exclude_re = [
     # (Column 27 is `unit.len() > self.max_payload`; the group check after it stays mutated.)
     "h26[45]/packet.rs:\\d+:27: replace > with >= in PacketNormalizer::pack_units",
     # retina's RTP channel is even, so OR-ing in the RTCP bit and XOR-ing it set the same channel.
-    "lotse-rtsp/src/udp.rs:.*replace \\| with \\^ in UdpRelay::datagram$",
+    "rocko-rtsp/src/udp.rs:.*replace \\| with \\^ in UdpRelay::datagram$",
     # Reading one more piece of the body before the sniff decides the same: it looks at the
     # first bytes only, and every byte read is handed on either way.
-    "lotse-http/src/source/mod.rs:.*replace < with <= in sniff$",
+    "rocko-http/src/source/mod.rs:.*replace < with <= in sniff$",
     # The open flags and modes are disjoint bits, so `|` and `^` produce the same flags.
     "identity.rs:.*replace \\| with \\^ in (ServerIdentity::load_in|open_directory|write_new)$",
     # `write_new` unlinks the partial file's name just before, in a directory only the owner
@@ -168,9 +168,9 @@ exclude_re = [
     "backchannel.rs:.*replace < with <= in Packetizer::stamp$",
     # `abi_of` only picks filesystem rights (`AccessFs::from_all`), and ABI 4 adds none to ABI 3's
     # (landlock(7), "Landlock ABI versions"): ABI 3 taken as 4 handles the same rights.
-    "lotse-sandbox/src/linux.rs:.*delete match arm 3 in abi_of$",
+    "rocko-sandbox/src/linux.rs:.*delete match arm 3 in abi_of$",
     # Landlock's TCP rights are disjoint flags, so `|` and `^` produce the same set.
-    "lotse-sandbox/src/linux.rs:.*replace \\| with \\^ in net_access$",
+    "rocko-sandbox/src/linux.rs:.*replace \\| with \\^ in net_access$",
     # A leaked empty Vec is the empty slice: the same (absent) hint list.
     "replace <impl ClientCertVerifier for PinVerifier>::root_hint_subjects -> &\\[DistinguishedName\\] with Vec::leak\\(Vec::new\\(\\)\\)",
     # An empty host let through goes on to `Url::set_username`, which refuses a URL whose host
@@ -178,6 +178,6 @@ exclude_re = [
     "source_url.rs:.*replace match guard !host.is_empty\\(\\) with true in SourceUrl::parse$",
     # A pipe takes at least one byte of a write of non-empty slices or refuses it with
     # EWOULDBLOCK (pipe(7)), and the queue holds no empty slice: `Ok(0)` never comes.
-    "lotse-worker/src/live.rs:.*replace match guard written > 0 with true in Output::write$",
-    "lotse-worker/src/live.rs:.*replace > with >= in Output::write$",
+    "rocko-worker/src/live.rs:.*replace match guard written > 0 with true in Output::write$",
+    "rocko-worker/src/live.rs:.*replace > with >= in Output::write$",
 ]

@@ -1,17 +1,17 @@
 # The browser test: one pytest test, run once per browser (`--browser chrome|firefox|safari`), that
 # drives the browser with Selenium and checks what the test page measured. `mise run browser
-# <engine>` builds the daemon and the `lotse-browser` example and runs it; without `--browser` only
+# <engine>` builds the daemon and the `rocko-browser` example and runs it; without `--browser` only
 # the checks' unit tests run. uv installs the Python (.python-version) and the packages pinned in
 # uv.lock.
 
 [project]
-name = "lotse-browser-test"
+name = "rocko-browser-test"
 version = "0.0.0"
-description = "The browser test of lotse and its go2rtc comparison: Selenium drives Chrome, Firefox or Safari"
+description = "The browser test of rocko and its go2rtc comparison: Selenium drives Chrome, Firefox or Safari"
 requires-python = ">=3.14"
 dependencies = [
   "go2rtc-client==0.4.0", # go2rtc's Python client, the version its common deployment pins: the comparison registers the camera with go2rtc through it, as deployed
-  "psutil==7.2.2", # the comparison's per-process CPU and memory of lotse and go2rtc
+  "psutil==7.2.2", # the comparison's per-process CPU and memory of rocko and go2rtc
   "pytest==9.2.0",
   "selenium==4.52.0", # the official W3C WebDriver bindings; its Selenium Manager finds or fetches the driver
 ]

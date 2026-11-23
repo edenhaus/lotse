@@ -21,8 +21,8 @@ def settings_for(engine: str, *, headless: bool = True) -> Settings:
     return Settings(
         engine=engine,
         play_s=20.0,
-        lotse=Path("lotse"),
-        lotse_browser=Path("lotse-browser"),
+        rocko=Path("rocko"),
+        rocko_browser=Path("rocko-browser"),
         camera=None,
         out=Path("out"),
         headless=headless,

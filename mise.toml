@@ -69,8 +69,8 @@ run = [
 ]
 
 [tasks.test-musl]
-description = "The tests on the host's static musl target (Linux only); from $LOTSE_NEXTEST_ARCHIVE when set (CI)"
-run = 'LOTSE_NEXTEST_TARGET="$(uname -m)-unknown-linux-musl" scripts/nextest.sh --no-tests=warn'
+description = "The tests on the host's static musl target (Linux only); from $ROCKO_NEXTEST_ARCHIVE when set (CI)"
+run = 'ROCKO_NEXTEST_TARGET="$(uname -m)-unknown-linux-musl" scripts/nextest.sh --no-tests=warn'
 
 [tasks.test-archive]
 description = "The tests of the host's musl target, built and archived for other machines (CI's Build job), then the doctests"
@@ -93,7 +93,7 @@ description = "Line-coverage gate as CI's Tests jobs run it: the instrumented mu
 depends = ["coverage-archive"]
 run = "mise run coverage-musl"
 
-# The tests embed the path of the `lotse` they start at compile time (`env!("CARGO_BIN_EXE_lotse")`),
+# The tests embed the path of the `rocko` they start at compile time (`env!("CARGO_BIN_EXE_rocko")`),
 # and an archive unpacks its target directory as `target/` under the directory it is extracted to.
 # So the archive is built in target/cov/target and coverage-musl extracts it to target/cov: the
 # binaries land where they were built, as on every GitHub runner, whose checkout path is the same.
@@ -113,8 +113,8 @@ run = [
   # The report for Codecov first, so a run that misses the gate still uploads what it missed. lcov,
   # not Codecov's own format: that one marks a line with an unrun region as partial, which Codecov
   # counts as missed, so its line coverage would not be this gate's.
-  "cargo llvm-cov report --nextest-archive-file target/cov/nextest-archive.tar.zst --ignore-filename-regex 'crates/lotse-testing/' --lcov --output-path target/cov/lcov.info",
-  "cargo llvm-cov report --nextest-archive-file target/cov/nextest-archive.tar.zst --ignore-filename-regex 'crates/lotse-testing/' --fail-under-lines 100 --show-missing-lines",
+  "cargo llvm-cov report --nextest-archive-file target/cov/nextest-archive.tar.zst --ignore-filename-regex 'crates/rocko-testing/' --lcov --output-path target/cov/lcov.info",
+  "cargo llvm-cov report --nextest-archive-file target/cov/nextest-archive.tar.zst --ignore-filename-regex 'crates/rocko-testing/' --fail-under-lines 100 --show-missing-lines",
 ]
 
 [tasks.mutants]
@@ -144,16 +144,16 @@ cargo mutants --workspace --all-features --test-tool nextest "$@"
 description = "The Mutants jobs' build: each package's tests built alone, as cargo-mutants builds a mutant (CI's Mutants cache job)"
 # A dependency's features depend on which packages a build selects, so a workspace build would
 # leave other variants of tokio, serde_json and the like than the ones a mutant's build needs.
-# lotse-testing has no mutants (.cargo/mutants.toml), so it is never built alone.
+# rocko-testing has no mutants (.cargo/mutants.toml), so it is never built alone.
 run = """
 for manifest in crates/*/Cargo.toml; do
-  case "$manifest" in crates/lotse-testing/*) continue ;; esac
+  case "$manifest" in crates/rocko-testing/*) continue ;; esac
   cargo nextest run --no-run --all-features --manifest-path "$manifest"
 done
 """
 
 [tasks.bench]
-description = "The divan microbenchmarks of the media path (benches/ of lotse-codec, lotse-http and lotse-supervisor), in the release profile; a report, not a gate. Arguments go to divan: a filter, --sample-count N, --help"
+description = "The divan microbenchmarks of the media path (benches/ of rocko-codec, rocko-http and rocko-supervisor), in the release profile; a report, not a gate. Arguments go to divan: a filter, --sample-count N, --help"
 # `--bench '*'`: the bench targets only; `--benches` would also run every library's unit tests
 # under libtest's bench harness, which rejects divan's flags. `--all-features`: the codec benches
 # build their input from its `test-util` fixtures. mise appends the task's arguments after `--`.
@@ -165,7 +165,7 @@ run = "scripts/turn-e2e.sh"
 
 [tasks.interop]
 description = "The daemon against MediaMTX with ffmpeg publishing: RTSP over TCP and UDP, video only and with AAC, PCMU and Opus; HLS with MPEG-TS and fMP4 segments, low-latency and over HTTPS with a pinned certificate; and ffmpeg's raw MPEG-TS over HTTP (the ignored `mediamtx_` and `ffmpeg_` tests); event recordings of MediaMTX's stream (H.264 with AAC, Opus, PCMU and G.722, H.265, a publisher restart inside a recording) checked by ffprobe, which decodes every frame (the ignored `mediamtx_iso14496_12_recording_` tests); an LL-HLS session read by ffmpeg as plain HLS, H.264 with AAC and with Opus, and decoded by ffprobe (the ignored `mediamtx_hls_ll_` tests); and ffprobe reading the recording muxer's fixtures (the ignored `ffprobe_` tests); and a real Prometheus scraping `GET /v0/metrics` over mutual TLS with an openssl-made P-256 client certificate, in OpenMetrics and in the Prometheus text format, a certificate never enrolled refused (the ignored `prometheus_` test)"
-run = "scripts/nextest.sh -E 'binary_id(lotse::interop) | binary_id(lotse::metrics) | binary_id(lotse-mux::fixtures)' --run-ignored only --no-tests=fail mediamtx_ ffmpeg_ ffprobe_ prometheus_"
+run = "scripts/nextest.sh -E 'binary_id(rocko::interop) | binary_id(rocko::metrics) | binary_id(rocko-mux::fixtures)' --run-ignored only --no-tests=fail mediamtx_ ffmpeg_ ffprobe_ prometheus_"
 
 [tasks.load]
 description = "The load generator: N fake cameras x M headless viewers against a release daemon; report in target/load-report.json"
@@ -194,7 +194,7 @@ arg "[case]" help="join, aac, pli, reconnect, crash, mse, mse-pcmu, mse-opus, ll
 run = 'scripts/browser.sh "$usage_engine" "$usage_play" --case "$usage_case"'
 
 [tasks.compare]
-description = "The go2rtc comparison: the browser test through lotse and through go2rtc as its common deployment configures it, alternating, N runs each, reported side by side (fails only on lotse's own checks); report in target/compare-<engine>/"
+description = "The go2rtc comparison: the browser test through rocko and through go2rtc as its common deployment configures it, alternating, N runs each, reported side by side (fails only on rocko's own checks); report in target/compare-<engine>/"
 usage = '''
 arg "[engine]" help="chrome, firefox or safari" default="chrome"
 arg "[runs]" help="plays through each server" default="5"
@@ -234,7 +234,7 @@ description = "Static musl binary with its dependency list embedded (cargo audit
 usage = 'arg "[arch]" help="x86_64 or aarch64" default="x86_64"'
 run = """
 [ "$(uname -s)" = Linux ] || { echo "release-build runs on Linux; CI builds both arches (build.yml)" >&2; exit 1; }
-cargo auditable build --release --locked --bin lotse --target ${usage_arch}-unknown-linux-musl
+cargo auditable build --release --locked --bin rocko --target ${usage_arch}-unknown-linux-musl
 """
 
 # The release steps that need no tag, so a release can be checked and reproduced off CI;
@@ -242,15 +242,15 @@ cargo auditable build --release --locked --bin lotse --target ${usage_arch}-unkn
 [tasks.sbom]
 description = "CycloneDX SBOMs of the binary, one per release target, in target/dist/ (scripts/sbom.py)"
 run = [
-  "python3 scripts/sbom.py x86_64-unknown-linux-musl target/dist/lotse-x86_64-unknown-linux-musl.cdx.json",
-  "python3 scripts/sbom.py aarch64-unknown-linux-musl target/dist/lotse-aarch64-unknown-linux-musl.cdx.json",
+  "python3 scripts/sbom.py x86_64-unknown-linux-musl target/dist/rocko-x86_64-unknown-linux-musl.cdx.json",
+  "python3 scripts/sbom.py aarch64-unknown-linux-musl target/dist/rocko-aarch64-unknown-linux-musl.cdx.json",
 ]
 
 [tasks.licenses]
 description = "THIRD_PARTY_LICENSES.md of the crates the binary links, in target/dist/ (cargo about, .cargo/about.toml)"
 run = """
 mkdir -p target/dist
-cargo about generate --locked --fail --config .cargo/about.toml --manifest-path crates/lotse/Cargo.toml \
+cargo about generate --locked --fail --config .cargo/about.toml --manifest-path crates/rocko/Cargo.toml \
   --output-file target/dist/THIRD_PARTY_LICENSES.md .cargo/about.hbs
 """
 
@@ -259,18 +259,18 @@ cargo about generate --locked --fail --config .cargo/about.toml --manifest-path 
 # --timestamp sets them all. Docker: BuildKit's rewrite-timestamp, and no provenance attestation,
 # which records the build's own time.
 [tasks.image]
-description = "The release image of the host's arch (Dockerfile), reproducibly, into the local Podman, or Docker without it, as lotse:dev (Linux only, as release-build)"
+description = "The release image of the host's arch (Dockerfile), reproducibly, into the local Podman, or Docker without it, as rocko:dev (Linux only, as release-build)"
 run = """
 mise run release-build "$(uname -m)"
-install -D target/$(uname -m)-unknown-linux-musl/release/lotse target/image/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/lotse
+install -D target/$(uname -m)-unknown-linux-musl/release/rocko target/image/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/rocko
 epoch="$(git log -1 --format=%ct)"
 if ! command -v podman >/dev/null; then
   SOURCE_DATE_EPOCH="$epoch" docker buildx build --file Dockerfile --provenance=false --sbom=false \
-    --output type=docker,name=lotse:dev,rewrite-timestamp=true .
+    --output type=docker,name=rocko:dev,rewrite-timestamp=true .
 elif podman build --help | grep -q -- --rewrite-timestamp; then
-  podman build --file Dockerfile --source-date-epoch "$epoch" --rewrite-timestamp --tag lotse:dev .
+  podman build --file Dockerfile --source-date-epoch "$epoch" --rewrite-timestamp --tag rocko:dev .
 else
-  podman build --file Dockerfile --timestamp "$epoch" --tag lotse:dev .
+  podman build --file Dockerfile --timestamp "$epoch" --tag rocko:dev .
 fi
 """
 
@@ -282,5 +282,5 @@ arg "[arch]" help="x86_64 or aarch64, the host's by default" default=""
 '''
 run = """
 arch="${usage_arch:-$(uname -m)}"
-scripts/rootless-podman.sh "${usage_binary:-target/$arch-unknown-linux-musl/release/lotse}" "$arch"
+scripts/rootless-podman.sh "${usage_binary:-target/$arch-unknown-linux-musl/release/rocko}" "$arch"
 """

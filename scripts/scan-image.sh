@@ -8,7 +8,7 @@
 # found is a failure too. Fails on a HIGH or CRITICAL vulnerability that has a fix.
 #
 # Usage: scripts/scan-image.sh <grype source> [platform] [sarif file]
-#   e.g. oci-archive:lotse.tar, or registry:ghcr.io/<owner>/lotse@sha256:<digest> linux/arm64
+#   e.g. oci-archive:rocko.tar, or registry:ghcr.io/<owner>/rocko@sha256:<digest> linux/arm64
 set -eu
 
 SOURCE="${1:?usage: $0 <grype source> [platform] [sarif file]}"

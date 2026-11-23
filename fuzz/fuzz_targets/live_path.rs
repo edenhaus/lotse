@@ -1,4 +1,4 @@
-//! `live_path`: the live route's path parser (`lotse_api::live_id_of`), which
+//! `live_path`: the live route's path parser (`rocko_api::live_id_of`), which
 //! reads an untrusted request path, never panics; a path it takes is
 //! exactly `/v0/live/{live_id}` with an id of the identifier pattern
 //! (`^[A-Za-z0-9._-]{1,128}$`, never `.` or `..`, RFC 3986 §3.3), so the id
@@ -8,13 +8,13 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_api_types::live::live_path;
+use rocko_api_types::live::live_path;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(path) = std::str::from_utf8(data) else {
         return;
     };
-    let Some(live_id) = lotse_api::live_id_of(path) else {
+    let Some(live_id) = rocko_api::live_id_of(path) else {
         return;
     };
     let id = live_id.as_str();

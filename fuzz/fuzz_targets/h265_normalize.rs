@@ -12,7 +12,7 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::h265::{Depacketizer, PacketNormalizer, ParameterSets, packetize};
+use rocko_codec::h265::{Depacketizer, PacketNormalizer, ParameterSets, packetize};
 
 /// The depacketizer's frame limit: one packet's payload (at most 255
 /// bytes) and its start code always fit, two packets can cross it, so

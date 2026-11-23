@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use lotse_hls::{
+use rocko_hls::{
     Blocking, Config, Fragment, Lookup, MSN_DIRECTIVE, PART_DIRECTIVE, Resource, Window,
     decimal_integer,
 };

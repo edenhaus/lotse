@@ -8,7 +8,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_supervisor::net::stun::{Builder, Class, METHOD_BINDING, is_stun, parse};
+use rocko_supervisor::net::stun::{Builder, Class, METHOD_BINDING, is_stun, parse};
 
 fuzz_target!(|data: &[u8]| {
     let _ = is_stun(data);

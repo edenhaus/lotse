@@ -17,9 +17,9 @@ unused-ignored-advisory = "deny"
 ignore = [
   # chrono is unmaintained (no fix to wait for), not vulnerable. It comes in only through
   # m3u8-rs 6.0.1, the newest release, which needs it to parse the dates of EXT-X-PROGRAM-DATE-TIME
-  # and EXT-X-DATERANGE (RFC 3339): lotse-http reads neither, and the parsing runs in the
+  # and EXT-X-DATERANGE (RFC 3339): rocko-http reads neither, and the parsing runs in the
   # sandboxed worker. Remove with the m3u8-rs release or the own playlist parser that drops it.
-  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; only via m3u8-rs's date parsing, unused by lotse" },
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; only via m3u8-rs's date parsing, unused by rocko" },
 ]
 
 [licenses]
@@ -39,7 +39,7 @@ allow = [
 ]
 exceptions = [
   # libFuzzer's own license (LLVM's before Apache-2.0 WITH LLVM-exception); only the fuzz targets
-  # (lotse-fuzz) link it, never a release build, so cargo-about never meets it.
+  # (rocko-fuzz) link it, never a release build, so cargo-about never meets it.
   { crate = "libfuzzer-sys", allow = ["NCSA"] },
 ]
 

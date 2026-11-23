@@ -25,14 +25,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::aac::test_data::CONFIG_16K_MONO;
-use lotse_codec::{h264, h265};
-use lotse_core::clock::{Clock as _, FakeClock};
-use lotse_core::live::{LiveFragment, LiveMuxer as _, LiveStep};
-use lotse_core::recording::RecordingTrack;
-use lotse_core::{Codec, Kind, MediaFrame, MediaTime};
-use lotse_mux::LiveWriter;
 use mp4_atom::{Any, Decode as _};
+use rocko_codec::aac::test_data::CONFIG_16K_MONO;
+use rocko_codec::{h264, h265};
+use rocko_core::clock::{Clock as _, FakeClock};
+use rocko_core::live::{LiveFragment, LiveMuxer as _, LiveStep};
+use rocko_core::recording::RecordingTrack;
+use rocko_core::{Codec, Kind, MediaFrame, MediaTime};
+use rocko_mux::LiveWriter;
 
 /// The most frames one input pushes.
 const MAX_FRAMES: usize = 512;

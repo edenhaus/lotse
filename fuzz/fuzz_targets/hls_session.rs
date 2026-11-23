@@ -30,7 +30,7 @@
 //! - 3: a media playlist built from the bytes (`media_playlist`), live
 //!   ones growing by a segment at every load.
 //! - 4: a multivariant playlist built from the bytes (`multivariant`).
-//! - 5: a recorded segment (`crates/lotse-http/testdata/`) picked by the
+//! - 5: a recorded segment (`crates/rocko-http/testdata/`) picked by the
 //!   first byte, the rest written over it at the offset the next two give.
 //! - 6: a 200 whose body stops short of its `Content-Length`.
 //! - 7: no answer.
@@ -52,15 +52,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use lotse_core::clock::{Clock, FakeClock};
-use lotse_core::clock_map::ClockMapper;
-use lotse_core::source::{
+use rocko_core::clock::{Clock, FakeClock};
+use rocko_core::clock_map::ClockMapper;
+use rocko_core::source::{
     BackchannelSlot, ClockInput, ResolvedPeer, SourceCtx, SourceFactory as _, TrackSet,
 };
-use lotse_core::source_url::SourceUrl;
-use lotse_core::task::spawn_named;
-use lotse_core::track::TrackLimits;
-use lotse_http::HttpFactory;
+use rocko_core::source_url::SourceUrl;
+use rocko_core::task::spawn_named;
+use rocko_core::track::TrackLimits;
+use rocko_http::HttpFactory;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -80,20 +80,20 @@ const CANCEL_GRACE: Duration = Duration::from_secs(1);
 
 /// The recorded segments kind 5 serves.
 const FIXTURES: [&[u8]; 14] = [
-    include_bytes!("../../crates/lotse-http/testdata/live_0.m2t"),
-    include_bytes!("../../crates/lotse-http/testdata/live_1.m2t"),
-    include_bytes!("../../crates/lotse-http/testdata/live_2.m2t"),
-    include_bytes!("../../crates/lotse-http/testdata/h264_aac.m2t"),
-    include_bytes!("../../crates/lotse-http/testdata/h265_v1.m2t"),
-    include_bytes!("../../crates/lotse-http/testdata/h264_aac_init.mp4"),
-    include_bytes!("../../crates/lotse-http/testdata/h264_aac_0.m4s"),
-    include_bytes!("../../crates/lotse-http/testdata/h264_aac_1.m4s"),
-    include_bytes!("../../crates/lotse-http/testdata/h265_init.mp4"),
-    include_bytes!("../../crates/lotse-http/testdata/h265_0.m4s"),
-    include_bytes!("../../crates/lotse-http/testdata/split_video_init.mp4"),
-    include_bytes!("../../crates/lotse-http/testdata/split_video_0.m4s"),
-    include_bytes!("../../crates/lotse-http/testdata/split_audio_init.mp4"),
-    include_bytes!("../../crates/lotse-http/testdata/split_audio_0.m4s"),
+    include_bytes!("../../crates/rocko-http/testdata/live_0.m2t"),
+    include_bytes!("../../crates/rocko-http/testdata/live_1.m2t"),
+    include_bytes!("../../crates/rocko-http/testdata/live_2.m2t"),
+    include_bytes!("../../crates/rocko-http/testdata/h264_aac.m2t"),
+    include_bytes!("../../crates/rocko-http/testdata/h265_v1.m2t"),
+    include_bytes!("../../crates/rocko-http/testdata/h264_aac_init.mp4"),
+    include_bytes!("../../crates/rocko-http/testdata/h264_aac_0.m4s"),
+    include_bytes!("../../crates/rocko-http/testdata/h264_aac_1.m4s"),
+    include_bytes!("../../crates/rocko-http/testdata/h265_init.mp4"),
+    include_bytes!("../../crates/rocko-http/testdata/h265_0.m4s"),
+    include_bytes!("../../crates/rocko-http/testdata/split_video_init.mp4"),
+    include_bytes!("../../crates/rocko-http/testdata/split_video_0.m4s"),
+    include_bytes!("../../crates/rocko-http/testdata/split_audio_init.mp4"),
+    include_bytes!("../../crates/rocko-http/testdata/split_audio_0.m4s"),
 ];
 
 /// The `CODECS` a multivariant playlist's variants pick from (RFC 6381).

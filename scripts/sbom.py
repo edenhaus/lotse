@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the CycloneDX SBOM of the `lotse` binary for one release target.
+"""Write the CycloneDX SBOM of the `rocko` binary for one release target.
 
 `mise run sbom` and release.yml call it:
 
@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-MANIFEST = ROOT / "crates" / "lotse" / "Cargo.toml"
+MANIFEST = ROOT / "crates" / "rocko" / "Cargo.toml"
 
 
 def cyclonedx(target, env):
@@ -54,11 +54,11 @@ def cyclonedx(target, env):
     written = sorted((ROOT / "crates").glob(f"*/{pattern}"))
     document = None
     for path in written:
-        if path.parent == MANIFEST.parent and path.name == f"lotse_bin_{target}.cdx.json":
+        if path.parent == MANIFEST.parent and path.name == f"rocko_bin_{target}.cdx.json":
             document = json.loads(path.read_text())
         path.unlink()
     if document is None:
-        sys.exit(f"cargo cyclonedx wrote no SBOM for the lotse binary on {target}")
+        sys.exit(f"cargo cyclonedx wrote no SBOM for the rocko binary on {target}")
     return document
 
 
@@ -67,7 +67,7 @@ def resolved(target):
     out = subprocess.run(
         [
             "cargo", "tree", "--locked",
-            "--package", "lotse",
+            "--package", "rocko",
             "--target", target,
             "--edges", "normal",
             "--prefix", "none",
@@ -84,7 +84,7 @@ def resolved(target):
         if len(fields) >= 2 and fields[1].startswith("v"):
             crates.add((fields[0], fields[1][1:]))
     if not crates:
-        sys.exit(f"cargo tree resolved no crates for lotse on {target}")
+        sys.exit(f"cargo tree resolved no crates for rocko on {target}")
     return crates
 
 

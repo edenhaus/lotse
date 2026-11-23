@@ -28,15 +28,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::aac::test_data::CONFIG_16K_MONO;
-use lotse_codec::h264::annex_b_units;
-use lotse_codec::{h264, h265};
-use lotse_core::clock::{Clock as _, FakeClock};
-use lotse_core::recording::{RecordingMuxer as _, RecordingPolicy, RecordingTrack};
-use lotse_core::{Codec, Kind, MediaFrame, MediaTime};
-use lotse_http::fmp4::Reader;
-use lotse_mux::Muxer;
 use mp4_atom::{Any, Decode as _};
+use rocko_codec::aac::test_data::CONFIG_16K_MONO;
+use rocko_codec::h264::annex_b_units;
+use rocko_codec::{h264, h265};
+use rocko_core::clock::{Clock as _, FakeClock};
+use rocko_core::recording::{RecordingMuxer as _, RecordingPolicy, RecordingTrack};
+use rocko_core::{Codec, Kind, MediaFrame, MediaTime};
+use rocko_http::fmp4::Reader;
+use rocko_mux::Muxer;
 
 /// The most frames one input pushes.
 const MAX_FRAMES: usize = 512;
@@ -317,7 +317,7 @@ fuzz_target!(|data: &[u8]| {
             .filter(|(_, sample)| !sample.is_empty())
             .map(|(unit, _)| unit)
             .collect();
-        let got: Vec<&lotse_http::media::Unit> =
+        let got: Vec<&rocko_http::media::Unit> =
             units.iter().filter(|unit| unit.track == track).collect();
         assert!(
             got.windows(2)

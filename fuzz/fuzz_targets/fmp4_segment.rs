@@ -7,7 +7,7 @@
 //! parameter sets as the publisher seeds it.
 //!
 //! The first input byte picks the init segment: one of the recorded
-//! streams' (`crates/lotse-http/testdata/`, ISO/IEC 14496-12 §8.2.1), or
+//! streams' (`crates/rocko-http/testdata/`, ISO/IEC 14496-12 §8.2.1), or
 //! one from the input, whose first two bytes give its length. Its next
 //! bits pick the media segment: the rest of the input, or the recorded
 //! segment of the stream with the rest written over it at the offset the
@@ -19,10 +19,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::{h264, h265};
-use lotse_core::Codec;
-use lotse_http::fmp4::Reader;
-use lotse_http::media::Layout;
+use rocko_codec::{h264, h265};
+use rocko_core::Codec;
+use rocko_http::fmp4::Reader;
+use rocko_http::media::Layout;
 
 /// The frame limit: small, so the limit is reached.
 const MAX_FRAME: usize = 4096;
@@ -30,28 +30,28 @@ const MAX_FRAME: usize = 4096;
 /// The recorded streams: init segment and a media segment.
 const STREAMS: [(&[u8], &[u8]); 6] = [
     (
-        include_bytes!("../../crates/lotse-http/testdata/h264_aac_init.mp4"),
-        include_bytes!("../../crates/lotse-http/testdata/h264_aac_0.m4s"),
+        include_bytes!("../../crates/rocko-http/testdata/h264_aac_init.mp4"),
+        include_bytes!("../../crates/rocko-http/testdata/h264_aac_0.m4s"),
     ),
     (
-        include_bytes!("../../crates/lotse-http/testdata/h265_init.mp4"),
-        include_bytes!("../../crates/lotse-http/testdata/h265_0.m4s"),
+        include_bytes!("../../crates/rocko-http/testdata/h265_init.mp4"),
+        include_bytes!("../../crates/rocko-http/testdata/h265_0.m4s"),
     ),
     (
-        include_bytes!("../../crates/lotse-http/testdata/h264_bframes_init.mp4"),
-        include_bytes!("../../crates/lotse-http/testdata/h264_bframes_0.m4s"),
+        include_bytes!("../../crates/rocko-http/testdata/h264_bframes_init.mp4"),
+        include_bytes!("../../crates/rocko-http/testdata/h264_bframes_0.m4s"),
     ),
     (
-        include_bytes!("../../crates/lotse-http/testdata/split_video_init.mp4"),
-        include_bytes!("../../crates/lotse-http/testdata/split_video_0.m4s"),
+        include_bytes!("../../crates/rocko-http/testdata/split_video_init.mp4"),
+        include_bytes!("../../crates/rocko-http/testdata/split_video_0.m4s"),
     ),
     (
-        include_bytes!("../../crates/lotse-http/testdata/split_audio_init.mp4"),
-        include_bytes!("../../crates/lotse-http/testdata/split_audio_0.m4s"),
+        include_bytes!("../../crates/rocko-http/testdata/split_audio_init.mp4"),
+        include_bytes!("../../crates/rocko-http/testdata/split_audio_0.m4s"),
     ),
     (
-        include_bytes!("../../crates/lotse-http/testdata/opus_init.mp4"),
-        include_bytes!("../../crates/lotse-http/testdata/h264_aac_1.m4s"),
+        include_bytes!("../../crates/rocko-http/testdata/opus_init.mp4"),
+        include_bytes!("../../crates/rocko-http/testdata/h264_aac_1.m4s"),
     ),
 ];
 

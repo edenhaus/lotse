@@ -16,7 +16,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use lotse_codec::aac::{AacDecoder, FRAME_SAMPLES, parse_config};
+use rocko_codec::aac::{AacDecoder, FRAME_SAMPLES, parse_config};
 
 /// Takes `n` bytes off the front of `rest`.
 fn take<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
