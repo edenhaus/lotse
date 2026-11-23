@@ -156,26 +156,26 @@ url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.3/carg
 url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/677829608"
 
 [[tools."github:bluenviron/mediamtx"]]
-version = "1.21.3"
+version = "1.21.4"
 backend = "github:bluenviron/mediamtx"
-specifiers = ["1.21.3"]
+specifiers = ["v1.21.4"]
 
 [tools."github:bluenviron/mediamtx"."platforms.linux-arm64"]
-checksum = "sha256:27f038237cb5f77a724f6afc58eca2798f2bc4edf9989895631a80eeb41a4fe2"
-url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.3/mediamtx_v1.21.3_linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/674819375"
+checksum = "sha256:47784081da54c0608ea4dc359f5cfb19880209434769c532b3ed3a67ea99c29d"
+url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.4/mediamtx_v1.21.4_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/751108642"
 provenance = "github-attestations"
 
 [tools."github:bluenviron/mediamtx"."platforms.linux-x64"]
-checksum = "sha256:0a2ea7eba96023631efa1bea7804823a9145b043b6646a8a05798d4ac24ed635"
-url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.3/mediamtx_v1.21.3_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/674819329"
+checksum = "sha256:be0c05d9c8af8338116977e7f1c3fcb409fbf882075e5ab075cf8baad76a59d2"
+url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.4/mediamtx_v1.21.4_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/751108568"
 provenance = "github-attestations"
 
 [tools."github:bluenviron/mediamtx"."platforms.macos-arm64"]
-checksum = "sha256:bc1a0762fd18ffb413bcd81dcb9a072ac159fbd1f27e79ac6f14598aaac5ed3f"
-url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.3/mediamtx_v1.21.3_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/674819276"
+checksum = "sha256:20dfa23c1db149b935c2f23439ffbf0820a0ac1d6979a6eb9b21f74fc8376647"
+url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.4/mediamtx_v1.21.4_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/bluenviron/mediamtx/releases/assets/751108504"
 provenance = "github-attestations"
 
 [[tools."github:boshen/cargo-shear"]]

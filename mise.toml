@@ -37,7 +37,7 @@ uv = "0.13.8" # the browser test's Python, Selenium and pytest, and its checks (
 # The camera of the browser and interop tests: ffmpeg encodes and publishes, MediaMTX serves RTSP
 # and HLS; ffmpeg alone serves raw MPEG-TS over HTTP.
 # Third-party tools on purpose, so the stream is not our own reading of the specs.
-"github:bluenviron/mediamtx" = "1.21.3"
+"github:bluenviron/mediamtx" = "v1.21.4"
 # The scraper of the metrics test (`mise run interop`, the ignored `prometheus_` test): a real
 # Prometheus scraping the daemon over mutual TLS, so the exposition and Go's TLS path (the server
 # certificate's DNS name, `server_name`, the client certificate) are a third party's reading.
