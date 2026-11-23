@@ -775,11 +775,12 @@ mod http {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs ffmpeg: mise run interop"]
     async fn ffmpeg_iso13818_1_raw_mpegts_http() {
-        // ffmpeg serves one client and listens only a moment after it
-        // starts: an attempt before that is refused and retried, so the
-        // attempts are not counted here.
+        // ffmpeg serves one client, and listens once started: the daemon's
+        // first attempt is not refused.
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let server = TsServer::start(Audio::Aac).expect("ffmpeg (run through `mise run interop`)");
+        let server = TsServer::start(Audio::Aac, Arc::clone(&clock))
+            .await
+            .expect("ffmpeg (run through `mise run interop`)");
         let (daemon, control) = daemon("raw-mpegts").await;
         put(&control, &server.url(), json!({})).await;
         check_live_http(
