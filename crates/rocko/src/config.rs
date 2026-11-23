@@ -1074,7 +1074,8 @@ const SANDBOX: Mode = Mode::Require;
 /// port 30415. IANA has not assigned it (30401–30831 are unassigned), it
 /// needs no privilege (above 1023), and it is below Linux's ephemeral range
 /// (32768–60999, `net.ipv4.ip_local_port_range`'s default), so no outgoing
-/// connection holds it when the daemon binds.
+/// connection holds it when the daemon binds. The number is the birthday
+/// of the dog the project is named after, 30.4.15 (README, "Rocko").
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(
     std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
     30_415,
