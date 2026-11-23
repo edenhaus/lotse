@@ -31,6 +31,8 @@
 //! self-signed certificate ([`CameraTls`]) the test pins. [`TsServer`] is
 //! ffmpeg alone serving the stream as one raw MPEG-TS body (ISO/IEC
 //! 13818-1) over HTTP with `-listen 1`: one client, after which it exits.
+//! [`TsServer::start`] waits until ffmpeg listens, which Linux's procfs
+//! tells: a connection to ask would be that one client.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
@@ -77,7 +79,11 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// before its API answers: a port [`Ports::free`] found was taken before
 /// MediaMTX bound it (observed in CI on 2026-10-15, MediaMTX 1.21.1:
 /// `bind: address already in use`, with the interop tests and their
-/// daemons binding port 0 alongside).
+/// daemons binding port 0 alongside). [`TsServer::start`] starts ffmpeg as
+/// often on a new port when it exits before it listens, for the same
+/// reason (observed in CI on 2026-11-23, ffmpeg n9.0.2: `Error opening
+/// output http://127.0.0.1:40333/cam.ts: Address already in use`, and an
+/// exit at once).
 const START_ATTEMPTS: u32 = 4;
 
 /// Numbers the HTTPS key and certificate directories of this process's
@@ -89,6 +95,14 @@ const POLL: Duration = Duration::from_millis(100);
 
 /// The largest API answer read.
 const MAX_ANSWER: u64 = 1 << 20;
+
+/// Where Linux's procfs is mounted.
+const PROC: &str = "/proc";
+
+/// A listening socket in the `st` column of `/proc/net/tcp`: `TCP_LISTEN`
+/// (10, Linux `include/net/tcp_states.h`), which the table prints in
+/// hexadecimal.
+const TCP_LISTEN: &str = "0A";
 
 /// The video ffmpeg publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,14 +737,9 @@ impl Camera {
 
     /// Fails when a process has exited.
     fn check_running(&mut self) -> Result<(), String> {
-        let exited = |name: &str, child: &mut Child| match child.try_wait() {
-            Ok(Some(status)) => Err(format!("{name} exited: {status}")),
-            Ok(None) => Ok(()),
-            Err(err) => Err(format!("{name}: {err}")),
-        };
-        exited("mediamtx", &mut self.mediamtx)?;
+        running("mediamtx", &mut self.mediamtx)?;
         if let Some(ffmpeg) = self.ffmpeg.as_mut() {
-            exited("ffmpeg", ffmpeg)?;
+            running("ffmpeg", ffmpeg)?;
         }
         Ok(())
     }
@@ -839,16 +848,67 @@ pub struct TsServer {
 }
 
 impl TsServer {
-    /// Starts ffmpeg with `audio`. It listens a moment later, and only
-    /// then encodes: a client that connects first is refused and retries.
-    pub fn start(audio: Audio) -> Result<Self, String> {
-        let port = free_tcp_port().map_err(|err| format!("a free port: {err}"))?;
-        let mut ffmpeg = command("ffmpeg").map_err(|err| format!("ffmpeg: {err}"))?;
-        ffmpeg.args(ts_server_args(audio, &Self::url_at(port)));
-        Ok(Self {
-            ffmpeg: spawn(ffmpeg)?,
-            port,
+    /// Starts ffmpeg with `audio` and waits until it listens, so
+    /// [`Self::url`] is one its first client is not refused at. ffmpeg
+    /// encodes only once that client has asked.
+    pub async fn start(audio: Audio, clock: Arc<dyn Clock>) -> Result<Self, String> {
+        Self::start_ffmpeg(&*clock, |port| {
+            let mut ffmpeg = command("ffmpeg")?;
+            ffmpeg.args(ts_server_args(audio, &Self::url_at(port)));
+            Ok(ffmpeg)
         })
+        .await
+    }
+
+    /// Starts ffmpeg from the command `ffmpeg` makes for the free port it
+    /// is given and waits until it listens there; on a new port, up to
+    /// [`START_ATTEMPTS`] times, while it exits before then: the port was
+    /// taken before ffmpeg bound it. One that is still running when the
+    /// wait times out is not started again.
+    async fn start_ffmpeg(
+        clock: &dyn Clock,
+        mut ffmpeg: impl FnMut(u16) -> io::Result<Command>,
+    ) -> Result<Self, String> {
+        let mut attempt = 1;
+        loop {
+            let port = free_tcp_port().map_err(|err| format!("a free port: {err}"))?;
+            let ffmpeg = ffmpeg(port).map_err(|err| format!("ffmpeg: {err}"))?;
+            let mut server = Self {
+                ffmpeg: spawn(ffmpeg)?,
+                port,
+            };
+            match server.wait_listening(clock).await {
+                Ok(()) => return Ok(server),
+                // Exited at start: its port was taken meanwhile.
+                Err(err)
+                    if attempt < START_ATTEMPTS
+                        && matches!(server.ffmpeg.try_wait(), Ok(Some(_))) =>
+                {
+                    tracing::warn!(attempt, port, %err, "ffmpeg did not listen; a new port");
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Waits until ffmpeg listens on its port; fails when it has exited,
+    /// or does not listen within [`READY_TIMEOUT`].
+    async fn wait_listening(&mut self, clock: &dyn Clock) -> Result<(), String> {
+        let deadline = clock.now().checked_add(READY_TIMEOUT);
+        loop {
+            running("ffmpeg", &mut self.ffmpeg)?;
+            if listens(Path::new(PROC), self.ffmpeg.id(), self.port)? {
+                return Ok(());
+            }
+            if deadline.is_some_and(|at| clock.now() >= at) {
+                return Err(format!(
+                    "ffmpeg not listening on port {} in {READY_TIMEOUT:?}",
+                    self.port
+                ));
+            }
+            clock.sleep(POLL).await;
+        }
     }
 
     /// The URL it serves the stream at.
@@ -873,6 +933,76 @@ impl Drop for TsServer {
         let _killed = self.ffmpeg.kill();
         let _reaped = self.ffmpeg.wait();
     }
+}
+
+/// Fails when the process `child`, called `name`, has exited.
+fn running(name: &str, child: &mut Child) -> Result<(), String> {
+    match child.try_wait() {
+        Ok(Some(status)) => Err(format!("{name} exited: {status}")),
+        Ok(None) => Ok(()),
+        Err(err) => Err(format!("{name}: {err}")),
+    }
+}
+
+/// Whether the process `pid` holds a socket that listens on the TCP port
+/// `port` over IPv4, as the procfs mounted at `proc` tells: a socket of
+/// [`listening_inodes`] that one of the process's descriptors is
+/// ([`socket_inode`]). A listener on the port alone would not say whose it
+/// is: another process that took the port listens there as well, and
+/// asking by connecting would use up the one client `ffmpeg -listen 1`
+/// serves.
+///
+/// A process whose descriptors cannot be read does not listen: it has
+/// exited (observed on Linux 6.18 on 2026-11-23: the `fd` directory of a
+/// child not yet waited for is root's, `EACCES` to another user, and gone
+/// once it is), and a descriptor closed while they are read is not the
+/// listener's. Fails when the table of sockets cannot be read, as off
+/// Linux.
+fn listens(proc: &Path, pid: u32, port: u16) -> Result<bool, String> {
+    let table = proc.join("net/tcp");
+    let listeners = std::fs::read_to_string(&table)
+        .map(|table| listening_inodes(&table, port))
+        .map_err(|err| format!("{}: {err}", table.display()))?;
+    let Ok(descriptors) = std::fs::read_dir(proc.join(pid.to_string()).join("fd")) else {
+        return Ok(false);
+    };
+    Ok(descriptors
+        .filter_map(|descriptor| std::fs::read_link(descriptor.ok()?.path()).ok())
+        .filter_map(|target| socket_inode(&target))
+        .any(|inode| listeners.contains(&inode)))
+}
+
+/// The inodes of the sockets listening on the TCP port `port` in `table`,
+/// the text of `/proc/net/tcp` (Linux
+/// `Documentation/networking/proc_net_tcp.rst`): a heading, then a line
+/// per IPv4 socket, of whose columns the second is the local address and
+/// port in hexadecimal (`0100007F:9D8D`), the fourth the state
+/// ([`TCP_LISTEN`]) and the tenth the inode. Lines that read otherwise,
+/// the heading among them, name no socket.
+fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let (_address, local_port) = columns.nth(1)?.rsplit_once(':')?;
+            let state = columns.nth(1)?;
+            let inode = columns.nth(5)?.parse().ok()?;
+            (state == TCP_LISTEN && u16::from_str_radix(local_port, 16) == Ok(port))
+                .then_some(inode)
+        })
+        .collect()
+}
+
+/// The inode of the socket a descriptor is, from the `target` its
+/// `/proc/<pid>/fd/<n>` links to: `socket:[<inode>]` for a socket
+/// (`proc_pid_fd(5)`); `None` for a file's path or another type.
+fn socket_inode(target: &Path) -> Option<u64> {
+    target
+        .to_str()?
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
 }
 
 /// Whether the API's `path` is ready with `video`'s and `audio`'s tracks.
@@ -1095,6 +1225,171 @@ mod tests {
             "{line}"
         );
         assert_eq!(TsServer::url_at(7), "http://127.0.0.1:7/cam.ts");
+    }
+
+    /// A `/proc/net/tcp` in the layout Linux 6.18 prints (observed
+    /// 2026-11-23): a listener on 127.0.0.1:40333 (`9D8D`), one on every
+    /// address's port 2024 (`07E8`), and a connection the first accepted
+    /// from port 50000 (`C350`).
+    const TCP_TABLE: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:9D8D 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 4711 1 000000003c555a7a 100 0 0 10 0
+   1: 00000000:07E8 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 2104 1 0000000061e66be4 100 0 0 10 0
+   2: 0100007F:9D8D 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1001        0 4712 1 00000000a1b2c3d4 20 4 30 10 -1
+";
+
+    #[test]
+    fn the_listeners_of_a_port_are_read_from_the_table_of_sockets() {
+        assert_eq!(listening_inodes(TCP_TABLE, 40_333), [4711]);
+        assert_eq!(listening_inodes(TCP_TABLE, 2024), [2104]);
+        // The remote port of a connection is not a listener's.
+        assert_eq!(listening_inodes(TCP_TABLE, 50_000), [0_u64; 0]);
+        let two = format!("{TCP_TABLE}   3: 00000000:9D8D 00000000:0000 0A 0:0 0:0 0 0 0 4713\n");
+        assert_eq!(listening_inodes(&two, 40_333), [4711, 4713]);
+        // Lines that are no socket's: too short, no port, a port or an
+        // inode that is no number.
+        for line in [
+            "",
+            "0:",
+            "0: 0100007F:9D8D 00000000:0000",
+            "0: 0100007F:9D8D 00000000:0000 0A 0:0 0:0 0 0 0",
+            "0: 0100007F9D8D 00000000:0000 0A 0:0 0:0 0 0 0 4711",
+            "0: 0100007F:port 00000000:0000 0A 0:0 0:0 0 0 0 4711",
+            "0: 0100007F:9D8D 00000000:0000 0A 0:0 0:0 0 0 0 inode",
+        ] {
+            assert_eq!(listening_inodes(line, 40_333), [0_u64; 0], "{line}");
+        }
+    }
+
+    #[test]
+    fn a_descriptor_that_is_a_socket_names_its_inode() {
+        assert_eq!(socket_inode(Path::new("socket:[4711]")), Some(4711));
+        assert_eq!(socket_inode(Path::new("pipe:[4711]")), None);
+        assert_eq!(socket_inode(Path::new("/dev/null")), None);
+        assert_eq!(socket_inode(Path::new("socket:[4711")), None);
+        assert_eq!(socket_inode(Path::new("socket:[inode]")), None);
+    }
+
+    #[test]
+    fn a_process_listens_when_a_descriptor_of_its_is_the_ports_listener() {
+        use std::os::unix::fs::symlink;
+
+        let proc =
+            std::env::temp_dir().join(format!("lotse-ts-server-proc-{}", std::process::id()));
+        let fd = |pid: u32| proc.join(pid.to_string()).join("fd");
+        // One a failed run of a process with this id left behind.
+        let _stale = std::fs::remove_dir_all(&proc);
+        std::fs::create_dir_all(proc.join("net")).unwrap();
+        // Without the table of sockets nothing can be told.
+        let err = listens(&proc, 7, 40_333).unwrap_err();
+        assert!(err.contains("net/tcp"), "{err}");
+        std::fs::write(proc.join("net/tcp"), TCP_TABLE).unwrap();
+        // A process that is gone, or whose descriptors cannot be read.
+        assert_eq!(listens(&proc, 7, 40_333), Ok(false));
+        // 7 holds the listener of 40333; 8 a connection it accepted, and
+        // nothing that is a socket; a descriptor that is no link is passed
+        // over, as one closed meanwhile.
+        for pid in [7, 8] {
+            std::fs::create_dir_all(fd(pid)).unwrap();
+            symlink("/dev/null", fd(pid).join("0")).unwrap();
+            std::fs::write(fd(pid).join("1"), "").unwrap();
+        }
+        symlink("socket:[4711]", fd(7).join("3")).unwrap();
+        symlink("socket:[4712]", fd(8).join("3")).unwrap();
+        assert_eq!(listens(&proc, 7, 40_333), Ok(true));
+        assert_eq!(listens(&proc, 8, 40_333), Ok(false));
+        // The listener of another port is another process's.
+        assert_eq!(listens(&proc, 7, 2024), Ok(false));
+        std::fs::remove_dir_all(&proc).unwrap();
+    }
+
+    #[test]
+    fn the_procfs_tells_which_process_listens_on_a_port() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut sleep = command("sleep").unwrap();
+        sleep.arg("5");
+        let mut other = spawn(sleep).unwrap();
+        let proc = Path::new(PROC);
+        assert_eq!(listens(proc, std::process::id(), port), Ok(true));
+        // The port is taken, but not by that process.
+        assert_eq!(listens(proc, other.id(), port), Ok(false));
+        drop(listener);
+        assert_eq!(listens(proc, std::process::id(), port), Ok(false));
+        other.kill().unwrap();
+        other.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_ffmpeg_that_exits_at_start_is_started_again_on_a_new_port() {
+        let mut starts = 0;
+        let err = TsServer::start_ffmpeg(&lotse_core::clock::SystemClock, |_| {
+            starts += 1;
+            command("false")
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("ffmpeg exited"), "{err}");
+        assert_eq!(starts, START_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn an_ffmpeg_started_again_after_an_exit_listens() {
+        let mut ports = Vec::new();
+        let server = TsServer::start_ffmpeg(&lotse_core::clock::SystemClock, |port| {
+            ports.push(port);
+            if ports.len() == 1 {
+                return command("false");
+            }
+            // The second one stays up and listens on its port: the
+            // listening socket is its standard input.
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+            let mut sleep = command("sleep")?;
+            sleep.arg("5").stdin(std::os::fd::OwnedFd::from(listener));
+            Ok(sleep)
+        })
+        .await
+        .unwrap();
+        assert_eq!(ports.len(), 2);
+        assert_eq!(server.url(), TsServer::url_at(ports[1]));
+        // A client is not refused there.
+        std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, ports[1])).unwrap();
+        server.stop();
+    }
+
+    #[tokio::test]
+    async fn a_running_ffmpeg_that_does_not_listen_in_time_is_not_started_again() {
+        let clock = lotse_core::clock::FakeClock::default();
+        let mut taken = Vec::new();
+        // The process stays up without listening, and the listener on its
+        // port is another process's (this one's).
+        let start = TsServer::start_ffmpeg(&clock, |port| {
+            taken.push(TcpListener::bind((Ipv4Addr::LOCALHOST, port))?);
+            let mut sleep = command("sleep")?;
+            sleep.arg("5");
+            Ok(sleep)
+        });
+        let advance = async {
+            loop {
+                clock.advance(POLL);
+                tokio::task::yield_now().await;
+            }
+        };
+        let err = tokio::select! {
+            result = start => result.unwrap_err(),
+            () = advance => unreachable!(),
+        };
+        assert!(err.contains("ffmpeg not listening on port"), "{err}");
+        assert_eq!(taken.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_command_that_cannot_be_made_fails_the_start() {
+        let err = TsServer::start_ffmpeg(&lotse_core::clock::SystemClock, |_| {
+            Err(io::Error::other("no command"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err, "ffmpeg: no command");
     }
 
     #[test]
