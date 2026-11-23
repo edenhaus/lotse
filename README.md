@@ -9,7 +9,7 @@ as event recordings: fragmented MP4 that starts before the event, from the
 seconds it keeps in memory, for its client to store. It does nothing
 else.
 
-It is named after [Rocko](#rocko), who watched over a house long before
+It is named after [Rocko](#the-name), who watched over a house long before
 this daemon did.
 
 > [!WARNING]
@@ -518,7 +518,7 @@ units are in the name (`_bytes`, `_seconds`). Over TLS, a `metrics`
 client is answered 403 on every other route and 404 on a path that does
 not exist. `mise run interop` runs this setup against a real Prometheus.
 
-## Rocko
+## The name
 
 Rocko was my dog. He was born on 30 April 2015 and died at the beginning
 of 2026. He always watched over us and our house. This daemon does that
